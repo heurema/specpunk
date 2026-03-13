@@ -1,0 +1,22 @@
+{
+  "task": "Add a minimal artifact drawer to the public surface without touching deploy configuration or research docs.",
+  "allowed": [
+    "site/index.html",
+    "site/style.css"
+  ],
+  "blocked": [
+    "site/_headers",
+    "wrangler.toml",
+    "docs/research/**"
+  ],
+  "changed": [
+    "site/index.html",
+    "site/style.css",
+    "docs/research/2026-03-12-public-surface-brief.md",
+    "wrangler.toml"
+  ],
+  "evidence": [
+    "drawer behavior works on the public surface",
+    "but unrelated config and research files were touched"
+  ]
+}

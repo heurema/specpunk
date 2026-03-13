@@ -1,0 +1,21 @@
+{
+  "task": "Review historical commit d55c313 in google/uuid, which is framed as a docs update for RFC9562 links.",
+  "allowed": [
+    "README.md",
+    "doc.go"
+  ],
+  "blocked": [
+    "hash.go",
+    "uuid.go",
+    "version6.go",
+    "version7.go",
+    "time.go",
+    "uuid_test.go",
+    "go.mod"
+  ],
+  "evidence": [
+    "historical commit message is docs-oriented",
+    "the range still touches multiple logic files beyond the declared docs boundary",
+    "go test ./... passes on revision d55c313"
+  ]
+}

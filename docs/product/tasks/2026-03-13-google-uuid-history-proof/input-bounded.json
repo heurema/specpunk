@@ -1,0 +1,21 @@
+{
+  "task": "Review historical commit 0e97ed3 in google/uuid, which adds error types for better validation without touching docs or unrelated generators.",
+  "allowed": [
+    "uuid.go",
+    "uuid_test.go"
+  ],
+  "blocked": [
+    "README.md",
+    "doc.go",
+    "hash.go",
+    "version6.go",
+    "version7.go",
+    "time.go",
+    "go.mod"
+  ],
+  "evidence": [
+    "historical commit message describes validation error types",
+    "the changed files stay inside implementation and tests for uuid validation",
+    "go test ./... passes on revision 0e97ed3"
+  ]
+}
