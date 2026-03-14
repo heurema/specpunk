@@ -1,6 +1,6 @@
 # Decisions
 
-Last updated: 2026-03-12
+Last updated: 2026-03-14
 Owner: Vitaly
 Status: active
 
@@ -63,3 +63,18 @@ Reason:
 Consequence:
 - new CLI foundation work should land in `Go`
 - the current Python tool is treated as a spike, not as the long-term runtime base
+
+## 2026-03-14 / D-006
+
+Decision:
+- pause implementation after the current wedge proof and switch the next pass to idea research
+
+Reason:
+- the repo now has a credible wedge proof and product path
+- the next major risk is thesis drift, not missing CLI mechanics
+- continuing implementation before another research pass would increase local polish faster than product certainty
+
+Consequence:
+- no new product-path code should be treated as the default next move
+- the next return to execution starts from `pause-handoff-2026-03-14.md`, `queued-next-tasks.md`, and `open-questions.md`
+- if research changes the thesis, update `brief.md` before resuming implementation

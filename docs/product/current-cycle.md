@@ -1,9 +1,9 @@
 # Current Cycle
 
-Last updated: 2026-03-13
+Last updated: 2026-03-14
 Owner: Vitaly
 Cycle: 2026-03-12 to 2026-03-26
-Status: active
+Status: paused
 
 ## Cycle Rule
 
@@ -13,6 +13,22 @@ If it conflicts with `brief.md`, update `decisions.md` and `brief.md` first, or 
 ## Goal
 
 Turn the current research and public surface into a working product loop on this repo.
+
+## Pause State
+
+Reason:
+- the current wedge is stable enough for pause
+- the next uncertainty is idea research, not implementation mechanics
+
+Resume trigger:
+- review the pause handoff and queued tasks
+- decide whether the current wedge still matches the refined thesis
+- update `decisions.md` and `brief.md` first if the thesis changed during research
+
+Resume entry points:
+- [pause-handoff-2026-03-14.md](/Users/vi/personal/specpunk/docs/product/pause-handoff-2026-03-14.md)
+- [queued-next-tasks.md](/Users/vi/personal/specpunk/docs/product/queued-next-tasks.md)
+- [2026-03-14.md](/Users/vi/personal/specpunk/docs/product/reviews/2026-03-14.md)
 
 ## Priorities
 
@@ -55,6 +71,9 @@ Current proof:
 - [google uuid PR context proof task](/Users/vi/personal/specpunk/docs/product/tasks/2026-03-13-google-uuid-pr-context-proof.md)
 - [google uuid issue proof task](/Users/vi/personal/specpunk/docs/product/tasks/2026-03-13-google-uuid-issue-proof.md)
 - [task dir workflow task](/Users/vi/personal/specpunk/docs/product/tasks/2026-03-13-task-dir-workflow.md)
+
+Remaining gap before Milestone 1 exit:
+- run the `task-dir` workflow on one real repo-local code change instead of a static demo task
 
 ## Success Criteria
 

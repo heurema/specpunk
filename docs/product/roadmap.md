@@ -1,8 +1,8 @@
 # Roadmap
 
-Last updated: 2026-03-13
+Last updated: 2026-03-14
 Owner: Vitaly
-Status: active
+Status: paused
 
 ## Roadmap Rule
 
@@ -14,9 +14,13 @@ A milestone is complete only when it has:
 - a dogfooded usage path in this repo
 - a short evidence note showing why it matters
 
+Execution note:
+- implementation is paused for idea research
+- milestone definitions stay current until a decision changes them
+
 ## Milestone 0
 
-Status: active
+Status: complete
 Outcome:
 - public surface is live and honest enough to show the product shape
 - the repo has a product operating system under `docs/product/`
