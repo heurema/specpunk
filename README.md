@@ -1,113 +1,118 @@
-# Specpunk
+# punk
 
-Specpunk is a repo-native review boundary for AI-assisted brownfield change.
+**Your codebase is not ready for AI agents. punk fixes that.**
 
-Current thesis:
+AI agents write code fast. But they don't know your conventions, your boundaries, or your invariants. They generate PRs that compile, pass tests, and silently break everything you've built.
 
-- AI can generate code faster than teams can safely review it.
-- The bottleneck is no longer generation, but review clarity and trust.
-- Specpunk turns a noisy change into a bounded review object.
+punk is a CLI that scans your project, extracts its implicit rules, and turns every task into a verifiable contract — before any code is written.
 
-Public surface:
+```
+punk init          # understand the project (< 10 seconds)
+punk plan "task"   # generate a contract, not code
+punk check         # verify the implementation matches the contract
+punk receipt       # cryptographic proof of what happened
+```
 
-- `https://specpunk.com`
+---
+
+## The problem
+
+Every AI coding tool today starts from a blank context. They read your files, guess your patterns, and hope for the best. The result:
+
+- Convention drift (your style guide exists, nobody reads it)
+- Scope creep (asked to fix auth, also "improved" the database layer)
+- Ghost solutions (old approach left in, new one added on top)
+- Review theater (1000-line PR, 3 reviewers, "LGTM")
+
+**The cost isn't generation. It's verification.**
+
+## What punk does
+
+**Phase 1 — Understand** (`punk init`)
+
+Scans your codebase in under 10 seconds. No LLM, no API calls. Detects language, framework, conventions, test patterns, commit style, and boundaries. Outputs machine-readable artifacts that make every subsequent AI interaction dramatically better.
+
+**Phase 2 — Contract** (`punk plan "add user auth"`)
+
+Before anyone writes code, punk generates a contract: what files to touch, what to never touch, acceptance criteria, and a quality score. You approve it like `terraform plan`. The contract becomes the review boundary.
+
+**Phase 3 — Verify** (`punk check`)
+
+After implementation, punk verifies the change stayed within the contract. Scope violations, missing acceptance criteria, convention breaks — caught automatically, not in review.
+
+**Phase 4 — Receipt** (`punk receipt`)
+
+Cryptographic proof of what was planned, what was built, and whether they match. Append-only. Auditable. The missing link between "the AI wrote it" and "we verified it."
+
+## Design principles
+
+- **Brownfield-first.** Built for existing codebases, not greenfield demos.
+- **CLI-native.** Works in your terminal, your CI, your pre-commit hooks. No web UI, no vendor lock-in.
+- **Deterministic by default.** `punk init` and `punk check` never call an LLM. Only `punk plan` uses one, and `--manual` works offline.
+- **Receipts, not trust.** Every decision is recorded. Every verification is reproducible.
 
 ## Status
 
-Experimental.
+Active development. Phase 0-2 complete (init + plan + config). Phase 3 (check) in progress.
 
-What already exists in this repo:
+- 40 tests, 0 clippy warnings
+- Rust workspace (punk-core lib + punk-cli bin)
+- git + jj support via VCS trait abstraction
+- Multi-language scanning: Rust, JavaScript/TypeScript, Python, Go
 
-- a Go CLI wedge
-- repo-local task scaffolding
-- scope checking against manifest, diff, stdin, or git range
-- stored proof artifacts on internal and external repos
-- product operating docs under `docs/product/`
+## Install
 
-## Current Wedge
-
-The first wedge is:
-
-`scope enforcement + minimal review artifact`
-
-That means:
-
-- declare what files a task should touch
-- compare the declared boundary with the actual change
-- emit a compact review artifact that says whether the change stayed bounded
-
-## Quick Start
-
-Run tests:
-
-```bash
-go test ./...
+```sh
+cargo install --path punk/punk-cli
 ```
 
-Create a minimal task directory:
+## Quick start
 
-```bash
-go run ./cmd/specpunk task init \
-  --task-dir tmp/demo-task \
-  --task "Review a bounded site change." \
-  --allow "site/index.html" \
-  --allow "site/style.css" \
-  --block "docs/research/**" \
-  --evidence "manual browser check"
+```sh
+# Scan an existing project
+cd your-project
+punk init
+
+# Configure LLM provider (for punk plan)
+punk config set-provider anthropic https://api.anthropic.com/v1/messages sk-ant-...
+
+# Generate a contract
+punk plan "add rate limiting to the API"
+
+# Or work offline
+punk plan --manual "add rate limiting to the API"
 ```
 
-Important:
+## Sponsor
 
-- quote glob patterns like `"docs/research/**"` so the shell does not expand them before Specpunk sees them
+punk is built in the open by one developer. If this solves a real problem for you, consider sponsoring development:
 
-Add a changed-file manifest:
+**USDC (Polygon):** `0x1EB9b1dec7Ee036BE0BABE9B75AdaF6BD72f546C`
 
-```bash
-printf 'site/index.html\nsite/style.css\n' > tmp/demo-task/changed.txt
-```
+**What sponsorship enables:**
+- Faster iteration on Phase 3-4 (check + receipt)
+- Multi-model contract generation (Claude + GPT + Gemini)
+- Convention auto-tuning (auto-research loop for rule optimization)
+- `punk scan --agents-md` — generate optimized AI agent instructions from your codebase
 
-Generate a review artifact:
+Every sponsor gets early access to features and a voice in the roadmap.
 
-```bash
-go run ./cmd/specpunk check \
-  --task-dir tmp/demo-task \
-  --changed-manifest tmp/demo-task/changed.txt
-```
+## Roadmap
 
-That writes:
+| Phase | Status | What |
+|-------|--------|------|
+| 0 | done | Scaffold, CLI, VCS trait, CI |
+| 1 | done | `punk init` — brownfield scan, conventions, boundaries |
+| 2 | done | `punk plan` — contract generation, quality heuristic, approval |
+| 0.9 | done | `punk config` — provider management |
+| 3 | next | `punk check` — verify implementation vs contract |
+| 4 | planned | `punk receipt` — cryptographic completion proof |
+| 5+ | research | Convention auto-tuning, AGENTS.md generation, multi-model audit |
 
-- `tmp/demo-task/generated-review.md`
+## Why "punk"
 
-## Repo Map
+Because your codebase has rules that nobody wrote down, conventions that nobody enforces, and boundaries that nobody respects. punk makes them explicit, verifiable, and non-negotiable.
 
-- `cmd/specpunk/`
-  CLI entrypoint
-- `internal/check/`
-  scope classification and review artifact rendering
-- `internal/taskdir/`
-  task-directory scaffold workflow
-- `site/`
-  current public surface deployed on `specpunk.com`
-- `docs/product/`
-  product source of truth, roadmap, cycle, reviews, and dogfood packets
-- `docs/research/`
-  supporting research and synthesis docs
-- `tools/specpunk_review.py`
-  earlier spike, kept for reference, not the current product path
+## License
 
-## Product Docs
-
-Start here:
-
-- [Product Brief](docs/product/brief.md)
-- [Roadmap](docs/product/roadmap.md)
-- [Current Cycle](docs/product/current-cycle.md)
-
-## Non-Goals
-
-Specpunk is not:
-
-- a new IDE
-- a replacement for Claude Code, Codex, or Cursor
-- a natural-language compiler
-- a full spec-as-source system
+MIT
