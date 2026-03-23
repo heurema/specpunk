@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "punk-core",
+    "punk-cli",
+]
+resolver = "2"

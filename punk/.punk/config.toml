@@ -1,0 +1,11 @@
+# punk configuration
+# https://github.com/heurema/specpunk
+
+[vcs]
+# auto-detected: jj takes priority over git
+preferred = "auto"
+
+[provider]
+# LLM provider configuration (Phase 1)
+# api_key = ""
+# model = ""

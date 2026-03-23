@@ -1,0 +1,17 @@
+[package]
+name = "punk-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for punk — spec-driven development toolkit"
+license = "MIT"
+
+[[bin]]
+name = "punk"
+path = "src/main.rs"
+
+[dependencies]
+punk-core = { path = "../punk-core" }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -12,3 +12,5 @@ docs/research/_delve_runs/
 specpunk-final-desktop.png
 specpunk-final-mobile.png
 specpunk-site-build.png
+.signum/
+punk/target/
