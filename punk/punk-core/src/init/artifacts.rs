@@ -1,5 +1,3 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -88,7 +86,7 @@ pub fn write_artifacts(
     let intent_path = punk_dir.join("intent.md");
     if intent_path.exists() {
         let existing = std::fs::read_to_string(&intent_path)?;
-        if content_hash(&existing) == content_hash(&artifacts.intent_md) {
+        if existing == artifacts.intent_md {
             safe_write(&punk_dir, "intent.md", &artifacts.intent_md)?;
         }
         // else: user edited — preserve
@@ -147,13 +145,6 @@ fn write_gitignore(punk_dir: &Path) -> Result<(), InitError> {
     }
 
     Ok(())
-}
-
-/// Simple content hash for idempotency checks.
-fn content_hash(s: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
-    hasher.finish()
 }
 
 // ---------------------------------------------------------------------------

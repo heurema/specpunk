@@ -188,6 +188,7 @@ async fn main() {
                                             match save_contract(&punk_dir, &mut contract, &feedback) {
                                                 Ok((cp, _)) => {
                                                     println!("punk plan: edited contract saved to {}", cp.display());
+                                                    break;
                                                 }
                                                 Err(e) => {
                                                     eprintln!("punk plan: save error: {e}");
