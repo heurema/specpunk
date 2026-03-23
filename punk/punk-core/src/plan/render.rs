@@ -122,6 +122,7 @@ mod tests {
                 latency_ms: 120,
                 token_estimate: 512,
                 router_policy_version: "1.0".to_string(),
+                unfamiliarity_ratio: 0.0,
             },
             task_id: "deadbeef".to_string(),
             attempt_number: 1,

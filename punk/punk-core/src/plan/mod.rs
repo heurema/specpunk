@@ -294,6 +294,7 @@ pub fn parse_llm_response(
             latency_ms,
             token_estimate,
             router_policy_version: "1.0".to_string(),
+            unfamiliarity_ratio: 0.0, // TODO: compute from scan.json vs touched files
         },
         task_id: task_id.to_string(),
         attempt_number,
@@ -532,6 +533,7 @@ mod tests {
                 latency_ms: 0,
                 token_estimate: 0,
                 router_policy_version: "1.0".to_string(),
+                unfamiliarity_ratio: 0.0,
             },
             task_id: task_id_from_description("test"),
             attempt_number: 1,

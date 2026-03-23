@@ -12,6 +12,14 @@ pub struct DiffMetadata {
     pub public_api_changes: usize,
     /// Keywords hinting at security-sensitive changes (auth, crypto, secret, token, permission…)
     pub security_keyword_hits: usize,
+    /// Fraction of touched files that are in unfamiliar territory (0.0–1.0).
+    /// "Unfamiliar" = not in conventions.json known patterns, new framework,
+    /// new language, or directories not seen in scan.json.
+    /// Source: OXRL paper (arxiv 2603.19335) — ranking inversions between
+    /// cheap/expensive models vanish for in-distribution tasks but diverge
+    /// for out-of-distribution. Cheap model handles known patterns fine;
+    /// unfamiliar territory needs expensive model.
+    pub unfamiliarity_ratio: f64,
 }
 
 /// Compute a 0–10 complexity score from diff metadata.
@@ -58,6 +66,15 @@ pub fn complexity_score(meta: &DiffMetadata) -> u8 {
         score += 1;
     }
 
+    // domain unfamiliarity: >50% unfamiliar files → +1, >80% → +2
+    // OXRL evidence: cheap models match expensive on in-distribution,
+    // but collapse on out-of-distribution (19pp → 0.5pp spread)
+    if meta.unfamiliarity_ratio > 0.8 {
+        score += 2;
+    } else if meta.unfamiliarity_ratio > 0.5 {
+        score += 1;
+    }
+
     score.min(10)
 }
 
@@ -75,9 +92,7 @@ mod tests {
         let meta = DiffMetadata {
             file_count: 1,
             loc_delta: 20,
-            cross_module_count: 0,
-            public_api_changes: 0,
-            security_keyword_hits: 0,
+            ..Default::default()
         };
         let score = complexity_score(&meta);
         assert!(score <= 2, "small change should score ≤2, got {score}");
@@ -91,7 +106,42 @@ mod tests {
             cross_module_count: 10,
             public_api_changes: 10,
             security_keyword_hits: 10,
+            unfamiliarity_ratio: 1.0,
         };
         assert_eq!(complexity_score(&meta), 10);
+    }
+
+    #[test]
+    fn unfamiliarity_bumps_score() {
+        let familiar = DiffMetadata {
+            file_count: 3,
+            loc_delta: 50,
+            unfamiliarity_ratio: 0.0,
+            ..Default::default()
+        };
+        let unfamiliar = DiffMetadata {
+            file_count: 3,
+            loc_delta: 50,
+            unfamiliarity_ratio: 0.9,
+            ..Default::default()
+        };
+        let score_f = complexity_score(&familiar);
+        let score_u = complexity_score(&unfamiliar);
+        assert!(
+            score_u > score_f,
+            "unfamiliar ({score_u}) should score higher than familiar ({score_f})"
+        );
+    }
+
+    #[test]
+    fn moderate_unfamiliarity_adds_one() {
+        let meta = DiffMetadata {
+            file_count: 1,
+            loc_delta: 10,
+            unfamiliarity_ratio: 0.6,
+            ..Default::default()
+        };
+        // base = 0 (1 file + <20 loc) + 1 (unfamiliarity 0.6 > 0.5) = 1
+        assert_eq!(complexity_score(&meta), 1);
     }
 }

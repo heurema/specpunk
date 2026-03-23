@@ -109,6 +109,7 @@ mod tests {
             cross_module_count: 3,
             public_api_changes: 2,
             security_keyword_hits: 1,
+            ..Default::default()
         };
         let (score, level, tier) = detect_ceremony(&full_meta);
         assert!(score >= 6, "expected score ≥6, got {score}");

@@ -17,6 +17,11 @@ pub struct RoutingMetadata {
     pub token_estimate: usize,
     /// Monotonically-increasing version of the router policy used.
     pub router_policy_version: String,
+    /// Fraction of touched files in unfamiliar territory (0.0–1.0).
+    /// OXRL evidence: cheap models match expensive on in-distribution,
+    /// collapse on OOD. Used by learned router to select model tier.
+    #[serde(default)]
+    pub unfamiliarity_ratio: f64,
 }
 
 /// One acceptance criterion inside a contract.
@@ -117,6 +122,7 @@ mod tests {
                 latency_ms: 0,
                 token_estimate: 0,
                 router_policy_version: "1.0".to_string(),
+                unfamiliarity_ratio: 0.0,
             },
             task_id: "deadbeef".to_string(),
             attempt_number: 1,
