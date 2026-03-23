@@ -1,0 +1,21 @@
+{
+  "task": "Add a minimal artifact drawer to the public surface without changing deploy configuration or research docs.",
+  "allowed": [
+    "site/index.html",
+    "site/style.css"
+  ],
+  "blocked": [
+    "site/_headers",
+    "wrangler.toml",
+    "docs/research/**"
+  ],
+  "changed": [
+    "site/index.html",
+    "site/style.css"
+  ],
+  "evidence": [
+    "open artifact drawer scrolls to the artifact pack",
+    "open required exposes only the minimal boundary artifacts",
+    "expand all and collapse all toggle the full artifact set"
+  ]
+}

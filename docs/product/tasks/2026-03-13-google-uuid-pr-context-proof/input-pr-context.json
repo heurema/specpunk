@@ -1,0 +1,22 @@
+{
+  "task": "Review google/uuid PR #166 as a bounded functional change: add validation error types and related tests without formatter spillover or backward-compatibility regressions outside uuid validation paths.",
+  "allowed": [
+    "uuid.go",
+    "uuid_test.go"
+  ],
+  "blocked": [
+    "json_test.go",
+    "README.md",
+    "doc.go",
+    "hash.go",
+    "version6.go",
+    "version7.go",
+    "time.go",
+    "go.mod"
+  ],
+  "evidence": [
+    "PR body frames the change around validation error types and Parse/ParseBytes/Validate behavior",
+    "maintainer review asked to avoid cosmetic spillover and preserve backward compatibility",
+    "revised PR commit 54f9572 passes go test ./..."
+  ]
+}

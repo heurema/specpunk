@@ -1,0 +1,25 @@
+{
+  "task": "Review google/uuid issue #137 as a bounded change: add Validate(s string) error so callers can validate UUID strings without creating a UUID object or its underlying byte array.",
+  "allowed": [
+    "uuid.go",
+    "uuid_test.go"
+  ],
+  "blocked": [
+    "README.md",
+    "doc.go",
+    "hash.go",
+    "json_test.go",
+    "null_test.go",
+    "sql_test.go",
+    "time.go",
+    "version6.go",
+    "version7.go",
+    ".github/workflows/**",
+    "go.mod"
+  ],
+  "evidence": [
+    "issue #137 explicitly asks for Validate(s string) error without creating UUID objects",
+    "merged revision 9ee7366 changes only uuid.go and uuid_test.go",
+    "go test ./... passes on revision 9ee7366"
+  ]
+}

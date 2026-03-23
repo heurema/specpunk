@@ -1,0 +1,15 @@
+{
+  "task": "Review a bounded git-backed change inside the sandbox repo without touching research notes or deploy config.",
+  "allowed": [
+    "site/index.html",
+    "site/style.css"
+  ],
+  "blocked": [
+    "wrangler.toml",
+    "docs/research/**"
+  ],
+  "evidence": [
+    "the bounded git change updates only the site surface files",
+    "the sandbox repo keeps review input close to a real VCS workflow"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "task": "Review a bounded public-surface change in site files.",
+  "allowed": [
+    "site/index.html",
+    "site/style.css"
+  ],
+  "blocked": [
+    "docs/research/**",
+    "docs/product/**"
+  ],
+  "evidence": [
+    "manual browser check",
+    "scope stays in site files"
+  ]
+}

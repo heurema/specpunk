@@ -1,0 +1,18 @@
+{
+  "task": "Review a follow-up change in matryer/is where compact comment support also spilled into docs even though the task boundary was code-only.",
+  "allowed": [
+    "is.go",
+    "is_test.go",
+    "testdata/example_comment_test.go"
+  ],
+  "blocked": [
+    "README.md",
+    "go.mod",
+    "misc/**"
+  ],
+  "evidence": [
+    "the code change still relates to compact comment support",
+    "but the follow-up range also touched README.md outside the declared boundary",
+    "go test ./... still passes in the external repo"
+  ]
+}

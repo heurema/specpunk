@@ -1,0 +1,18 @@
+{
+  "task": "Review a compact code change in matryer/is that adds support for compact line comments without touching docs or module metadata.",
+  "allowed": [
+    "is.go",
+    "is_test.go",
+    "testdata/example_comment_test.go"
+  ],
+  "blocked": [
+    "README.md",
+    "go.mod",
+    "misc/**"
+  ],
+  "evidence": [
+    "loadComment now accepts compact //comment forms",
+    "a focused regression test covers the new behavior",
+    "go test ./... passes in the external repo"
+  ]
+}

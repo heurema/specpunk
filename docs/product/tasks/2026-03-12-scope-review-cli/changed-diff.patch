@@ -1,0 +1,14 @@
+diff --git a/site/index.html b/site/index.html
+index 1111111..2222222 100644
+--- a/site/index.html
++++ b/site/index.html
+@@ -1 +1 @@
+-before
++after
+diff --git a/site/style.css b/site/style.css
+index 3333333..4444444 100644
+--- a/site/style.css
++++ b/site/style.css
+@@ -1 +1 @@
+-before
++after
