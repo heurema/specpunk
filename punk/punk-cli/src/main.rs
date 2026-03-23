@@ -41,7 +41,35 @@ enum Commands {
     /// Show current workspace status
     Status,
     /// Manage punk configuration
-    Config,
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Set an LLM provider (name, endpoint, API key)
+    SetProvider {
+        /// Provider name (e.g. "anthropic", "openai")
+        name: String,
+        /// API endpoint URL
+        endpoint: String,
+        /// API key (will be stored in ~/.config/punk/providers.toml)
+        api_key: String,
+        /// Optional model name
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Remove a configured provider
+    RemoveProvider {
+        /// Provider name to remove
+        name: String,
+    },
+    /// List configured providers
+    List,
+    /// Show resolved provider (env vars + config file)
+    Show,
 }
 
 #[tokio::main]
@@ -76,11 +104,27 @@ async fn main() {
         Commands::Plan { task, manual } => {
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
+            // Resolve LLM provider: env vars → config file → guided setup
+            let resolved = punk_core::config::resolve_provider();
+            let http_provider = resolved.map(|p| {
+                punk_core::plan::llm::HttpProvider::new(p.endpoint, p.api_key)
+            });
+            let provider_ref: Option<&dyn punk_core::plan::LlmProvider> =
+                http_provider.as_ref().map(|p| p as &dyn punk_core::plan::LlmProvider);
+
+            if !manual && provider_ref.is_none() {
+                eprintln!("punk plan: no LLM provider configured");
+                eprintln!("  Set up with: punk config set-provider anthropic https://api.anthropic.com/v1/messages <your-key>");
+                eprintln!("  Or set env:  PUNK_LLM_ENDPOINT + PUNK_LLM_API_KEY");
+                eprintln!("  Or use:      punk plan --manual (offline, no LLM)");
+                std::process::exit(1);
+            }
+
             let opts = PlanOptions {
                 root: &root,
                 task: &task,
                 manual,
-                provider: None, // use HttpProvider::from_env() in real usage
+                provider: provider_ref,
             };
 
             let (mut contract, quality, summary) = match run_plan_headless(&opts).await {
@@ -250,9 +294,70 @@ async fn main() {
             eprintln!("punk status: not yet implemented");
             std::process::exit(1);
         }
-        Commands::Config => {
-            eprintln!("punk config: not yet implemented");
-            std::process::exit(1);
+        Commands::Config { action } => {
+            match action {
+                ConfigAction::SetProvider { name, endpoint, api_key, model } => {
+                    match punk_core::config::set_provider(&name, &endpoint, &api_key, model.as_deref()) {
+                        Ok(()) => {
+                            println!("Provider '{name}' saved to {}", punk_core::config::providers_path().display());
+                        }
+                        Err(e) => {
+                            eprintln!("punk config: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                ConfigAction::RemoveProvider { name } => {
+                    match punk_core::config::remove_provider(&name) {
+                        Ok(()) => println!("Provider '{name}' removed"),
+                        Err(e) => {
+                            eprintln!("punk config: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                ConfigAction::List => {
+                    match punk_core::config::load_config() {
+                        Ok(config) => {
+                            if config.providers.is_empty() {
+                                println!("No providers configured.");
+                                println!("  punk config set-provider <name> <endpoint> <api-key>");
+                            } else {
+                                let default = config.default_provider.as_deref().unwrap_or("");
+                                for (name, p) in &config.providers {
+                                    let marker = if name == default { " (default)" } else { "" };
+                                    let model_str = p.model.as_deref().unwrap_or("-");
+                                    println!("  {name}{marker}: {endpoint} model={model_str}",
+                                        endpoint = p.endpoint);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("punk config: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                ConfigAction::Show => {
+                    match punk_core::config::resolve_provider() {
+                        Some(p) => {
+                            println!("Active provider:");
+                            println!("  Endpoint: {}", p.endpoint);
+                            println!("  API key:  {}...{}", &p.api_key[..4.min(p.api_key.len())],
+                                &p.api_key[p.api_key.len().saturating_sub(4)..]);
+                            if let Some(model) = &p.model {
+                                println!("  Model:    {model}");
+                            }
+                        }
+                        None => {
+                            println!("No active provider. Resolution order:");
+                            println!("  1. PUNK_LLM_ENDPOINT + PUNK_LLM_API_KEY env vars");
+                            println!("  2. ANTHROPIC_API_KEY or OPENAI_API_KEY env vars");
+                            println!("  3. ~/.config/punk/providers.toml (default provider)");
+                        }
+                    }
+                }
+            }
         }
     }
 }

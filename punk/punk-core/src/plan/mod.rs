@@ -16,11 +16,12 @@ use crate::vcs;
 use self::ceremony::{detect_ceremony, CeremonyLevel, ModelTier};
 use self::context::{build_prompt_context, load_context, ContextError};
 pub use self::contract::FeedbackOutcome;
+pub use self::llm::LlmProvider;
 use self::contract::{
     AcceptanceCriterion, Contract, Feedback, RoutingMetadata, Scope,
     CONTRACT_VERSION,
 };
-use self::llm::{LlmError, LlmProvider, MockProvider};
+use self::llm::{LlmError, MockProvider};
 use self::quality::{check_quality, QualityReport};
 use self::render::render_summary;
 
