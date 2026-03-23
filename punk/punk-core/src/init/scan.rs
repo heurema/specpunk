@@ -432,7 +432,7 @@ fn unescape_pattern(p: &str) -> String {
     p.replace("\\[", "[")
         .replace("\\]", "]")
         .replace("\\b", "")
-        .replace("\\s*", " ")
+        .replace("\\s*", "")
         .replace("\\(", "(")
 }
 

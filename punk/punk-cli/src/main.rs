@@ -197,18 +197,20 @@ async fn main() {
                                         }
                                         Err(e) => {
                                             eprintln!("punk plan: invalid JSON after edit: {e}");
+                                            continue;
                                         }
                                     },
                                     Err(e) => {
                                         eprintln!("punk plan: could not read edited file: {e}");
+                                        continue;
                                     }
                                 }
                             }
                             _ => {
                                 eprintln!("punk plan: editor exited with error");
+                                continue;
                             }
                         }
-                        break;
                     }
                     "q" | "quit" => {
                         let feedback = Feedback {

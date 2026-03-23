@@ -186,10 +186,12 @@ fn check_staleness(
     }
 
     // Check if >20% of tracked files have changed (heuristic: count missing files)
+    // Resolve paths against project root (parent of .punk/), not CWD
+    let project_root = punk_dir.parent().unwrap_or(punk_dir);
     if !file_inventory.is_empty() {
         let missing = file_inventory
             .iter()
-            .filter(|f| !std::path::Path::new(f.as_str()).exists())
+            .filter(|f| !project_root.join(f).exists())
             .count();
         let ratio = missing as f64 / file_inventory.len() as f64;
         if ratio > 0.2 {
