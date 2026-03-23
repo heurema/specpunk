@@ -1,8 +1,11 @@
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
 use punk_core::init::run_init;
+use punk_core::plan::{run_plan_headless, save_contract, PlanOptions};
+use punk_core::plan::contract::{Feedback, FeedbackOutcome};
 
 #[derive(Parser)]
 #[command(
@@ -23,8 +26,14 @@ enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
-    /// Generate an implementation plan from a contract
-    Plan,
+    /// Generate an implementation plan from a task description
+    Plan {
+        /// Task description (what to build)
+        task: String,
+        /// Open $EDITOR with contract template instead of calling LLM
+        #[arg(long)]
+        manual: bool,
+    },
     /// Check implementation against the active contract
     Check,
     /// Record a receipt for the completed contract
@@ -35,7 +44,8 @@ enum Commands {
     Config,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
@@ -63,9 +73,167 @@ fn main() {
                 }
             }
         }
-        Commands::Plan => {
-            eprintln!("punk plan: not yet implemented");
-            std::process::exit(1);
+        Commands::Plan { task, manual } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            let opts = PlanOptions {
+                root: &root,
+                task: &task,
+                manual,
+                provider: None, // use HttpProvider::from_env() in real usage
+            };
+
+            let (mut contract, quality, summary) = match run_plan_headless(&opts).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("punk plan: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            println!("{summary}");
+
+            // Interactive approval loop
+            let punk_dir = root.join(".punk");
+            loop {
+                print!("\nApprove contract? [y]es / [n]o / [e]dit / [q]uit: ");
+                io::stdout().flush().unwrap_or_default();
+
+                let mut input = String::new();
+                match io::stdin().read_line(&mut input) {
+                    Ok(0) => {
+                        // EOF — treat as quit
+                        eprintln!("punk plan: aborted (EOF)");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("punk plan: stdin error: {e}");
+                        std::process::exit(1);
+                    }
+                    Ok(_) => {}
+                }
+
+                let choice = input.trim().to_lowercase();
+                match choice.as_str() {
+                    "y" | "yes" => {
+                        let feedback = Feedback {
+                            outcome: FeedbackOutcome::Approve,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            note: None,
+                        };
+                        match save_contract(&punk_dir, &mut contract, &feedback) {
+                            Ok((cp, _fp)) => {
+                                println!("punk plan: contract saved to {}", cp.display());
+                            }
+                            Err(e) => {
+                                eprintln!("punk plan: save error: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                        break;
+                    }
+                    "n" | "no" => {
+                        let feedback = Feedback {
+                            outcome: FeedbackOutcome::Reject,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            note: None,
+                        };
+                        // Save feedback only (no contract) — create directory for tracking
+                        let dir = punk_dir.join("contracts").join(&contract.change_id);
+                        if let Err(e) = std::fs::create_dir_all(&dir) {
+                            eprintln!("punk plan: could not create feedback dir: {e}");
+                        } else {
+                            let fb_json = serde_json::to_string_pretty(&feedback)
+                                .unwrap_or_default();
+                            let _ = std::fs::write(dir.join("feedback.json"), fb_json);
+                        }
+                        println!("punk plan: contract rejected and discarded");
+                        break;
+                    }
+                    "e" | "edit" => {
+                        // Open $EDITOR with contract JSON
+                        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+                        let contract_json =
+                            serde_json::to_string_pretty(&contract).unwrap_or_default();
+                        let tmp = std::env::temp_dir().join("punk-contract-edit.json");
+                        if let Err(e) = std::fs::write(&tmp, &contract_json) {
+                            eprintln!("punk plan: could not write temp file: {e}");
+                            continue;
+                        }
+                        let status = std::process::Command::new(&editor)
+                            .arg(&tmp)
+                            .status();
+                        match status {
+                            Ok(s) if s.success() => {
+                                // Re-read and re-validate
+                                match std::fs::read_to_string(&tmp) {
+                                    Ok(raw) => match serde_json::from_str(&raw) {
+                                        Ok(edited) => {
+                                            contract = edited;
+                                            let new_quality = punk_core::plan::quality::check_quality(
+                                                &contract.acceptance_criteria,
+                                                &contract.scope.touch,
+                                                &contract.scope.dont_touch,
+                                            );
+                                            let new_summary = punk_core::plan::render::render_summary(
+                                                &contract,
+                                                &new_quality,
+                                            );
+                                            println!("{new_summary}");
+                                            let feedback = Feedback {
+                                                outcome: FeedbackOutcome::ApproveWithEdit,
+                                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                                note: Some("edited in $EDITOR".to_string()),
+                                            };
+                                            match save_contract(&punk_dir, &mut contract, &feedback) {
+                                                Ok((cp, _)) => {
+                                                    println!("punk plan: edited contract saved to {}", cp.display());
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("punk plan: save error: {e}");
+                                                    std::process::exit(1);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("punk plan: invalid JSON after edit: {e}");
+                                        }
+                                    },
+                                    Err(e) => {
+                                        eprintln!("punk plan: could not read edited file: {e}");
+                                    }
+                                }
+                            }
+                            _ => {
+                                eprintln!("punk plan: editor exited with error");
+                            }
+                        }
+                        break;
+                    }
+                    "q" | "quit" => {
+                        let feedback = Feedback {
+                            outcome: FeedbackOutcome::Quit,
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            note: None,
+                        };
+                        // Log quit feedback
+                        let dir = punk_dir.join("contracts").join(&contract.change_id);
+                        if let Ok(()) = std::fs::create_dir_all(&dir) {
+                            let fb_json = serde_json::to_string_pretty(&feedback)
+                                .unwrap_or_default();
+                            let _ = std::fs::write(dir.join("feedback.json"), fb_json);
+                        }
+                        eprintln!("punk plan: aborted");
+                        std::process::exit(1);
+                    }
+                    _ => {
+                        eprintln!("punk plan: unknown choice '{choice}' — enter y/n/e/q");
+                    }
+                }
+            }
+
+            // Suppress unused warning on quality in this path
+            let _ = quality;
         }
         Commands::Check => {
             eprintln!("punk check: not yet implemented");
