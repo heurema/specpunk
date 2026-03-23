@@ -85,9 +85,16 @@ punk plan --manual "add rate limiting to the API"
 
 ## Sponsor
 
-punk is built in the open by one developer. If this solves a real problem for you, consider sponsoring development:
+punk is built in the open by one developer. If this solves a real problem for you, consider sponsoring development.
 
-**USDC (Polygon):** `0x1EB9b1dec7Ee036BE0BABE9B75AdaF6BD72f546C`
+| Network | Address |
+|---------|---------|
+| **Ethereum** | `0x1EB9b1dec7Ee036BE0BABE9B75AdaF6BD72f546C` |
+| **Arbitrum** | `0x1EB9b1dec7Ee036BE0BABE9B75AdaF6BD72f546C` |
+| **BNB Chain** | `0x1EB9b1dec7Ee036BE0BABE9B75AdaF6BD72f546C` |
+| **Solana** | `HR1i9CFb8D1yGXkiu7CkdhCqBJvsc1hSRrTPLR3f7Hcq` |
+
+USDC, USDT, ETH, SOL — any token on these networks works.
 
 **What sponsorship enables:**
 - Faster iteration on Phase 3-4 (check + receipt)
