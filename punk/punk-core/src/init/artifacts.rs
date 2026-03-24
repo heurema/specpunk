@@ -104,8 +104,10 @@ pub fn write_artifacts(
         }
     }
 
-    // .gitignore — ensure scan.json is gitignored
-    write_gitignore(&punk_dir)?;
+    // .gitignore — ensure scan.json is gitignored (only in brownfield)
+    if is_brownfield {
+        write_gitignore(&punk_dir)?;
+    }
 
     Ok(())
 }

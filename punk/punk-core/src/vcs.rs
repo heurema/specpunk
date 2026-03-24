@@ -169,7 +169,7 @@ impl Vcs for GitVcs {
 
     fn changed_files(&self) -> Result<Vec<String>, VcsError> {
         let out = Command::new("git")
-            .args(["diff", "--name-only", "HEAD"])
+            .args(["-c", "core.quotepath=false", "diff", "--name-only", "HEAD"])
             .current_dir(&self.root)
             .output()
             .map_err(|e| VcsError::CommandFailed(e.to_string()))?;
@@ -188,7 +188,7 @@ impl Vcs for GitVcs {
 
     fn untracked_files(&self) -> Result<Vec<String>, VcsError> {
         let out = Command::new("git")
-            .args(["ls-files", "--others", "--exclude-standard"])
+            .args(["-c", "core.quotepath=false", "ls-files", "--others", "--exclude-standard"])
             .current_dir(&self.root)
             .output()
             .map_err(|e| VcsError::CommandFailed(e.to_string()))?;

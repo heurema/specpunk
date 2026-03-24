@@ -132,12 +132,23 @@ pub fn count_attempts(punk_dir: &Path, task_id: &str) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Save contract + feedback to `.punk/contracts/<change_id>/`.
+/// If a contract already exists for this change_id, the directory is
+/// suffixed with the attempt number to prevent silent overwrites.
 pub fn save_contract(
     punk_dir: &Path,
     contract: &mut Contract,
     feedback: &Feedback,
 ) -> Result<(PathBuf, PathBuf), PlanError> {
-    let dir = punk_dir.join("contracts").join(&contract.change_id);
+    let base_dir = punk_dir.join("contracts").join(&contract.change_id);
+    let dir = if base_dir.join("contract.json").exists() {
+        // Avoid overwriting existing contract — use attempt-suffixed dir
+        let suffixed = punk_dir
+            .join("contracts")
+            .join(format!("{}-{}", contract.change_id, contract.attempt_number));
+        suffixed
+    } else {
+        base_dir
+    };
     std::fs::create_dir_all(&dir)?;
 
     // Serialise without approval_hash to compute canonical bytes
@@ -349,7 +360,8 @@ pub struct PlanOptions<'a> {
 /// This function does NOT do the interactive approval loop — the CLI layer owns stdin/stdout.
 /// It returns the contract + rendered summary so the caller can present it.
 pub async fn run_plan_headless(opts: &PlanOptions<'_>) -> Result<(Contract, QualityReport, String), PlanError> {
-    if opts.task.trim().is_empty() {
+    let task = opts.task.trim();
+    if task.is_empty() {
         return Err(PlanError::EmptyTask);
     }
 
@@ -361,7 +373,7 @@ pub async fn run_plan_headless(opts: &PlanOptions<'_>) -> Result<(Contract, Qual
         .and_then(|v| v.change_id())
         .unwrap_or_else(|_| format!("manual-{}", Utc::now().timestamp()));
 
-    let task_id = task_id_from_description(opts.task);
+    let task_id = task_id_from_description(task);
     let punk_dir = opts.root.join(".punk");
     let attempt_number = count_attempts(&punk_dir, &task_id) + 1;
 
@@ -370,11 +382,11 @@ pub async fn run_plan_headless(opts: &PlanOptions<'_>) -> Result<(Contract, Qual
     let (score, level, tier) = detect_ceremony(&meta);
 
     let contract = if opts.manual {
-        let template = build_manual_template(opts.task, &context_text, &change_id);
+        let template = build_manual_template(task, &context_text, &change_id);
         // In tests / headless: parse the template directly as if the user returned it unchanged
         parse_llm_response(
             &template,
-            opts.task,
+            task,
             &change_id,
             &task_id,
             attempt_number,
@@ -389,14 +401,14 @@ pub async fn run_plan_headless(opts: &PlanOptions<'_>) -> Result<(Contract, Qual
             .provider
             .unwrap_or(&fallback);
 
-        let prompt = build_generation_prompt(&context_text, opts.task);
+        let prompt = build_generation_prompt(&context_text, task);
         let start = std::time::Instant::now();
         let raw = provider_ref.generate(&prompt).await?;
         let latency_ms = start.elapsed().as_millis() as u64;
 
         parse_llm_response(
             &raw,
-            opts.task,
+            task,
             &change_id,
             &task_id,
             attempt_number,

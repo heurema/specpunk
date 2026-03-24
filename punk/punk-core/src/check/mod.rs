@@ -19,6 +19,7 @@ pub const EXIT_PASS: i32 = 0;
 pub const EXIT_VIOLATION: i32 = 1;
 pub const EXIT_NO_CONTRACT: i32 = 2;
 pub const EXIT_NOT_APPROVED: i32 = 3;
+pub const EXIT_INTERNAL: i32 = 4;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -328,6 +329,9 @@ pub fn run_check(opts: &CheckOptions) -> Result<(CheckReceipt, i32), CheckError>
             }
         }
     }
+
+    // Filter out .punk/ own files — they are punk infrastructure, not user code
+    changed_files.retain(|f| !f.starts_with(".punk/") && !f.starts_with(".punk\\"));
 
     // 3. Load never_touch from scan.json
     let never_touch = load_never_touch(opts.root);

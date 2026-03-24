@@ -8,7 +8,7 @@ pub fn render_summary(contract: &Contract, quality: &QualityReport) -> String {
     let mut out = Vec::new();
 
     out.push("╔══════════════════════════════════════════════════════════╗".to_string());
-    out.push(format!("║  punk plan — contract v{}                                ║", contract.version));
+    out.push(format!("║  punk plan -- contract v{}                               ║", contract.version));
     out.push("╚══════════════════════════════════════════════════════════╝".to_string());
     out.push(String::new());
 

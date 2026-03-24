@@ -64,7 +64,7 @@ fn count_source_files(root: &Path) -> usize {
     ];
     let walker = walkdir::WalkDir::new(root)
         .follow_links(false)
-        .max_depth(4)
+        .max_depth(8)
         .into_iter()
         .filter_entry(|e| {
             if e.depth() == 0 { return true; }

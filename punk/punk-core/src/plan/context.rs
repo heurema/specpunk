@@ -65,7 +65,7 @@ const STALENESS_DAYS: i64 = 90;
 /// Returns `ContextError::MissingPunkDir` if the directory is absent.
 pub fn load_context(root: &Path) -> Result<ProjectContext, ContextError> {
     let punk_dir = root.join(".punk");
-    if !punk_dir.exists() {
+    if !punk_dir.is_dir() {
         return Err(ContextError::MissingPunkDir);
     }
 

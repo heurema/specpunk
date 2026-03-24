@@ -278,8 +278,8 @@ async fn main() {
                                 .unwrap_or_default();
                             let _ = std::fs::write(dir.join("feedback.json"), fb_json);
                         }
-                        eprintln!("punk plan: aborted");
-                        std::process::exit(1);
+                        println!("punk plan: quit");
+                        break;
                     }
                     _ => {
                         eprintln!("punk plan: unknown choice '{choice}' — enter y/n/e/q");
@@ -309,16 +309,35 @@ async fn main() {
                     std::process::exit(exit_code);
                 }
                 Err(check::CheckError::NoContract(msg)) => {
-                    eprintln!("punk check: {msg}");
+                    if json {
+                        println!(r#"{{"status":"ERROR","code":{},"message":{}}}"#,
+                            check::EXIT_NO_CONTRACT,
+                            serde_json::to_string(&msg).unwrap_or_default());
+                    } else {
+                        eprintln!("punk check: {msg}");
+                    }
                     std::process::exit(check::EXIT_NO_CONTRACT);
                 }
                 Err(check::CheckError::NotApproved(msg)) => {
-                    eprintln!("punk check: {msg}");
+                    if json {
+                        println!(r#"{{"status":"ERROR","code":{},"message":{}}}"#,
+                            check::EXIT_NOT_APPROVED,
+                            serde_json::to_string(&msg).unwrap_or_default());
+                    } else {
+                        eprintln!("punk check: {msg}");
+                    }
                     std::process::exit(check::EXIT_NOT_APPROVED);
                 }
                 Err(e) => {
-                    eprintln!("punk check: {e}");
-                    std::process::exit(1);
+                    let msg = e.to_string();
+                    if json {
+                        println!(r#"{{"status":"ERROR","code":{},"message":{}}}"#,
+                            check::EXIT_INTERNAL,
+                            serde_json::to_string(&msg).unwrap_or_default());
+                    } else {
+                        eprintln!("punk check: {msg}");
+                    }
+                    std::process::exit(check::EXIT_INTERNAL);
                 }
             }
         }
