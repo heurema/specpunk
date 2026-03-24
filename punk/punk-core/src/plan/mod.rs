@@ -132,23 +132,20 @@ pub fn count_attempts(punk_dir: &Path, task_id: &str) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Save contract + feedback to `.punk/contracts/<change_id>/`.
-/// If a contract already exists for this change_id, the directory is
-/// suffixed with the attempt number to prevent silent overwrites.
+/// One change = one active contract. Re-approving overwrites the previous
+/// contract with a warning (this is the user's intent — they ran plan again).
 pub fn save_contract(
     punk_dir: &Path,
     contract: &mut Contract,
     feedback: &Feedback,
 ) -> Result<(PathBuf, PathBuf), PlanError> {
-    let base_dir = punk_dir.join("contracts").join(&contract.change_id);
-    let dir = if base_dir.join("contract.json").exists() {
-        // Avoid overwriting existing contract — use attempt-suffixed dir
-        let suffixed = punk_dir
-            .join("contracts")
-            .join(format!("{}-{}", contract.change_id, contract.attempt_number));
-        suffixed
-    } else {
-        base_dir
-    };
+    let dir = punk_dir.join("contracts").join(&contract.change_id);
+    if dir.join("contract.json").exists() {
+        eprintln!(
+            "punk plan: replacing existing contract for change '{}'",
+            contract.change_id
+        );
+    }
     std::fs::create_dir_all(&dir)?;
 
     // Serialise without approval_hash to compute canonical bytes

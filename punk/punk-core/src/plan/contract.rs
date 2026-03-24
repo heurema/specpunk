@@ -43,6 +43,7 @@ pub struct Scope {
 
 /// Top-level contract struct (v1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Contract {
     /// Schema version — always "1" for this implementation.
     pub version: String,
