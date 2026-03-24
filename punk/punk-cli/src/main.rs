@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
+use punk_core::check::{self, CheckOptions, render_check};
 use punk_core::init::run_init;
 use punk_core::plan::{run_plan_headless, save_contract, PlanOptions};
 use punk_core::plan::contract::{Feedback, FeedbackOutcome};
@@ -35,7 +36,14 @@ enum Commands {
         manual: bool,
     },
     /// Check implementation against the active contract
-    Check,
+    Check {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+        /// Strict mode: undeclared files are hard failures (for CI)
+        #[arg(long)]
+        strict: bool,
+    },
     /// Record a receipt for the completed contract
     Receipt,
     /// Show current workspace status
@@ -282,9 +290,37 @@ async fn main() {
             // Suppress unused warning on quality in this path
             let _ = quality;
         }
-        Commands::Check => {
-            eprintln!("punk check: not yet implemented");
-            std::process::exit(1);
+        Commands::Check { json, strict } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let opts = CheckOptions {
+                root: &root,
+                strict,
+                json,
+            };
+
+            match check::run_check(&opts) {
+                Ok((receipt, exit_code)) => {
+                    if json {
+                        let j = serde_json::to_string_pretty(&receipt).unwrap_or_default();
+                        println!("{j}");
+                    } else {
+                        print!("{}", render_check(&receipt, strict));
+                    }
+                    std::process::exit(exit_code);
+                }
+                Err(check::CheckError::NoContract(msg)) => {
+                    eprintln!("punk check: {msg}");
+                    std::process::exit(check::EXIT_NO_CONTRACT);
+                }
+                Err(check::CheckError::NotApproved(msg)) => {
+                    eprintln!("punk check: {msg}");
+                    std::process::exit(check::EXIT_NOT_APPROVED);
+                }
+                Err(e) => {
+                    eprintln!("punk check: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::Receipt => {
             eprintln!("punk receipt: not yet implemented");

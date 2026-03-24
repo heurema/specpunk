@@ -37,6 +37,9 @@ pub trait Vcs {
     /// Returns a list of files changed in the current working change/commit.
     fn changed_files(&self) -> Result<Vec<String>, VcsError>;
 
+    /// Returns a list of untracked files (not yet added to VCS).
+    fn untracked_files(&self) -> Result<Vec<String>, VcsError>;
+
     /// Returns the unified diff of the current working change/commit.
     fn diff(&self) -> Result<String, VcsError>;
 }
@@ -117,6 +120,11 @@ impl Vcs for JjVcs {
         Ok(files)
     }
 
+    fn untracked_files(&self) -> Result<Vec<String>, VcsError> {
+        // jj tracks all files in the working copy — no concept of "untracked"
+        Ok(Vec::new())
+    }
+
     fn diff(&self) -> Result<String, VcsError> {
         let out = Command::new("jj")
             .args(["diff"])
@@ -162,6 +170,25 @@ impl Vcs for GitVcs {
     fn changed_files(&self) -> Result<Vec<String>, VcsError> {
         let out = Command::new("git")
             .args(["diff", "--name-only", "HEAD"])
+            .current_dir(&self.root)
+            .output()
+            .map_err(|e| VcsError::CommandFailed(e.to_string()))?;
+        if !out.status.success() {
+            return Err(VcsError::CommandFailed(
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ));
+        }
+        let files = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_owned())
+            .collect();
+        Ok(files)
+    }
+
+    fn untracked_files(&self) -> Result<Vec<String>, VcsError> {
+        let out = Command::new("git")
+            .args(["ls-files", "--others", "--exclude-standard"])
             .current_dir(&self.root)
             .output()
             .map_err(|e| VcsError::CommandFailed(e.to_string()))?;
