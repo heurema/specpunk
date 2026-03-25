@@ -164,6 +164,14 @@ pub fn save_contract(
 
     std::fs::write(&contract_path, &final_json)?;
 
+    // Write engineer view (holdouts stripped) for implementer blinding
+    if !contract.holdout_scenarios.is_empty() {
+        let engineer_view = crate::holdout::strip_holdouts(contract);
+        let engineer_json = serde_json::to_string_pretty(&engineer_view)
+            .map_err(|e| PlanError::Serialize(e.to_string()))?;
+        std::fs::write(dir.join("contract-engineer.json"), &engineer_json)?;
+    }
+
     let feedback_json =
         serde_json::to_string_pretty(feedback).map_err(|e| PlanError::Serialize(e.to_string()))?;
     std::fs::write(&feedback_path, &feedback_json)?;

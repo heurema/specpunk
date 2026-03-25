@@ -10,6 +10,7 @@ pub mod init;
 pub mod mechanic;
 pub mod pack;
 pub mod plan;
+pub mod policy;
 pub mod recall;
 pub mod receipt;
 pub mod repair;

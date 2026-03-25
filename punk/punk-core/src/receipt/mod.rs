@@ -159,6 +159,26 @@ pub fn run_receipt(opts: &ReceiptOptions) -> Result<(TaskReceipt, i32), ReceiptE
 
     let contract_hash = sha256_hex(contract_raw.as_bytes());
 
+    // 1.5. T2+ tasks require passing audit
+    let assessment = crate::risk::assess(&contract.goal, &contract.scope);
+    if assessment.tier >= crate::risk::AssuranceTier::T2 {
+        let audit_path = contract_dir.join("audit.json");
+        if !audit_path.exists() {
+            return Err(ReceiptError::NoCheckReceipt(
+                format!("T2+ task (tier={:?}) requires audit. Run `punk audit` first.", assessment.tier),
+            ));
+        }
+        if let Ok(raw) = std::fs::read_to_string(&audit_path) {
+            if let Ok(audit) = serde_json::from_str::<crate::audit::AuditReport>(&raw) {
+                if audit.decision == crate::audit::AuditDecision::AutoBlock {
+                    return Err(ReceiptError::CheckFailed(
+                        "audit decision is AUTO_BLOCK. Fix findings before receipt.".into(),
+                    ));
+                }
+            }
+        }
+    }
+
     // 2. Load check receipt — must exist and be PASS
     let check_path = contract_dir.join("receipts").join("check.json");
     if !check_path.exists() {
