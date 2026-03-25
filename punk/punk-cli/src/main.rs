@@ -7,6 +7,7 @@ use punk_core::check::{self, CheckOptions, render_check};
 use punk_core::init::run_init;
 use punk_core::plan::{run_plan_headless, save_contract, PlanOptions};
 use punk_core::plan::contract::{Feedback, FeedbackOutcome};
+use punk_core::receipt::{self, ReceiptOptions, render_receipt_md, render_receipt_short};
 
 #[derive(Parser)]
 #[command(
@@ -44,10 +45,22 @@ enum Commands {
         #[arg(long)]
         strict: bool,
     },
-    /// Record a receipt for the completed contract
-    Receipt,
+    /// Record a task receipt for the completed contract
+    Receipt {
+        /// Output JSON instead of short summary
+        #[arg(long)]
+        json: bool,
+        /// Output Markdown summary
+        #[arg(long)]
+        md: bool,
+    },
     /// Show current workspace status
     Status,
+    /// Close (abandon) the active contract with a reason
+    Close {
+        /// Reason for closing the contract
+        reason: String,
+    },
     /// Manage punk configuration
     Config {
         #[command(subcommand)]
@@ -352,13 +365,124 @@ async fn main() {
                 }
             }
         }
-        Commands::Receipt => {
-            eprintln!("punk receipt: not yet implemented");
-            std::process::exit(1);
+        Commands::Receipt { json, md } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let opts = ReceiptOptions {
+                root: &root,
+                json,
+                md,
+            };
+
+            match receipt::run_receipt(&opts) {
+                Ok((task_receipt, exit_code)) => {
+                    if json {
+                        let j = serde_json::to_string_pretty(&task_receipt).unwrap_or_default();
+                        println!("{j}");
+                    } else if md {
+                        print!("{}", render_receipt_md(&task_receipt));
+                    } else {
+                        print!("{}", render_receipt_short(&task_receipt));
+                    }
+                    std::process::exit(exit_code);
+                }
+                Err(receipt::ReceiptError::NoCheckReceipt(msg)) => {
+                    eprintln!("punk receipt: {msg}");
+                    std::process::exit(receipt::EXIT_NO_CHECK);
+                }
+                Err(receipt::ReceiptError::CheckFailed(msg)) => {
+                    eprintln!("punk receipt: {msg}");
+                    std::process::exit(receipt::EXIT_CHECK_FAILED);
+                }
+                Err(e) => {
+                    eprintln!("punk receipt: {e}");
+                    std::process::exit(receipt::EXIT_INTERNAL);
+                }
+            }
         }
         Commands::Status => {
-            eprintln!("punk status: not yet implemented");
-            std::process::exit(1);
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let punk_dir = root.join(".punk");
+
+            if !punk_dir.is_dir() {
+                eprintln!("punk status: no .punk/ directory. Run `punk init` first.");
+                std::process::exit(1);
+            }
+
+            // Find current VCS change
+            let change_id = punk_core::vcs::detect(&root)
+                .and_then(|v| v.change_id())
+                .unwrap_or_else(|_| "(no VCS)".to_string());
+
+            println!("punk status: change {change_id}");
+
+            let contract_dir = punk_dir.join("contracts").join(&change_id);
+            let contract_path = contract_dir.join("contract.json");
+
+            if !contract_path.exists() {
+                println!("  contract: none");
+                println!("  action:   run `punk plan` to create a contract");
+            } else {
+                // Load contract to show goal
+                let goal = std::fs::read_to_string(&contract_path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .and_then(|v| v["goal"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "(parse error)".to_string());
+
+                let has_approval = std::fs::read_to_string(&contract_path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .and_then(|v| v["approval_hash"].as_str().map(|_| true))
+                    .unwrap_or(false);
+
+                let check_exists = contract_dir.join("receipts").join("check.json").exists();
+                let task_exists = contract_dir.join("receipts").join("task.json").exists();
+
+                let state = if task_exists {
+                    "COMPLETED"
+                } else if check_exists {
+                    "CHECKED"
+                } else if has_approval {
+                    "APPROVED"
+                } else {
+                    "DRAFT"
+                };
+
+                println!("  contract: {state}");
+                println!("  goal:     {goal}");
+
+                if state == "APPROVED" {
+                    println!("  action:   implement, then run `punk check`");
+                } else if state == "CHECKED" {
+                    println!("  action:   run `punk receipt` to complete");
+                } else if state == "DRAFT" {
+                    println!("  action:   run `punk plan` to approve");
+                }
+            }
+        }
+        Commands::Close { reason } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            // Resolve contract
+            match check::resolve_contract(&root) {
+                Ok((contract, contract_dir, _)) => {
+                    let feedback = Feedback {
+                        outcome: FeedbackOutcome::Reject,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        note: Some(format!("closed: {reason}")),
+                    };
+                    let fb_json = serde_json::to_string_pretty(&feedback).unwrap_or_default();
+                    let _ = std::fs::write(contract_dir.join("closed.json"), &fb_json);
+                    println!(
+                        "punk close: contract '{}' closed — {}",
+                        contract.change_id, reason
+                    );
+                }
+                Err(e) => {
+                    eprintln!("punk close: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::Config { action } => {
             match action {
