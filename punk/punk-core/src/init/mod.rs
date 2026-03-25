@@ -46,13 +46,36 @@ pub fn run_init(root: &Path, answers: Option<GreenFieldAnswers>) -> Result<InitR
 }
 
 /// Detect whether the project is greenfield or brownfield.
+/// Brownfield if: any manifest file exists OR 2+ source files.
+/// Greenfield only if truly empty (0-1 source files AND no manifest).
 fn detect_mode(root: &Path) -> Result<InitMode, InitError> {
     let source_count = count_source_files(root);
-    if source_count < 5 {
-        Ok(InitMode::Greenfield)
-    } else {
+    let has_manifest = has_project_manifest(root);
+
+    if has_manifest || source_count >= 2 {
         Ok(InitMode::Brownfield)
+    } else {
+        Ok(InitMode::Greenfield)
     }
+}
+
+/// Check for common project manifest files that indicate a real project.
+fn has_project_manifest(root: &Path) -> bool {
+    let manifests = [
+        "Cargo.toml",
+        "package.json",
+        "go.mod",
+        "pyproject.toml",
+        "setup.py",
+        "Gemfile",
+        "pom.xml",
+        "build.gradle",
+        "CMakeLists.txt",
+        "Makefile",
+        "composer.json",
+        "mix.exs",
+    ];
+    manifests.iter().any(|m| root.join(m).exists())
 }
 
 /// Count non-config source files. We look for files with code extensions,

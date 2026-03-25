@@ -203,11 +203,22 @@ async fn main() {
                         break;
                     }
                     "e" | "edit" => {
-                        // Open $EDITOR with contract JSON
+                        // Open $EDITOR with contract JSON (secure temp file, 0600)
                         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
                         let contract_json =
                             serde_json::to_string_pretty(&contract).unwrap_or_default();
-                        let tmp = std::env::temp_dir().join("punk-contract-edit.json");
+                        let tmp_file = match tempfile::Builder::new()
+                            .prefix("punk-contract-")
+                            .suffix(".json")
+                            .tempfile()
+                        {
+                            Ok(f) => f,
+                            Err(e) => {
+                                eprintln!("punk plan: could not create temp file: {e}");
+                                continue;
+                            }
+                        };
+                        let tmp = tmp_file.path().to_path_buf();
                         if let Err(e) = std::fs::write(&tmp, &contract_json) {
                             eprintln!("punk plan: could not write temp file: {e}");
                             continue;

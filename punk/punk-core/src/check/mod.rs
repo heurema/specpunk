@@ -389,12 +389,15 @@ pub fn run_check(opts: &CheckOptions) -> Result<(CheckReceipt, i32), CheckError>
         punk_version: PUNK_VERSION.to_string(),
     };
 
-    // 7. Write receipt (always)
+    // 7. Write receipt atomically (always — pass or fail)
     let receipts_dir = contract_dir.join("receipts");
     std::fs::create_dir_all(&receipts_dir)?;
     let receipt_json = serde_json::to_string_pretty(&receipt)
         .map_err(|e| CheckError::Parse(format!("receipt serialize: {e}")))?;
-    std::fs::write(receipts_dir.join("check.json"), &receipt_json)?;
+    let target = receipts_dir.join("check.json");
+    let mut tmp = tempfile::NamedTempFile::new_in(&receipts_dir)?;
+    std::io::Write::write_all(&mut tmp, receipt_json.as_bytes())?;
+    tmp.persist(&target).map_err(|e| CheckError::Io(e.error))?;
 
     Ok((receipt, exit_code))
 }
