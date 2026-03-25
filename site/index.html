@@ -37,7 +37,7 @@
             <span class="brand-glyph" aria-hidden="true">][</span>
             <div class="brand">Specpunk</div>
           </div>
-          <div class="topbar-note">public build / march 2026</div>
+          <div class="topbar-note">v1.0 / march 2026</div>
         </div>
         <nav class="topnav" aria-label="Primary">
           <a href="#notebook">01 how it works</a>
@@ -364,16 +364,21 @@
             </summary>
             <div class="artifact-body">
               <pre>{
-  "task": "add session timeout",
+  "version": "2",
+  "goal": "add session timeout",
   "scope": {
     "touch": ["src/auth/"],
-    "never_touch": ["src/billing/", "src/payments/"]
+    "dont_touch": ["src/billing/", "src/payments/"]
   },
   "acceptance_criteria": [
-    "timeout enforced after inactivity",
-    "refresh token flow unchanged"
+    {"id": "AC-01", "description": "timeout enforced after inactivity"},
+    {"id": "AC-02", "description": "refresh token flow unchanged"}
   ],
-  "holdouts": ["tests/holdout/session_timeout_blind.rs"]
+  "risk_level": "medium",
+  "holdout_scenarios": [
+    {"id": "HO-1", "steps": [{"exec": {"argv": ["test", "-f", "..."]}}]}
+  ],
+  "approval_hash": "a3f9c2d1e7b4..."
 }</pre>
             </div>
           </details>
@@ -386,14 +391,19 @@
             </summary>
             <div class="artifact-body">
               <pre>{
+  "schema_version": "0.1.0",
+  "type": "check",
   "status": "FAIL",
-  "violations": [
-    {"file": "src/billing/subscription.rs", "rule": "never_touch"},
-    {"file": "src/billing/invoice.rs", "rule": "never_touch"},
-    {"file": "src/billing/plan.rs", "rule": "never_touch"}
-  ],
-  "approval_hash": null,
-  "checked_at": "2026-03-25T09:14:00Z"
+  "contract_hash": "a3f9c2d1e7b4...",
+  "scope": {
+    "declared_files": ["src/auth/"],
+    "actual_files": ["src/auth/login.rs", "src/billing/subscription.rs"],
+    "violations": [
+      {"file": "src/billing/subscription.rs", "violation_type": "never_touch"},
+      {"file": "src/billing/invoice.rs", "violation_type": "never_touch"}
+    ]
+  },
+  "duration_ms": 42
 }</pre>
             </div>
           </details>
@@ -427,13 +437,18 @@
             </summary>
             <div class="artifact-body">
               <pre>{
-  "holdout_results": [
-    {"test": "session_timeout_blind", "status": "pass"},
-    {"test": "refresh_token_invariant", "status": "pass"}
-  ],
-  "ac_coverage": 1.0,
-  "confidence": 0.94,
-  "approval_hash": "a3f9c2d1"
+  "schema_version": "1.0",
+  "decision": "AUTO_OK",
+  "release_verdict": "PROMOTE",
+  "confidence": {
+    "execution_health": 95,
+    "baseline_stability": 100,
+    "behavioral_evidence": 100,
+    "review_alignment": 90,
+    "overall": 96
+  },
+  "evidence_coverage": 0.92,
+  "contract_full_sha256": "a3f9c2d1..."
 }</pre>
             </div>
           </details>
@@ -446,12 +461,16 @@
             </summary>
             <div class="artifact-body">
               <pre>{
-  "status": "PASS",
-  "violations": [],
-  "ac_verified": true,
-  "holdouts_passed": 4,
-  "approval_hash": "a3f9c2d1",
-  "sealed_at": "2026-03-25T09:31:00Z"
+  "schema_version": "0.1.0",
+  "type": "task",
+  "status": "COMPLETED",
+  "contract_hash": "a3f9c2d1e7b4...",
+  "check_receipt_hash": "b7e2f9a1c3d5...",
+  "summary": {
+    "files_modified": ["src/auth/login.rs", "src/auth/session.rs"],
+    "files_created": ["src/auth/timeout.rs"],
+    "scope_violations": 0
+  }
 }</pre>
             </div>
           </details>
