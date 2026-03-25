@@ -7,6 +7,7 @@ pub mod init;
 pub mod mechanic;
 pub mod plan;
 pub mod receipt;
+pub mod repair;
 pub mod risk;
 pub mod vcs;
 

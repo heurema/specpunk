@@ -9,6 +9,7 @@ use punk_core::init::run_init;
 use punk_core::plan::{run_plan_headless, save_contract, PlanOptions};
 use punk_core::plan::contract::{Feedback, FeedbackOutcome};
 use punk_core::holdout::{self, render_holdout_short};
+use punk_core::repair;
 use punk_core::mechanic::{self, render_baseline_short, render_mechanic_short};
 use punk_core::receipt::{self, ReceiptOptions, render_receipt_md, render_receipt_short};
 
@@ -56,6 +57,12 @@ enum Commands {
         /// Output Markdown summary
         #[arg(long)]
         md: bool,
+    },
+    /// Generate repair brief from audit findings
+    Repair {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
     },
     /// Run multi-model audit (mechanic + holdouts + external review)
     Audit {
@@ -419,6 +426,55 @@ async fn main() {
                 Err(e) => {
                     eprintln!("punk receipt: {e}");
                     std::process::exit(receipt::EXIT_INTERNAL);
+                }
+            }
+        }
+        Commands::Repair { json } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            match check::resolve_contract(&root) {
+                Ok((contract, contract_dir, _)) => {
+                    // Load audit report
+                    let audit_path = contract_dir.join("audit.json");
+                    if !audit_path.exists() {
+                        eprintln!("punk repair: no audit.json found. Run `punk audit` first.");
+                        std::process::exit(1);
+                    }
+                    let audit_raw = std::fs::read_to_string(&audit_path).unwrap_or_default();
+                    let audit_report: audit::AuditReport = match serde_json::from_str(&audit_raw) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("punk repair: parse audit.json: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    if audit_report.decision == audit::AuditDecision::AutoOk {
+                        println!("punk repair: audit already passed (AutoOk). No repair needed.");
+                        std::process::exit(0);
+                    }
+
+                    // Generate brief
+                    let brief = repair::generate_brief(
+                        &contract.change_id,
+                        1,
+                        &audit_report.all_findings,
+                        &contract.scope.touch,
+                    );
+
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&brief).unwrap_or_default());
+                    } else {
+                        print!("{}", repair::render_brief(&brief));
+                    }
+
+                    // Save brief
+                    let brief_json = serde_json::to_string_pretty(&brief).unwrap_or_default();
+                    let _ = std::fs::write(contract_dir.join("repair-brief.json"), &brief_json);
+                }
+                Err(e) => {
+                    eprintln!("punk repair: {e}");
+                    std::process::exit(2);
                 }
             }
         }
