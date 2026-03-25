@@ -3,6 +3,7 @@ pub mod check;
 pub mod cleanup;
 pub mod config;
 pub mod coupling;
+pub mod critique;
 pub mod depcheck;
 pub mod dsl;
 pub mod explain;
