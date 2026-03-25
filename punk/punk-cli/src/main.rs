@@ -71,6 +71,20 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Run 4-pass self-critique on active contract
+    Critique,
+    /// Check dependencies against deps.dev (existence + deprecation)
+    DepCheck {
+        /// Specific files to scan (default: all changed files)
+        files: Vec<String>,
+    },
+    /// Static test quality analysis (assertions, mocks, tautologies)
+    TestQuality {
+        /// Specific test files (default: all changed test files)
+        files: Vec<String>,
+    },
+    /// Detect ghost functions via jj predecessor chain
+    Supersede,
     /// Verify contract removals and cleanup obligations
     Cleanup,
     /// Generate context pack for AI agent session
@@ -626,6 +640,73 @@ async fn main() {
                     std::process::exit(2);
                 }
             }
+        }
+        Commands::Critique => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match check::resolve_contract(&root) {
+                Ok((contract, _, _)) => {
+                    let report = punk_core::critique::critique(&contract);
+                    print!("{}", punk_core::critique::render_critique(&report));
+                    let exit_code = match report.readiness {
+                        punk_core::critique::Readiness::Go => 0,
+                        punk_core::critique::Readiness::GoWithWarnings => 0,
+                        punk_core::critique::Readiness::NeedsRevision => 1,
+                    };
+                    std::process::exit(exit_code);
+                }
+                Err(e) => { eprintln!("punk critique: {e}"); std::process::exit(2); }
+            }
+        }
+        Commands::DepCheck { files } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let scan_files = if files.is_empty() {
+                // Get changed files from VCS
+                punk_core::vcs::detect(&root)
+                    .and_then(|v| v.changed_files())
+                    .unwrap_or_default()
+            } else {
+                files
+            };
+
+            // Extract imports from all files
+            let mut all_imports = Vec::new();
+            for file in &scan_files {
+                let path = root.join(file);
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let lang = if file.ends_with(".rs") { "rust" }
+                        else if file.ends_with(".py") { "python" }
+                        else if file.ends_with(".ts") || file.ends_with(".tsx") { "typescript" }
+                        else if file.ends_with(".js") || file.ends_with(".jsx") { "javascript" }
+                        else if file.ends_with(".go") { "go" }
+                        else { continue };
+                    all_imports.extend(punk_core::depcheck::extract_imports(&content, lang));
+                }
+            }
+            all_imports.sort();
+            all_imports.dedup();
+
+            let report = punk_core::depcheck::check_imports(&all_imports);
+            print!("{}", punk_core::depcheck::render_dep_report(&report));
+            std::process::exit(if report.hard_fail_count > 0 { 1 } else { 0 });
+        }
+        Commands::TestQuality { files } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let scan_files = if files.is_empty() {
+                punk_core::vcs::detect(&root)
+                    .and_then(|v| v.changed_files())
+                    .unwrap_or_default()
+            } else {
+                files
+            };
+
+            let report = punk_core::testquality::scan_test_files(&root, &scan_files);
+            print!("{}", punk_core::testquality::render_test_quality(&report));
+            std::process::exit(if report.zero_assertion_count > 0 { 1 } else { 0 });
+        }
+        Commands::Supersede => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let report = punk_core::supersede::detect_ghosts(&root);
+            print!("{}", punk_core::supersede::render_ghosts(&report));
         }
         Commands::Cleanup => {
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
