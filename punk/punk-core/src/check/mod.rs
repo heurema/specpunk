@@ -199,6 +199,13 @@ pub fn resolve_contract(root: &Path) -> Result<(Contract, PathBuf, String), Chec
         ));
     }
 
+    // Reject closed (abandoned) contracts
+    if contract_dir.join("closed.json").exists() {
+        return Err(CheckError::NoContract(
+            "contract was closed (abandoned). Run `punk plan` to create a new one.".into(),
+        ));
+    }
+
     let contract_path = contract_dir.join("contract.json");
 
     if !contract_path.exists() {

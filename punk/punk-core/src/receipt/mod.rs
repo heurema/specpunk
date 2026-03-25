@@ -105,7 +105,8 @@ impl From<vcs::VcsError> for ReceiptError {
 // File diff summary
 // ---------------------------------------------------------------------------
 
-/// Classify changed files into created/modified/deleted by checking VCS.
+/// Classify changed files into created/modified/deleted.
+/// Uses `git cat-file -e HEAD:<file>` to check if file existed in the last commit.
 fn build_file_summary(root: &Path, changed_files: &[String], scope_violations: usize) -> FileSummary {
     let mut created = Vec::new();
     let mut modified = Vec::new();
@@ -116,16 +117,15 @@ fn build_file_summary(root: &Path, changed_files: &[String], scope_violations: u
         if !path.exists() {
             deleted.push(file.clone());
         } else {
-            // Check if file is new (untracked) or modified
-            // Simple heuristic: try git ls-files to see if tracked
-            let is_tracked = std::process::Command::new("git")
-                .args(["-c", "core.quotepath=false", "ls-files", "--error-unmatch", file])
+            // Check if file existed in HEAD (committed state)
+            let existed_in_head = std::process::Command::new("git")
+                .args(["cat-file", "-e", &format!("HEAD:{file}")])
                 .current_dir(root)
                 .output()
                 .map(|o| o.status.success())
-                .unwrap_or(true); // assume modified if can't check
+                .unwrap_or(false);
 
-            if is_tracked {
+            if existed_in_head {
                 modified.push(file.clone());
             } else {
                 created.push(file.clone());

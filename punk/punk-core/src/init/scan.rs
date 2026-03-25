@@ -372,7 +372,7 @@ fn count_tests(root: &Path, primary: &Option<String>, start: Instant) -> Option<
         Some("rust") => ("#\\[test\\]|#\\[tokio::test\\]", &["rs"]),
         Some("go") => ("func Test", &["go"]),
         Some("python") => ("def test_", &["py"]),
-        Some("javascript") | Some("typescript") => ("\\b(it|test)\\s*\\(", &["js", "ts", "jsx", "tsx"]),
+        Some("javascript") | Some("typescript") => ("it(|test(|describe(", &["js", "ts", "jsx", "tsx"]),
         _ => return None,
     };
 

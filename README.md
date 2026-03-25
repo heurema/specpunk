@@ -82,11 +82,7 @@ punk receipt --md                      # human-readable markdown
 punk status                            # where am I?
 ```
 
-For LLM-powered contract generation:
-```sh
-punk config set-provider anthropic https://api.anthropic.com/v1/messages sk-ant-...
-punk plan "add rate limiting to the API"
-```
+LLM-powered contract generation is planned for v0.2. Currently `--manual` is the primary path.
 
 ## Sponsor
 
