@@ -1,125 +1,154 @@
-# punk
+```
+                      ██╗
+ ██████╗ ██╗   ██╗███╗██║██╗  ██╗
+ ██╔══██╗██║   ██║████║██║██║ ██╔╝
+ ██████╔╝██║   ██║██╔██╗██║█████╔╝
+ ██╔═══╝ ██║   ██║██║╚████║██╔═██╗
+ ██║     ╚██████╔╝██║ ╚███║██║  ██╗
+ ╚═╝      ╚═════╝ ╚═╝  ╚══╝╚═╝  ╚═╝
+```
 
-**Your codebase is not ready for AI agents. punk fixes that.**
+**Spec-driven development for AI agents.**
 
-AI agents write code fast. But they don't know your conventions, your boundaries, or your invariants. They generate PRs that compile, pass tests, and silently break everything you've built.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
+[![Tests](https://img.shields.io/badge/tests-64%20passing-brightgreen.svg)]()
 
-punk is a CLI that scans your project, extracts its implicit rules, and turns every task into a verifiable contract — before any code is written.
+> Your AI agent writes code. punk makes sure it writes the *right* code.
+
+---
+
+## The Problem
+
+AI agents generate PRs that compile, pass tests, and silently break everything:
+
+- **Scope creep** — asked to fix auth, also "improved" the database layer
+- **Convention drift** — your style guide exists, nobody reads it
+- **Ghost solutions** — old approach left in, new one piled on top
+- **Review theater** — 1000-line PR, 3 reviewers, "LGTM"
+
+The cost isn't generation. **It's verification.**
+
+## How It Works
 
 ```
-punk init          # understand the project (< 10 seconds)
-punk plan "task"   # generate a contract, not code
-punk check         # verify the implementation matches the contract
+punk init          # scan your project in <10s — no LLM, no API calls
+punk plan "task"   # generate a contract: scope, boundaries, acceptance criteria
+punk check         # verify implementation stayed within the contract
 punk receipt       # cryptographic proof of what happened
+```
+
+### `punk init` — Understand
+
+Scans your codebase. Detects language, framework, conventions, test patterns, commit style, and never-touch boundaries. Machine-readable artifacts that make every AI interaction better.
+
+### `punk plan` — Contract
+
+Before code is written, punk creates a contract: what files to touch, what to never touch, acceptance criteria, and a quality score. You approve it like `terraform plan`. The contract becomes the review boundary.
+
+### `punk check` — Verify
+
+Compares the actual diff against the approved contract. Scope violations, never-touch breaches, undeclared files — caught in the pre-commit hook, not in code review.
+
+```
+punk check: FAIL (4 files checked, 3 in scope)
+
+  error[NEVER_TOUCH]: .env
+    .env is in project never_touch boundaries.
+    fix: unstage this file or abandon the contract
+
+  warning[UNDECLARED]: README.md
+    README.md is not in contract scope.
+    fix: `punk plan --expand` or `git restore --staged`
+```
+
+### `punk receipt` — Proof
+
+Cryptographic receipt linking the approved contract to the verified diff. Receipt chain via SHA-256 hashes. Append-only. Auditable.
+
+```
+punk receipt: COMPLETED (3 files: +1 ~2 -0, 0 violations)
+  contract: 7c0b9fb
+  receipt:  .punk/contracts/7c0b9fb/receipts/task.json
 ```
 
 ---
 
-## The problem
-
-Every AI coding tool today starts from a blank context. They read your files, guess your patterns, and hope for the best. The result:
-
-- Convention drift (your style guide exists, nobody reads it)
-- Scope creep (asked to fix auth, also "improved" the database layer)
-- Ghost solutions (old approach left in, new one added on top)
-- Review theater (1000-line PR, 3 reviewers, "LGTM")
-
-**The cost isn't generation. It's verification.**
-
-## What punk does
-
-**Phase 1 — Understand** (`punk init`)
-
-Scans your codebase in under 10 seconds. No LLM, no API calls. Detects language, framework, conventions, test patterns, commit style, and boundaries. Outputs machine-readable artifacts that make every subsequent AI interaction dramatically better.
-
-**Phase 2 — Contract** (`punk plan "add user auth"`)
-
-Before anyone writes code, punk generates a contract: what files to touch, what to never touch, acceptance criteria, and a quality score. You approve it like `terraform plan`. The contract becomes the review boundary.
-
-**Phase 3 — Verify** (`punk check`)
-
-After implementation, punk verifies the change stayed within the contract. Scope violations, missing acceptance criteria, convention breaks — caught automatically, not in review.
-
-**Phase 4 — Receipt** (`punk receipt`)
-
-Cryptographic proof of what was planned, what was built, and whether they match. Append-only. Auditable. The missing link between "the AI wrote it" and "we verified it."
-
-## Design principles
-
-- **Brownfield-first.** Built for existing codebases, not greenfield demos.
-- **CLI-native.** Works in your terminal, your CI, your pre-commit hooks. No web UI, no vendor lock-in.
-- **Deterministic by default.** `punk init` and `punk check` never call an LLM. Only `punk plan` uses one, and `--manual` works offline.
-- **Receipts, not trust.** Every decision is recorded. Every verification is reproducible.
-
-## Status
-
-**v0.1.0 — MVP complete.** Full loop works: init, plan, check, receipt, status, close.
-
-- 64 tests, 0 clippy warnings, 3 rounds of adversarial QA
-- Rust workspace (punk-core lib + punk-cli bin)
-- git + jj support via VCS trait abstraction
-- Multi-language scanning: Rust, JavaScript/TypeScript, Python, Go
-- SHA-256 approval hash with tamper detection
-- Atomic receipt writes, symlink defenses, `deny_unknown_fields`
-
-## Install
+## Quick Start
 
 ```sh
 cargo install --path punk/punk-cli
 ```
 
-## Quick start
-
 ```sh
 cd your-project
-punk init                              # scan project (< 10s, no LLM)
-punk plan --manual "add rate limiting"  # create contract, approve
+punk init                               # scan project
+punk plan --manual "add rate limiting"   # create contract, approve
 # ... implement the feature ...
-punk check                             # did it stay in scope?
-punk check --strict                    # CI mode: undeclared = fail
-punk receipt                           # completion proof
-punk receipt --md                      # human-readable markdown
-punk status                            # where am I?
+punk check                              # scope gate
+punk check --strict                     # CI mode: undeclared = fail
+punk receipt                            # completion proof
+punk receipt --md                       # markdown summary
+punk status                             # current state
+punk close "changed requirements"       # abandon contract
 ```
 
-LLM-powered contract generation is planned for v0.2. Currently `--manual` is the primary path.
+## Design Principles
 
-## Sponsor
+| Principle | What it means |
+|-----------|---------------|
+| **Brownfield-first** | Built for existing codebases, not greenfield demos |
+| **CLI-native** | Terminal, CI, pre-commit hooks. No web UI, no vendor lock-in |
+| **Deterministic** | `init` and `check` never call an LLM. `plan --manual` works offline |
+| **Receipts, not trust** | Every decision recorded. Every verification reproducible |
 
-punk is built in the open by one developer. If this solves a real problem for you, consider sponsoring development.
+## Features
 
-| Network | Address |
-|---------|---------|
-| **Ethereum** | `0x1EB9b1dec7Ee036BE0BABE9B75AdaF6BD72f546C` |
-| **Arbitrum** | `0x1EB9b1dec7Ee036BE0BABE9B75AdaF6BD72f546C` |
-| **BNB Chain** | `0x1EB9b1dec7Ee036BE0BABE9B75AdaF6BD72f546C` |
-| **Solana** | `HR1i9CFb8D1yGXkiu7CkdhCqBJvsc1hSRrTPLR3f7Hcq` |
+- **Multi-language scanning** — Rust, TypeScript, Python, Go, Java, Ruby, PHP, C/C++
+- **VCS-agnostic** — git and [jj](https://github.com/jj-vcs/jj) via trait abstraction
+- **SHA-256 tamper detection** — contracts are hash-signed at approval time
+- **Atomic writes** — receipt writes use tempfile+rename, safe under concurrency
+- **Symlink defense** — `.punk/` directories and contract dirs reject symlinks
+- **`deny_unknown_fields`** — contract JSON rejects injected fields
+- **Rust-style errors** — actionable messages with fix suggestions
+- **Pre-commit ready** — `punk check` runs in <200ms, exit codes for CI gates
 
-USDC, USDT, ETH, SOL — any token on these networks works.
+## Exit Codes
 
-**What sponsorship enables:**
-- Phase 5+ development (convention scan, AGENTS.md, CI mode)
-- Multi-model contract generation (Claude + GPT + Gemini)
-- Convention auto-tuning (auto-research loop for rule optimization)
-- `punk scan --agents-md` — generate optimized AI agent instructions from your codebase
-
-Every sponsor gets early access to features and a voice in the roadmap.
+| Code | Meaning |
+|------|---------|
+| `0` | Pass (or deliberate quit) |
+| `1` | Scope violation (never_touch, dont_touch, strict undeclared) |
+| `2` | No contract found |
+| `3` | Contract not approved or tampered |
+| `4` | Internal error (parse, I/O) |
 
 ## Roadmap
 
 | Phase | Status | What |
 |-------|--------|------|
-| 0 | done | Scaffold, CLI, VCS trait |
-| 1 | done | `punk init` — brownfield scan, conventions, boundaries |
-| 2 | done | `punk plan` — contract generation, quality heuristic, approval |
-| 3 | done | `punk check` — scope gate, never_touch, pre-commit |
-| 4 | done | `punk receipt` — completion proof, receipt chain |
-| 5 | next | Convention scan — tree-sitter, AGENTS.md generation |
-| 6+ | planned | Explain gate, CI mode, risk router, multi-model audit |
+| 0-2 | **done** | Scaffold, `init`, `plan`, `config` |
+| 3 | **done** | `check` — scope gate, never_touch, pre-commit |
+| 4 | **done** | `receipt` — completion proof, receipt chain |
+| 5 | next | Convention scan — tree-sitter, `AGENTS.md` generation |
+| 6 | planned | Explain gate — human comprehension requirement |
+| 7 | planned | CI mode — GitHub Action, SARIF output |
+| 8+ | planned | Risk router, recall, multi-model audit, cleanup |
 
 ## Why "punk"
 
-Because your codebase has rules that nobody wrote down, conventions that nobody enforces, and boundaries that nobody respects. punk makes them explicit, verifiable, and non-negotiable.
+Your codebase has rules that nobody wrote down, conventions that nobody enforces, and boundaries that nobody respects. punk makes them explicit, verifiable, and non-negotiable.
+
+## Sponsor
+
+punk is built in the open by one developer. If it solves a real problem for you:
+
+| Network | Address |
+|---------|---------|
+| **Ethereum / Arbitrum / BNB** | `0x1EB9b1dec7Ee036BE0BABE9B75AdaF6BD72f546C` |
+| **Solana** | `HR1i9CFb8D1yGXkiu7CkdhCqBJvsc1hSRrTPLR3f7Hcq` |
+
+USDC, USDT, ETH, SOL — any token works. Sponsors get early access + roadmap voice.
 
 ## License
 
