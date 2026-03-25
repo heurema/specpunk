@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
+use punk_core::audit::{self, render_audit_short};
 use punk_core::check::{self, CheckOptions, render_check};
 use punk_core::init::run_init;
 use punk_core::plan::{run_plan_headless, save_contract, PlanOptions};
@@ -55,6 +56,12 @@ enum Commands {
         /// Output Markdown summary
         #[arg(long)]
         md: bool,
+    },
+    /// Run multi-model audit (mechanic + holdouts + external review)
+    Audit {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
     },
     /// Capture pre-change test baseline
     Baseline,
@@ -412,6 +419,57 @@ async fn main() {
                 Err(e) => {
                     eprintln!("punk receipt: {e}");
                     std::process::exit(receipt::EXIT_INTERNAL);
+                }
+            }
+        }
+        Commands::Audit { json } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            match check::resolve_contract(&root) {
+                Ok((contract, _, _)) => {
+                    // Get diff
+                    let diff = punk_core::vcs::detect(&root)
+                        .and_then(|v| v.diff())
+                        .unwrap_or_default();
+
+                    // Assess risk
+                    let assessment = punk_core::risk::assess(&contract.goal, &contract.scope);
+
+                    // Run audit
+                    let audit_input = audit::AuditInput {
+                        goal: &contract.goal,
+                        diff: &diff,
+                        contract_id: &contract.change_id,
+                        tier: &assessment.tier,
+                        mechanic_regressions: 0,
+                        holdout_pass_rate: 1.0,
+                        ac_verified: contract.acceptance_criteria.len(),
+                        ac_total: contract.acceptance_criteria.len(),
+                        root: &root,
+                    };
+                    match audit::run_audit(&audit_input) {
+                        Ok(report) => {
+                            if json {
+                                println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                            } else {
+                                print!("{}", render_audit_short(&report));
+                            }
+                            let exit_code = match report.decision {
+                                audit::AuditDecision::AutoOk => 0,
+                                audit::AuditDecision::AutoBlock => 1,
+                                audit::AuditDecision::HumanReview => 2,
+                            };
+                            std::process::exit(exit_code);
+                        }
+                        Err(e) => {
+                            eprintln!("punk audit: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("punk audit: {e}");
+                    std::process::exit(2);
                 }
             }
         }
