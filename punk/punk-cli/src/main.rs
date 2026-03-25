@@ -435,10 +435,13 @@ async fn main() {
                     .and_then(|v| v["approval_hash"].as_str().map(|_| true))
                     .unwrap_or(false);
 
+                let closed_exists = contract_dir.join("closed.json").exists();
                 let check_exists = contract_dir.join("receipts").join("check.json").exists();
                 let task_exists = contract_dir.join("receipts").join("task.json").exists();
 
-                let state = if task_exists {
+                let state = if closed_exists {
+                    "CLOSED"
+                } else if task_exists {
                     "COMPLETED"
                 } else if check_exists {
                     "CHECKED"

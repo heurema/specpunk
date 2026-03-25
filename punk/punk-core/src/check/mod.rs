@@ -187,6 +187,18 @@ pub fn resolve_contract(root: &Path) -> Result<(Contract, PathBuf, String), Chec
 
     // Exact match only — no cross-change fallback
     let contract_dir = punk_dir.join("contracts").join(&change_id);
+
+    // Security: reject symlinked contract directories (arbitrary write defense)
+    if contract_dir
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(CheckError::Parse(
+            "contract directory is a symlink — refusing (possible path traversal)".into(),
+        ));
+    }
+
     let contract_path = contract_dir.join("contract.json");
 
     if !contract_path.exists() {

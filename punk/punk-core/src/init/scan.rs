@@ -263,7 +263,12 @@ fn detect_build_system_from_file(name: &str) -> Option<String> {
 }
 
 fn primary_lang(langs: &HashMap<String, usize>) -> Option<String> {
-    langs.iter().max_by_key(|(_, v)| *v).map(|(k, _)| k.clone())
+    // Sort by (-count, name) for deterministic tie-breaking
+    let mut sorted: Vec<_> = langs.iter().collect();
+    sorted.sort_by(|(a_name, a_count), (b_name, b_count)| {
+        b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
+    });
+    sorted.first().map(|(k, _)| (*k).clone())
 }
 
 // ---------------------------------------------------------------------------
