@@ -6,6 +6,7 @@ pub mod init;
 pub mod mechanic;
 pub mod plan;
 pub mod receipt;
+pub mod risk;
 pub mod vcs;
 
 pub use vcs::{Vcs, VcsError, VcsType, detect};
