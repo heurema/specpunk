@@ -11,6 +11,7 @@ use punk_core::plan::contract::{Feedback, FeedbackOutcome};
 use punk_core::holdout::{self, render_holdout_short};
 use punk_core::repair;
 use punk_core::mechanic::{self, render_baseline_short, render_mechanic_short};
+use punk_core::pack;
 use punk_core::receipt::{self, ReceiptOptions, render_receipt_md, render_receipt_short};
 
 #[derive(Parser)]
@@ -67,6 +68,17 @@ enum Commands {
     /// Run multi-model audit (mechanic + holdouts + external review)
     Audit {
         /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Assemble proofpack from all verification artifacts
+    Pack,
+    /// CI gate: read proofpack, exit 0=promote, 1=reject, 2=hold
+    Ci {
+        /// Path to proofpack.json (default: auto-detect from active contract)
+        #[arg(long)]
+        proofpack: Option<std::path::PathBuf>,
+        /// Output JSON instead of summary
         #[arg(long)]
         json: bool,
     },
@@ -560,6 +572,102 @@ async fn main() {
                 Err(e) => {
                     eprintln!("punk holdout: {e}");
                     std::process::exit(2);
+                }
+            }
+        }
+        Commands::Pack => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            match check::resolve_contract(&root) {
+                Ok((contract, contract_dir, contract_raw)) => {
+                    // Load audit report
+                    let audit_path = contract_dir.join("audit.json");
+                    if !audit_path.exists() {
+                        eprintln!("punk pack: no audit.json found. Run `punk audit` first.");
+                        std::process::exit(1);
+                    }
+                    let audit_raw = std::fs::read_to_string(&audit_path).unwrap_or_default();
+                    let audit_report: punk_core::audit::AuditReport = match serde_json::from_str(&audit_raw) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("punk pack: invalid audit.json: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+
+                    // Get diff
+                    let diff = punk_core::vcs::detect(&root)
+                        .and_then(|v| v.diff())
+                        .unwrap_or_default();
+
+                    // Strip holdouts for embedded contract
+                    let stripped = punk_core::holdout::strip_holdouts(&contract);
+                    let stripped_json = serde_json::to_string_pretty(&stripped).unwrap_or_default();
+
+                    // Load holdout results
+                    let holdout_path = contract_dir.join("holdout.json");
+                    let (ho_total, ho_passed) = if holdout_path.exists() {
+                        let raw = std::fs::read_to_string(&holdout_path).unwrap_or_default();
+                        if let Ok(r) = serde_json::from_str::<punk_core::holdout::HoldoutReport>(&raw) {
+                            (r.total, r.passed)
+                        } else {
+                            (0, 0)
+                        }
+                    } else {
+                        (0, 0)
+                    };
+
+                    let proofpack = pack::assemble(
+                        &contract_dir, &contract_raw, &stripped_json, &diff,
+                        &audit_report, ho_total, ho_passed,
+                    );
+
+                    match pack::save(&proofpack, &contract_dir) {
+                        Ok(path) => {
+                            print!("{}", pack::render_pack_short(&proofpack));
+                            println!("  saved: {}", path.display());
+                        }
+                        Err(e) => {
+                            eprintln!("punk pack: save error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("punk pack: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Commands::Ci { proofpack, json } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            // Find proofpack path
+            let pack_path = if let Some(p) = proofpack {
+                p
+            } else {
+                // Auto-detect from active contract
+                let change_id = punk_core::vcs::detect(&root)
+                    .and_then(|v| v.change_id())
+                    .unwrap_or_default();
+                root.join(".punk").join("contracts").join(&change_id).join("proofpack.json")
+            };
+
+            match pack::ci_gate(&pack_path) {
+                Ok((code, summary)) => {
+                    if json {
+                        println!(r#"{{"code":{},"verdict":"{}","summary":{}}}"#,
+                            code,
+                            match code { 0 => "PROMOTE", 1 => "REJECT", _ => "HOLD" },
+                            serde_json::to_string(&summary).unwrap_or_default());
+                    } else {
+                        println!("{summary}");
+                    }
+                    std::process::exit(code);
+                }
+                Err(e) => {
+                    eprintln!("punk ci: {e}");
+                    std::process::exit(1);
                 }
             }
         }

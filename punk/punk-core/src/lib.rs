@@ -5,6 +5,7 @@ pub mod dsl;
 pub mod holdout;
 pub mod init;
 pub mod mechanic;
+pub mod pack;
 pub mod plan;
 pub mod receipt;
 pub mod repair;
