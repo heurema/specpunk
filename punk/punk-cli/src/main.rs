@@ -7,6 +7,7 @@ use punk_core::check::{self, CheckOptions, render_check};
 use punk_core::init::run_init;
 use punk_core::plan::{run_plan_headless, save_contract, PlanOptions};
 use punk_core::plan::contract::{Feedback, FeedbackOutcome};
+use punk_core::mechanic::{self, render_baseline_short, render_mechanic_short};
 use punk_core::receipt::{self, ReceiptOptions, render_receipt_md, render_receipt_short};
 
 #[derive(Parser)]
@@ -53,6 +54,14 @@ enum Commands {
         /// Output Markdown summary
         #[arg(long)]
         md: bool,
+    },
+    /// Capture pre-change test baseline
+    Baseline,
+    /// Compare post-change tests against baseline (regression detection)
+    Mechanic {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
     },
     /// Show current workspace status
     Status,
@@ -396,6 +405,66 @@ async fn main() {
                 Err(e) => {
                     eprintln!("punk receipt: {e}");
                     std::process::exit(receipt::EXIT_INTERNAL);
+                }
+            }
+        }
+        Commands::Baseline => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            // Get contract ID from VCS
+            let change_id = punk_core::vcs::detect(&root)
+                .and_then(|v| v.change_id())
+                .unwrap_or_else(|_| String::new());
+
+            if change_id.is_empty() {
+                eprintln!("punk baseline: could not determine VCS change id");
+                std::process::exit(1);
+            }
+
+            match mechanic::capture_baseline(&root, &change_id) {
+                Ok(baseline) => {
+                    print!("{}", render_baseline_short(&baseline));
+                    for check in &baseline.checks {
+                        println!("  {} (exit {}): {} failures, {}ms",
+                            check.name, check.exit_code, check.failures.len(), check.duration_ms);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("punk baseline: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Mechanic { json } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            let change_id = punk_core::vcs::detect(&root)
+                .and_then(|v| v.change_id())
+                .unwrap_or_else(|_| String::new());
+
+            if change_id.is_empty() {
+                eprintln!("punk mechanic: could not determine VCS change id");
+                std::process::exit(1);
+            }
+
+            match mechanic::run_mechanic(&root, &change_id) {
+                Ok(report) => {
+                    if json {
+                        let j = serde_json::to_string_pretty(&report).unwrap_or_default();
+                        println!("{j}");
+                    } else {
+                        print!("{}", render_mechanic_short(&report));
+                    }
+                    let exit_code = match report.status {
+                        mechanic::MechanicStatus::Pass => 0,
+                        mechanic::MechanicStatus::Regression => 1,
+                        mechanic::MechanicStatus::Error => 2,
+                    };
+                    std::process::exit(exit_code);
+                }
+                Err(e) => {
+                    eprintln!("punk mechanic: {e}");
+                    std::process::exit(1);
                 }
             }
         }
