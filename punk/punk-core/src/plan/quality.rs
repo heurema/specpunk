@@ -94,6 +94,7 @@ mod tests {
             id: id.to_string(),
             description: desc.to_string(),
             verify: verify.map(|s| s.to_string()),
+            verify_steps: vec![],
         }
     }
 

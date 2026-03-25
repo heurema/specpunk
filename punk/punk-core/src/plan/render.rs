@@ -93,7 +93,9 @@ pub fn render_summary(contract: &Contract, quality: &QualityReport) -> String {
 mod tests {
     use super::*;
     use crate::plan::ceremony::{CeremonyLevel, ModelTier};
-    use crate::plan::contract::{AcceptanceCriterion, Contract, RoutingMetadata, Scope};
+    use crate::plan::contract::{
+        AcceptanceCriterion, Contract, ContextInheritance, RiskLevel, RoutingMetadata, Scope,
+    };
     use crate::plan::quality::check_quality;
 
     fn sample_contract() -> Contract {
@@ -108,6 +110,7 @@ mod tests {
                 id: "AC-01".to_string(),
                 description: "cargo test passes".to_string(),
                 verify: Some("cargo test".to_string()),
+                verify_steps: vec![],
             }],
             assumptions: vec!["tokio present".to_string()],
             warnings: vec!["scan.json is 100 days old".to_string()],
@@ -126,6 +129,11 @@ mod tests {
             },
             task_id: "deadbeef".to_string(),
             attempt_number: 1,
+            risk_level: RiskLevel::Low,
+            holdout_scenarios: vec![],
+            removals: vec![],
+            cleanup_obligations: vec![],
+            context_inheritance: ContextInheritance::default(),
         }
     }
 

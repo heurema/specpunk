@@ -18,8 +18,8 @@ use self::context::{build_prompt_context, load_context, ContextError};
 pub use self::contract::FeedbackOutcome;
 pub use self::llm::LlmProvider;
 use self::contract::{
-    AcceptanceCriterion, Contract, Feedback, RoutingMetadata, Scope,
-    CONTRACT_VERSION,
+    AcceptanceCriterion, Contract, ContextInheritance, Feedback, RiskLevel,
+    RoutingMetadata, Scope, CONTRACT_VERSION,
 };
 use self::llm::{LlmError, MockProvider};
 use self::quality::{check_quality, QualityReport};
@@ -257,7 +257,7 @@ pub fn parse_llm_response(
                     let id = item["id"].as_str()?.to_string();
                     let description = item["description"].as_str()?.to_string();
                     let verify = item["verify"].as_str().map(|s| s.to_string());
-                    Some(AcceptanceCriterion { id, description, verify })
+                    Some(AcceptanceCriterion { id, description, verify, verify_steps: vec![] })
                 })
                 .collect()
         })
@@ -307,6 +307,11 @@ pub fn parse_llm_response(
         },
         task_id: task_id.to_string(),
         attempt_number,
+        risk_level: RiskLevel::Low,
+        holdout_scenarios: vec![],
+        removals: vec![],
+        cleanup_obligations: vec![],
+        context_inheritance: ContextInheritance::default(),
     })
 }
 
@@ -562,6 +567,7 @@ mod tests {
                 id: "AC-01".to_string(),
                 description: "cargo test".to_string(),
                 verify: Some("cargo test".to_string()),
+                verify_steps: vec![],
             }],
             assumptions: vec![],
             warnings: vec![],
@@ -580,6 +586,11 @@ mod tests {
             },
             task_id: task_id_from_description("test"),
             attempt_number: 1,
+            risk_level: RiskLevel::Low,
+            holdout_scenarios: vec![],
+            removals: vec![],
+            cleanup_obligations: vec![],
+            context_inheritance: ContextInheritance::default(),
         };
 
         let feedback = Feedback {

@@ -496,8 +496,8 @@ mod tests {
 
     use crate::plan::ceremony::{CeremonyLevel, ModelTier};
     use crate::plan::contract::{
-        AcceptanceCriterion, Contract, Feedback, FeedbackOutcome, RoutingMetadata, Scope,
-        CONTRACT_VERSION,
+        AcceptanceCriterion, Contract, ContextInheritance, Feedback, FeedbackOutcome,
+        RiskLevel, RoutingMetadata, Scope, CONTRACT_VERSION,
     };
     use crate::plan::save_contract;
 
@@ -513,6 +513,7 @@ mod tests {
                 id: "AC-01".to_string(),
                 description: "tests pass".to_string(),
                 verify: Some("cargo test".to_string()),
+                verify_steps: vec![],
             }],
             assumptions: vec![],
             warnings: vec![],
@@ -531,6 +532,11 @@ mod tests {
             },
             task_id: "test-task-id".to_string(),
             attempt_number: 1,
+            risk_level: RiskLevel::Low,
+            holdout_scenarios: vec![],
+            removals: vec![],
+            cleanup_obligations: vec![],
+            context_inheritance: ContextInheritance::default(),
         };
 
         let feedback = Feedback {
@@ -657,6 +663,11 @@ mod tests {
             },
             task_id: "tid".to_string(),
             attempt_number: 1,
+            risk_level: RiskLevel::Low,
+            holdout_scenarios: vec![],
+            removals: vec![],
+            cleanup_obligations: vec![],
+            context_inheritance: ContextInheritance::default(),
         };
         let raw = serde_json::to_string_pretty(&contract).unwrap();
         let result = verify_approval_hash(&contract, &raw);
@@ -674,6 +685,7 @@ mod tests {
                 id: "AC-01".to_string(),
                 description: "test".to_string(),
                 verify: None,
+            verify_steps: vec![],
             }],
             assumptions: vec![],
             warnings: vec![],
@@ -692,6 +704,11 @@ mod tests {
             },
             task_id: "tid".to_string(),
             attempt_number: 1,
+            risk_level: RiskLevel::Low,
+            holdout_scenarios: vec![],
+            removals: vec![],
+            cleanup_obligations: vec![],
+            context_inheritance: ContextInheritance::default(),
         };
 
         // Compute valid hash
@@ -718,6 +735,7 @@ mod tests {
                 id: "AC-01".to_string(),
                 description: "test".to_string(),
                 verify: None,
+            verify_steps: vec![],
             }],
             assumptions: vec![],
             warnings: vec![],
@@ -736,6 +754,11 @@ mod tests {
             },
             task_id: "tid".to_string(),
             attempt_number: 1,
+            risk_level: RiskLevel::Low,
+            holdout_scenarios: vec![],
+            removals: vec![],
+            cleanup_obligations: vec![],
+            context_inheritance: ContextInheritance::default(),
         };
 
         let canonical = serde_json::to_string_pretty(&contract).unwrap();
