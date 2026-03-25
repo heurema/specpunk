@@ -314,8 +314,41 @@ pub fn parse_llm_response(
 // Manual mode — template generation
 // ---------------------------------------------------------------------------
 
+/// Detect the verify command from .punk/config.toml test_runner field.
+fn detect_verify_command(root: &Path) -> String {
+    #[derive(serde::Deserialize)]
+    struct PunkToml {
+        #[serde(default)]
+        project: ProjectSection,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct ProjectSection {
+        #[serde(default)]
+        test_runner: Option<String>,
+    }
+
+    let config_path = root.join(".punk").join("config.toml");
+    if let Ok(raw) = std::fs::read_to_string(&config_path) {
+        if let Ok(cfg) = toml::from_str::<PunkToml>(&raw) {
+            if let Some(runner) = cfg.project.test_runner {
+                return match runner.as_str() {
+                    "pytest" => "pytest tests/".to_string(),
+                    "jest" | "vitest" => "npm test".to_string(),
+                    "go-test" => "go test ./...".to_string(),
+                    "cargo-test" => "cargo test".to_string(),
+                    "rspec" => "bundle exec rspec".to_string(),
+                    "mix-test" => "mix test".to_string(),
+                    other => other.to_string(),
+                };
+            }
+        }
+    }
+    "cargo test".to_string()
+}
+
 /// Build a pre-filled JSON template for --manual mode.
-pub fn build_manual_template(task: &str, context_text: &str, change_id: &str) -> String {
+pub fn build_manual_template(task: &str, context_text: &str, change_id: &str, root: &Path) -> String {
+    let verify = detect_verify_command(root);
     serde_json::to_string_pretty(&serde_json::json!({
         "version": CONTRACT_VERSION,
         "goal": task,
@@ -329,7 +362,7 @@ pub fn build_manual_template(task: &str, context_text: &str, change_id: &str) ->
             {
                 "id": "AC-01",
                 "description": "describe the verifiable outcome",
-                "verify": "cargo test"
+                "verify": verify
             }
         ],
         "assumptions": [],
@@ -379,7 +412,7 @@ pub async fn run_plan_headless(opts: &PlanOptions<'_>) -> Result<(Contract, Qual
     let (score, level, tier) = detect_ceremony(&meta);
 
     let contract = if opts.manual {
-        let template = build_manual_template(task, &context_text, &change_id);
+        let template = build_manual_template(task, &context_text, &change_id, opts.root);
         // In tests / headless: parse the template directly as if the user returned it unchanged
         parse_llm_response(
             &template,
