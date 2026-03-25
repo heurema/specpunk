@@ -9,6 +9,7 @@ pub mod pack;
 pub mod plan;
 pub mod receipt;
 pub mod repair;
+pub mod scan;
 pub mod risk;
 pub mod vcs;
 

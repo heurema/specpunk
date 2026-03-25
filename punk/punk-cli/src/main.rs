@@ -71,6 +71,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Scan project conventions and optionally generate AGENTS.md
+    Scan {
+        /// Generate AGENTS.md file
+        #[arg(long)]
+        agents_md: bool,
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
     /// Assemble proofpack from all verification artifacts
     Pack,
     /// CI gate: read proofpack, exit 0=promote, 1=reject, 2=hold
@@ -573,6 +582,59 @@ async fn main() {
                     eprintln!("punk holdout: {e}");
                     std::process::exit(2);
                 }
+            }
+        }
+        Commands::Scan { agents_md, json } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            // Detect language from .punk/config.toml or scan.json
+            let language = {
+                let config_path = root.join(".punk").join("config.toml");
+                if let Ok(raw) = std::fs::read_to_string(&config_path) {
+                    #[derive(serde::Deserialize)]
+                    struct C { #[serde(default)] project: P }
+                    #[derive(serde::Deserialize, Default)]
+                    struct P { #[serde(default)] primary_language: Option<String> }
+                    toml::from_str::<C>(&raw)
+                        .ok()
+                        .and_then(|c| c.project.primary_language)
+                        .unwrap_or_else(|| "rust".to_string())
+                } else {
+                    "rust".to_string()
+                }
+            };
+
+            let report = punk_core::scan::scan_conventions(&root, &language);
+
+            if agents_md {
+                let project_name = root.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "project".to_string());
+                let md = punk_core::scan::generate_agents_md(&report, &project_name);
+                let agents_path = root.join("AGENTS.md");
+                if let Err(e) = std::fs::write(&agents_path, &md) {
+                    eprintln!("punk scan: write AGENTS.md: {e}");
+                    std::process::exit(1);
+                }
+                println!("punk scan: AGENTS.md written ({} bytes)", md.len());
+            } else if json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+            } else {
+                println!("punk scan: {} ({} findings)", report.language, report.findings.len());
+                println!("  naming:  fn={}, types={}", report.naming.functions, report.naming.types);
+                println!("  imports: {}", report.imports.style);
+                println!("  errors:  {}", report.errors.style);
+                println!("  tests:   {} ({})", report.tests.framework, report.tests.style);
+                if !report.imports.top_imports.is_empty() {
+                    println!("  top deps: {}", report.imports.top_imports.join(", "));
+                }
+            }
+
+            // Save to .punk/conventions-scan.json
+            let punk_dir = root.join(".punk");
+            if punk_dir.is_dir() {
+                let scan_json = serde_json::to_string_pretty(&report).unwrap_or_default();
+                let _ = std::fs::write(punk_dir.join("conventions-scan.json"), &scan_json);
             }
         }
         Commands::Pack => {
