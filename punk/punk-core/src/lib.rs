@@ -3,6 +3,7 @@ pub mod check;
 pub mod cleanup;
 pub mod config;
 pub mod coupling;
+pub mod depcheck;
 pub mod dsl;
 pub mod explain;
 pub mod holdout;
@@ -17,6 +18,8 @@ pub mod repair;
 pub mod risk;
 pub mod scan;
 pub mod session;
+pub mod supersede;
+pub mod testquality;
 pub mod vcs;
 
 pub use vcs::{Vcs, VcsError, VcsType, detect};
