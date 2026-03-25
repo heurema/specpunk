@@ -1,0 +1,656 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Specpunk</title>
+    <meta
+      name="description"
+      content="Spec-driven development toolkit — verify AI agent code against approved contracts"
+    >
+    <meta name="theme-color" content="#F5F1E8">
+    <link rel="canonical" href="https://specpunk.com/">
+    <meta property="og:title" content="Specpunk">
+    <meta
+      property="og:description"
+      content="Spec-driven development toolkit — verify AI agent code against approved contracts"
+    >
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://specpunk.com/">
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23F5F1E8'/%3E%3Ctext x='50%25' y='54%25' text-anchor='middle' font-family='monospace' font-size='26' fill='%231F5C56'%3E%5D%5B%3C/text%3E%3C/svg%3E"
+    >
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Recursive:slnt,CASL,CRSV,MONO,wght@0,0,0,0,400;0,0,0,0,500;0,0,0,0,600;0,1,0,1,450;0,1,0,1,500&display=swap"
+      rel="stylesheet"
+    >
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand-block">
+          <div class="brand-lockup">
+            <span class="brand-glyph" aria-hidden="true">][</span>
+            <div class="brand">Specpunk</div>
+          </div>
+          <div class="topbar-note">public build / march 2026</div>
+        </div>
+        <nav class="topnav" aria-label="Primary">
+          <a href="#notebook">01 how it works</a>
+          <a href="#artifact-pack">02 commands</a>
+          <a href="#conversation">03 install</a>
+        </nav>
+      </div>
+    </header>
+
+    <main class="page-shell">
+      <section class="boundary-section section" id="top">
+        <p class="section-kicker">spec-driven development toolkit</p>
+        <div class="boundary-head">
+          <p class="premise">punk check: FAIL — 3 never_touch violations in src/billing/</p>
+          <p class="boundary-subcopy boundary-subcopy--editorial">
+            AI agents drift. punk doesn't let them.
+          </p>
+        </div>
+
+        <div class="boundary-scene">
+          <div class="scene-toolbar">
+            <div class="scene-kicker">
+              <span class="chip chip-risk">scope violation</span>
+              <span class="chip chip-contained">contract enforced</span>
+            </div>
+            <div class="state-switches" aria-label="Boundary modes">
+              <button class="switch" type="button" data-mode="raw" aria-pressed="false">without punk</button>
+              <button class="switch" type="button" data-mode="scoped" aria-pressed="true">with punk check</button>
+              <button class="switch" type="button" data-mode="evidence" aria-pressed="false">with proofpack</button>
+            </div>
+          </div>
+
+          <p class="scene-caption">punk init → punk plan → punk check → punk receipt</p>
+
+          <dl class="scene-metrics" aria-label="Boundary summary">
+            <div class="scene-stat">
+              <dt>contract scope</dt>
+              <dd>4 files</dd>
+            </div>
+            <div class="scene-stat scene-stat-risk">
+              <dt>actual touched</dt>
+              <dd>7 files</dd>
+            </div>
+            <div class="scene-stat scene-stat-risk">
+              <dt>never_touch violations</dt>
+              <dd>3 files</dd>
+            </div>
+            <div class="scene-stat scene-stat-contained">
+              <dt>approval hash</dt>
+              <dd>a3f9c2d1</dd>
+            </div>
+          </dl>
+
+          <div class="boundary-grid" id="boundary-grid" data-mode="scoped">
+            <article class="panel raw-state">
+              <header class="panel-header">
+                <div>
+                  <div class="chip-row">
+                    <span class="chip chip-risk">without punk</span>
+                    <span class="chip">7 files changed</span>
+                  </div>
+                  <h2 class="panel-title">Raw agent output</h2>
+                  <p class="panel-meta">review confidence: low / contract drift: invisible</p>
+                </div>
+              </header>
+
+              <ul class="file-list risk-state-fade">
+                <li class="file-row">
+                  <span>src/auth/login.rs</span>
+                  <span class="row-flag">in scope</span>
+                </li>
+                <li class="file-row">
+                  <span>src/auth/session.rs</span>
+                  <span class="row-flag">in scope</span>
+                </li>
+                <li class="file-row">
+                  <span>src/auth/policy.rs</span>
+                  <span class="row-flag">in scope</span>
+                </li>
+                <li class="file-row scope-summary">
+                  <span>+3 files outside contract scope</span>
+                  <span class="row-flag row-flag-risk">collapsed</span>
+                </li>
+                <li class="file-row is-risk">
+                  <span>src/billing/subscription.rs</span>
+                  <span class="row-flag row-flag-risk">never_touch</span>
+                </li>
+                <li class="file-row is-risk">
+                  <span>src/billing/invoice.rs</span>
+                  <span class="row-flag row-flag-risk">never_touch</span>
+                </li>
+                <li class="file-row is-risk">
+                  <span>src/billing/plan.rs</span>
+                  <span class="row-flag row-flag-risk">never_touch</span>
+                </li>
+              </ul>
+
+              <div class="rail-box panel-foot">
+                <p class="rail-label">risk markers</p>
+                <ul class="signal-list">
+                  <li class="risk">never_touch violations are indistinguishable from valid edits</li>
+                  <li class="risk">no contract hash — impossible to verify what was approved</li>
+                  <li class="risk">acceptance criteria exist, but no proof they were tested</li>
+                </ul>
+              </div>
+            </article>
+
+            <aside class="panel panel-strong">
+              <header class="panel-header">
+                <div>
+                  <div class="chip-row">
+                    <span class="chip">contract 001</span>
+                    <span class="chip">session timeout</span>
+                  </div>
+                  <h2 class="panel-title">Contract rail</h2>
+                  <p class="panel-meta">the semantic spine that turns an agent diff into a bounded review decision</p>
+                </div>
+              </header>
+
+              <div class="rail-stack">
+                <div class="rail-box">
+                  <p class="rail-label">check facts</p>
+                  <dl class="metric-grid">
+                    <div class="metric">
+                      <dt>task</dt>
+                      <dd>add session timeout without touching billing or payment flows</dd>
+                    </div>
+                    <div class="metric">
+                      <dt>contract scope</dt>
+                      <dd>4 files / auth module only</dd>
+                    </div>
+                    <div class="metric">
+                      <dt>actual scope</dt>
+                      <dd>7 files / 3 violate never_touch</dd>
+                    </div>
+                    <div class="metric">
+                      <dt>missing evidence</dt>
+                      <dd>holdout test results and AC verification</dd>
+                    </div>
+                  </dl>
+                </div>
+
+                <div class="rail-box rail-box-note">
+                  <p class="rail-label">mode note</p>
+                  <p class="mode-note" id="mode-note">
+                    Scoped view makes the contract boundary visible. punk check emits PASS or FAIL — not a suggestion. The agent either stayed in scope or it didn't.
+                  </p>
+                </div>
+
+                <div class="rail-box is-evidence">
+                  <p class="rail-label">review posture</p>
+                  <ul class="signal-list">
+                    <li>check contract first</li>
+                    <li>inspect never_touch violations second</li>
+                    <li>accept only after punk receipt is attached</li>
+                  </ul>
+                </div>
+              </div>
+            </aside>
+
+            <article class="panel contained-state">
+              <header class="panel-header">
+                <div>
+                  <div class="chip-row">
+                    <span class="chip chip-contained">with punk check</span>
+                    <span class="chip">4 files contained</span>
+                  </div>
+                  <h2 class="panel-title">Check receipt</h2>
+                  <p class="panel-meta">contained enough to reason about</p>
+                </div>
+              </header>
+
+              <div class="contained-stack">
+                <div class="contained-box">
+                  <p class="box-label">contract ACs</p>
+                  <ul class="intent-list">
+                    <li class="contained">enforce session timeout after inactivity</li>
+                    <li class="contained">preserve refresh-token behavior</li>
+                    <li class="contained">never touch billing or payment modules</li>
+                  </ul>
+                </div>
+
+                <div class="contained-box">
+                  <p class="box-label">approved scope</p>
+                  <ul class="artifact-list">
+                    <li class="contained">src/auth/login.rs</li>
+                    <li class="contained">src/auth/session.rs</li>
+                    <li class="contained">src/auth/policy.rs</li>
+                    <li class="contained">src/auth/timeout.rs</li>
+                  </ul>
+                </div>
+
+                <div class="contained-box is-evidence">
+                  <p class="box-label">proofpack</p>
+                  <ul class="artifact-list">
+                    <li class="contained">holdout tests: 4/4 pass</li>
+                    <li class="contained">AC coverage: verified</li>
+                    <li class="contained">approval hash: a3f9c2d1</li>
+                  </ul>
+                </div>
+              </div>
+            </article>
+          </div>
+
+          <div class="scene-anchor" aria-hidden="true">
+            <span class="scene-anchor-mark scene-anchor-mark-left">[</span>
+            <div class="scene-anchor-center">
+              <div class="containment-seal">
+                <span class="containment-seal-kicker">check state</span>
+                <span class="containment-seal-value">PASS / 25 commands</span>
+                <span class="containment-seal-meta">receipt attached</span>
+              </div>
+            </div>
+            <span class="scene-anchor-mark scene-anchor-mark-right">]</span>
+          </div>
+
+          <dl class="boundary-strip">
+            <div class="strip-cell">
+              <dt>latest notebook delta</dt>
+              <dd>holdout blind testing is the moat — agents can't game what they can't see.</dd>
+            </div>
+            <div class="strip-cell">
+              <dt>benchmark note</dt>
+              <dd>scope containment matters more than confidence scores alone.</dd>
+            </div>
+            <div class="strip-cell">
+              <dt>open question</dt>
+              <dd>how much signal does punk scan add over a manually authored contract.json?</dd>
+            </div>
+            <div class="strip-cell">
+              <dt>next build</dt>
+              <dd>proofpack drawer + AC contradiction checks + multi-agent receipt bundle.</dd>
+              <div class="action-row boundary-strip-actions">
+                <button class="action" id="open-artifact-drawer" type="button">open artifact drawer</button>
+              </div>
+            </div>
+          </dl>
+        </div>
+      </section>
+
+      <section class="section" id="notebook">
+        <div class="section-header">
+          <p class="section-kicker">public lab notebook</p>
+          <h2 class="editorial-title">A tool that shows its work.</h2>
+          <p class="section-copy">
+            Not a blog. Not founder theater. Just the narrow layer where decisions, failures, and unresolved
+            questions stay visible enough to keep the rest honest.
+          </p>
+        </div>
+
+        <div class="notebook-log">
+          <article class="log-entry log-entry-featured">
+            <div class="log-meta">
+              <p class="note-meta">thesis delta / v1.0</p>
+              <p class="log-status">holdout testing / moat confirmed</p>
+            </div>
+            <div class="log-body">
+              <h3 class="note-title">v1.0: holdout blind testing is the moat.</h3>
+              <p class="note-copy">
+                Agents optimize for what they can observe. Holdout tests are invisible to the agent during
+                generation — they can only be passed by code that actually satisfies the contract, not by
+                code that learned the test shape.
+              </p>
+            </div>
+          </article>
+
+          <article class="log-entry">
+            <div class="log-meta">
+              <p class="note-meta">milestone</p>
+              <p class="log-status">shipped / zero warnings</p>
+            </div>
+            <div class="log-body">
+              <h3 class="note-title">25 commands. 214 tests. Zero clippy warnings.</h3>
+              <p class="note-copy">
+                The full command surface — init, plan, check, receipt, scan, proofpack, and more — ships
+                clean. 214 tests and no warnings means the tool enforces on itself what it enforces on agents.
+              </p>
+            </div>
+          </article>
+
+          <article class="log-entry">
+            <div class="log-meta">
+              <p class="note-meta">architecture decision</p>
+              <p class="log-status">resolved / unified tool</p>
+            </div>
+            <div class="log-body">
+              <h3 class="note-title">signum absorbed. One tool to rule them all.</h3>
+              <p class="note-copy">
+                Signum's receipt chain and boundary verification moved into punk. The approval hash,
+                deterministic boundary seal, and receipt chain are now first-class punk primitives, not
+                a separate project.
+              </p>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="section section-artifact-pack" id="artifact-pack">
+        <div class="section-header">
+          <p class="section-kicker">control room</p>
+          <h2 class="editorial-title">Open the artifact pack.</h2>
+          <p class="section-copy">
+            Closer to opening a module than reading copy. The artifacts are the object. The page only arranges them.
+          </p>
+        </div>
+
+        <div class="artifact-toolbar">
+          <p class="artifact-toolbar-note" id="artifact-pack-status">
+            Required view: contract, check receipt, and proofpack define the minimal boundary.
+          </p>
+          <div class="action-row artifact-actions">
+            <button class="action" type="button" data-artifact-action="required">open required</button>
+            <button class="action action-secondary" type="button" data-artifact-action="expand">expand all</button>
+            <button class="action action-secondary" type="button" data-artifact-action="collapse">collapse all</button>
+          </div>
+        </div>
+
+        <div class="artifact-stack">
+          <details class="artifact-card" data-artifact-group="required" open>
+            <summary>
+              <p class="artifact-label">artifact</p>
+              <h3 class="artifact-name">contract.json</h3>
+              <p class="artifact-copy">The approved contract: scope.touch, dont_touch, ACs, and holdout tests.</p>
+            </summary>
+            <div class="artifact-body">
+              <pre>{
+  "task": "add session timeout",
+  "scope": {
+    "touch": ["src/auth/"],
+    "never_touch": ["src/billing/", "src/payments/"]
+  },
+  "acceptance_criteria": [
+    "timeout enforced after inactivity",
+    "refresh token flow unchanged"
+  ],
+  "holdouts": ["tests/holdout/session_timeout_blind.rs"]
+}</pre>
+            </div>
+          </details>
+
+          <details class="artifact-card" data-artifact-group="required" open>
+            <summary>
+              <p class="artifact-label">artifact</p>
+              <h3 class="artifact-name">check.json</h3>
+              <p class="artifact-copy">Receipt from punk check — scope violations, PASS/FAIL, approval hash.</p>
+            </summary>
+            <div class="artifact-body">
+              <pre>{
+  "status": "FAIL",
+  "violations": [
+    {"file": "src/billing/subscription.rs", "rule": "never_touch"},
+    {"file": "src/billing/invoice.rs", "rule": "never_touch"},
+    {"file": "src/billing/plan.rs", "rule": "never_touch"}
+  ],
+  "approval_hash": null,
+  "checked_at": "2026-03-25T09:14:00Z"
+}</pre>
+            </div>
+          </details>
+
+          <details class="artifact-card" data-artifact-group="supporting">
+            <summary>
+              <p class="artifact-label">artifact</p>
+              <h3 class="artifact-name">AGENTS.md</h3>
+              <p class="artifact-copy">Generated by punk scan — repo conventions surfaced for the agent.</p>
+            </summary>
+            <div class="artifact-body">
+              <pre>## Scope
+- auth module: src/auth/
+- never touch: src/billing/, src/payments/
+
+## Conventions
+- error handling: Result&lt;T, PunkError&gt;
+- test location: tests/ (unit) + tests/holdout/ (blind)
+
+## Approval
+- run punk check before submitting any diff
+- attach punk receipt to every PR</pre>
+            </div>
+          </details>
+
+          <details class="artifact-card" data-artifact-group="supporting">
+            <summary>
+              <p class="artifact-label">artifact</p>
+              <h3 class="artifact-name">proofpack.json</h3>
+              <p class="artifact-copy">Holdout test results with confidence scores — proof the contract was satisfied.</p>
+            </summary>
+            <div class="artifact-body">
+              <pre>{
+  "holdout_results": [
+    {"test": "session_timeout_blind", "status": "pass"},
+    {"test": "refresh_token_invariant", "status": "pass"}
+  ],
+  "ac_coverage": 1.0,
+  "confidence": 0.94,
+  "approval_hash": "a3f9c2d1"
+}</pre>
+            </div>
+          </details>
+
+          <details class="artifact-card" data-artifact-group="required" open>
+            <summary>
+              <p class="artifact-label">artifact</p>
+              <h3 class="artifact-name">receipt.json</h3>
+              <p class="artifact-copy">The minimal reviewable bundle: scope clean, ACs verified, hash sealed.</p>
+            </summary>
+            <div class="artifact-body">
+              <pre>{
+  "status": "PASS",
+  "violations": [],
+  "ac_verified": true,
+  "holdouts_passed": 4,
+  "approval_hash": "a3f9c2d1",
+  "sealed_at": "2026-03-25T09:31:00Z"
+}</pre>
+            </div>
+          </details>
+
+          <details class="artifact-card" data-artifact-group="required" open>
+            <summary>
+              <p class="artifact-label">artifact</p>
+              <h3 class="artifact-name">review.md</h3>
+              <p class="artifact-copy">A review posture driven by the contract, not just a list of files touched.</p>
+            </summary>
+            <div class="artifact-body">
+              <pre>decision: inspect and approve
+reason:
+  - contract scope respected
+  - never_touch rules clean
+  - holdout tests passed
+  - approval hash attached
+remaining_risk:
+  - timeout threshold may need product tuning</pre>
+            </div>
+          </details>
+        </div>
+      </section>
+
+      <section class="section" id="conversation">
+        <div class="section-header">
+          <p class="section-kicker">prompt surface</p>
+          <h2 class="editorial-title">Run punk on the last AI PR you merged without checking scope.</h2>
+          <p class="section-copy">
+            A real prompt, not a lead form. It should stay useful even before there is any proper contact surface behind it.
+          </p>
+        </div>
+
+        <div class="conversation-sheet">
+          <div class="conversation-pane">
+            <p class="rail-label">quick start</p>
+            <textarea id="conversation-prompt" aria-label="punk install and quick start" readonly>cargo install --path punk/punk-cli
+
+# init a contract for the current task
+punk init
+
+# let the agent plan against the contract
+punk plan
+
+# after the agent commits — verify scope
+punk check
+
+# seal the receipt with an approval hash
+punk receipt</textarea>
+            <div class="action-row conversation-actions">
+              <button class="action" id="copy-prompt" type="button">copy prompt</button>
+              <a class="action action-secondary" data-artifact-link="required" href="#artifact-pack">open artifact pack</a>
+            </div>
+          </div>
+
+          <div class="conversation-pane conversation-pane-aside">
+            <p class="rail-label">why punk exists</p>
+            <ul class="conversation-list">
+              <li>AI agents routinely touch files outside their stated task — punk makes that a hard failure, not a review suggestion</li>
+              <li>holdout blind testing means agents can't optimize for the test; they have to satisfy the contract</li>
+              <li>every approved change gets a sealed receipt — scope, AC coverage, confidence score, approval hash</li>
+            </ul>
+            <p class="footer-note" id="prompt-status" role="status" aria-live="polite">
+              This prompt is local. Nothing is submitted from this page.
+            </p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const grid = document.getElementById("boundary-grid");
+      const switches = Array.from(document.querySelectorAll(".switch"));
+      const modeNote = document.getElementById("mode-note");
+      const prompt = document.getElementById("conversation-prompt");
+      const copyPrompt = document.getElementById("copy-prompt");
+      const promptStatus = document.getElementById("prompt-status");
+      const artifactSection = document.getElementById("artifact-pack");
+      const artifactStatus = document.getElementById("artifact-pack-status");
+      const artifactCards = Array.from(document.querySelectorAll(".artifact-card"));
+      const artifactButtons = Array.from(document.querySelectorAll("[data-artifact-action]"));
+      const artifactLinks = Array.from(document.querySelectorAll("[data-artifact-link]"));
+      const openArtifactDrawer = document.getElementById("open-artifact-drawer");
+
+      const notes = {
+        raw: "Raw view is the anxiety surface: too many touched files, no contract boundary, never_touch violations invisible.",
+        scoped: "Scoped view compresses drift into one visible fact: punk check either PASSes or FAILs against the contract.",
+        evidence: "Evidence view asks the harder question: does the proofpack prove the contract was satisfied, not just that tests ran."
+      };
+
+      const artifactNotes = {
+        required: "Required view: contract, check receipt, and proofpack define the minimal boundary.",
+        expand: "Expanded view: AGENTS.md and review posture join the required boundary.",
+        collapse: "Collapsed view: artifact titles stay visible, but the review boundary is hidden again."
+      };
+
+      const artifactModes = {
+        required(card) {
+          card.open = card.dataset.artifactGroup === "required";
+        },
+        expand(card) {
+          card.open = true;
+        },
+        collapse(card) {
+          card.open = false;
+        }
+      };
+
+      function pulseArtifactSection(mode) {
+        if (!artifactSection) {
+          return;
+        }
+
+        artifactSection.dataset.drawerMode = mode;
+        artifactSection.classList.remove("artifact-pack-pulse");
+        window.requestAnimationFrame(() => {
+          artifactSection.classList.add("artifact-pack-pulse");
+        });
+
+        window.setTimeout(() => {
+          artifactSection.classList.remove("artifact-pack-pulse");
+        }, 1100);
+      }
+
+      function setArtifactMode(mode, scrollToSection = false) {
+        if (!artifactSection || !artifactStatus || !artifactModes[mode]) {
+          return;
+        }
+
+        artifactCards.forEach((card) => {
+          artifactModes[mode](card);
+        });
+
+        artifactStatus.textContent = artifactNotes[mode];
+
+        artifactButtons.forEach((button) => {
+          const isActive = button.dataset.artifactAction === mode;
+          button.classList.toggle("is-active", isActive);
+          button.setAttribute("aria-pressed", String(isActive));
+        });
+
+        pulseArtifactSection(mode);
+
+        if (scrollToSection) {
+          artifactSection.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      }
+
+      switches.forEach((button) => {
+        button.addEventListener("click", () => {
+          const { mode } = button.dataset;
+          grid.dataset.mode = mode;
+          modeNote.textContent = notes[mode];
+          switches.forEach((candidate) => {
+            candidate.setAttribute("aria-pressed", String(candidate === button));
+          });
+        });
+      });
+
+      artifactButtons.forEach((button) => {
+        button.addEventListener("click", () => {
+          setArtifactMode(button.dataset.artifactAction, false);
+        });
+      });
+
+      artifactLinks.forEach((link) => {
+        link.addEventListener("click", (event) => {
+          event.preventDefault();
+          setArtifactMode(link.dataset.artifactLink, true);
+        });
+      });
+
+      if (openArtifactDrawer) {
+        openArtifactDrawer.addEventListener("click", () => {
+          setArtifactMode("required", true);
+        });
+      }
+
+      if (copyPrompt && prompt && promptStatus) {
+        const defaultStatus = "This prompt is local. Nothing is submitted from this page.";
+
+        copyPrompt.addEventListener("click", async () => {
+          try {
+            await navigator.clipboard.writeText(prompt.value);
+            promptStatus.textContent = "Prompt copied. Nothing is submitted from this page.";
+          } catch (error) {
+            prompt.focus();
+            prompt.select();
+            document.execCommand("copy");
+            promptStatus.textContent = "Prompt copied. Nothing is submitted from this page.";
+          }
+
+          window.setTimeout(() => {
+            promptStatus.textContent = defaultStatus;
+          }, 1800);
+        });
+      }
+
+      setArtifactMode("required", false);
+    </script>
+  </body>
+</html>
