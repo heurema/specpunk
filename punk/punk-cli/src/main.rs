@@ -7,6 +7,7 @@ use punk_core::check::{self, CheckOptions, render_check};
 use punk_core::init::run_init;
 use punk_core::plan::{run_plan_headless, save_contract, PlanOptions};
 use punk_core::plan::contract::{Feedback, FeedbackOutcome};
+use punk_core::holdout::{self, render_holdout_short};
 use punk_core::mechanic::{self, render_baseline_short, render_mechanic_short};
 use punk_core::receipt::{self, ReceiptOptions, render_receipt_md, render_receipt_short};
 
@@ -57,6 +58,12 @@ enum Commands {
     },
     /// Capture pre-change test baseline
     Baseline,
+    /// Run blind holdout tests against implementation
+    Holdout {
+        /// Output JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
     /// Compare post-change tests against baseline (regression detection)
     Mechanic {
         /// Output JSON instead of human-readable text
@@ -405,6 +412,40 @@ async fn main() {
                 Err(e) => {
                     eprintln!("punk receipt: {e}");
                     std::process::exit(receipt::EXIT_INTERNAL);
+                }
+            }
+        }
+        Commands::Holdout { json } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+            match check::resolve_contract(&root) {
+                Ok((contract, _, _)) => {
+                    match holdout::run_holdouts(&contract, &root) {
+                        Ok(report) => {
+                            if json {
+                                let j = serde_json::to_string_pretty(&report).unwrap_or_default();
+                                println!("{j}");
+                            } else {
+                                print!("{}", render_holdout_short(&report));
+                            }
+                            let exit_code = if report.meets_threshold { 0 } else { 1 };
+                            std::process::exit(exit_code);
+                        }
+                        Err(holdout::HoldoutError::NoHoldouts) => {
+                            eprintln!("punk holdout: contract has no holdout scenarios (risk={:?}, min={})",
+                                contract.risk_level,
+                                holdout::min_holdouts_for_risk(&contract.risk_level));
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("punk holdout: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("punk holdout: {e}");
+                    std::process::exit(2);
                 }
             }
         }
