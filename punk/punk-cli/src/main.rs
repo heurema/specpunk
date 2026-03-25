@@ -71,6 +71,33 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Verify contract removals and cleanup obligations
+    Cleanup,
+    /// Generate context pack for AI agent session
+    Session,
+    /// Show temporal coupling for a file (co-change patterns)
+    Coupling {
+        /// File to analyze
+        file: String,
+        /// Minimum confidence threshold (default 0.2)
+        #[arg(long, default_value = "0.2")]
+        min_confidence: f64,
+    },
+    /// Create or confirm an explanation artifact
+    Explain {
+        /// What changed
+        #[arg(long)]
+        what: Option<String>,
+        /// Why this approach
+        #[arg(long)]
+        why: Option<String>,
+        /// What can break
+        #[arg(long)]
+        risks: Option<String>,
+        /// Confirm existing explanation
+        #[arg(long)]
+        confirm: Option<String>,
+    },
     /// Search prior events relevant to a context (pre-action recall)
     Recall {
         /// Search query (file paths, keywords)
@@ -598,6 +625,66 @@ async fn main() {
                     eprintln!("punk holdout: {e}");
                     std::process::exit(2);
                 }
+            }
+        }
+        Commands::Cleanup => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match check::resolve_contract(&root) {
+                Ok((contract, _, _)) => {
+                    let report = punk_core::cleanup::run_cleanup(
+                        &root, &contract.removals, &contract.cleanup_obligations,
+                    );
+                    print!("{}", punk_core::cleanup::render_cleanup(&report));
+                    std::process::exit(if report.all_passed { 0 } else { 1 });
+                }
+                Err(e) => { eprintln!("punk cleanup: {e}"); std::process::exit(2); }
+            }
+        }
+        Commands::Session => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let pack = punk_core::session::build_context_pack(&root);
+            print!("{}", punk_core::session::render_context_pack(&pack));
+        }
+        Commands::Coupling { file, min_confidence } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let result = punk_core::coupling::find_coupling(&root, &file, min_confidence);
+            print!("{}", punk_core::coupling::render_coupling(&result));
+        }
+        Commands::Explain { what, why, risks, confirm } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match check::resolve_contract(&root) {
+                Ok((contract, contract_dir, _)) => {
+                    if let Some(by) = confirm {
+                        // Confirm existing explanation
+                        match punk_core::explain::load(&contract_dir) {
+                            Some(mut e) => {
+                                punk_core::explain::confirm(&mut e, &by);
+                                if let Err(err) = punk_core::explain::save(&e, &contract_dir) {
+                                    eprintln!("punk explain: {err}");
+                                    std::process::exit(1);
+                                }
+                                println!("punk explain: confirmed by {by}");
+                            }
+                            None => {
+                                eprintln!("punk explain: no explanation found. Create one first.");
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        let what = what.unwrap_or_else(|| "(describe what changed)".into());
+                        let why = why.unwrap_or_else(|| "(explain why this approach)".into());
+                        let risks = risks.unwrap_or_else(|| "(what can break)".into());
+                        let e = punk_core::explain::create_draft(
+                            &contract.change_id, &what, &why, &risks,
+                        );
+                        if let Err(err) = punk_core::explain::save(&e, &contract_dir) {
+                            eprintln!("punk explain: {err}");
+                            std::process::exit(1);
+                        }
+                        print!("{}", punk_core::explain::render_explanation(&e));
+                    }
+                }
+                Err(e) => { eprintln!("punk explain: {e}"); std::process::exit(2); }
             }
         }
         Commands::Recall { query, limit } => {

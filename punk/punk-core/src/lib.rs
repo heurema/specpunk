@@ -1,7 +1,10 @@
 pub mod audit;
 pub mod check;
+pub mod cleanup;
 pub mod config;
+pub mod coupling;
 pub mod dsl;
+pub mod explain;
 pub mod holdout;
 pub mod init;
 pub mod mechanic;
@@ -10,8 +13,9 @@ pub mod plan;
 pub mod recall;
 pub mod receipt;
 pub mod repair;
-pub mod scan;
 pub mod risk;
+pub mod scan;
+pub mod session;
 pub mod vcs;
 
 pub use vcs::{Vcs, VcsError, VcsType, detect};
