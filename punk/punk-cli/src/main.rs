@@ -71,6 +71,22 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Search prior events relevant to a context (pre-action recall)
+    Recall {
+        /// Search query (file paths, keywords)
+        query: String,
+        /// Max results (default 5)
+        #[arg(long, default_value = "5")]
+        limit: usize,
+    },
+    /// Record a human invariant rule
+    Remember {
+        /// Rule description
+        description: String,
+        /// Reason for the rule
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Scan project conventions and optionally generate AGENTS.md
     Scan {
         /// Generate AGENTS.md file
@@ -581,6 +597,28 @@ async fn main() {
                 Err(e) => {
                     eprintln!("punk holdout: {e}");
                     std::process::exit(2);
+                }
+            }
+        }
+        Commands::Recall { query, limit } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let results = punk_core::recall::recall(&root, &query, limit);
+            let output = punk_core::recall::render_recall(&results);
+            if output.is_empty() {
+                // Silent when nothing found (by design)
+            } else {
+                print!("{output}");
+            }
+        }
+        Commands::Remember { description, reason } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match punk_core::recall::remember(&root, &description, reason.as_deref()) {
+                Ok(event) => {
+                    println!("punk remember: saved invariant '{}' ({})", event.context, event.id);
+                }
+                Err(e) => {
+                    eprintln!("punk remember: {e}");
+                    std::process::exit(1);
                 }
             }
         }
