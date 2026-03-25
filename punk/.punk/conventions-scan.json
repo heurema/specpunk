@@ -1,0 +1,56 @@
+{
+  "language": "rust",
+  "findings": [
+    {
+      "name": "function_naming",
+      "pattern": "snake_case",
+      "frequency": 36,
+      "confidence": "high",
+      "examples": []
+    },
+    {
+      "name": "error_handling",
+      "pattern": "thiserror + Result<T, E>",
+      "frequency": 36,
+      "confidence": "high",
+      "examples": [
+        "anyhow for error propagation",
+        "thiserror for custom error types"
+      ]
+    }
+  ],
+  "naming": {
+    "functions": "snake_case",
+    "types": "PascalCase",
+    "constants": "SCREAMING_SNAKE_CASE",
+    "files": "snake_case.rs"
+  },
+  "imports": {
+    "style": "use crate::module",
+    "top_imports": [
+      "std",
+      "super",
+      "crate",
+      "serde",
+      "tempfile",
+      "punk_core",
+      "chrono",
+      "self",
+      "sha2",
+      "clap"
+    ],
+    "layering": []
+  },
+  "errors": {
+    "style": "thiserror + Result<T, E>",
+    "examples": [
+      "anyhow for error propagation",
+      "thiserror for custom error types"
+    ]
+  },
+  "tests": {
+    "framework": "cargo test",
+    "style": "229 tests found",
+    "mock_usage": "mocks detected"
+  }
+}

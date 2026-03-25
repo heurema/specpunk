@@ -143,12 +143,12 @@ pub fn check_package_depsdev(name: &str, ecosystem: &str) -> (DepStatus, bool) {
 
             match status_code {
                 200 => {
-                    let body = lines.get(1).unwrap_or(&"");
-                    if body.contains("\"isDeprecated\":true") || body.contains("\"isDeprecated\": true") {
-                        (DepStatus::Deprecated, true)
-                    } else {
-                        (DepStatus::Ok, true)
-                    }
+                    // Package exists. Deprecation is per-version, not per-package.
+                    // The package endpoint returns ALL versions — scanning for
+                    // isDeprecated in the full body gives false positives on
+                    // popular packages (old versions are deprecated, current is not).
+                    // For MVP: existence check is the high-value signal.
+                    (DepStatus::Ok, true)
                 }
                 404 => (DepStatus::NotFound, true),
                 _ => (DepStatus::Unknown, true),

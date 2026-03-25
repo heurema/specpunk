@@ -53,7 +53,10 @@ pub fn build_context_pack(root: &Path) -> ContextPack {
         .collect();
 
     // Rough token estimate (4 chars ≈ 1 token)
-    let total_chars = intent.len() + conventions.len()
+    let contract_chars = active_contract.as_ref()
+        .map(|c| c.goal.len() + c.scope_touch.join(" ").len() + c.scope_dont_touch.join(" ").len())
+        .unwrap_or(0);
+    let total_chars = intent.len() + conventions.len() + contract_chars
         + recent_events.iter().map(|e| e.len()).sum::<usize>();
     let token_estimate = total_chars / 4;
 

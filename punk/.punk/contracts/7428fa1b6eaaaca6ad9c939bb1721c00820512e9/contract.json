@@ -1,0 +1,41 @@
+{
+  "version": "2",
+  "goal": "improve everything",
+  "scope": {
+    "touch": [],
+    "dont_touch": []
+  },
+  "acceptance_criteria": [
+    {
+      "id": "AC-01",
+      "description": "describe the verifiable outcome",
+      "verify": "cargo test"
+    }
+  ],
+  "assumptions": [],
+  "warnings": [
+    "93% of tracked files missing from last scan — run `punk init --refresh`"
+  ],
+  "ceremony_level": "skip",
+  "created_at": "2026-03-25T12:00:30.748839+00:00",
+  "change_id": "7428fa1b6eaaaca6ad9c939bb1721c00820512e9",
+  "approval_hash": "69c4d71ca7a274d228e3895df5804a278130178e6e9dce88d622bb3bd790f732",
+  "routing_metadata": {
+    "complexity_score": 0,
+    "ceremony_level": "skip",
+    "suggested_model_tier": "haiku",
+    "latency_ms": 0,
+    "token_estimate": 474,
+    "router_policy_version": "1.0",
+    "unfamiliarity_ratio": 0.0
+  },
+  "task_id": "c41447d6d22f4788dee5bdb3ec24f9b49dc4a8e51edd633abdb3b82a208cdb7c",
+  "attempt_number": 1,
+  "risk_level": "low",
+  "context_inheritance": {
+    "project_ref": null,
+    "project_intent_sha256": null,
+    "glossary_sha256": null,
+    "staleness_policy": ""
+  }
+}
