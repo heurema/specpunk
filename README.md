@@ -53,12 +53,14 @@ Cryptographic proof of what was planned, what was built, and whether they match.
 
 ## Status
 
-Active development. Phase 0-2 complete (init + plan + config). Phase 3 (check) in progress.
+**v0.1.0 — MVP complete.** Full loop works: init, plan, check, receipt, status, close.
 
-- 40 tests, 0 clippy warnings
+- 64 tests, 0 clippy warnings, 3 rounds of adversarial QA
 - Rust workspace (punk-core lib + punk-cli bin)
 - git + jj support via VCS trait abstraction
 - Multi-language scanning: Rust, JavaScript/TypeScript, Python, Go
+- SHA-256 approval hash with tamper detection
+- Atomic receipt writes, symlink defenses, `deny_unknown_fields`
 
 ## Install
 
@@ -69,18 +71,21 @@ cargo install --path punk/punk-cli
 ## Quick start
 
 ```sh
-# Scan an existing project
 cd your-project
-punk init
+punk init                              # scan project (< 10s, no LLM)
+punk plan --manual "add rate limiting"  # create contract, approve
+# ... implement the feature ...
+punk check                             # did it stay in scope?
+punk check --strict                    # CI mode: undeclared = fail
+punk receipt                           # completion proof
+punk receipt --md                      # human-readable markdown
+punk status                            # where am I?
+```
 
-# Configure LLM provider (for punk plan)
+For LLM-powered contract generation:
+```sh
 punk config set-provider anthropic https://api.anthropic.com/v1/messages sk-ant-...
-
-# Generate a contract
 punk plan "add rate limiting to the API"
-
-# Or work offline
-punk plan --manual "add rate limiting to the API"
 ```
 
 ## Sponsor
@@ -97,7 +102,7 @@ punk is built in the open by one developer. If this solves a real problem for yo
 USDC, USDT, ETH, SOL — any token on these networks works.
 
 **What sponsorship enables:**
-- Faster iteration on Phase 3-4 (check + receipt)
+- Phase 5+ development (convention scan, AGENTS.md, CI mode)
 - Multi-model contract generation (Claude + GPT + Gemini)
 - Convention auto-tuning (auto-research loop for rule optimization)
 - `punk scan --agents-md` — generate optimized AI agent instructions from your codebase
@@ -108,13 +113,13 @@ Every sponsor gets early access to features and a voice in the roadmap.
 
 | Phase | Status | What |
 |-------|--------|------|
-| 0 | done | Scaffold, CLI, VCS trait, CI |
+| 0 | done | Scaffold, CLI, VCS trait |
 | 1 | done | `punk init` — brownfield scan, conventions, boundaries |
 | 2 | done | `punk plan` — contract generation, quality heuristic, approval |
-| 0.9 | done | `punk config` — provider management |
-| 3 | next | `punk check` — verify implementation vs contract |
-| 4 | planned | `punk receipt` — cryptographic completion proof |
-| 5+ | research | Convention auto-tuning, AGENTS.md generation, multi-model audit |
+| 3 | done | `punk check` — scope gate, never_touch, pre-commit |
+| 4 | done | `punk receipt` — completion proof, receipt chain |
+| 5 | next | Convention scan — tree-sitter, AGENTS.md generation |
+| 6+ | planned | Explain gate, CI mode, risk router, multi-model audit |
 
 ## Why "punk"
 
