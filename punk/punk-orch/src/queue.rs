@@ -246,6 +246,7 @@ pub struct QueuedEntry {
     pub model: String,
     pub worktree: bool,
     pub priority: String,
+    pub depends_on: Vec<String>,
 }
 
 /// Atomically claim a task: rename from new/ to cur/.
@@ -254,6 +255,13 @@ pub fn claim_task(bus: &Path, entry: &QueuedEntry) -> Option<PathBuf> {
     let dest = bus.join("cur").join(format!("{}.json", entry.task_id));
     fs::create_dir_all(bus.join("cur")).ok();
     fs::rename(&entry.path, &dest).ok().map(|_| dest)
+}
+
+/// Check if all dependencies of a task are completed (receipt in done/).
+pub fn deps_ready(bus: &Path, entry: &QueuedEntry) -> bool {
+    entry.depends_on.iter().all(|dep| {
+        bus.join("done").join(dep).join("receipt.json").exists()
+    })
 }
 
 /// Move a task from cur/ to failed/ (timeout, error).
@@ -278,6 +286,10 @@ fn parse_queued_entry(path: &Path, priority: &str) -> Option<QueuedEntry> {
         model: v.get("model").and_then(|v| v.as_str()).unwrap_or("claude").to_string(),
         worktree: v.get("worktree").and_then(|v| v.as_bool()).unwrap_or(false),
         priority: priority.to_string(),
+        depends_on: v.get("depends_on")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default(),
     })
 }
 
@@ -680,6 +692,7 @@ mod tests {
             model: "claude".into(),
             worktree: false,
             priority: "p1".into(),
+            depends_on: vec![],
         };
 
         let result = claim_task(bus, &fake_entry);

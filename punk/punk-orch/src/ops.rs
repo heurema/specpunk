@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::Value;
 
@@ -86,55 +86,12 @@ pub fn cancel_task(bus: &Path, task_id: &str) -> Result<(), String> {
         }
     }
 
-    // Check cur/ (running) — kill process, clean up, move to failed
+    // Check cur/ (running) — write cancel signal for daemon to process
     let cur_path = bus.join("cur").join(format!("{task_id}.json"));
     if cur_path.exists() {
-        // Kill process if PID file exists
-        let pid_file = bus.join(".pids").join(format!("{task_id}.pid"));
-        if let Ok(pid_str) = fs::read_to_string(&pid_file) {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
-            }
-        }
-
-        // Clean up tracking files
-        fs::remove_file(bus.join(".heartbeats").join(format!("{task_id}.hb"))).ok();
-        fs::remove_file(&pid_file).ok();
-
-        // Release slot
-        let slots_dir = bus.join(".slots");
-        if let Ok(entries) = fs::read_dir(&slots_dir) {
-            for entry in entries.flatten() {
-                let slot_dir = entry.path();
-                if slot_dir.join(task_id).exists() {
-                    fs::remove_dir_all(&slot_dir).ok();
-                    break;
-                }
-            }
-        }
-
-        // Release project lock
-        let task_data = fs::read_to_string(&cur_path).ok();
-        if let Some(ref data) = task_data {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                if let Some(project) = v.get("project").and_then(|v| v.as_str()) {
-                    fs::remove_file(bus.join(".locks").join(project)).ok();
-                }
-            }
-        }
-
-        // Move staging dir to failed/ (preserves stdout/stderr for diagnostics)
-        let staging = PathBuf::from(format!("/tmp/punk-stage-{task_id}"));
-        let dest = bus.join("failed").join(task_id);
-        if staging.is_dir() {
-            fs::rename(&staging, &dest).ok();
-        } else {
-            fs::create_dir_all(&dest).ok();
-            fs::rename(&cur_path, dest.join("task.json"))
-                .map_err(|e| format!("move failed: {e}"))?;
-        }
+        let cancel_dir = bus.join(".cancel");
+        fs::create_dir_all(&cancel_dir).ok();
+        fs::write(cancel_dir.join(task_id), "cancel").map_err(|e| format!("signal failed: {e}"))?;
         return Ok(());
     }
 

@@ -70,9 +70,34 @@ pub async fn run(dcfg: DaemonConfig) {
     let locks = ProjectLock::new(bus);
     let heartbeats = HeartbeatTracker::new(bus);
 
-    // Crash recovery: reap stale slots FIRST, then clear locks
-    // (prevents dispatching new tasks for locked projects before orphans are killed)
+    // Crash recovery: reap stale slots, scan cur/ for orphans, then clear locks
     heartbeats.recover_stale_slots(&slots);
+
+    // Adopt orphaned tasks from cur/ (left from previous daemon crash)
+    if let Ok(entries) = fs::read_dir(bus.join("cur")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                let task_id = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                let pid_file = bus.join(".pids").join(format!("{task_id}.pid"));
+                let process_alive = fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+                    .is_some_and(|pid| unsafe { libc::kill(pid, 0) == 0 });
+
+                if !process_alive {
+                    // Orphaned task: process dead, move to failed
+                    eprintln!("daemon: crash recovery: orphan {task_id} → failed/");
+                    queue::move_to_failed(bus, &task_id);
+                    heartbeats.unregister(&task_id);
+                    log_event(bus, "orphan_recovered", &format!(",\"task\":\"{task_id}\""));
+                } else {
+                    eprintln!("daemon: crash recovery: {task_id} still alive (PID), skipping");
+                }
+            }
+        }
+    }
+
     locks.clear_all();
 
     let mut active: HashMap<String, ActiveTask> = HashMap::new();
@@ -85,7 +110,32 @@ pub async fn run(dcfg: DaemonConfig) {
     loop {
         interval.tick().await;
 
-        // 0. Update heartbeats for still-running tasks (daemon is the heartbeat source)
+        // 0. Process cancel signals (written by punk-run cancel)
+        let cancel_dir = bus.join(".cancel");
+        if let Ok(entries) = fs::read_dir(&cancel_dir) {
+            for entry in entries.flatten() {
+                let task_id = entry.file_name().to_string_lossy().to_string();
+                if let Some(mut task) = active.remove(&task_id) {
+                    // Kill the process
+                    if let Some(pid) = task.process.child.id() {
+                        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+                    }
+                    task.run.mark_failed(130, task.run.duration_ms, crate::run::TerminationReason::UserCancel);
+                    save_run(bus, &task.run);
+                    heartbeats.unregister(&task_id);
+                    slots.release(task.run.slot_id);
+                    let proj = task.task_json.get("project").and_then(|v| v.as_str()).unwrap_or("");
+                    locks.release(proj);
+                    move_staging(bus, &task.staging_dir, &task_id, "failed");
+                    fs::remove_file(bus.join("cur").join(format!("{task_id}.json"))).ok();
+                    log_event(bus, "cancelled", &format!(",\"task\":\"{task_id}\""));
+                    eprintln!("daemon: cancelled {task_id}");
+                }
+                fs::remove_file(entry.path()).ok();
+            }
+        }
+
+        // 0b. Update heartbeats for still-running tasks (daemon is the heartbeat source)
         for (task_id, _) in active.iter() {
             let hb_path = bus.join(".heartbeats").join(format!("{task_id}.hb"));
             fs::write(&hb_path, Utc::now().to_rfc3339()).ok();
@@ -158,6 +208,12 @@ async fn dispatch_queued(
             None => break, // all slots full
         };
 
+        // Dependency check
+        if !queue::deps_ready(bus, &entry) {
+            slots.release(slot_id);
+            continue;
+        }
+
         // Circuit breaker check
         let provider = &entry.model;
         let cb = circuits
@@ -205,11 +261,24 @@ async fn dispatch_queued(
             }
         };
 
-        // Resolve adapter
-        let adapter = match Adapter::from_provider(&entry.model) {
+        // Resolve agent → provider/model via agents.toml
+        let config_dir = crate::config::config_dir();
+        let (provider, agent_model, agent_id) = if let Ok(cfg) = crate::config::load(&config_dir) {
+            if let Some(agent) = cfg.agents.agents.get(&entry.model) {
+                // Task specified an agent ID (e.g. "claude-reviewer")
+                (agent.provider.clone(), agent.model.clone(), entry.model.clone())
+            } else {
+                // Fallback: treat entry.model as raw provider name
+                (entry.model.clone(), String::new(), entry.model.clone())
+            }
+        } else {
+            (entry.model.clone(), String::new(), entry.model.clone())
+        };
+
+        let adapter = match Adapter::from_provider(&provider) {
             Some(a) => a,
             None => {
-                eprintln!("daemon: unknown provider '{}'", entry.model);
+                eprintln!("daemon: unknown provider '{provider}' (agent: {agent_id})");
                 queue::move_to_failed(bus, &entry.task_id);
                 slots.release(slot_id);
                 locks.release(&entry.project);
@@ -221,7 +290,7 @@ async fn dispatch_queued(
         let attempt = count_attempts(bus, &entry.task_id) + 1;
 
         // Create run entity
-        let mut run_entity = Run::new(&entry.task_id, attempt, slot_id, adapter.name(), &entry.model);
+        let mut run_entity = Run::new(&entry.task_id, attempt, slot_id, &agent_id, &provider);
 
         // Build TaskSpec
         let project_path = task_json
@@ -233,11 +302,15 @@ async fn dispatch_queued(
         // Inject frozen session context into prompt
         let raw_prompt = task_json.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-        // Smart routing: compute model before moving raw_prompt (Hermes pattern)
-        let explicit_model = task_json.get("claude_model").and_then(|v| v.as_str())
-            .or_else(|| task_json.get("model").and_then(|v| v.as_str()))
-            .unwrap_or("")
-            .to_string();
+        // Model resolution: agent config > task field > smart routing
+        let explicit_model = if !agent_model.is_empty() {
+            agent_model.clone() // from agents.toml
+        } else {
+            task_json.get("claude_model").and_then(|v| v.as_str())
+                .or_else(|| task_json.get("model_override").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string()
+        };
         let routed_model = if explicit_model.is_empty() {
             run::route_model(&raw_prompt, "sonnet")
         } else {

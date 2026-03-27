@@ -184,6 +184,10 @@ impl CodexAdapter {
         cmd.stdout(Stdio::from(stdout_file));
         cmd.stderr(Stdio::from(stderr_file));
 
+        // Credential isolation
+        cmd.env_remove("ANTHROPIC_API_KEY");
+        cmd.env_remove("GOOGLE_API_KEY");
+
         cmd.env("PUNK_TASK_ID", &task.task_id);
         cmd.env("PUNK_PROJECT", &task.project);
 
@@ -227,6 +231,10 @@ impl GeminiAdapter {
         cmd.current_dir(&task.project_path);
         cmd.stdout(Stdio::from(stdout_file));
         cmd.stderr(Stdio::from(stderr_file));
+
+        // Credential isolation
+        cmd.env_remove("ANTHROPIC_API_KEY");
+        cmd.env_remove("OPENAI_API_KEY");
 
         cmd.env("PUNK_TASK_ID", &task.task_id);
         cmd.env("PUNK_PROJECT", &task.project);
