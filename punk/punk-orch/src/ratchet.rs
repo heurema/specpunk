@@ -19,9 +19,20 @@ pub struct WeeklyMetrics {
 
 /// Compute metrics for the last N days from receipts/index.jsonl.
 pub fn compute_metrics(bus: &Path, days: i64) -> WeeklyMetrics {
+    compute_metrics_window(bus, 0, days)
+}
+
+/// Compute metrics for a bounded window: from `start_days_ago` to `end_days_ago`.
+pub fn compute_metrics_window(bus: &Path, start_days_ago: i64, end_days_ago: i64) -> WeeklyMetrics {
     let index = bus.parent().unwrap_or(bus).join("receipts/index.jsonl");
-    let cutoff = (Utc::now() - Duration::days(days)).to_rfc3339();
-    let period = format!("last {}d", days);
+    let now = Utc::now();
+    let cutoff_recent = (now - Duration::days(start_days_ago)).to_rfc3339();
+    let cutoff_old = (now - Duration::days(end_days_ago)).to_rfc3339();
+    let period = if start_days_ago == 0 {
+        format!("last {}d", end_days_ago)
+    } else {
+        format!("{}d-{}d ago", start_days_ago, end_days_ago)
+    };
 
     let content = match fs::read_to_string(index) {
         Ok(c) => c,
@@ -58,7 +69,7 @@ pub fn compute_metrics(bus: &Path, days: i64) -> WeeklyMetrics {
             .and_then(|t| t.as_str())
             .unwrap_or("");
 
-        if ts < cutoff.as_str() {
+        if ts > cutoff_recent.as_str() || ts < cutoff_old.as_str() {
             continue;
         }
 

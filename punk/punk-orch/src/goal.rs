@@ -291,9 +291,20 @@ pub fn queue_ready_steps(bus: &Path, goal: &mut Goal) -> Vec<String> {
 
         // Create task file in bus queue
         let task_id = format!("{}-step{}", goal.id, step.step);
+        // Resolve project path from config, fallback to convention
+        let config_dir = crate::config::config_dir();
+        let project_path = crate::config::load(&config_dir)
+            .ok()
+            .and_then(|cfg| {
+                cfg.projects.projects.iter()
+                    .find(|p| p.id == goal.project)
+                    .map(|p| p.path.clone())
+            })
+            .unwrap_or_else(|| format!("~/personal/heurema/{}", goal.project));
+
         let task_json = serde_json::json!({
             "project": goal.project,
-            "project_path": format!("~/personal/heurema/{}", goal.project),
+            "project_path": project_path,
             "model": provider_from_agent(&step.agent),
             "prompt": step.prompt,
             "category": step.category,

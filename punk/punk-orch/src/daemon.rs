@@ -633,9 +633,10 @@ fn evaluate_goals(bus: &Path) {
                 continue;
             }
 
-            // Check if task failed
-            let failed_path = bus.join("failed").join(&task_id);
-            if failed_path.is_dir() {
+            // Check if task failed or dead (retry exhausted)
+            let failed = bus.join("failed").join(&task_id).is_dir();
+            let dead = bus.join("dead").join(&task_id).is_dir();
+            if failed || dead {
                 step.status = StepStatus::Blocked;
                 changed = true;
             }

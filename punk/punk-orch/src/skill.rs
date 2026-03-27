@@ -54,9 +54,12 @@ pub fn create_skill(
     description: &str,
     content: &str,
 ) -> Result<PathBuf, String> {
-    // Security scan
+    // Security scan on both content and description
     if let Some(issue) = security_scan(content) {
-        return Err(format!("security scan failed: {issue}"));
+        return Err(format!("security scan failed (content): {issue}"));
+    }
+    if let Some(issue) = security_scan(description) {
+        return Err(format!("security scan failed (description): {issue}"));
     }
 
     sanitize::safe_id(name)?;

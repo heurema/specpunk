@@ -749,8 +749,8 @@ async fn cmd_panel(question: &str, timeout: u64) {
 
 fn cmd_ratchet() {
     let bus_path = bus::bus_dir();
-    let current = ratchet::compute_metrics(&bus_path, 7);
-    let previous = ratchet::compute_metrics(&bus_path, 14);
+    let current = ratchet::compute_metrics_window(&bus_path, 0, 7);
+    let previous = ratchet::compute_metrics_window(&bus_path, 7, 14);
 
     println!("Metric Ratchet\n");
     println!("  This week:  {}", ratchet::format_metrics(&current));
