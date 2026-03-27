@@ -10,6 +10,8 @@ use tokio::time;
 use crate::adapter::{Adapter, SpawnedProcess, TaskSpec};
 use crate::queue::{self, HeartbeatTracker, ProjectLock, SlotManager};
 use crate::receipt::{CallStyle, Receipt, ReceiptStatus};
+use crate::goal::{self, GoalStatus, StepStatus};
+use crate::session;
 use crate::run::{self, CircuitBreaker, RetryDecision, Run};
 
 /// Active task being tracked by the daemon.
@@ -96,6 +98,9 @@ pub async fn run(dcfg: DaemonConfig) {
 
         // 3. Process retry queue
         process_retries(bus);
+
+        // 3.5. Evaluate active goals (check step completion, queue next steps)
+        evaluate_goals(bus);
 
         // 4. Scan and dispatch new tasks
         if !dcfg.shadow {
@@ -332,6 +337,9 @@ async fn collect_completed(
                 move_staging(bus, &task.staging_dir, &task_id, "done");
 
                 log_event(bus, "completed", &format!(",\"task\":\"{task_id}\",\"duration\":{}", result.duration_ms));
+
+                // Update session context
+                session::add_from_receipt(bus, project, &task_id, "success", receipt.cost_usd, 0.0, &receipt.summary);
             } else {
                 // Failure — classify and maybe retry
                 let stderr = fs::read_to_string(&result.stderr_path).unwrap_or_default();
@@ -417,6 +425,8 @@ async fn collect_completed(
                         move_staging(bus, &task.staging_dir, &task_id, dest);
 
                         log_event(bus, "failed", &format!(",\"task\":\"{task_id}\",\"reason\":\"{reason:?}\",\"attempts\":{}", task.run.attempt));
+
+                        session::add_from_receipt(bus, project, &task_id, "failure", 0.0, 0.0, &format!("{reason:?}"));
                     }
                 }
             }
@@ -562,6 +572,104 @@ fn process_retries(bus: &Path) {
 
         let task_id = task_dir.file_name().unwrap_or_default().to_string_lossy();
         eprintln!("daemon: requeued {task_id} after backoff");
+    }
+}
+
+/// Check active goals: mark completed steps, queue next ready steps, detect completion.
+fn evaluate_goals(bus: &Path) {
+    let goals = goal::list_goals(bus);
+
+    for mut g in goals {
+        if g.status != GoalStatus::Active {
+            continue;
+        }
+
+        let plan = match g.plan.as_mut() {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let mut changed = false;
+
+        // Check running steps for completion
+        for step in &mut plan.steps {
+            if step.status != StepStatus::Running {
+                continue;
+            }
+
+            let task_id = match &step.task_id {
+                Some(id) => id.clone(),
+                None => continue,
+            };
+
+            // Check if task completed (receipt in done/)
+            let receipt_path = bus.join("done").join(&task_id).join("receipt.json");
+            if receipt_path.exists() {
+                if let Ok(data) = fs::read_to_string(&receipt_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                        let status = v.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                        let cost = v.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        g.spent_usd += cost;
+
+                        if status == "success" {
+                            step.status = StepStatus::Done;
+                            changed = true;
+                        } else {
+                            step.status = StepStatus::Blocked;
+                            changed = true;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Check if task failed
+            let failed_path = bus.join("failed").join(&task_id);
+            if failed_path.is_dir() {
+                step.status = StepStatus::Blocked;
+                changed = true;
+            }
+        }
+
+        if changed {
+            // Queue next ready steps (borrows &mut g, so drop plan ref first)
+            let queued = goal::queue_ready_steps(bus, &mut g);
+            if !queued.is_empty() {
+                eprintln!(
+                    "daemon: goal {} queued {} step(s): {}",
+                    g.id,
+                    queued.len(),
+                    queued.join(", ")
+                );
+            }
+
+            // Re-borrow plan for status checks
+            if let Some(ref plan) = g.plan {
+                let all_done = plan.steps.iter().all(|s| {
+                    s.status == StepStatus::Done || s.status == StepStatus::Skipped
+                });
+                if all_done {
+                    g.status = GoalStatus::Done;
+                    g.completed_at = Some(Utc::now());
+                    eprintln!("daemon: goal {} completed", g.id);
+                    log_event(bus, "goal_completed", &format!(",\"goal\":\"{}\"", g.id));
+                }
+
+                let any_blocked = plan.steps.iter().any(|s| s.status == StepStatus::Blocked);
+                let all_resolved = plan.steps.iter().all(|s| {
+                    s.status == StepStatus::Done
+                        || s.status == StepStatus::Blocked
+                        || s.status == StepStatus::Skipped
+                });
+                if any_blocked && all_resolved && g.status != GoalStatus::Done {
+                    g.status = GoalStatus::Failed;
+                    eprintln!("daemon: goal {} failed (blocked steps)", g.id);
+                    log_event(bus, "goal_failed", &format!(",\"goal\":\"{}\"", g.id));
+                }
+            }
+
+            goal::save_goal(bus, &g).ok();
+        }
     }
 }
 

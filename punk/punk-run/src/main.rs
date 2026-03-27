@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use punk_orch::{bus, config, daemon, doctor, morning, ops};
+use punk_orch::{bus, config, daemon, doctor, goal, morning, ops};
 
 #[derive(Parser)]
 #[command(name = "punk-run", version, about = "Specpunk agent orchestration")]
@@ -43,6 +43,36 @@ enum Command {
     },
     /// Health check: providers, bus, config
     Doctor,
+    /// Goal management (create, list, approve, pause, resume, cancel)
+    Goal {
+        #[command(subcommand)]
+        action: GoalAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum GoalAction {
+    /// Create a new goal with planner
+    Create {
+        project: String,
+        objective: String,
+        #[arg(long, default_value_t = 5.0)]
+        budget: f64,
+        #[arg(long)]
+        deadline: Option<String>,
+    },
+    /// List all goals
+    List,
+    /// Show detailed goal status
+    Status { goal_id: String },
+    /// Approve a pending plan
+    Approve { goal_id: String },
+    /// Pause an active goal
+    Pause { goal_id: String },
+    /// Resume a paused goal
+    Resume { goal_id: String },
+    /// Cancel a goal
+    Cancel { goal_id: String },
 }
 
 #[tokio::main]
@@ -100,6 +130,20 @@ async fn main() -> anyhow::Result<()> {
             let report = doctor::check_all(&bus_path, &config_dir);
             print!("{}", report.display());
         }
+        Command::Goal { action } => match action {
+            GoalAction::Create {
+                project,
+                objective,
+                budget,
+                deadline,
+            } => cmd_goal(&project, &objective, budget, deadline.as_deref()),
+            GoalAction::List => cmd_goals(),
+            GoalAction::Status { goal_id } => cmd_goal_status(&goal_id),
+            GoalAction::Approve { goal_id } => cmd_approve(&goal_id),
+            GoalAction::Pause { goal_id } => cmd_goal_set_status(&goal_id, goal::GoalStatus::Paused),
+            GoalAction::Resume { goal_id } => cmd_goal_set_status(&goal_id, goal::GoalStatus::Active),
+            GoalAction::Cancel { goal_id } => cmd_goal_set_status(&goal_id, goal::GoalStatus::Failed),
+        },
     }
 
     Ok(())
@@ -309,6 +353,248 @@ fn cmd_triage() {
         );
     }
     println!("\nActions: punk-run retry <id> | punk-run cancel <id>");
+}
+
+fn cmd_goal(project: &str, objective: &str, budget: f64, deadline: Option<&str>) {
+    let bus_path = bus::bus_dir();
+    let config_dir = config::config_dir();
+
+    let mut g = match goal::create_goal(&bus_path, project, objective, deadline, budget) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Error creating goal: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    println!("Goal created: {}", g.id);
+    println!("  project:   {}", g.project);
+    println!("  objective: {}", g.objective);
+    println!("  budget:    ${:.2}", g.budget_usd);
+    if let Some(ref d) = g.deadline {
+        println!("  deadline:  {d}");
+    }
+    println!();
+
+    // Resolve project path
+    let project_path = if let Ok(cfg) = config::load(&config_dir) {
+        cfg.projects
+            .projects
+            .iter()
+            .find(|p| p.id == project)
+            .map(|p| p.path.replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if project_path.is_empty() {
+        eprintln!("Warning: project '{}' not found in config, skipping planner", project);
+        println!("Add plan manually or configure project in ~/.config/punk/projects.toml");
+        return;
+    }
+
+    // Generate plan via CLI
+    println!("Generating plan...");
+    let prompt = goal::build_planner_prompt(&g, std::path::Path::new(&project_path));
+
+    let output = std::process::Command::new("claude")
+        .args(["-p", &prompt, "--output-format", "text", "--model", "sonnet"])
+        .env_remove("CLAUDECODE")
+        .env_remove("ANTHROPIC_API_KEY")
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            match goal::parse_plan(&text, "claude-sonnet") {
+                Some(plan) => {
+                    let step_count = plan.steps.len();
+                    let est_cost: f64 = plan.steps.iter().map(|s| s.est_cost_usd).sum();
+                    g.plan = Some(plan);
+                    g.status = goal::GoalStatus::AwaitingApproval;
+                    goal::save_goal(&bus_path, &g).ok();
+
+                    println!("Plan generated: {} steps, ${:.2} estimated\n", step_count, est_cost);
+                    println!("Review and approve:");
+                    println!("  punk-run approve {}", g.id);
+                }
+                None => {
+                    eprintln!("Failed to parse planner output. Raw output saved to goal file.");
+                    eprintln!("Try: punk-run approve {} (after manual plan edit)", g.id);
+                }
+            }
+        }
+        Ok(out) => {
+            eprintln!("Planner failed (exit {})", out.status.code().unwrap_or(-1));
+            eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+        }
+        Err(e) => {
+            eprintln!("Failed to invoke planner: {e}");
+            eprintln!("Install claude CLI or add plan manually");
+        }
+    }
+}
+
+fn cmd_goals() {
+    let bus_path = bus::bus_dir();
+    let goals = goal::list_goals(&bus_path);
+
+    if goals.is_empty() {
+        println!("No goals.");
+        return;
+    }
+
+    println!("Goals ({})\n", goals.len());
+    println!(
+        "  {:<35} {:<12} {:<10} {:>8} {:>8} OBJECTIVE",
+        "ID", "PROJECT", "STATUS", "SPENT", "BUDGET"
+    );
+    for g in &goals {
+        println!(
+            "  {:<35} {:<12} {:<10} {:>8} {:>8} {}",
+            truncate(&g.id, 35),
+            g.project,
+            format!("{:?}", g.status).to_lowercase(),
+            format_cost(g.spent_usd),
+            format_cost(g.budget_usd),
+            truncate(&g.objective, 40)
+        );
+        if let Some(ref plan) = g.plan {
+            let done = plan.steps.iter().filter(|s| s.status == goal::StepStatus::Done).count();
+            let total = plan.steps.len();
+            println!("    plan v{}: {done}/{total} steps done", plan.version);
+        }
+    }
+}
+
+fn cmd_approve(goal_id: &str) {
+    let bus_path = bus::bus_dir();
+
+    let mut g = match goal::load_goal(&bus_path, goal_id) {
+        Some(g) => g,
+        None => {
+            eprintln!("Goal not found: {goal_id}");
+            std::process::exit(1);
+        }
+    };
+
+    if g.plan.is_none() {
+        eprintln!("Goal has no plan yet. Run planner first.");
+        std::process::exit(1);
+    }
+
+    if g.status != goal::GoalStatus::AwaitingApproval && g.status != goal::GoalStatus::Planning {
+        eprintln!("Goal status is {:?}, cannot approve.", g.status);
+        std::process::exit(1);
+    }
+
+    // Show plan
+    if let Some(ref plan) = g.plan {
+        println!("Plan v{} ({} steps):\n", plan.version, plan.steps.len());
+        let mut total_cost = 0.0;
+        for step in &plan.steps {
+            let deps = if step.depends_on.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (after {})",
+                    step.depends_on
+                        .iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            };
+            println!(
+                "  {}. [{}] {} ${:.2}{}",
+                step.step, step.category, step.prompt, step.est_cost_usd, deps
+            );
+            total_cost += step.est_cost_usd;
+        }
+        println!("\n  Total estimated: ${total_cost:.2} / ${:.2} budget", g.budget_usd);
+    }
+
+    // Approve
+    if let Some(ref mut plan) = g.plan {
+        plan.approved_at = Some(punk_orch::chrono::Utc::now());
+    }
+    g.status = goal::GoalStatus::Active;
+
+    // Queue first ready steps
+    let queued = goal::queue_ready_steps(&bus_path, &mut g);
+
+    if let Err(e) = goal::save_goal(&bus_path, &g) {
+        eprintln!("Error saving goal: {e}");
+        std::process::exit(1);
+    }
+
+    println!("\nApproved. {} step(s) queued: {}", queued.len(), queued.join(", "));
+}
+
+fn cmd_goal_status(goal_id: &str) {
+    let bus_path = bus::bus_dir();
+    let g = match goal::load_goal(&bus_path, goal_id) {
+        Some(g) => g,
+        None => {
+            eprintln!("Goal not found: {goal_id}");
+            std::process::exit(1);
+        }
+    };
+
+    println!("Goal: {}", g.id);
+    println!("  project:   {}", g.project);
+    println!("  objective: {}", g.objective);
+    println!("  status:    {:?}", g.status);
+    println!("  budget:    ${:.2} (spent: ${:.2})", g.budget_usd, g.spent_usd);
+    if let Some(ref d) = g.deadline {
+        println!("  deadline:  {d}");
+    }
+    println!();
+
+    if let Some(ref plan) = g.plan {
+        println!("Plan v{} ({} steps):\n", plan.version, plan.steps.len());
+        for step in &plan.steps {
+            let status_icon = match step.status {
+                goal::StepStatus::Done => "[x]",
+                goal::StepStatus::Running => "[>]",
+                goal::StepStatus::Blocked => "[!]",
+                goal::StepStatus::Pending => "[ ]",
+                goal::StepStatus::Skipped => "[-]",
+            };
+            println!(
+                "  {} {}. [{}] {} (${:.2})",
+                status_icon, step.step, step.category, step.prompt, step.est_cost_usd
+            );
+            if let Some(ref tid) = step.task_id {
+                println!("      task: {tid}");
+            }
+        }
+    } else {
+        println!("  No plan yet.");
+    }
+}
+
+fn cmd_goal_set_status(goal_id: &str, new_status: goal::GoalStatus) {
+    let bus_path = bus::bus_dir();
+    let mut g = match goal::load_goal(&bus_path, goal_id) {
+        Some(g) => g,
+        None => {
+            eprintln!("Goal not found: {goal_id}");
+            std::process::exit(1);
+        }
+    };
+
+    let old = format!("{:?}", g.status);
+    g.status = new_status;
+    let new = format!("{:?}", g.status);
+
+    if let Err(e) = goal::save_goal(&bus_path, &g) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+
+    println!("{goal_id}: {old} -> {new}");
 }
 
 fn truncate(s: &str, max: usize) -> String {
