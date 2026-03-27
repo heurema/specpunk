@@ -17,6 +17,7 @@ pub mod queue;
 pub mod ratchet;
 pub mod receipt;
 pub mod run;
+pub mod sanitize;
 pub mod session;
 pub mod skill;
 pub mod task;

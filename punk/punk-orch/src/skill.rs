@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
+use crate::sanitize;
+
 /// A skill file (markdown with YAML frontmatter).
 #[derive(Debug, Clone)]
 pub struct Skill {
@@ -56,6 +58,8 @@ pub fn create_skill(
     if let Some(issue) = security_scan(content) {
         return Err(format!("security scan failed: {issue}"));
     }
+
+    sanitize::safe_id(name)?;
 
     let dir = skills_dir(bus);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;

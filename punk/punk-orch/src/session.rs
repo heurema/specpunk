@@ -93,6 +93,14 @@ pub fn add_from_receipt(
         summary.to_string()
     };
 
+    // Decrement TTL on existing entries BEFORE adding new one
+    for entry in &mut ctx.entries {
+        if entry.ttl_tasks > 0 {
+            entry.ttl_tasks -= 1;
+        }
+    }
+    ctx.entries.retain(|e| e.ttl_tasks > 0);
+
     ctx.entries.push(SessionEntry {
         entry_type: actual_type,
         fact,
@@ -100,14 +108,6 @@ pub fn add_from_receipt(
         ttl_tasks: 5,
         created_at: Utc::now(),
     });
-
-    // Evict expired entries (TTL countdown happens when new entry is added)
-    for entry in &mut ctx.entries {
-        if entry.ttl_tasks > 0 {
-            entry.ttl_tasks -= 1;
-        }
-    }
-    ctx.entries.retain(|e| e.ttl_tasks > 0);
 
     // Cap at MAX_ENTRIES (keep newest)
     if ctx.entries.len() > MAX_ENTRIES {

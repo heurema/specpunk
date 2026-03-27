@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::sanitize;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -101,7 +103,8 @@ pub fn list_goals(bus: &Path) -> Vec<Goal> {
 
 /// Load a specific goal.
 pub fn load_goal(bus: &Path, goal_id: &str) -> Option<Goal> {
-    let path = goals_dir(bus).join(format!("{goal_id}.json"));
+    let safe = sanitize::safe_id(goal_id).ok()?;
+    let path = goals_dir(bus).join(format!("{safe}.json"));
     fs::read_to_string(path)
         .ok()
         .and_then(|data| serde_json::from_str(&data).ok())
