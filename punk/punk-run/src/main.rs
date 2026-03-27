@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use punk_orch::{bus, config, daemon, doctor, goal, morning, ops, pipeline};
+use punk_orch::{bus, config, daemon, diverge, doctor, goal, graph, morning, ops, panel, pipeline, ratchet, skill};
 
 #[derive(Parser)]
 #[command(name = "punk-run", version, about = "Specpunk agent orchestration")]
@@ -57,6 +57,55 @@ enum Command {
     Pipeline {
         #[command(subcommand)]
         action: PipelineAction,
+    },
+    /// 3-provider parallel implementation, compare and select
+    Diverge {
+        /// Project slug
+        project: String,
+        /// Implementation spec
+        spec: String,
+        /// Timeout per provider in seconds
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+    },
+    /// Ask all providers the same question, compare answers
+    Panel {
+        /// Question to ask all providers
+        question: String,
+        /// Timeout per provider in seconds
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
+    /// List or create skills
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+    /// Weekly performance comparison (metric ratchet)
+    Ratchet,
+    /// On-demand charts (cost, project distribution)
+    Graph {
+        /// Chart type: cost or project
+        #[arg(default_value = "cost")]
+        chart_type: String,
+        /// Number of days to look back
+        #[arg(long, default_value_t = 14)]
+        since: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillAction {
+    /// List all skills
+    List,
+    /// Create a new skill
+    Create {
+        name: String,
+        #[arg(long)]
+        description: String,
+        /// Path to skill content file
+        #[arg(long)]
+        file: String,
     },
 }
 
@@ -195,6 +244,46 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
+        Command::Diverge { project, spec, timeout } => {
+            cmd_diverge(&project, &spec, timeout).await;
+        }
+        Command::Panel { question, timeout } => {
+            cmd_panel(&question, timeout).await;
+        }
+        Command::Skill { action } => match action {
+            SkillAction::List => {
+                let bus_path = bus::bus_dir();
+                let skills = skill::list_skills(&bus_path);
+                if skills.is_empty() {
+                    println!("No skills.");
+                } else {
+                    println!("Skills ({})\n", skills.len());
+                    for s in &skills {
+                        println!("  {:<20} {}", s.name, s.description);
+                    }
+                }
+            }
+            SkillAction::Create { name, description, file } => {
+                let bus_path = bus::bus_dir();
+                let content = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+                    eprintln!("Error reading {file}: {e}");
+                    std::process::exit(1);
+                });
+                match skill::create_skill(&bus_path, &name, &description, &content) {
+                    Ok(path) => println!("Created: {}", path.display()),
+                    Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                }
+            }
+        },
+        Command::Ratchet => cmd_ratchet(),
+        Command::Graph { chart_type, since } => {
+            let bus_path = bus::bus_dir();
+            match chart_type.as_str() {
+                "cost" => print!("{}", graph::cost_chart(&bus_path, since)),
+                "project" => print!("{}", graph::project_chart(&bus_path, since)),
+                _ => eprintln!("Unknown chart type: {chart_type}. Available: cost, project"),
+            }
+        }
         Command::Goal { action } => match action {
             GoalAction::Create {
                 project,
@@ -595,6 +684,87 @@ fn cmd_approve(goal_id: &str) {
     }
 
     println!("\nApproved. {} step(s) queued: {}", queued.len(), queued.join(", "));
+}
+
+async fn cmd_diverge(project: &str, spec: &str, timeout: u64) {
+    let config_dir = config::config_dir();
+    let project_path = if let Ok(cfg) = config::load(&config_dir) {
+        cfg.projects.projects.iter()
+            .find(|p| p.id == project)
+            .map(|p| p.path.replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy()))
+    } else {
+        None
+    };
+
+    let path = match project_path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            eprintln!("Project '{project}' not found in config");
+            std::process::exit(1);
+        }
+    };
+
+    let strategies = diverge::Strategy::defaults();
+    println!("Diverge: dispatching to {} providers...\n", strategies.len());
+
+    match diverge::run_diverge(&path, spec, &strategies, timeout).await {
+        Ok(solutions) => {
+            println!("{:<6} {:<10} {:<6} {:>6} {:>6} FILES", "LABEL", "PROVIDER", "EXIT", "+LINES", "-LINES");
+            for s in &solutions {
+                println!(
+                    "{:<6} {:<10} {:<6} {:>6} {:>6} {}",
+                    s.label, s.provider, s.exit_code, s.lines_added, s.lines_removed,
+                    s.files_changed.len()
+                );
+            }
+            println!("\nWorktrees preserved. Inspect with: git -C <worktree> diff HEAD");
+        }
+        Err(e) => {
+            eprintln!("Diverge failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_panel(question: &str, timeout: u64) {
+    println!("Panel: asking all providers...\n");
+
+    let responses = panel::ask_all(question, timeout).await;
+
+    for r in &responses {
+        println!("### {} {}", r.provider, if r.exit_code == 0 { "" } else { "(FAILED)" });
+        if let Some(ref err) = r.error {
+            println!("  Error: {err}");
+        } else {
+            // Show first 500 chars
+            let preview: String = r.answer.chars().take(500).collect();
+            println!("{preview}");
+        }
+        println!();
+    }
+
+    let ok_count = responses.iter().filter(|r| r.exit_code == 0).count();
+    println!("Panel: {ok_count}/{} providers responded", responses.len());
+}
+
+fn cmd_ratchet() {
+    let bus_path = bus::bus_dir();
+    let current = ratchet::compute_metrics(&bus_path, 7);
+    let previous = ratchet::compute_metrics(&bus_path, 14);
+
+    println!("Metric Ratchet\n");
+    println!("  This week:  {}", ratchet::format_metrics(&current));
+    println!("  Last week:  {}", ratchet::format_metrics(&previous));
+    println!();
+
+    let directives = ratchet::compare(&current, &previous);
+    if directives.is_empty() {
+        println!("  No significant changes.");
+    } else {
+        for d in &directives {
+            println!("  {d}");
+        }
+    }
 }
 
 fn cmd_ask(question: &str) {
