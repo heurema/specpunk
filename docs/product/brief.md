@@ -2,7 +2,11 @@
 
 Last updated: 2026-03-12
 Owner: Vitaly
-Status: active
+Status: **archived** (superseded 2026-03-27)
+
+> **This document describes the original review-boundary product direction.**
+> The product has pivoted to an agent orchestration platform.
+> Current SSoT: [VISION.md](VISION.md), [ARCHITECTURE.md](ARCHITECTURE.md), [ROADMAP-v2.md](ROADMAP-v2.md)
 
 ## SSoT Rule
 

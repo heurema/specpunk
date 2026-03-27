@@ -2,7 +2,7 @@
 
 Last updated: 2026-03-14
 Owner: Vitaly
-Status: paused
+Status: **archived** (superseded by [ROADMAP-v2.md](ROADMAP-v2.md) on 2026-03-27)
 
 ## Roadmap Rule
 

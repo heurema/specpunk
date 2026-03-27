@@ -2,7 +2,11 @@
 
 Last updated: 2026-03-14
 Owner: Vitaly
-Status: active
+Status: **archived** (superseded 2026-03-27)
+
+> **Decisions D-001 through D-006 apply to the original review-boundary product.**
+> D-005 (Go runtime) is explicitly superseded: the product is Rust, shipping as punk-run.
+> Current SSoT: [VISION.md](VISION.md), [ARCHITECTURE.md](ARCHITECTURE.md), [ROADMAP-v2.md](ROADMAP-v2.md)
 
 ## 2026-03-12 / D-001
 

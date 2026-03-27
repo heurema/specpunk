@@ -1,0 +1,19 @@
+[package]
+name = "punk-run"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for specpunk agent orchestration — dispatch, status, goals"
+license = "MIT"
+
+[[bin]]
+name = "punk-run"
+path = "src/main.rs"
+
+[dependencies]
+punk-orch = { path = "../punk-orch" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros"] }
+anyhow = "1.0.102"
+serde_json = "1.0.149"
+
+[dev-dependencies]

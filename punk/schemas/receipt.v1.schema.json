@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://specpunk.dev/schemas/receipt.v1.schema.json",
+  "title": "Receipt v1",
+  "description": "Structured output of every completed task. Append-only to receipts/index.jsonl.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "task_id",
+    "status",
+    "agent",
+    "model",
+    "project",
+    "category",
+    "tokens_used",
+    "cost_usd",
+    "duration_ms",
+    "exit_code",
+    "artifacts",
+    "errors",
+    "summary",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version. Always 1 for this schema."
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Links to the originating task."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["success", "failure", "timeout", "cancelled"],
+      "description": "Outcome of the task execution."
+    },
+    "agent": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Agent configuration ID (e.g. claude-sonnet, codex-auto)."
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Actual model used (e.g. sonnet, gpt-5.4, gemini-3-flash)."
+    },
+    "project": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Project slug."
+    },
+    "category": {
+      "type": "string",
+      "enum": ["codegen", "research", "fix", "review", "content", "audit"],
+      "description": "Task category."
+    },
+    "call_style": {
+      "type": ["string", "null"],
+      "enum": ["tool_use", "function_declarations", "plain_text", null],
+      "description": "How the agent was invoked. Null if unknown."
+    },
+    "tokens_used": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total tokens consumed."
+    },
+    "cost_usd": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Actual spend in USD."
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Wall-clock time in milliseconds."
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "Process exit code."
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Files created or modified."
+    },
+    "errors": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Error messages, if any."
+    },
+    "summary": {
+      "type": "string",
+      "description": "One-line human-readable summary."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the task completed (ISO 8601)."
+    },
+    "parent_task_id": {
+      "type": ["string", "null"],
+      "description": "For sub-agent chains."
+    },
+    "punk_check_exit": {
+      "type": ["integer", "null"],
+      "description": "If verification ran: 0=pass, non-zero=scope violation."
+    }
+  },
+  "additionalProperties": false
+}
