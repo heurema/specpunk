@@ -207,6 +207,45 @@ pub fn classify_failure(exit_code: i32, stderr: &str) -> TerminationReason {
     TerminationReason::ExitNonzero
 }
 
+// --- Smart Model Routing (Hermes pattern) ---
+
+/// Determine if a prompt is simple enough for a cheap model.
+/// Hermes heuristic: ≤160 chars, ≤28 words, ≤1 newline, no backticks/URLs.
+pub fn is_simple_prompt(prompt: &str) -> bool {
+    let char_count = prompt.len();
+    let word_count = prompt.split_whitespace().count();
+    let newline_count = prompt.chars().filter(|&c| c == '\n').count();
+    let has_code = prompt.contains('`') || prompt.contains("```");
+    let has_url = prompt.contains("http://") || prompt.contains("https://");
+
+    char_count <= 160 && word_count <= 28 && newline_count <= 1 && !has_code && !has_url
+}
+
+/// Suggest a cheap model for simple prompts.
+pub fn route_model(prompt: &str, default_model: &str) -> String {
+    if is_simple_prompt(prompt) {
+        // Use haiku/flash for simple queries
+        match default_model {
+            m if m.contains("claude") || m == "sonnet" || m == "opus" => "haiku".to_string(),
+            m if m.contains("codex") || m.contains("gpt") => default_model.to_string(), // codex has no cheap tier on subscription
+            m if m.contains("gemini") => "gemini-2.5-flash".to_string(),
+            _ => default_model.to_string(),
+        }
+    } else {
+        default_model.to_string()
+    }
+}
+
+/// Suggest a fallback provider when current provider fails with 429.
+pub fn fallback_provider(failed_provider: &str) -> Option<&'static str> {
+    match failed_provider {
+        "claude" => Some("codex"),
+        "codex" => Some("gemini"),
+        "gemini" => Some("claude"),
+        _ => None,
+    }
+}
+
 // --- Retry Policy ---
 
 /// Retry decision for a failed run.

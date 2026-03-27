@@ -232,6 +232,18 @@ async fn dispatch_queued(
 
         // Inject frozen session context into prompt
         let raw_prompt = task_json.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        // Smart routing: compute model before moving raw_prompt (Hermes pattern)
+        let explicit_model = task_json.get("claude_model").and_then(|v| v.as_str())
+            .or_else(|| task_json.get("model").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+        let routed_model = if explicit_model.is_empty() {
+            run::route_model(&raw_prompt, "sonnet")
+        } else {
+            run::route_model(&raw_prompt, &explicit_model)
+        };
+
         let session_ctx = session::load(bus, &entry.project);
         let session_section = session::format_for_prompt(&session_ctx);
         let prompt_with_session = if session_section.is_empty() {
@@ -245,10 +257,7 @@ async fn dispatch_queued(
             project: entry.project.clone(),
             project_path: PathBuf::from(&project_path),
             prompt: prompt_with_session,
-            model: task_json.get("claude_model").and_then(|v| v.as_str())
-                .or_else(|| task_json.get("model").and_then(|v| v.as_str()))
-                .unwrap_or("")
-                .to_string(),
+            model: routed_model,
             timeout_s: task_json.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(600),
             budget_usd: task_json.get("max_budget_usd").and_then(|v| v.as_f64()),
             allowed_tools: task_json.get("allowedTools").and_then(|v| v.as_str()).unwrap_or("Read,Edit,Bash").to_string(),
@@ -360,6 +369,35 @@ async fn collect_completed(
 
                 // Update session context
                 session::add_from_receipt(bus, project, &task_id, "success", receipt.cost_usd, 0.0, &receipt.summary);
+
+                // Skill auto-authoring trigger (Hermes pattern):
+                // complex task (long duration + high cost) may warrant a skill
+                if result.duration_ms > 120_000 && receipt.cost_usd > 0.50 {
+                    let skill_prompt = format!(
+                        "Based on task '{}' (project={}, {}ms, ${:.2}), \
+                         create a reusable skill if the task discovered a non-trivial workflow. \
+                         Write it to state/skills/<name>.md",
+                        task_id, project, result.duration_ms, receipt.cost_usd
+                    );
+                    eprintln!("daemon: skill authoring candidate: {task_id} ({}ms, ${:.2})", result.duration_ms, receipt.cost_usd);
+                    // Queue a skill-authoring meta-task
+                    let skill_task = serde_json::json!({
+                        "project": project,
+                        "project_path": task.task_json.get("project_path").and_then(|v| v.as_str()).unwrap_or(""),
+                        "model": "claude",
+                        "prompt": skill_prompt,
+                        "category": "content",
+                        "timeout_seconds": 120,
+                        "max_budget_usd": 0.10,
+                        "parent_task_id": task_id,
+                    });
+                    let skill_task_id = format!("{task_id}-skill");
+                    let skill_path = bus.join("new/p2").join(format!("{skill_task_id}.json"));
+                    if let Ok(data) = serde_json::to_string_pretty(&skill_task) {
+                        fs::write(skill_path, data).ok();
+                        log_event(bus, "skill_authoring_queued", &format!(",\"task\":\"{task_id}\",\"trigger\":\"complex_task\""));
+                    }
+                }
             } else {
                 // Failure — classify and maybe retry
                 let stderr = fs::read_to_string(&result.stderr_path).unwrap_or_default();
@@ -383,6 +421,19 @@ async fn collect_completed(
 
                 match decision {
                     RetryDecision::Retry { delay_s } => {
+                        // 429 → fallback to different provider (Hermes pattern)
+                        let mut retry_task = task.task_json.clone();
+                        if reason == run::TerminationReason::Provider429 || reason == run::TerminationReason::Provider529 {
+                            if let Some(fallback) = run::fallback_provider(&task.adapter_name) {
+                                eprintln!(
+                                    "daemon: {} rate-limited on {}, falling back to {fallback}",
+                                    task_id, task.adapter_name
+                                );
+                                retry_task["model"] = serde_json::json!(fallback);
+                                log_event(bus, "provider_fallback", &format!(",\"task\":\"{task_id}\",\"from\":\"{}\",\"to\":\"{fallback}\"", task.adapter_name));
+                            }
+                        }
+
                         eprintln!(
                             "daemon: {} failed ({reason:?}), retry in {delay_s}s (attempt {})",
                             task_id, task.run.attempt
@@ -393,7 +444,7 @@ async fn collect_completed(
                         // Store task data in staging for delayed write
                         let retry_staging = bus.join("runs").join(&task_id);
                         fs::create_dir_all(&retry_staging).ok();
-                        let retry_ok = serde_json::to_string_pretty(&task.task_json)
+                        let retry_ok = serde_json::to_string_pretty(&retry_task)
                             .ok()
                             .and_then(|task_data| fs::write(retry_staging.join("retry-pending.json"), &task_data).ok())
                             .and_then(|_| fs::write(
