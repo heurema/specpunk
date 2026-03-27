@@ -129,12 +129,28 @@ pub fn add_from_receipt(
     save(bus, &ctx).ok();
 }
 
+/// Compression threshold: if raw format exceeds this many chars, compress.
+const COMPRESSION_THRESHOLD: usize = 2000;
+
 /// Format session context for agent prompt injection.
+/// If context exceeds threshold, uses 7-section Hermes compression template.
 pub fn format_for_prompt(ctx: &SessionContext) -> String {
     if ctx.entries.is_empty() {
         return String::new();
     }
 
+    let raw = format_raw(ctx);
+
+    if raw.len() <= COMPRESSION_THRESHOLD {
+        return raw;
+    }
+
+    // Compress using deterministic template (no LLM needed)
+    compress(ctx)
+}
+
+/// Raw format — one line per entry.
+fn format_raw(ctx: &SessionContext) -> String {
     let mut out = String::new();
     out.push_str("## Recent session context\n\n");
 
@@ -146,6 +162,64 @@ pub fn format_for_prompt(ctx: &SessionContext) -> String {
             EntryType::CostOverrun => "$",
         };
         out.push_str(&format!("- [{}] {} ({})\n", icon, entry.fact, entry.task_id));
+    }
+
+    out
+}
+
+/// Hermes-style 7-section compression: condense entries into structured summary.
+fn compress(ctx: &SessionContext) -> String {
+    let successes: Vec<_> = ctx.entries.iter().filter(|e| e.entry_type == EntryType::Success).collect();
+    let failures: Vec<_> = ctx.entries.iter().filter(|e| e.entry_type == EntryType::Failure).collect();
+    let surprises: Vec<_> = ctx.entries.iter().filter(|e| e.entry_type == EntryType::Surprise).collect();
+    let overruns: Vec<_> = ctx.entries.iter().filter(|e| e.entry_type == EntryType::CostOverrun).collect();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Session context (compressed, {} entries)\n\n",
+        ctx.entries.len()
+    ));
+
+    // 1. Summary stats
+    out.push_str(&format!(
+        "**Stats:** {} ok, {} fail, {} surprise, {} cost overrun\n\n",
+        successes.len(), failures.len(), surprises.len(), overruns.len()
+    ));
+
+    // 2. Recent successes (last 3)
+    if !successes.is_empty() {
+        out.push_str("**Recent successes:**\n");
+        for e in successes.iter().rev().take(3) {
+            out.push_str(&format!("- {} ({})\n", e.fact, e.task_id));
+        }
+        out.push('\n');
+    }
+
+    // 3. All failures (important for avoiding repeats)
+    if !failures.is_empty() {
+        out.push_str("**Failures (avoid repeating):**\n");
+        for e in &failures {
+            out.push_str(&format!("- {} ({})\n", e.fact, e.task_id));
+        }
+        out.push('\n');
+    }
+
+    // 4. Surprises
+    if !surprises.is_empty() {
+        out.push_str("**Surprises:**\n");
+        for e in &surprises {
+            out.push_str(&format!("- {} ({})\n", e.fact, e.task_id));
+        }
+        out.push('\n');
+    }
+
+    // 5. Cost warnings
+    if !overruns.is_empty() {
+        out.push_str("**Cost warnings:**\n");
+        for e in &overruns {
+            out.push_str(&format!("- {} ({})\n", e.fact, e.task_id));
+        }
+        out.push('\n');
     }
 
     out
@@ -241,6 +315,34 @@ mod tests {
         let prompt = format_for_prompt(&ctx);
         assert!(prompt.contains("[+] deployed v2"));
         assert!(prompt.contains("[!] tests broke"));
+    }
+
+    #[test]
+    fn compression_kicks_in_over_threshold() {
+        let mut entries = Vec::new();
+        for i in 0..10 {
+            entries.push(SessionEntry {
+                entry_type: if i % 3 == 0 { EntryType::Failure } else { EntryType::Success },
+                fact: format!("A very long description of task {} that takes up space in the session context to push us over the compression threshold limit of 2000 characters. Extra padding to ensure we reach the threshold: {}", i, "x".repeat(100)),
+                task_id: format!("task-{i}"),
+                ttl_tasks: 5,
+                created_at: Utc::now(),
+            });
+        }
+
+        let ctx = SessionContext {
+            project: "test".into(),
+            entries,
+            updated_at: Utc::now(),
+        };
+
+        let raw = super::format_raw(&ctx);
+        assert!(raw.len() > super::COMPRESSION_THRESHOLD, "raw should exceed threshold: {}", raw.len());
+
+        let compressed = format_for_prompt(&ctx);
+        assert!(compressed.contains("compressed"));
+        assert!(compressed.contains("Failures (avoid repeating)"));
+        assert!(compressed.len() < raw.len(), "compressed should be shorter");
     }
 
     // --- Adversarial tests ---
