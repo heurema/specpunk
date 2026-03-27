@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use punk_orch::{bus, config, daemon, doctor, goal, morning, ops};
+use punk_orch::{bus, config, daemon, doctor, goal, morning, ops, pipeline};
 
 #[derive(Parser)]
 #[command(name = "punk-run", version, about = "Specpunk agent orchestration")]
@@ -48,6 +48,39 @@ enum Command {
         #[command(subcommand)]
         action: GoalAction,
     },
+    /// AI-powered query over state (uses Claude haiku)
+    Ask {
+        /// Question about tasks, goals, or project state
+        question: String,
+    },
+    /// Pipeline CRM management
+    Pipeline {
+        #[command(subcommand)]
+        action: PipelineAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PipelineAction {
+    /// List current opportunities
+    List,
+    /// Add a new opportunity
+    Add {
+        project: String,
+        contact: String,
+        #[arg(long)]
+        next_step: String,
+        #[arg(long)]
+        due: String,
+        #[arg(long)]
+        value: Option<u32>,
+    },
+    /// Advance opportunity to next stage
+    Advance { id: u32 },
+    /// Mark opportunity as won
+    Win { id: u32 },
+    /// Mark opportunity as lost
+    Lose { id: u32 },
 }
 
 #[derive(Subcommand)]
@@ -130,6 +163,38 @@ async fn main() -> anyhow::Result<()> {
             let report = doctor::check_all(&bus_path, &config_dir);
             print!("{}", report.display());
         }
+        Command::Ask { question } => cmd_ask(&question),
+        Command::Pipeline { action } => match action {
+            PipelineAction::List => cmd_pipeline_list(),
+            PipelineAction::Add { project, contact, next_step, due, value } => {
+                let bus_path = bus::bus_dir();
+                match pipeline::add(&bus_path, &project, &contact, &next_step, &due, value) {
+                    Ok(opp) => println!("Added: #{} {} ({}) -> {}", opp.id, opp.contact, opp.project, opp.next_step),
+                    Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                }
+            }
+            PipelineAction::Advance { id } => {
+                let bus_path = bus::bus_dir();
+                match pipeline::advance(&bus_path, id) {
+                    Ok(opp) => println!("#{}: -> {:?}", opp.id, opp.stage),
+                    Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                }
+            }
+            PipelineAction::Win { id } => {
+                let bus_path = bus::bus_dir();
+                match pipeline::set_stage(&bus_path, id, pipeline::Stage::Won) {
+                    Ok(opp) => println!("#{}: WON", opp.id),
+                    Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                }
+            }
+            PipelineAction::Lose { id } => {
+                let bus_path = bus::bus_dir();
+                match pipeline::set_stage(&bus_path, id, pipeline::Stage::Lost) {
+                    Ok(opp) => println!("#{}: LOST", opp.id),
+                    Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                }
+            }
+        },
         Command::Goal { action } => match action {
             GoalAction::Create {
                 project,
@@ -530,6 +595,90 @@ fn cmd_approve(goal_id: &str) {
     }
 
     println!("\nApproved. {} step(s) queued: {}", queued.len(), queued.join(", "));
+}
+
+fn cmd_ask(question: &str) {
+    let bus_path = bus::bus_dir();
+    let state = bus::read_state(&bus_path, 20);
+
+    // Build deterministic data snapshot
+    let mut context = format!("Data snapshot ({}):\n", punk_orch::chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S"));
+    context.push_str(&format!("- Recent: {} tasks ({} ok)\n",
+        state.done.len(),
+        state.done.iter().filter(|t| t.status == "success").count()
+    ));
+    if !state.running.is_empty() {
+        context.push_str(&format!("- Running: {} tasks\n", state.running.len()));
+    }
+    if !state.queued.is_empty() {
+        context.push_str(&format!("- Queued: {} tasks\n", state.queued.len()));
+    }
+    if !state.failed.is_empty() {
+        context.push_str(&format!("- Failed: {} tasks pending triage\n", state.failed.len()));
+        for t in &state.failed {
+            context.push_str(&format!("  - {} ({}, {})\n", t.id, t.project, t.model));
+        }
+    }
+    let goals = goal::list_goals(&bus_path);
+    if !goals.is_empty() {
+        context.push_str(&format!("- Goals: {}\n", goals.len()));
+        for g in &goals {
+            context.push_str(&format!("  - {} ({:?}, ${:.2}/${:.2})\n", g.id, g.status, g.spent_usd, g.budget_usd));
+        }
+    }
+
+    let prompt = format!(
+        "{context}\n\nBased ONLY on the data above, answer: {question}\nRules: cite task/goal IDs, don't invent data not in the snapshot, say 'unknown' if data insufficient."
+    );
+
+    // Call Claude haiku for fast answer
+    let output = std::process::Command::new("claude")
+        .args(["-p", &prompt, "--output-format", "text", "--model", "haiku"])
+        .env_remove("CLAUDECODE")
+        .env_remove("ANTHROPIC_API_KEY")
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            println!("{}", String::from_utf8_lossy(&out.stdout));
+        }
+        Ok(out) => {
+            eprintln!("claude failed (exit {})", out.status.code().unwrap_or(-1));
+            std::process::exit(1);
+        }
+        Err(_) => {
+            eprintln!("claude not found. Install: https://claude.ai/download");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_pipeline_list() {
+    let bus_path = bus::bus_dir();
+    let opps = pipeline::load_pipeline(&bus_path);
+
+    if opps.is_empty() {
+        println!("Pipeline empty.");
+        return;
+    }
+
+    println!("Pipeline ({} opportunities)\n", opps.len());
+    println!(
+        "  {:<4} {:<12} {:<15} {:<14} {:<20} {:>8}",
+        "ID", "PROJECT", "CONTACT", "STAGE", "NEXT STEP", "VALUE"
+    );
+    for o in &opps {
+        let val = o.value_usd.map(|v| format!("${v}")).unwrap_or_default();
+        println!(
+            "  {:<4} {:<12} {:<15} {:<14} {:<20} {:>8}",
+            o.id,
+            truncate(&o.project, 12),
+            truncate(&o.contact, 15),
+            format!("{:?}", o.stage).to_lowercase(),
+            truncate(&o.next_step, 20),
+            val
+        );
+    }
 }
 
 fn cmd_goal_status(goal_id: &str) {

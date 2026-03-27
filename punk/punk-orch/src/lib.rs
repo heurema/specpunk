@@ -1,6 +1,7 @@
 pub use chrono;
 
 pub mod adapter;
+pub mod budget;
 pub mod bus;
 pub mod config;
 pub mod daemon;
@@ -8,6 +9,7 @@ pub mod doctor;
 pub mod goal;
 pub mod morning;
 pub mod ops;
+pub mod pipeline;
 pub mod queue;
 pub mod receipt;
 pub mod run;

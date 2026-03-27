@@ -8,6 +8,7 @@ use serde_json::Value;
 use tokio::time;
 
 use crate::adapter::{Adapter, SpawnedProcess, TaskSpec};
+use crate::budget;
 use crate::queue::{self, HeartbeatTracker, ProjectLock, SlotManager};
 use crate::receipt::{CallStyle, Receipt, ReceiptStatus};
 use crate::goal::{self, GoalStatus, StepStatus};
@@ -102,7 +103,16 @@ pub async fn run(dcfg: DaemonConfig) {
         // 3.5. Evaluate active goals (check step completion, queue next steps)
         evaluate_goals(bus);
 
-        // 4. Scan and dispatch new tasks
+        // 4. Budget backpressure check
+        let (pressure, spent) = budget::check_pressure(bus, 50.0, 80, 95);
+        if pressure != budget::PressureLevel::Normal {
+            eprintln!(
+                "daemon: budget pressure {:?} (${:.2} spent)",
+                pressure, spent
+            );
+        }
+
+        // 5. Scan and dispatch new tasks
         if !dcfg.shadow {
             dispatch_queued(
                 bus,
