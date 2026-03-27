@@ -92,12 +92,15 @@ impl ProjectLock {
     }
 
     /// Try to acquire project lock. Returns false if project already locked.
+    /// Uses O_CREAT|O_EXCL (create_new) for atomic lock acquisition.
     pub fn try_acquire(&self, project: &str, task_id: &str) -> bool {
         let lock_file = self.locks_dir.join(project);
-        if lock_file.exists() {
-            return false;
-        }
-        fs::write(&lock_file, task_id).is_ok()
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_file)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, task_id.as_bytes()))
+            .is_ok()
     }
 
     /// Release project lock.
@@ -303,6 +306,9 @@ fn is_process_alive(pid: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
     use tempfile::TempDir;
 
     #[test]
@@ -383,6 +389,224 @@ mod tests {
         assert!(scan_queue(bus).is_empty());
     }
 
+    // --- Concurrency tests ---
+
+    /// 10 threads each try to acquire 3 slots from a 3-slot manager.
+    /// Invariant: no slot ID is ever held by more than one thread simultaneously.
+    #[test]
+    fn concurrent_slot_no_double_acquire() {
+        const ITERATIONS: usize = 100;
+
+        for _ in 0..ITERATIONS {
+            let tmp = TempDir::new().unwrap();
+            let bus = tmp.path().to_path_buf();
+            let sm = Arc::new(SlotManager::new(&bus, 3));
+            let barrier = Arc::new(Barrier::new(10));
+            let acquired: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
+            let double_acquire_detected = Arc::new(Mutex::new(false));
+
+            let mut handles = vec![];
+            for _ in 0..10 {
+                let sm = Arc::clone(&sm);
+                let barrier = Arc::clone(&barrier);
+                let acquired = Arc::clone(&acquired);
+                let flag = Arc::clone(&double_acquire_detected);
+
+                handles.push(thread::spawn(move || {
+                    barrier.wait();
+                    if let Some(slot_id) = sm.acquire() {
+                        {
+                            let mut set = acquired.lock().unwrap();
+                            if !set.insert(slot_id) {
+                                // slot_id already in set — double acquire
+                                *flag.lock().unwrap() = true;
+                            }
+                        }
+                        // hold briefly then release
+                        thread::yield_now();
+                        {
+                            let mut set = acquired.lock().unwrap();
+                            set.remove(&slot_id);
+                        }
+                        sm.release(slot_id);
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            assert!(
+                !*double_acquire_detected.lock().unwrap(),
+                "double acquire detected: same slot given to two threads simultaneously"
+            );
+        }
+    }
+
+    /// release() called concurrently with acquire() must not panic or corrupt state.
+    #[test]
+    fn concurrent_slot_release_during_acquire() {
+        const ITERATIONS: usize = 100;
+
+        for _ in 0..ITERATIONS {
+            let tmp = TempDir::new().unwrap();
+            let bus = tmp.path().to_path_buf();
+            let sm = Arc::new(SlotManager::new(&bus, 3));
+
+            // Pre-fill all 3 slots
+            let s1 = sm.acquire().unwrap();
+            let s2 = sm.acquire().unwrap();
+            let s3 = sm.acquire().unwrap();
+            assert!(sm.acquire().is_none());
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            // Thread 1: release slots rapidly
+            let sm1 = Arc::clone(&sm);
+            let b1 = Arc::clone(&barrier);
+            let releaser = thread::spawn(move || {
+                b1.wait();
+                sm1.release(s1);
+                sm1.release(s2);
+                sm1.release(s3);
+            });
+
+            // Thread 2: try to acquire while releases are happening
+            let sm2 = Arc::clone(&sm);
+            let b2 = Arc::clone(&barrier);
+            let acquirer = thread::spawn(move || {
+                b2.wait();
+                let mut acquired_ids = vec![];
+                for _ in 0..3 {
+                    if let Some(id) = sm2.acquire() {
+                        acquired_ids.push(id);
+                    }
+                }
+                acquired_ids
+            });
+
+            releaser.join().unwrap();
+            let ids = acquirer.join().unwrap();
+
+            // All returned IDs must be in valid range and unique
+            let id_set: HashSet<u32> = ids.iter().copied().collect();
+            assert_eq!(id_set.len(), ids.len(), "duplicate slot IDs returned");
+            for id in &ids {
+                assert!(*id >= 1 && *id <= 3, "slot ID out of range: {id}");
+            }
+        }
+    }
+
+    /// Two threads try_acquire the same project simultaneously.
+    /// At most one must succeed per attempt.
+    #[test]
+    fn concurrent_project_lock_at_most_one() {
+        const ITERATIONS: usize = 100;
+
+        for _ in 0..ITERATIONS {
+            let tmp = TempDir::new().unwrap();
+            let bus = tmp.path().to_path_buf();
+            let pl = Arc::new(ProjectLock::new(&bus));
+            let barrier = Arc::new(Barrier::new(2));
+            let wins: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(vec![]));
+
+            let mut handles = vec![];
+            for t in 0..2u32 {
+                let pl = Arc::clone(&pl);
+                let barrier = Arc::clone(&barrier);
+                let wins = Arc::clone(&wins);
+
+                handles.push(thread::spawn(move || {
+                    barrier.wait();
+                    let task_id = format!("task-{t}");
+                    let ok = pl.try_acquire("test-project", &task_id);
+                    wins.lock().unwrap().push(ok);
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let results = wins.lock().unwrap();
+            let successes = results.iter().filter(|&&v| v).count();
+            assert!(
+                successes <= 1,
+                "both threads acquired the same project lock simultaneously"
+            );
+
+            // cleanup for next iteration
+            pl.release("test-project");
+        }
+    }
+
+    /// 5 tasks in the queue, 5 threads each claiming. Each task must be claimed exactly once.
+    #[test]
+    fn concurrent_scan_claim_exactly_once() {
+        const ITERATIONS: usize = 100;
+
+        for _ in 0..ITERATIONS {
+            let tmp = TempDir::new().unwrap();
+            let bus = tmp.path().to_path_buf();
+
+            // Setup queue dirs
+            for d in &["new/p1", "cur"] {
+                fs::create_dir_all(bus.join(d)).unwrap();
+            }
+
+            // Write 5 tasks
+            let task_json = r#"{"project":"test","model":"claude","timeout_seconds":600}"#;
+            for i in 0..5u32 {
+                fs::write(bus.join(format!("new/p1/task-{i:03}.json")), task_json).unwrap();
+            }
+
+            let bus_arc = Arc::new(bus.clone());
+            let barrier = Arc::new(Barrier::new(5));
+            let claimed_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+
+            let mut handles = vec![];
+            for _ in 0..5 {
+                let bus_arc = Arc::clone(&bus_arc);
+                let barrier = Arc::clone(&barrier);
+                let claimed_ids = Arc::clone(&claimed_ids);
+
+                handles.push(thread::spawn(move || {
+                    barrier.wait();
+                    // Each thread scans and tries to claim whatever it sees
+                    let entries = scan_queue(&bus_arc);
+                    for entry in entries {
+                        if let Some(_path) = claim_task(&bus_arc, &entry) {
+                            claimed_ids.lock().unwrap().push(entry.task_id);
+                        }
+                    }
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let ids = claimed_ids.lock().unwrap();
+            let id_set: HashSet<String> = ids.iter().cloned().collect();
+
+            // Each task must be claimed at most once (rename is atomic)
+            assert_eq!(
+                id_set.len(),
+                ids.len(),
+                "task claimed more than once: {:?}",
+                ids
+            );
+            // All 5 tasks must be claimed
+            assert_eq!(
+                ids.len(),
+                5,
+                "not all tasks claimed: only {} out of 5",
+                ids.len()
+            );
+        }
+    }
+
     #[test]
     fn priority_ordering() {
         let tmp = TempDir::new().unwrap();
@@ -400,5 +624,143 @@ mod tests {
         assert_eq!(entries[0].priority, "p0");
         assert_eq!(entries[1].priority, "p1");
         assert_eq!(entries[2].priority, "p2");
+    }
+
+    // --- Adversarial tests ---
+
+    #[test]
+    fn adversarial_scan_queue_no_new_dir() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path();
+        // new/ dir doesn't exist at all — should return empty, not panic
+        let entries = scan_queue(bus);
+        assert!(entries.is_empty(), "missing new/ dir should return empty entries");
+    }
+
+    #[test]
+    fn adversarial_scan_queue_zero_json_files() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path();
+        for d in &["new/p0", "new/p1", "new/p2"] {
+            fs::create_dir_all(bus.join(d)).unwrap();
+        }
+        // Non-JSON files should be ignored
+        fs::write(bus.join("new/p0/task.txt"), "not json").unwrap();
+        fs::write(bus.join("new/p1/task.yaml"), "project: x").unwrap();
+
+        let entries = scan_queue(bus);
+        assert!(entries.is_empty(), "non-JSON files should be ignored");
+    }
+
+    #[test]
+    fn adversarial_scan_queue_corrupt_json() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path();
+        fs::create_dir_all(bus.join("new/p0")).unwrap();
+
+        // Corrupt JSON — parse_queued_entry returns None, entries silently skipped
+        fs::write(bus.join("new/p0/corrupt.json"), b"not json!!!").unwrap();
+        fs::write(bus.join("new/p0/empty.json"), b"").unwrap();
+        fs::write(bus.join("new/p0/partial.json"), b"{\"project\":").unwrap();
+
+        let entries = scan_queue(bus);
+        assert!(entries.is_empty(), "corrupt JSON files should be silently skipped");
+    }
+
+    #[test]
+    fn adversarial_claim_nonexistent_task() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path();
+        fs::create_dir_all(bus.join("cur")).unwrap();
+
+        let fake_entry = QueuedEntry {
+            task_id: "ghost-task".into(),
+            path: bus.join("new/p1/ghost-task.json"), // doesn't exist
+            project: "test".into(),
+            model: "claude".into(),
+            worktree: false,
+            priority: "p1".into(),
+        };
+
+        let result = claim_task(bus, &fake_entry);
+        // rename of nonexistent src fails — should return None, not panic
+        assert!(result.is_none(), "claiming nonexistent task should return None");
+    }
+
+    #[test]
+    fn adversarial_release_nonexistent_slot() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path();
+        let sm = SlotManager::new(bus, 3);
+
+        // Release slots that were never acquired — remove_dir_all on nonexistent is .ok()
+        sm.release(1);
+        sm.release(99); // out-of-range slot
+        sm.release(0);  // boundary: slot 0 not in 1..=max_slots
+
+        // Should still work normally after ghost releases
+        assert_eq!(sm.occupied(), 0);
+        let s = sm.acquire().unwrap();
+        assert_eq!(s, 1);
+    }
+
+    #[test]
+    fn adversarial_slot_exhaustion_with_zero_max() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path();
+        // max_slots = 0: loop 1..=0 never executes
+        let sm = SlotManager::new(bus, 0);
+        let result = sm.acquire();
+        assert!(result.is_none(), "0-slot manager should always return None");
+        assert_eq!(sm.occupied(), 0);
+    }
+
+    #[test]
+    fn adversarial_move_to_failed_nonexistent_task() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path();
+        // cur/ doesn't have the task — rename fails, should be silent (.ok())
+        // No panic expected
+        move_to_failed(bus, "nonexistent-task-xyz");
+    }
+
+    #[test]
+    fn adversarial_scan_queue_task_missing_model_field() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path();
+        fs::create_dir_all(bus.join("new/p1")).unwrap();
+
+        // Task JSON missing model — should use default "claude"
+        let task = r#"{"project":"signum"}"#;
+        fs::write(bus.join("new/p1/no-model.json"), task).unwrap();
+
+        let entries = scan_queue(bus);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model, "claude", "missing model should default to 'claude'");
+        assert_eq!(entries[0].project, "signum");
+    }
+
+    #[test]
+    fn adversarial_heartbeat_empty_task_id() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path();
+        let hbt = HeartbeatTracker::new(bus);
+
+        // Empty task_id — creates files named ".hb" and ".pid"
+        // Should not panic
+        hbt.register("", 12345);
+        hbt.unregister("");
+    }
+
+    #[test]
+    fn adversarial_project_lock_lock_and_relock_same_task() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path();
+        let pl = ProjectLock::new(bus);
+
+        assert!(pl.try_acquire("proj", "task-1"));
+        // Same task tries to acquire again — file already exists, should fail
+        assert!(!pl.try_acquire("proj", "task-1"), "re-acquiring same lock should fail");
+        pl.release("proj");
     }
 }

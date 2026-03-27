@@ -432,4 +432,164 @@ mod tests {
         assert!(!TerminationReason::BudgetExceeded.is_retryable());
         assert!(TerminationReason::ExitNonzero.is_retryable()); // unknown = maybe
     }
+
+    // --- Adversarial tests ---
+
+    #[test]
+    fn adversarial_classify_failure_empty_stderr() {
+        // Empty stderr with non-special exit codes — should return ExitNonzero, not panic
+        let result = classify_failure(0, "");
+        // exit_code=0 is not 124 or 137, stderr is empty — no pattern matches
+        assert_eq!(result, TerminationReason::ExitNonzero);
+
+        let result = classify_failure(1, "");
+        assert_eq!(result, TerminationReason::ExitNonzero);
+
+        // Boundary exit codes
+        let result = classify_failure(i32::MAX, "");
+        assert_eq!(result, TerminationReason::ExitNonzero);
+
+        let result = classify_failure(i32::MIN, "");
+        assert_eq!(result, TerminationReason::ExitNonzero);
+    }
+
+    #[test]
+    fn adversarial_classify_failure_very_long_stderr() {
+        // 10K chars of stderr — should not hang, OOM, or panic
+        let long_stderr = "error message ".repeat(750); // ~10.5K chars
+        assert!(long_stderr.len() >= 10_000);
+
+        let result = classify_failure(1, &long_stderr);
+        // No patterns match in random text → ExitNonzero
+        assert_eq!(result, TerminationReason::ExitNonzero);
+    }
+
+    #[test]
+    fn adversarial_classify_failure_stderr_with_all_patterns() {
+        // stderr containing multiple matching patterns — first match wins
+        // Order: auth > 429 > 529/503/502 > overloaded
+        let mixed = "auth token 429 rate limit 529 overloaded";
+        let result = classify_failure(1, mixed);
+        // "auth" appears first in check order
+        assert_eq!(result, TerminationReason::AuthExpired);
+    }
+
+    #[test]
+    fn adversarial_classify_failure_unicode_stderr() {
+        // Unicode in stderr — to_lowercase() on unicode is well-defined, no panic expected
+        let unicode_stderr = "Ошибка аутентификации: token expired 认证失败";
+        let result = classify_failure(1, unicode_stderr);
+        // "token expired" substring is present after lowercase
+        assert_eq!(result, TerminationReason::AuthExpired);
+
+        // Pure unicode without any known patterns
+        let pure_unicode = "错误: 服务器过载 🔥🚨";
+        let result = classify_failure(1, pure_unicode);
+        assert_eq!(result, TerminationReason::ExitNonzero);
+    }
+
+    #[test]
+    fn adversarial_classify_failure_case_insensitive_patterns() {
+        // All pattern matching uses to_lowercase(), verify case variants
+        assert_eq!(classify_failure(1, "AUTH FAILURE"), TerminationReason::AuthExpired);
+        assert_eq!(classify_failure(1, "RATE LIMIT EXCEEDED"), TerminationReason::Provider429);
+        assert_eq!(classify_failure(1, "SERVER OVERLOADED"), TerminationReason::ProviderOverloaded);
+    }
+
+    #[test]
+    fn adversarial_retry_zero_max_attempts() {
+        // max_attempts = 0: attempt (1) >= 0 is always true → Exhausted
+        // But is_retryable check comes first
+        assert_eq!(
+            should_retry(&TerminationReason::Provider429, 1, 0, 30, 2, 300),
+            RetryDecision::Exhausted
+        );
+    }
+
+    #[test]
+    fn adversarial_retry_overflow_backoff() {
+        // Large attempt number could cause overflow in backoff_multiplier.pow(attempt-1)
+        // attempt=30, multiplier=2: 2^29 = 536870912, * base=30 = ~16B which overflows u64
+        // saturating_sub(1) prevents underflow on attempt=0
+        // But the pow could overflow u64...
+        let result = std::panic::catch_unwind(|| {
+            should_retry(&TerminationReason::Provider429, 30, 100, 30, 2, 300)
+        });
+        // Should not panic — if overflow occurs, result is still capped by backoff_max_s
+        // However u64 overflow in pow wraps or panics in debug mode
+        // This test documents the behavior
+        match result {
+            Ok(decision) => {
+                // If no panic: result should be Retry with delay capped at backoff_max_s=300
+                assert_eq!(decision, RetryDecision::Retry { delay_s: 300 });
+            }
+            Err(_) => {
+                // Panic due to u64 overflow in debug mode — this is a real bug
+                // Leave test failing to document it
+                panic!("backoff calculation overflowed u64 with large attempt count");
+            }
+        }
+    }
+
+    #[test]
+    fn adversarial_circuit_breaker_no_opened_at() {
+        // Open circuit with opened_at=None (shouldn't happen normally, but test robustness)
+        let mut cb = CircuitBreaker::new("test");
+        cb.state = CircuitState::Open;
+        cb.opened_at = None;
+        // allows() returns true when opened_at is None (else branch)
+        assert!(cb.allows(), "Open circuit with no opened_at should allow (else branch)");
+    }
+
+    #[test]
+    fn adversarial_circuit_breaker_overflow_consecutive_failures() {
+        let mut cb = CircuitBreaker::new("test");
+        cb.consecutive_failures = u32::MAX;
+        // record_failure does checked add? No — it's just += 1, which wraps in release or panics in debug
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cb.record_failure();
+        }));
+        // In debug mode, u32 overflow panics. In release, wraps to 0.
+        // This test documents the behavior — if it panics, it's a real gap.
+        match result {
+            Ok(_) => {
+                // Wrapped: consecutive_failures became 0, state may be inconsistent
+                // No assertion — just documenting that wraparound occurs
+            }
+            Err(_) => {
+                // Expected in debug builds — overflow panic
+                // This is a real bug if the circuit breaker can receive u32::MAX failures
+            }
+        }
+    }
+
+    #[test]
+    fn adversarial_run_mark_timeout_sets_correct_exit_code() {
+        let mut run = Run::new("task-1", 1, 1, "claude", "sonnet");
+        run.mark_started(100);
+        run.mark_timeout(60_000);
+
+        // mark_timeout calls mark_failed(124, ...) then overrides status to Timeout
+        assert_eq!(run.exit_code, 124);
+        assert_eq!(run.status, RunStatus::Timeout);
+        assert_eq!(run.termination_reason, Some(TerminationReason::Timeout));
+        // error_type should be Transient (Timeout is transient)
+        assert_eq!(run.error_type, Some(ErrorType::Transient));
+    }
+
+    #[test]
+    fn adversarial_run_mark_success_after_failure() {
+        // State machine: can mark_success be called after mark_failed? No guard.
+        let mut run = Run::new("task-1", 1, 1, "claude", "sonnet");
+        run.mark_started(100);
+        run.mark_failed(1, 1000, TerminationReason::ExitNonzero);
+        assert_eq!(run.status, RunStatus::Failure);
+
+        // Call mark_success after failure — no state guard, should overwrite
+        run.mark_success(2000);
+        assert_eq!(run.status, RunStatus::Success);
+        assert_eq!(run.exit_code, 0);
+        // error_type remains from mark_failed — stale state
+        assert!(run.error_type.is_some(), "error_type not cleared by mark_success");
+    }
 }

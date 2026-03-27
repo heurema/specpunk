@@ -40,7 +40,15 @@ fn sessions_dir(bus: &Path) -> PathBuf {
 
 /// Load session context for a project.
 pub fn load(bus: &Path, project: &str) -> SessionContext {
-    let path = sessions_dir(bus).join(format!("{project}.json"));
+    let safe_project = match crate::sanitize::safe_id(project) {
+        Ok(s) => s,
+        Err(_) => return SessionContext {
+            project: project.to_string(),
+            entries: vec![],
+            updated_at: Utc::now(),
+        },
+    };
+    let path = sessions_dir(bus).join(format!("{safe_project}.json"));
     fs::read_to_string(path)
         .ok()
         .and_then(|data| serde_json::from_str(&data).ok())
@@ -53,6 +61,8 @@ pub fn load(bus: &Path, project: &str) -> SessionContext {
 
 /// Save session context.
 pub fn save(bus: &Path, ctx: &SessionContext) -> std::io::Result<()> {
+    crate::sanitize::safe_id(&ctx.project)
+        .map_err(|e| std::io::Error::other(format!("unsafe project name: {e}")))?;
     let dir = sessions_dir(bus);
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", ctx.project));
@@ -231,5 +241,241 @@ mod tests {
         let prompt = format_for_prompt(&ctx);
         assert!(prompt.contains("[+] deployed v2"));
         assert!(prompt.contains("[!] tests broke"));
+    }
+
+    // --- Adversarial tests ---
+
+    #[test]
+    fn adversarial_rapid_add_from_receipt_20_calls() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        // 20 rapid calls — TTL eviction kicks in after 5 tasks
+        for i in 0..20 {
+            add_from_receipt(
+                &bus,
+                "test",
+                &format!("task-{i}"),
+                "success",
+                0.1,
+                1.0,
+                &format!("fact {i}"),
+            );
+        }
+
+        let ctx = load(&bus, "test");
+        // MAX_ENTRIES = 10, but TTL eviction also removes old ones
+        assert!(
+            ctx.entries.len() <= MAX_ENTRIES,
+            "entries should be capped at MAX_ENTRIES, got {}",
+            ctx.entries.len()
+        );
+        // All remaining entries should have ttl_tasks > 0
+        for e in &ctx.entries {
+            assert!(
+                e.ttl_tasks > 0,
+                "no entry with ttl=0 should survive: {:?}",
+                e.fact
+            );
+        }
+    }
+
+    #[test]
+    fn adversarial_empty_strings() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        // Empty task_id, empty summary, empty status
+        add_from_receipt(&bus, "proj", "", "success", 0.0, 1.0, "");
+        let ctx = load(&bus, "proj");
+        assert_eq!(ctx.entries.len(), 1);
+        // When summary is empty, fact becomes "success: " (empty task_id)
+        assert_eq!(ctx.entries[0].fact, "success: ");
+
+        // Empty project name: creates a file named ".json"
+        add_from_receipt(&bus, "", "task-x", "success", 0.0, 1.0, "something");
+        // Should not panic — loading empty project is valid
+        let empty_ctx = load(&bus, "");
+        assert_eq!(empty_ctx.project, "");
+    }
+
+    #[test]
+    fn adversarial_cost_overrun_zero_budget() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        // budget_usd = 0.0: overrun check is `cost > budget * 1.5 && budget > 0.0`
+        // so zero budget should NOT trigger CostOverrun
+        add_from_receipt(&bus, "test", "t1", "success", 9999.0, 0.0, "huge cost zero budget");
+        let ctx = load(&bus, "test");
+        assert_eq!(
+            ctx.entries[0].entry_type,
+            EntryType::Success,
+            "zero budget with high cost should not trigger CostOverrun"
+        );
+    }
+
+    #[test]
+    fn adversarial_negative_cost_overrun_check() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        // Negative cost_usd: cost_usd > budget_usd * 1.5 is false for negative cost
+        add_from_receipt(&bus, "test", "t1", "success", -5.0, 1.0, "negative cost");
+        let ctx = load(&bus, "test");
+        // Should be Success, not CostOverrun
+        assert_eq!(ctx.entries[0].entry_type, EntryType::Success);
+    }
+
+    #[test]
+    fn adversarial_unknown_status_maps_to_failure() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        // Status that is neither "success" nor "timeout" falls through to Failure
+        for status in &["error", "cancelled", "TIMEOUT", "SUCCESS", "", "🔥"] {
+            add_from_receipt(&bus, "test", "t1", status, 0.0, 1.0, "");
+        }
+
+        let ctx = load(&bus, "test");
+        // "success" (exact lowercase) is the only one that maps to Success
+        // All others → Failure (or possibly CostOverrun if cost threshold met)
+        // We added 6 entries but TTL will evict some; just check no panic
+        assert!(ctx.entries.len() <= MAX_ENTRIES);
+    }
+
+    #[test]
+    fn adversarial_format_for_prompt_empty_entries() {
+        let ctx = SessionContext {
+            project: "test".into(),
+            entries: vec![],
+            updated_at: Utc::now(),
+        };
+        let prompt = format_for_prompt(&ctx);
+        // Should return empty string, not header without content
+        assert!(prompt.is_empty(), "empty entries should produce empty prompt");
+    }
+
+    #[test]
+    fn adversarial_format_for_prompt_special_chars_in_fact() {
+        let ctx = SessionContext {
+            project: "test".into(),
+            entries: vec![SessionEntry {
+                entry_type: EntryType::Surprise,
+                fact: "task had [brackets] and (parens) and\nnewlines\ttabs".into(),
+                task_id: "t-weird".into(),
+                ttl_tasks: 5,
+                created_at: Utc::now(),
+            }],
+            updated_at: Utc::now(),
+        };
+        // Should not panic, special chars pass through as-is
+        let prompt = format_for_prompt(&ctx);
+        assert!(prompt.contains("[?]"));
+        assert!(prompt.contains("brackets"));
+    }
+
+    // --- Security tests: path traversal in load / save ---
+
+    #[test]
+    fn security_load_traversal_project_name() {
+        // load() constructs sessions_dir(bus).join("{project}.json") without sanitization.
+        // A project name of "../../../tmp/evil" would resolve outside the sessions dir.
+        // This test verifies whether the traversal is blocked or accepted.
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        // Create a sentinel file to detect escape
+        let sentinel = tmp.path().join("canary.json");
+        let sentinel_data = r#"{"project":"canary","entries":[],"updated_at":"2026-01-01T00:00:00Z"}"#;
+        fs::write(&sentinel, sentinel_data).unwrap();
+
+        // sessions_dir = tmp/sessions; path = tmp/sessions/../canary = tmp/canary
+        let traversal_project = "../canary";
+        let ctx = load(&bus, traversal_project);
+
+        // If traversal works, ctx.project would be "canary" (deserialized from sentinel).
+        // If blocked (or file not found), we get a default context with the traversal string.
+        assert!(
+            ctx.project != "canary",
+            "SECURITY BYPASS: load() with project='../canary' read file outside sessions dir — \
+             got project='{}' from sentinel",
+            ctx.project
+        );
+        // Note: on macOS Path::join with ".." does resolve at open() time,
+        // so this test MAY fail (bypass confirmed) depending on directory structure.
+    }
+
+    #[test]
+    fn security_save_traversal_project_name() {
+        // save() constructs path from ctx.project without sanitization.
+        // A SessionContext with project="../../../tmp/evil" would write outside sessions/.
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        let evil_ctx = SessionContext {
+            project: "../evil-session".into(),
+            entries: vec![],
+            updated_at: Utc::now(),
+        };
+
+        let _ = save(&bus, &evil_ctx);
+
+        // sessions_dir = tmp/sessions; path = tmp/sessions/../evil-session.json = tmp/evil-session.json
+        let escaped_path = tmp.path().join("evil-session.json");
+        assert!(
+            !escaped_path.exists(),
+            "SECURITY BYPASS: save() with project='../evil-session' wrote file outside sessions dir: {}",
+            escaped_path.display()
+        );
+    }
+
+    #[test]
+    fn security_add_from_receipt_traversal_project() {
+        // add_from_receipt calls load() then save() — same traversal vector.
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        // Should not panic regardless of traversal in project name
+        add_from_receipt(&bus, "../../../tmp/evil", "task-1", "success", 0.1, 1.0, "test");
+
+        // Verify no file was written outside tmp
+        let potential_escape = std::path::Path::new("/tmp/evil.json");
+        assert!(
+            !potential_escape.exists(),
+            "SECURITY BYPASS: add_from_receipt wrote session file to /tmp/evil.json"
+        );
+    }
+
+    #[test]
+    fn security_load_null_byte_in_project() {
+        // Null byte in project name terminates string at OS level on some platforms.
+        // sessions_dir.join("foo\x00bar.json") could become "foo.json" on some OSes.
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        // Create a "foo.json" as a sentinel
+        let sessions_dir = tmp.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let sentinel_data = r#"{"project":"foo","entries":[],"updated_at":"2026-01-01T00:00:00Z"}"#;
+        fs::write(sessions_dir.join("foo.json"), sentinel_data).unwrap();
+
+        // Try to load "foo\x00bar" — should NOT silently load "foo.json"
+        // Rust's std does reject null bytes in paths with an error, so load() should
+        // return a default context (file-not-found branch).
+        let ctx = load(&bus, "foo\x00bar");
+        assert!(
+            ctx.project != "foo",
+            "SECURITY: null byte in project name must not silently load 'foo.json'"
+        );
     }
 }

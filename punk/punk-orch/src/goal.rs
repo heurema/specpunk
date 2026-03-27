@@ -112,6 +112,8 @@ pub fn load_goal(bus: &Path, goal_id: &str) -> Option<Goal> {
 
 /// Save a goal (create or update).
 pub fn save_goal(bus: &Path, goal: &Goal) -> std::io::Result<()> {
+    sanitize::safe_id(&goal.id)
+        .map_err(|e| std::io::Error::other(format!("unsafe goal id: {e}")))?;
     let dir = goals_dir(bus);
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", goal.id));
@@ -128,6 +130,8 @@ pub fn create_goal(
     deadline: Option<&str>,
     budget_usd: f64,
 ) -> std::io::Result<Goal> {
+    sanitize::safe_id(project)
+        .map_err(|e| std::io::Error::other(format!("unsafe project name: {e}")))?;
     let id = format!(
         "{}-{}",
         project,
@@ -340,6 +344,10 @@ fn provider_from_agent(agent: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+    use tempfile::TempDir;
 
     #[test]
     fn parse_plan_from_json() {
@@ -385,5 +393,397 @@ mod tests {
         let parsed: Goal = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, "test-001");
         assert_eq!(parsed.status, GoalStatus::Planning);
+    }
+
+    // --- Adversarial tests ---
+
+    #[test]
+    fn adversarial_empty_project_create_goal() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        // Empty project string: safe_id("") returns Err → create_goal returns Err
+        let result = create_goal(&bus, "", "some objective", None, 1.0);
+        assert!(result.is_err(), "create_goal with empty project should return Err (safe_id rejects empty)");
+    }
+
+    #[test]
+    fn adversarial_10k_char_objective() {
+        use tempfile::TempDir;
+        use std::fs;
+
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        let huge_objective = "x".repeat(10_000);
+        let result = create_goal(&bus, "test", &huge_objective, None, 1.0);
+        assert!(result.is_ok(), "10K char objective should not panic");
+        let goal = result.unwrap();
+        assert_eq!(goal.objective.len(), 10_000);
+
+        // Should survive serde roundtrip
+        let json = serde_json::to_string(&goal).unwrap();
+        let parsed: Goal = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.objective.len(), 10_000);
+    }
+
+    #[test]
+    fn adversarial_empty_plan_parse() {
+        // Empty string
+        assert!(parse_plan("", "test").is_none(), "empty string should return None");
+
+        // Only whitespace
+        assert!(parse_plan("   \n\t  ", "test").is_none());
+
+        // Empty array produces None (existing behavior, but adversarially verify)
+        assert!(parse_plan("[]", "test").is_none());
+
+        // Array with null entries — should not panic
+        let output = r#"[null, null]"#;
+        // Each null becomes a step with defaults — steps vec non-empty, so Some is returned
+        // The question is: does it panic? It should not.
+        let result = std::panic::catch_unwind(|| parse_plan(output, "test"));
+        assert!(result.is_ok(), "null array entries should not cause panic");
+    }
+
+    #[test]
+    fn adversarial_plan_missing_required_fields() {
+        // Steps missing all fields — should use defaults, not panic
+        let output = r#"[{}, {}, {}]"#;
+        let plan = parse_plan(output, "model");
+        assert!(plan.is_some(), "steps with missing fields should use defaults");
+        let plan = plan.unwrap();
+        assert_eq!(plan.steps.len(), 3);
+        // step defaults to 0
+        assert_eq!(plan.steps[0].step, 0);
+        // All steps get step=0 — verify no panic on duplicate step ids
+    }
+
+    #[test]
+    fn adversarial_negative_budget_goal() {
+        use tempfile::TempDir;
+        use std::fs;
+
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        // Negative budget: no validation in create_goal, should store as-is
+        let result = create_goal(&bus, "test", "objective", None, -100.0);
+        assert!(result.is_ok());
+        let goal = result.unwrap();
+        assert_eq!(goal.budget_usd, -100.0);
+
+        // Verify loaded from disk
+        let loaded = load_goal(&bus, &goal.id);
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().budget_usd, -100.0);
+    }
+
+    #[test]
+    fn adversarial_load_goal_path_traversal() {
+        use tempfile::TempDir;
+        use std::fs;
+
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        // load_goal uses safe_id, so traversal should return None not panic
+        let result = load_goal(&bus, "../../etc/passwd");
+        assert!(result.is_none(), "traversal goal_id should return None");
+
+        let result = load_goal(&bus, "");
+        assert!(result.is_none(), "empty goal_id should return None");
+    }
+
+    #[test]
+    fn adversarial_list_goals_no_dir() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        // bus points to nonexistent parent structure
+        let bus = tmp.path().join("bus");
+        // goals dir doesn't exist — should return empty vec, not panic
+        let goals = list_goals(&bus);
+        assert!(goals.is_empty());
+    }
+
+    #[test]
+    fn adversarial_list_goals_corrupt_json() {
+        use tempfile::TempDir;
+        use std::fs;
+
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        let goals_dir = bus.parent().unwrap().join("goals");
+        fs::create_dir_all(&goals_dir).unwrap();
+
+        // Write corrupt JSON files
+        fs::write(goals_dir.join("bad1.json"), b"not json at all").unwrap();
+        fs::write(goals_dir.join("bad2.json"), b"{\"incomplete\":").unwrap();
+        fs::write(goals_dir.join("bad3.json"), b"").unwrap();
+
+        // Should silently skip corrupt files
+        let goals = list_goals(&bus);
+        assert!(goals.is_empty(), "corrupt json files should be silently skipped");
+    }
+
+    #[test]
+    fn adversarial_build_planner_prompt_nonexistent_project_path() {
+        let goal = Goal {
+            id: "g1".into(),
+            project: "signum".into(),
+            objective: "Build something".into(),
+            deadline: None,
+            budget_usd: 5.0,
+            spent_usd: 0.0,
+            status: GoalStatus::Planning,
+            plan: None,
+            created_at: Utc::now(),
+            completed_at: None,
+        };
+
+        // Non-existent path — should not panic, context files just skipped
+        let path = std::path::Path::new("/tmp/definitely-does-not-exist-xyzzy123");
+        let prompt = build_planner_prompt(&goal, path);
+        assert!(prompt.contains("Build something"));
+        // No context files appended since they don't exist
+        assert!(!prompt.contains("## CLAUDE.md"));
+    }
+
+    /// Two threads call queue_ready_steps on the same goal simultaneously.
+    /// Steps must not be double-queued (each step file created exactly once).
+    ///
+    /// NOTE: queue_ready_steps operates on an in-memory &mut Goal — the caller
+    /// is responsible for exclusive access. This test verifies that two threads
+    /// with *separate* clones of the same goal each see the correct initial state
+    /// (no shared mutable state corruption). It also verifies that the filesystem
+    /// layer (fs::write to queue) prevents two threads from colliding on the
+    /// same task_id file.
+    #[test]
+    fn concurrent_queue_ready_steps_no_double_queue() {
+        const ITERATIONS: usize = 100;
+
+        for _ in 0..ITERATIONS {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().to_path_buf();
+            // goals_dir() resolves as bus.parent() / "goals"
+            // bus must be root/bus so goals go to root/goals
+            let bus = root.join("bus");
+            fs::create_dir_all(bus.join("new/p1")).unwrap();
+
+            // Build a goal with two independent pending steps
+            let plan = Plan {
+                version: 1,
+                created_by: "test".into(),
+                approved_at: None,
+                steps: vec![
+                    Step {
+                        step: 1,
+                        category: "codegen".into(),
+                        prompt: "step one".into(),
+                        agent: "claude-sonnet".into(),
+                        est_cost_usd: 0.5,
+                        depends_on: vec![],
+                        status: StepStatus::Pending,
+                        task_id: None,
+                        sub_tasks: vec![],
+                    },
+                    Step {
+                        step: 2,
+                        category: "review".into(),
+                        prompt: "step two".into(),
+                        agent: "claude-sonnet".into(),
+                        est_cost_usd: 0.5,
+                        depends_on: vec![],
+                        status: StepStatus::Pending,
+                        task_id: None,
+                        sub_tasks: vec![],
+                    },
+                ],
+            };
+
+            let goal = Goal {
+                id: "test-concurrent-001".into(),
+                project: "test".into(),
+                objective: "test".into(),
+                deadline: None,
+                budget_usd: 5.0,
+                spent_usd: 0.0,
+                status: GoalStatus::Active,
+                plan: Some(plan),
+                created_at: Utc::now(),
+                completed_at: None,
+            };
+
+            let bus_arc = Arc::new(bus.clone());
+            let barrier = Arc::new(Barrier::new(2));
+            let all_queued: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+
+            let mut handles = vec![];
+            for _ in 0..2 {
+                // Each thread gets its own clone of the goal
+                let mut goal_clone = goal.clone();
+                let bus_clone = Arc::clone(&bus_arc);
+                let barrier = Arc::clone(&barrier);
+                let all_queued = Arc::clone(&all_queued);
+
+                handles.push(thread::spawn(move || {
+                    barrier.wait();
+                    let queued = queue_ready_steps(&bus_clone, &mut goal_clone);
+                    all_queued.lock().unwrap().extend(queued);
+                }));
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            // Count actual files in queue (filesystem is the authority)
+            let queue_files: Vec<_> = fs::read_dir(bus.join("new/p1"))
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .collect();
+
+            let file_names: HashSet<String> = queue_files
+                .iter()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+
+            // Step 1 and step 2 each create one file — at most 2 files total
+            assert!(
+                queue_files.len() <= 2,
+                "more than 2 task files created: {file_names:?} — steps double-queued"
+            );
+
+            // No duplicate filenames (would indicate double write)
+            assert_eq!(
+                file_names.len(),
+                queue_files.len(),
+                "duplicate queue filenames detected"
+            );
+        }
+    }
+
+    #[test]
+    fn adversarial_parse_plan_deeply_nested_depends_on() {
+        // depends_on with non-integer values — should not panic, filter_map skips them
+        let output = r#"[{
+            "step": 1,
+            "category": "codegen",
+            "prompt": "do it",
+            "agent": "claude-sonnet",
+            "est_cost_usd": 0.5,
+            "depends_on": ["not-a-number", null, -1, 9999999999999999]
+        }]"#;
+        let result = std::panic::catch_unwind(|| parse_plan(output, "test"));
+        assert!(result.is_ok(), "weird depends_on values should not panic");
+        let plan = result.unwrap().unwrap();
+        // negative -1: as_u64() returns None, so it's filtered out
+        // 9999999999999999 fits in u64, so it's kept
+        assert_eq!(plan.steps[0].step, 1);
+    }
+
+    // --- Security tests: path traversal in create_goal / load_goal ---
+
+    #[test]
+    fn security_create_goal_traversal_project_field() {
+        // project="../../../tmp" — create_goal does NOT sanitize the project field
+        // through safe_id(). The id is built as "{project}-{timestamp}", so the
+        // resulting filename contains "/../../../tmp-<ts>.json".
+        // save_goal uses path.join(format!("{}.json", goal.id)) which on Linux/macOS
+        // WILL resolve the traversal through path normalization at the OS level.
+        // This test verifies whether the file actually lands inside goals_dir or escapes.
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        let malicious_project = "../../../tmp";
+        let result = create_goal(&bus, malicious_project, "objective", None, 1.0);
+
+        if let Ok(goal) = result {
+            // The goal was "created". Check where the file actually landed.
+            // goals_dir is bus.parent()/goals = tmp/goals
+            // goal.id = "../../../tmp-<ts>", file path = tmp/goals/../../../tmp-<ts>.json
+            // which resolves to /tmp-<ts>.json (outside tmp/ sandbox).
+            // Verify the file is NOT outside the TempDir root.
+            let goals_dir_path = tmp.path().join("goals");
+            let expected_file = goals_dir_path.join(format!("{}.json", goal.id));
+            let canonical = expected_file.canonicalize();
+
+            if let Ok(canonical_path) = canonical {
+                assert!(
+                    canonical_path.starts_with(tmp.path()),
+                    "SECURITY BYPASS: create_goal with project='{}' wrote file outside sandbox: {}",
+                    malicious_project,
+                    canonical_path.display()
+                );
+            }
+            // If canonicalize fails, the file doesn't exist at that path (likely escaped).
+            // Try to find it outside the tmp dir.
+            let escaped_path = std::path::Path::new("/tmp").join(
+                format!("{}.json", goal.id.replace("../../../tmp", "tmp"))
+            );
+            assert!(
+                !escaped_path.exists(),
+                "SECURITY BYPASS: file may have escaped to {}",
+                escaped_path.display()
+            );
+        }
+        // If create_goal errored, traversal is blocked — pass.
+    }
+
+    #[test]
+    fn security_load_goal_traversal_blocked() {
+        // load_goal calls safe_id() which rejects ".." — traversal must return None.
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        // Create a sentinel file outside goals/ to detect escape
+        let sentinel = tmp.path().join("secret.json");
+        fs::write(&sentinel, b"{\"id\":\"secret\"}").unwrap();
+
+        // Try to reach ../../secret via goal_id
+        let result = load_goal(&bus, "../../secret");
+        assert!(
+            result.is_none(),
+            "SECURITY BYPASS: load_goal with traversal goal_id must return None"
+        );
+
+        let result = load_goal(&bus, "../secret");
+        assert!(result.is_none(), "load_goal with '../secret' must return None");
+    }
+
+    #[test]
+    fn security_save_goal_traversal_via_goal_id() {
+        // save_goal uses goal.id directly (no safe_id check).
+        // An attacker who can construct a Goal struct with a traversal id
+        // could write files outside the goals/ directory.
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        let evil_goal = Goal {
+            id: "../../evil".into(), // traversal in id field
+            project: "test".into(),
+            objective: "exfil".into(),
+            deadline: None,
+            budget_usd: 0.0,
+            spent_usd: 0.0,
+            status: GoalStatus::Planning,
+            plan: None,
+            created_at: Utc::now(),
+            completed_at: None,
+        };
+
+        let result = save_goal(&bus, &evil_goal);
+        assert!(
+            result.is_err(),
+            "save_goal with traversal id must return Err (safe_id rejects '../')"
+        );
     }
 }
