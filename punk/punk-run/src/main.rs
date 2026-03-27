@@ -21,7 +21,7 @@ enum Command {
     },
     /// Show loaded configuration
     Config,
-    /// Start the daemon (foreground)
+    /// Start the daemon
     Daemon {
         /// Shadow mode: log decisions without dispatching
         #[arg(long)]
@@ -29,6 +29,9 @@ enum Command {
         /// Max concurrent slots
         #[arg(long, default_value_t = 5)]
         slots: u32,
+        /// Run as background service (daemonize)
+        #[arg(long)]
+        background: bool,
     },
     /// Daily briefing: receipts, queue, checkpoints, budget
     Morning,
@@ -46,6 +49,17 @@ enum Command {
     },
     /// Health check: providers, bus, config
     Doctor,
+    /// Test routing rules against a task (dry run)
+    PolicyCheck {
+        /// Project slug
+        project: String,
+        /// Task category
+        #[arg(long, default_value = "codegen")]
+        category: String,
+        /// Priority
+        #[arg(long, default_value = "p1")]
+        priority: String,
+    },
     /// Queue a one-off task for agent dispatch
     Queue {
         /// Project slug
@@ -170,6 +184,8 @@ enum PipelineAction {
     Win { id: u32 },
     /// Mark opportunity as lost
     Lose { id: u32 },
+    /// Show overdue opportunities
+    Stale,
 }
 
 #[derive(Subcommand)]
@@ -208,10 +224,28 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Status { recent, project } => cmd_status(recent, project.as_deref()),
         Command::Config => cmd_config(),
-        Command::Daemon { shadow, slots } => {
+        Command::Daemon { shadow, slots, background } => {
+            if background {
+                // Fork to background
+                let exe = std::env::current_exe().unwrap();
+                let mut cmd = std::process::Command::new(exe);
+                cmd.args(["daemon"]);
+                if shadow { cmd.arg("--shadow"); }
+                if slots != 5 { cmd.args(["--slots", &slots.to_string()]); }
+                cmd.stdin(std::process::Stdio::null());
+                cmd.stdout(std::process::Stdio::null());
+                cmd.stderr(std::fs::File::create(
+                    bus::bus_dir().parent().unwrap_or(&bus::bus_dir()).join("daemon.log")
+                ).map(std::process::Stdio::from).unwrap_or(std::process::Stdio::null()));
+                match cmd.spawn() {
+                    Ok(child) => println!("Daemon started (PID {})", child.id()),
+                    Err(e) => { eprintln!("Failed to start daemon: {e}"); std::process::exit(1); }
+                }
+                return Ok(());
+            }
             // Wire policy.toml max_slots if CLI didn't override
             let effective_slots = if slots != 5 {
-                slots // explicit CLI override
+                slots
             } else if let Ok(cfg) = config::load(&config::config_dir()) {
                 cfg.policy.defaults.max_slots
             } else {
@@ -256,6 +290,9 @@ async fn main() -> anyhow::Result<()> {
             let report = doctor::check_all(&bus_path, &config_dir);
             print!("{}", report.display());
         }
+        Command::PolicyCheck { project, category, priority } => {
+            cmd_policy_check(&project, &category, &priority);
+        }
         Command::Queue {
             project, prompt, agent, category, priority, timeout, budget, worktree, after,
         } => {
@@ -286,6 +323,22 @@ async fn main() -> anyhow::Result<()> {
                 match pipeline::set_stage(&bus_path, id, pipeline::Stage::Won) {
                     Ok(opp) => println!("#{}: WON", opp.id),
                     Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                }
+            }
+            PipelineAction::Stale => {
+                let bus_path = bus::bus_dir();
+                let opps = pipeline::load_pipeline(&bus_path);
+                let today = punk_orch::chrono::Utc::now().format("%Y-%m-%d").to_string();
+                let stale: Vec<_> = opps.iter().filter(|o| {
+                    o.due < today && o.stage != pipeline::Stage::Won && o.stage != pipeline::Stage::Lost
+                }).collect();
+                if stale.is_empty() {
+                    println!("No stale opportunities.");
+                } else {
+                    println!("Stale opportunities ({}):\n", stale.len());
+                    for o in &stale {
+                        println!("  #{} {} ({}) — due {} — {:?}", o.id, o.contact, o.project, o.due, o.stage);
+                    }
                 }
             }
             PipelineAction::Lose { id } => {
@@ -845,6 +898,61 @@ fn cmd_ratchet() {
     } else {
         for d in &directives {
             println!("  {d}");
+        }
+    }
+}
+
+fn cmd_policy_check(project: &str, category: &str, priority: &str) {
+    let config_dir = config::config_dir();
+    match config::load(&config_dir) {
+        Ok(cfg) => {
+            let d = &cfg.policy.defaults;
+            let mut model = d.model.clone();
+            let mut budget = d.budget_usd;
+            let mut timeout = d.timeout_s;
+
+            // Apply matching rules
+            for rule in &cfg.policy.rules {
+                let matches = rule.match_criteria.iter().all(|(k, v)| {
+                    match k.as_str() {
+                        "project" => v == project,
+                        "category" => v == category,
+                        "priority" => v == priority,
+                        _ => false,
+                    }
+                });
+                if matches {
+                    if let Some(m) = rule.set.get("model").and_then(|v| v.as_str()) {
+                        model = m.to_string();
+                    }
+                    if let Some(b) = rule.set.get("budget_usd").and_then(|v| v.as_float()) {
+                        budget = b;
+                    }
+                    if let Some(t) = rule.set.get("timeout_s").and_then(|v| v.as_integer()) {
+                        timeout = t as u64;
+                    }
+                }
+            }
+
+            println!("Policy check (dry run)\n");
+            println!("  Input:    project={project}, category={category}, priority={priority}");
+            println!("  Resolved: model={model}, budget=${budget:.2}, timeout={timeout}s");
+            println!("  Slots:    {}/{}", 0, d.max_slots);
+
+            // Budget pressure
+            let bus_path = bus::bus_dir();
+            let (pressure, spent) = punk_orch::budget::check_pressure(&bus_path, cfg.policy.budget.monthly_ceiling_usd, cfg.policy.budget.soft_alert_pct, cfg.policy.budget.hard_stop_pct);
+            println!("  Budget:   ${spent:.2} / ${:.0} ({pressure:?})", cfg.policy.budget.monthly_ceiling_usd);
+
+            if !punk_orch::budget::priority_allowed(&pressure, priority) {
+                println!("\n  BLOCKED: priority {priority} not allowed at {pressure:?} pressure level");
+            } else {
+                println!("\n  OK: task would be dispatched");
+            }
+        }
+        Err(e) => {
+            eprintln!("Error loading config: {e}");
+            std::process::exit(1);
         }
     }
 }

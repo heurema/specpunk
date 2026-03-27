@@ -230,11 +230,21 @@ async fn dispatch_queued(
             .unwrap_or("")
             .replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy());
 
+        // Inject frozen session context into prompt
+        let raw_prompt = task_json.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let session_ctx = session::load(bus, &entry.project);
+        let session_section = session::format_for_prompt(&session_ctx);
+        let prompt_with_session = if session_section.is_empty() {
+            raw_prompt
+        } else {
+            format!("{session_section}\n---\n\n{raw_prompt}")
+        };
+
         let task_spec = TaskSpec {
             task_id: entry.task_id.clone(),
             project: entry.project.clone(),
             project_path: PathBuf::from(&project_path),
-            prompt: task_json.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            prompt: prompt_with_session,
             model: task_json.get("claude_model").and_then(|v| v.as_str())
                 .or_else(|| task_json.get("model").and_then(|v| v.as_str()))
                 .unwrap_or("")
