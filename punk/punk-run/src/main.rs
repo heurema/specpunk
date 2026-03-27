@@ -15,6 +15,9 @@ enum Command {
         /// Number of recent completed tasks to show
         #[arg(short = 'n', long, default_value_t = 10)]
         recent: usize,
+        /// Filter by project
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Show loaded configuration
     Config,
@@ -43,6 +46,43 @@ enum Command {
     },
     /// Health check: providers, bus, config
     Doctor,
+    /// Queue a one-off task for agent dispatch
+    Queue {
+        /// Project slug
+        project: String,
+        /// Task prompt
+        prompt: String,
+        /// Agent/model (claude, codex, gemini)
+        #[arg(long, default_value = "claude")]
+        agent: String,
+        /// Task category
+        #[arg(long, default_value = "codegen")]
+        category: String,
+        /// Priority (p0, p1, p2)
+        #[arg(long, default_value = "p1")]
+        priority: String,
+        /// Timeout in seconds
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        /// Max budget in USD
+        #[arg(long)]
+        budget: Option<f64>,
+        /// Run in isolated git worktree
+        #[arg(long)]
+        worktree: bool,
+        /// Run after this task completes
+        #[arg(long)]
+        after: Option<String>,
+    },
+    /// Query receipt history
+    Receipts {
+        /// Filter by project
+        #[arg(long)]
+        project: Option<String>,
+        /// Look back N days
+        #[arg(long, default_value_t = 7)]
+        since: i64,
+    },
     /// Goal management (create, list, approve, pause, resume, cancel)
     Goal {
         #[command(subcommand)]
@@ -153,6 +193,10 @@ enum GoalAction {
     Pause { goal_id: String },
     /// Resume a paused goal
     Resume { goal_id: String },
+    /// Adjust goal budget
+    Budget { goal_id: String, usd: f64 },
+    /// Force re-plan (generates new plan, requires re-approval)
+    Replan { goal_id: String },
     /// Cancel a goal
     Cancel { goal_id: String },
 }
@@ -162,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Status { recent } => cmd_status(recent),
+        Command::Status { recent, project } => cmd_status(recent, project.as_deref()),
         Command::Config => cmd_config(),
         Command::Daemon { shadow, slots } => {
             // Wire policy.toml max_slots if CLI didn't override
@@ -211,6 +255,14 @@ async fn main() -> anyhow::Result<()> {
             let config_dir = config::config_dir();
             let report = doctor::check_all(&bus_path, &config_dir);
             print!("{}", report.display());
+        }
+        Command::Queue {
+            project, prompt, agent, category, priority, timeout, budget, worktree, after,
+        } => {
+            cmd_queue(&project, &prompt, &agent, &category, &priority, timeout, budget, worktree, after.as_deref());
+        }
+        Command::Receipts { project, since } => {
+            cmd_receipts(project.as_deref(), since);
         }
         Command::Ask { question } => cmd_ask(&question),
         Command::Pipeline { action } => match action {
@@ -297,15 +349,45 @@ async fn main() -> anyhow::Result<()> {
             GoalAction::Pause { goal_id } => cmd_goal_set_status(&goal_id, goal::GoalStatus::Paused),
             GoalAction::Resume { goal_id } => cmd_goal_set_status(&goal_id, goal::GoalStatus::Active),
             GoalAction::Cancel { goal_id } => cmd_goal_set_status(&goal_id, goal::GoalStatus::Failed),
+            GoalAction::Budget { goal_id, usd } => {
+                let bus_path = bus::bus_dir();
+                let mut g = match goal::load_goal(&bus_path, &goal_id) {
+                    Some(g) => g,
+                    None => { eprintln!("Goal not found: {goal_id}"); std::process::exit(1); }
+                };
+                g.budget_usd = usd;
+                goal::save_goal(&bus_path, &g).ok();
+                println!("{goal_id}: budget -> ${usd:.2}");
+            }
+            GoalAction::Replan { goal_id } => {
+                let bus_path = bus::bus_dir();
+                let mut g = match goal::load_goal(&bus_path, &goal_id) {
+                    Some(g) => g,
+                    None => { eprintln!("Goal not found: {goal_id}"); std::process::exit(1); }
+                };
+                g.plan = None;
+                g.status = goal::GoalStatus::Planning;
+                goal::save_goal(&bus_path, &g).ok();
+                println!("{goal_id}: plan cleared, status -> planning");
+                println!("Re-run: punk-run goal create {} \"{}\"", g.project, g.objective);
+            }
         },
     }
 
     Ok(())
 }
 
-fn cmd_status(recent_limit: usize) {
+fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {
     let bus_path = bus::bus_dir();
-    let state = bus::read_state(&bus_path, recent_limit);
+    let mut state = bus::read_state(&bus_path, recent_limit);
+
+    // Apply project filter
+    if let Some(proj) = project_filter {
+        state.queued.retain(|t| t.project == proj);
+        state.running.retain(|t| t.project == proj);
+        state.done.retain(|t| t.project == proj);
+        state.failed.retain(|t| t.project == proj);
+    }
 
     println!(
         "Running ({} task{})",
@@ -765,6 +847,122 @@ fn cmd_ratchet() {
             println!("  {d}");
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_queue(
+    project: &str, prompt: &str, agent: &str, category: &str,
+    priority: &str, timeout: u64, budget: Option<f64>, worktree: bool, after: Option<&str>,
+) {
+    let bus_path = bus::bus_dir();
+    let config_dir = config::config_dir();
+
+    // Resolve project path from config
+    let project_path = config::load(&config_dir)
+        .ok()
+        .and_then(|cfg| {
+            cfg.projects.projects.iter()
+                .find(|p| p.id == project)
+                .map(|p| p.path.clone())
+        })
+        .unwrap_or_else(|| format!("~/personal/heurema/{project}"));
+
+    let task_id = format!("{}-{}", project, punk_orch::chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+
+    let mut task_json = serde_json::json!({
+        "project": project,
+        "project_path": project_path,
+        "model": agent,
+        "prompt": prompt,
+        "category": category,
+        "timeout_seconds": timeout,
+        "worktree": worktree,
+    });
+
+    if let Some(b) = budget {
+        task_json["max_budget_usd"] = serde_json::json!(b);
+    }
+    if let Some(dep) = after {
+        task_json["depends_on"] = serde_json::json!([dep]);
+    }
+
+    let queue_dir = bus_path.join(format!("new/{priority}"));
+    std::fs::create_dir_all(&queue_dir).ok();
+    let task_path = queue_dir.join(format!("{task_id}.json"));
+
+    match serde_json::to_string_pretty(&task_json) {
+        Ok(data) => {
+            std::fs::write(&task_path, data).unwrap_or_else(|e| {
+                eprintln!("Error writing task: {e}");
+                std::process::exit(1);
+            });
+            println!("Queued: {task_id}");
+            println!("  project:  {project}");
+            println!("  agent:    {agent}");
+            println!("  category: {category}");
+            println!("  priority: {priority}");
+            println!("  timeout:  {timeout}s");
+            if let Some(b) = budget {
+                println!("  budget:   ${b:.2}");
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_receipts(project_filter: Option<&str>, since_days: i64) {
+    let bus_path = bus::bus_dir();
+    let index = bus_path.parent().unwrap_or(&bus_path).join("receipts/index.jsonl");
+
+    let content = match std::fs::read_to_string(&index) {
+        Ok(c) => c,
+        Err(_) => {
+            println!("No receipts found.");
+            return;
+        }
+    };
+
+    let cutoff = (punk_orch::chrono::Utc::now() - punk_orch::chrono::Duration::days(since_days)).to_rfc3339();
+
+    println!(
+        "{:<40} {:<12} {:<8} {:<9} {:>7} {:>6}",
+        "TASK", "PROJECT", "MODEL", "STATUS", "COST", "TIME"
+    );
+
+    let mut count = 0u32;
+    for line in content.lines() {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let ts = v.get("created_at").or_else(|| v.get("completed_at"))
+            .and_then(|t| t.as_str()).unwrap_or("");
+        if ts < cutoff.as_str() { continue; }
+
+        let proj = v.get("project").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(filter) = project_filter {
+            if proj != filter { continue; }
+        }
+
+        let task_id = v.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+        let model = v.get("model").and_then(|v| v.as_str()).unwrap_or("");
+        let status = v.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let cost = v.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let dur = v.get("duration_ms").and_then(|v| v.as_u64())
+            .or_else(|| v.get("duration_seconds").and_then(|v| v.as_u64()).map(|s| s * 1000))
+            .unwrap_or(0) / 1000;
+
+        println!(
+            "{:<40} {:<12} {:<8} {:<9} {:>7} {:>5}s",
+            truncate(task_id, 40), proj, model, status, format_cost(cost), dur
+        );
+        count += 1;
+    }
+    println!("\n{count} receipts (last {since_days}d)");
 }
 
 fn cmd_ask(question: &str) {
