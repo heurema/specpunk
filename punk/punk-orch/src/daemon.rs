@@ -333,8 +333,10 @@ async fn dispatch_queued(
             model: routed_model,
             timeout_s: task_json.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(600),
             budget_usd: task_json.get("max_budget_usd").and_then(|v| v.as_f64()),
-            allowed_tools: task_json.get("allowedTools").and_then(|v| v.as_str()).unwrap_or("Read,Write,Edit,Bash").to_string(),
-            disallowed_tools: task_json.get("disallowedTools").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            allowed_tools: task_json.get("allowedTools").and_then(|v| v.as_str())
+                .unwrap_or("Read,Write,Edit,Bash(*)").to_string(),
+            disallowed_tools: task_json.get("disallowedTools").and_then(|v| v.as_str())
+                .unwrap_or("Bash(git push *),Bash(git remote *),Bash(rm -rf *),Bash(sudo *),Bash(curl *),Bash(wget *)").to_string(),
         };
 
         // Create staging dir
