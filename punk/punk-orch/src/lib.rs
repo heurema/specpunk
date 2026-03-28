@@ -15,6 +15,7 @@ pub mod panel;
 pub mod pipeline;
 pub mod queue;
 pub mod ratchet;
+pub mod recall;
 pub mod receipt;
 pub mod run;
 pub mod sanitize;

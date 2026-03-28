@@ -299,7 +299,11 @@ async fn dispatch_queued(
             .unwrap_or("")
             .replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy());
 
-        // Inject frozen session context into prompt
+        // Pre-action recall: inject relevant knowledge before dispatch (punk recall)
+        let recall_events = crate::recall::recall(bus, &entry.project, Some(&entry.project), 3);
+        let recall_section = crate::recall::format_recall(&recall_events);
+
+        // Inject frozen session context + recall into prompt
         let raw_prompt = task_json.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
         // Model resolution: agent config > task field > smart routing
@@ -319,10 +323,11 @@ async fn dispatch_queued(
 
         let session_ctx = session::load(bus, &entry.project);
         let session_section = session::format_for_prompt(&session_ctx);
-        let prompt_with_session = if session_section.is_empty() {
+        let context_prefix = format!("{recall_section}{session_section}");
+        let prompt_with_session = if context_prefix.trim().is_empty() {
             raw_prompt
         } else {
-            format!("{session_section}\n---\n\n{raw_prompt}")
+            format!("{context_prefix}\n---\n\n{raw_prompt}")
         };
 
         let task_spec = TaskSpec {
@@ -573,6 +578,13 @@ async fn collect_completed(
                         log_event(bus, "failed", &format!(",\"task\":\"{task_id}\",\"reason\":\"{reason:?}\",\"attempts\":{}", task.run.attempt));
 
                         session::add_from_receipt(bus, project, &task_id, "failure", 0.0, 0.0, &format!("{reason:?}"));
+
+                        // Auto-capture to knowledge store (punk recall)
+                        crate::recall::capture_from_failure(
+                            bus, &task_id, project, &format!("{reason:?}"),
+                            &stderr.lines().take(3).collect::<Vec<_>>().join("\n"),
+                            &receipt.artifacts,
+                        );
                     }
                 }
             }
@@ -658,6 +670,13 @@ async fn reap_stale(
         fs::remove_file(bus.join("cur").join(format!("{}.json", s.task_id))).ok();
         heartbeats.unregister(&s.task_id);
         log_event(bus, "timeout", &format!(",\"task\":\"{}\",\"age\":{}", s.task_id, s.age_s));
+
+        // Auto-capture timeout to knowledge store
+        crate::recall::capture_from_failure(
+            bus, &s.task_id, "unknown", "Timeout",
+            &format!("Task stale after {}s (limit: {}s)", s.age_s, s.timeout_s),
+            &[],
+        );
     }
 }
 

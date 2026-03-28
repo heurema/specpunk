@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use punk_orch::{bus, config, daemon, diverge, doctor, goal, graph, morning, ops, panel, pipeline, ratchet, skill};
+use punk_orch::{bus, config, daemon, diverge, doctor, goal, graph, morning, ops, panel, pipeline, ratchet, recall, skill};
 
 #[derive(Parser)]
 #[command(name = "punk-run", version, about = "Specpunk agent orchestration")]
@@ -137,6 +137,30 @@ enum Command {
     },
     /// Weekly performance comparison (metric ratchet)
     Ratchet,
+    /// Pre-action knowledge recall — find past failures relevant to a task
+    Recall {
+        /// Search query (project, topic, or task description)
+        query: String,
+        /// Filter by project
+        #[arg(long)]
+        project: Option<String>,
+        /// Max results
+        #[arg(short = 'n', long, default_value_t = 5)]
+        limit: usize,
+    },
+    /// Add a manual knowledge event (lesson, invariant)
+    Remember {
+        /// Project slug
+        project: String,
+        /// What happened or what to remember
+        context: String,
+        /// Why this matters
+        #[arg(long)]
+        why: String,
+        /// Event type: failure, lesson, invariant
+        #[arg(long, default_value = "lesson")]
+        kind: String,
+    },
     /// On-demand charts (cost, project distribution)
     Graph {
         /// Chart type: cost or project
@@ -380,6 +404,28 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
+        Command::Recall { query, project, limit } => {
+            let bus_path = bus::bus_dir();
+            let events = recall::recall(&bus_path, &query, project.as_deref(), limit);
+            if events.is_empty() {
+                println!("No relevant knowledge found for: {query}");
+            } else {
+                print!("{}", recall::format_recall(&events));
+            }
+        }
+        Command::Remember { project, context, why, kind } => {
+            let bus_path = bus::bus_dir();
+            let event_kind = match kind.as_str() {
+                "invariant" => recall::EventKind::Invariant,
+                "failure" => recall::EventKind::Failure,
+                "lesson" => recall::EventKind::Lesson,
+                _ => recall::EventKind::Lesson,
+            };
+            match recall::add_manual(&bus_path, &project, event_kind, &context, &why) {
+                Ok(()) => println!("Remembered: [{kind}] {context}"),
+                Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+            }
+        }
         Command::Ratchet => cmd_ratchet(),
         Command::Graph { chart_type, since } => {
             let bus_path = bus::bus_dir();
