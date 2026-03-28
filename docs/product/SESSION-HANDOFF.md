@@ -48,10 +48,17 @@ receipt, run, sanitize, session, skill, task, triage
 5. **Skills**: create project-specific skills in `~/vicc/state/skills/`
 
 ## Not Done (deferred)
+- **Phase 5: Zero-config** (ROADMAP-v2.md) — lazy project resolver, TOML optional, autodetect agents
 - OAuth API fast path for `punk-run ask` (optimization)
 - Parallel tool safety classification
 - punk recall distillation (events → invariants)
 - cargo publish to crates.io
+
+## Architecture Decisions (must follow in ALL future work)
+1. **Central orchestrator** — user never cd's into projects. punk dispatches INTO them.
+2. **Zero-config first** — no config before first success. TOML = optional power-user override.
+3. **CLI smart, daemon dumb** — CLI resolves project names → absolute path. Daemon only dispatches.
+4. **Identity check before coding** — does this feature assume CWD=project? Does it require config before first success? Does it make daemon smarter? If any = yes → redesign.
 
 ## How To Read Code
 1. `punk-orch/src/daemon.rs` — main loop, dispatch, completion handling

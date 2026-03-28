@@ -116,7 +116,7 @@ Never jump to implementation from the step title alone.
 | 0.1 | receipt.schema.json v1 + validation in bash supervisor | 2-4h | 0.2 |
 | 0.2 | receipts/index.jsonl append in bash | 2h | 0.3 |
 | 0.3 | `punk-run status` command (reads bash supervisor state, read-only) | 1d | morning |
-| 0.4 | projects.toml + agents.toml + policy.toml + `punk-run config` | 1d | Phase 1 |
+| 0.4 | TOML config (optional override) + `punk-run config` + built-in defaults | 1d | Phase 1 |
 
 **Architecture note:** punk-core/punk-cli = FROZEN (verification). punk-orch/punk-run = all new code. Same workspace, separate namespaces. No module conflicts.
 
@@ -207,6 +207,41 @@ Phase 3: goals = the differentiator vs Paperclip.
 Phase 4: polish and optimization.
 
 **Binary strategy:** punk-run is the new product. punk (verify) stays frozen.
+
+---
+
+## Phase 5: Zero-Config & Polish
+
+**Goal:** Remove mandatory TOML setup. First task dispatches without any config files.
+**Status:** designed (2026-03-28, arbiter panel consensus: Codex + Gemini + Claude)
+
+| Step | What | Effort | Blocks |
+|------|------|--------|--------|
+| 5.1 | Project resolver: lazy cache + scan roots + ambiguity handling | 1d | 5.2 |
+| 5.2 | Zero-config fallbacks: agents autodetect, built-in policy defaults | 4h | 5.3 |
+| 5.3 | `punk-run use/resolve/forget/projects/init` commands | 4h | — |
+| 5.4 | Config load fallback chain: TOML override > cache > autodetect > built-in | 4h | — |
+| 5.5 | Remove mandatory TOML requirement from daemon + queue | 2h | — |
+
+**Architecture decision (ADR-2026-03-28):**
+- projects.toml = OPTIONAL override, not mandatory. Cache = `~/.cache/punk/projects.json`
+- agents.toml = OPTIONAL override. Agents autodetected from PATH.
+- policy.toml = OPTIONAL override. Built-in safe defaults in code.
+- Resolution chain: CLI resolves project name → absolute path → writes to task.json. Daemon only dispatches resolved paths.
+- Three levels: L0 (zero files), L1 (auto-cache), L2 (TOML override)
+- Identity check: punk = central orchestrator, NOT per-project tool. Never assume CWD = project.
+
+**Done when:** `cargo install punk-run && punk-run queue signum "fix bug"` works without any config files.
+
+---
+
+## Design Principles (applies to ALL phases)
+
+1. **Central orchestrator** — user never cd's into projects. punk-run dispatches INTO them.
+2. **Zero-config first** — no config required before first successful task. TOML = optional override.
+3. **CLI smart, daemon dumb** — CLI resolves names, builds context, triages. Daemon only dispatches resolved tasks.
+4. **Don't duplicate** — punk orchestrates. It doesn't replace Claude Code, arbiter, delve, or loci.
+5. **Scale to N projects** — every feature must work across 5-10 projects from one place.
 Merge into one binary only after Phase 3 stabilizes + product narrative clear.
 
 ---
