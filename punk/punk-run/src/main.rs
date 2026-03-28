@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use punk_orch::{bus, config, daemon, diverge, doctor, goal, graph, morning, ops, panel, pipeline, ratchet, recall, skill};
+use punk_orch::{bus, config, context, daemon, diverge, doctor, goal, graph, morning, ops, panel, pipeline, ratchet, recall, skill};
 
 #[derive(Parser)]
 #[command(name = "punk-run", version, about = "Specpunk agent orchestration")]
@@ -137,6 +137,11 @@ enum Command {
     },
     /// Weekly performance comparison (metric ratchet)
     Ratchet,
+    /// Show unified project context (guidance + skills + recall + session + stats)
+    Context {
+        /// Project slug
+        project: String,
+    },
     /// Pre-action knowledge recall — find past failures relevant to a task
     Recall {
         /// Search query (project, topic, or task description)
@@ -404,6 +409,11 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
+        Command::Context { project } => {
+            let bus_path = bus::bus_dir();
+            let config_dir = config::config_dir();
+            print!("{}", context::format_context_report(&bus_path, &project, &config_dir));
+        }
         Command::Recall { query, project, limit } => {
             let bus_path = bus::bus_dir();
             let events = recall::recall(&bus_path, &query, project.as_deref(), limit);

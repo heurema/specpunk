@@ -2,6 +2,8 @@ pub use chrono;
 
 pub mod adapter;
 pub mod budget;
+pub mod context;
+pub mod followup;
 pub mod bus;
 pub mod config;
 pub mod daemon;
@@ -22,3 +24,4 @@ pub mod sanitize;
 pub mod session;
 pub mod skill;
 pub mod task;
+pub mod triage;

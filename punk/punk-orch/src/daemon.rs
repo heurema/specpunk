@@ -299,16 +299,21 @@ async fn dispatch_queued(
             .unwrap_or("")
             .replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy());
 
-        // Pre-action recall: inject relevant knowledge before dispatch (punk recall)
-        let recall_events = crate::recall::recall(bus, &entry.project, Some(&entry.project), 3);
-        let recall_section = crate::recall::format_recall(&recall_events);
-
-        // Inject frozen session context + recall into prompt
         let raw_prompt = task_json.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        // Auto-triage: infer category if not specified
+        let task_category = task_json.get("category")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let effective_category = if task_category.is_empty() {
+            crate::triage::infer_category(&raw_prompt)
+        } else {
+            task_category
+        };
 
         // Model resolution: agent config > task field > smart routing
         let explicit_model = if !agent_model.is_empty() {
-            agent_model.clone() // from agents.toml
+            agent_model.clone()
         } else {
             task_json.get("claude_model").and_then(|v| v.as_str())
                 .or_else(|| task_json.get("model_override").and_then(|v| v.as_str()))
@@ -321,20 +326,23 @@ async fn dispatch_queued(
             run::route_model(&raw_prompt, &explicit_model)
         };
 
-        let session_ctx = session::load(bus, &entry.project);
-        let session_section = session::format_for_prompt(&session_ctx);
-        let context_prefix = format!("{recall_section}{session_section}");
-        let prompt_with_session = if context_prefix.trim().is_empty() {
+        // Unified context injection (Linear Next pattern):
+        // agent guidance + skills + recall + session + project stats
+        let context_pack = crate::context::ContextPack::build(
+            bus, &entry.project, effective_category, &agent_id, &config_dir,
+        );
+        let context_prefix = context_pack.format();
+        let prompt_with_context = if context_prefix.is_empty() {
             raw_prompt
         } else {
-            format!("{context_prefix}\n---\n\n{raw_prompt}")
+            format!("{context_prefix}{raw_prompt}")
         };
 
         let task_spec = TaskSpec {
             task_id: entry.task_id.clone(),
             project: entry.project.clone(),
             project_path: PathBuf::from(&project_path),
-            prompt: prompt_with_session,
+            prompt: prompt_with_context,
             model: routed_model,
             timeout_s: task_json.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(600),
             budget_usd: task_json.get("max_budget_usd").and_then(|v| v.as_f64()),
@@ -477,6 +485,15 @@ async fn collect_completed(
                         fs::write(skill_path, data).ok();
                         log_event(bus, "skill_authoring_queued", &format!(",\"task\":\"{task_id}\",\"trigger\":\"complex_task\""));
                     }
+                }
+
+                // Follow-up task extraction (Linear Next pattern)
+                let followups = crate::followup::extract_and_queue(
+                    bus, &task_id, project, &result.stdout_path,
+                );
+                if !followups.is_empty() {
+                    eprintln!("daemon: {} follow-up(s) queued from {task_id}: {}", followups.len(), followups.join(", "));
+                    log_event(bus, "followups_queued", &format!(",\"task\":\"{task_id}\",\"count\":{}", followups.len()));
                 }
             } else {
                 // Failure — classify and maybe retry
