@@ -295,16 +295,18 @@ pub fn queue_ready_steps(bus: &Path, goal: &mut Goal) -> Vec<String> {
 
         // Create task file in bus queue
         let task_id = format!("{}-step{}", goal.id, step.step);
-        // Resolve project path from config, fallback to convention
+        // Resolve project path via resolver chain
         let config_dir = crate::config::config_dir();
-        let project_path = crate::config::load(&config_dir)
-            .ok()
-            .and_then(|cfg| {
-                cfg.projects.projects.iter()
-                    .find(|p| p.id == goal.project)
-                    .map(|p| p.path.clone())
-            })
-            .unwrap_or_else(|| format!("~/personal/heurema/{}", goal.project));
+        let cfg = match crate::config::load_or_default(&config_dir) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("Goal queue config error: {e}");
+                return queued;
+            }
+        };
+        let project_path = crate::resolver::resolve(&goal.project, None, Some(&cfg))
+            .map(|r| r.path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| format!("~/personal/heurema/{}", goal.project));
 
         let task_json = serde_json::json!({
             "project": goal.project,

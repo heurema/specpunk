@@ -157,6 +157,148 @@ fn load_toml<T: serde::de::DeserializeOwned>(dir: &Path, filename: &str) -> Resu
     })
 }
 
+fn load_optional_toml<T: serde::de::DeserializeOwned>(
+    dir: &Path,
+    filename: &str,
+) -> Result<Option<T>, ConfigError> {
+    let path = dir.join(filename);
+    match fs::read_to_string(&path) {
+        Ok(content) => toml::from_str(&content)
+            .map(Some)
+            .map_err(|e| ConfigError::ParseError {
+                file: filename.to_string(),
+                source: e,
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ConfigError::ReadError {
+            file: filename.to_string(),
+            source: e,
+        }),
+    }
+}
+
+// --- Zero-config fallbacks ---
+
+/// Load config with graceful fallbacks for missing files, but fail explicitly
+/// when an existing config file is unreadable or invalid.
+/// L0: no files at all -> built-in defaults
+/// L1: partial files -> loads what exists, defaults for rest
+/// L2: full TOML -> current behavior
+pub fn load_or_default(dir: &Path) -> Result<Config, ConfigError> {
+    let projects = load_optional_toml::<ProjectsFile>(dir, "projects.toml")?
+        .unwrap_or(ProjectsFile { projects: vec![] });
+
+    let agents = load_optional_toml::<AgentsFile>(dir, "agents.toml")?
+        .unwrap_or_else(detect_agents);
+
+    let policy = load_optional_toml::<PolicyFile>(dir, "policy.toml")?
+        .unwrap_or_else(default_policy);
+
+    Ok(Config {
+        projects,
+        agents,
+        policy,
+        dir: dir.to_path_buf(),
+    })
+}
+
+/// Detect available agents by checking which CLIs are in PATH.
+pub fn detect_agents() -> AgentsFile {
+    detect_agents_with(which_exists)
+}
+
+fn detect_agents_with<F>(mut exists: F) -> AgentsFile
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut agents = HashMap::new();
+    for (name, provider, model) in [
+        ("claude", "claude", "sonnet"),
+        ("codex", "codex", "o4-mini"),
+        ("gemini", "gemini", "gemini-2.5-flash"),
+    ] {
+        if exists(name) {
+            agents.insert(
+                name.to_string(),
+                Agent {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    role: "engineer".to_string(),
+                    invoke: "cli".to_string(),
+                    budget_usd: default_budget(),
+                    system_prompt: None,
+                    skills: vec![],
+                },
+            );
+        }
+    }
+    AgentsFile { agents }
+}
+
+/// Built-in safe policy defaults.
+pub fn default_policy() -> PolicyFile {
+    PolicyFile {
+        defaults: PolicyDefaults {
+            model: default_model(),
+            budget_usd: default_budget(),
+            timeout_s: default_timeout(),
+            max_slots: default_slots(),
+        },
+        budget: BudgetPolicy {
+            monthly_ceiling_usd: default_ceiling(),
+            soft_alert_pct: default_soft(),
+            hard_stop_pct: default_hard(),
+        },
+        rules: vec![],
+        features: HashMap::new(),
+    }
+}
+
+/// Report which config files are present.
+#[derive(Debug)]
+pub struct ConfigStatus {
+    pub dir: PathBuf,
+    pub has_projects: bool,
+    pub has_agents: bool,
+    pub has_policy: bool,
+}
+
+impl ConfigStatus {
+    pub fn is_complete(&self) -> bool {
+        self.has_projects && self.has_agents && self.has_policy
+    }
+    pub fn is_empty(&self) -> bool {
+        !self.has_projects && !self.has_agents && !self.has_policy
+    }
+    pub fn present_count(&self) -> u32 {
+        [self.has_projects, self.has_agents, self.has_policy]
+            .iter()
+            .filter(|&&v| v)
+            .count() as u32
+    }
+}
+
+pub fn config_status(dir: &Path) -> ConfigStatus {
+    ConfigStatus {
+        dir: dir.to_path_buf(),
+        has_projects: dir.join("projects.toml").is_file(),
+        has_agents: dir.join("agents.toml").is_file(),
+        has_policy: dir.join("policy.toml").is_file(),
+    }
+}
+
+fn which_exists(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// --- Defaults ---
+
 fn default_true() -> bool {
     true
 }
@@ -183,4 +325,52 @@ fn default_soft() -> u32 {
 }
 fn default_hard() -> u32 {
     95
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn load_or_default_rejects_invalid_existing_projects_toml() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("projects.toml"), "[[projects]\nid = \"broken\"").unwrap();
+
+        let err = load_or_default(tmp.path()).unwrap_err();
+        match err {
+            ConfigError::ParseError { file, .. } => assert_eq!(file, "projects.toml"),
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_or_default_rejects_invalid_existing_agents_toml() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("agents.toml"), "[agents.claude").unwrap();
+
+        let err = load_or_default(tmp.path()).unwrap_err();
+        match err {
+            ConfigError::ParseError { file, .. } => assert_eq!(file, "agents.toml"),
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_or_default_rejects_invalid_existing_policy_toml() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("policy.toml"), "[defaults").unwrap();
+
+        let err = load_or_default(tmp.path()).unwrap_err();
+        match err {
+            ConfigError::ParseError { file, .. } => assert_eq!(file, "policy.toml"),
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detect_agents_returns_empty_when_no_supported_cli_is_installed() {
+        let agents = detect_agents_with(|_| false);
+        assert!(agents.agents.is_empty());
+    }
 }

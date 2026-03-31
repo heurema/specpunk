@@ -75,7 +75,7 @@ impl ContextPack {
 
 /// Load agent guidance from system_prompt file in agents.toml.
 fn load_agent_guidance(config_dir: &Path, agent_id: &str) -> Option<String> {
-    let cfg = crate::config::load(config_dir).ok()?;
+    let cfg = crate::config::load_or_default(config_dir).ok()?;
     let agent = cfg.agents.agents.get(agent_id)?;
     let prompt_path = agent.system_prompt.as_ref()?;
 

@@ -79,48 +79,54 @@ pub fn briefing(bus_path: &Path, config_dir: &Path) -> String {
         out.push('\n');
     }
 
-    // Config summary
-    if let Ok(cfg) = config::load(config_dir) {
-        let active_projects: Vec<_> = cfg
-            .projects
-            .projects
-            .iter()
-            .filter(|p| p.active)
-            .collect();
-
-        // Checkpoints coming up
-        let upcoming: Vec<_> = active_projects
-            .iter()
-            .filter(|p| !p.checkpoint.is_empty())
-            .filter_map(|p| {
-                chrono::NaiveDate::parse_from_str(&p.checkpoint, "%Y-%m-%d")
-                    .ok()
-                    .map(|d| (&p.id, d))
-            })
-            .filter(|(_, d)| {
-                let days = (*d - now.date_naive()).num_days();
-                (0..=14).contains(&days)
-            })
-            .collect();
-
-        if !upcoming.is_empty() {
-            out.push_str("### Upcoming Checkpoints\n");
-            for (id, date) in &upcoming {
-                let days = (*date - now.date_naive()).num_days();
-                out.push_str(&format!("  {} -- {} ({} days)\n", id, date, days));
-            }
-            out.push('\n');
+    // Config summary (always works, uses defaults if no TOML)
+    let cfg = match config::load_or_default(config_dir) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            out.push_str("### Config Error\n");
+            out.push_str(&format!("  {e}\n\n"));
+            return out;
         }
+    };
+    let active_projects: Vec<_> = cfg
+        .projects
+        .projects
+        .iter()
+        .filter(|p| p.active)
+        .collect();
 
-        // Budget
-        let budget_ceiling = cfg.policy.budget.monthly_ceiling_usd;
-        if budget_ceiling > 0.0 {
-            let pct = (cost_7d / budget_ceiling * 100.0).min(999.0);
-            out.push_str(&format!(
-                "### Budget\n  ${:.2} / ${:.0} monthly (est {:.0}% at 7d rate)\n\n",
-                cost_7d, budget_ceiling, pct
-            ));
+    // Checkpoints coming up
+    let upcoming: Vec<_> = active_projects
+        .iter()
+        .filter(|p| !p.checkpoint.is_empty())
+        .filter_map(|p| {
+            chrono::NaiveDate::parse_from_str(&p.checkpoint, "%Y-%m-%d")
+                .ok()
+                .map(|d| (&p.id, d))
+        })
+        .filter(|(_, d)| {
+            let days = (*d - now.date_naive()).num_days();
+            (0..=14).contains(&days)
+        })
+        .collect();
+
+    if !upcoming.is_empty() {
+        out.push_str("### Upcoming Checkpoints\n");
+        for (id, date) in &upcoming {
+            let days = (*date - now.date_naive()).num_days();
+            out.push_str(&format!("  {} -- {} ({} days)\n", id, date, days));
         }
+        out.push('\n');
+    }
+
+    // Budget
+    let budget_ceiling = cfg.policy.budget.monthly_ceiling_usd;
+    if budget_ceiling > 0.0 {
+        let pct = (cost_7d / budget_ceiling * 100.0).min(999.0);
+        out.push_str(&format!(
+            "### Budget\n  ${:.2} / ${:.0} monthly (est {:.0}% at 7d rate)\n\n",
+            cost_7d, budget_ceiling, pct
+        ));
     }
 
     out
