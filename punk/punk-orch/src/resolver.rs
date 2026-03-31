@@ -306,31 +306,37 @@ pub fn scan_all_roots() -> Vec<ResolvedProject> {
     projects
 }
 
-/// Merge all known projects from TOML + cache + scan. Dedupe by id (TOML wins over cache).
+/// Merge all known projects from scan + cache + TOML. Dedupe by id while
+/// preserving runtime resolution precedence: pinned > TOML > cached scan > lazy scan.
 pub fn list_known(config: Option<&Config>) -> Vec<ResolvedProject> {
+    merge_known_projects(config, &load_cache(), scan_all_roots())
+}
+
+fn merge_known_projects(
+    config: Option<&Config>,
+    cache: &ProjectCache,
+    scanned: Vec<ResolvedProject>,
+) -> Vec<ResolvedProject> {
     let mut by_id: HashMap<String, ResolvedProject> = HashMap::new();
 
     // Scan roots (lowest priority)
-    for p in scan_all_roots() {
+    for p in scanned {
         by_id.entry(p.id.clone()).or_insert(p);
     }
 
-    // Cache (medium priority)
-    let cache = load_cache();
+    // Cache (medium priority for non-pinned entries)
     for entry in &cache.projects {
+        if entry.pinned {
+            continue;
+        }
         let path = PathBuf::from(&entry.path);
         if path.is_dir() {
-            let source = if entry.pinned {
-                ResolveSource::Pinned
-            } else {
-                ResolveSource::CachedScan
-            };
             by_id.insert(
                 entry.id.clone(),
                 ResolvedProject {
                     id: entry.id.clone(),
                     path,
-                    source,
+                    source: ResolveSource::CachedScan,
                     stack: entry.stack.clone(),
                 },
             );
@@ -355,6 +361,25 @@ pub fn list_known(config: Option<&Config>) -> Vec<ResolvedProject> {
                     } else {
                         Some(proj.stack.clone())
                     },
+                },
+            );
+        }
+    }
+
+    // Pinned aliases (highest priority, consistent with runtime resolution)
+    for entry in &cache.projects {
+        if !entry.pinned {
+            continue;
+        }
+        let path = PathBuf::from(&entry.path);
+        if path.is_dir() {
+            by_id.insert(
+                entry.id.clone(),
+                ResolvedProject {
+                    id: entry.id.clone(),
+                    path,
+                    source: ResolveSource::Pinned,
+                    stack: entry.stack.clone(),
                 },
             );
         }
@@ -467,6 +492,48 @@ mod tests {
             }
             other => panic!("expected configured path error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn list_known_keeps_pinned_aliases_ahead_of_toml_entries() {
+        let tmp = TempDir::new().unwrap();
+        let pinned = make_project_dir(tmp.path(), "pinned-proj");
+        let toml = make_project_dir(tmp.path(), "toml-proj");
+
+        let cache = ProjectCache {
+            version: 1,
+            updated_at: String::new(),
+            projects: vec![CachedProject {
+                id: "same-proj".to_string(),
+                path: pinned.to_string_lossy().to_string(),
+                pinned: true,
+                stack: Some("rust".to_string()),
+                discovered_at: String::new(),
+            }],
+        };
+
+        let cfg = crate::config::Config {
+            projects: crate::config::ProjectsFile {
+                projects: vec![crate::config::Project {
+                    id: "same-proj".to_string(),
+                    path: toml.to_string_lossy().to_string(),
+                    stack: "rust".to_string(),
+                    active: true,
+                    budget_usd: 0.0,
+                    checkpoint: String::new(),
+                }],
+            },
+            agents: crate::config::AgentsFile {
+                agents: HashMap::new(),
+            },
+            policy: crate::config::default_policy(),
+            dir: PathBuf::new(),
+        };
+
+        let listed = merge_known_projects(Some(&cfg), &cache, vec![]);
+        let project = listed.into_iter().find(|p| p.id == "same-proj").unwrap();
+        assert_eq!(project.source, ResolveSource::Pinned);
+        assert_eq!(project.path, pinned);
     }
 
     #[test]

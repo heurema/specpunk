@@ -890,14 +890,20 @@ fn cmd_approve(goal_id: &str) {
         println!("\n  Total estimated: ${total_cost:.2} / ${:.2} budget", g.budget_usd);
     }
 
-    // Approve
+    // Queue first ready steps
+    let queued = match goal::queue_ready_steps(&bus_path, &mut g) {
+        Ok(queued) => queued,
+        Err(e) => {
+            eprintln!("Error queueing initial goal steps: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Approve only after queueing succeeds
     if let Some(ref mut plan) = g.plan {
         plan.approved_at = Some(punk_orch::chrono::Utc::now());
     }
     g.status = goal::GoalStatus::Active;
-
-    // Queue first ready steps
-    let queued = goal::queue_ready_steps(&bus_path, &mut g);
 
     if let Err(e) = goal::save_goal(&bus_path, &g) {
         eprintln!("Error saving goal: {e}");
@@ -1319,9 +1325,7 @@ fn cmd_use(name: &str, path: &str) {
 }
 
 fn cmd_resolve(name: &str, cli_path: Option<&str>) {
-    let path = cli_path.map(expand_path);
-    let cfg = load_config_or_exit(&config::config_dir());
-    match resolver::resolve(name, path.as_deref(), Some(&cfg)) {
+    match resolve_for_cli(name, cli_path, &config::config_dir()) {
         Ok(r) => {
             println!("Resolved: {}", r.id);
             println!("  path:   {}", r.path.display());
@@ -1336,6 +1340,19 @@ fn cmd_resolve(name: &str, cli_path: Option<&str>) {
             std::process::exit(1);
         }
     }
+}
+
+fn resolve_for_cli(
+    name: &str,
+    cli_path: Option<&str>,
+    config_dir: &Path,
+) -> Result<resolver::ResolvedProject, String> {
+    let path = cli_path.map(expand_path);
+    if path.is_some() {
+        return resolver::resolve(name, path.as_deref(), None).map_err(|e| e.to_string());
+    }
+    let cfg = config::load_or_default(config_dir).map_err(|e| format!("Config error in {}: {e}", config_dir.display()))?;
+    resolver::resolve(name, None, Some(&cfg)).map_err(|e| e.to_string())
 }
 
 fn cmd_forget(name: &str) {
@@ -1616,5 +1633,22 @@ mod tests {
                 .any(|n| n.contains("Skipped agents.toml"))
         );
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_for_cli_path_bypasses_broken_config() {
+        let repo = temp_test_dir("punk-run-resolve-cli-path");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let config_dir = temp_test_dir("punk-run-broken-config");
+        fs::write(config_dir.join("agents.toml"), "[agents.claude").unwrap();
+
+        let resolved = resolve_for_cli("demo", Some(repo.to_string_lossy().as_ref()), &config_dir)
+            .expect("cli path should bypass broken config");
+        assert_eq!(resolved.source, ResolveSource::CliPath);
+        assert_eq!(resolved.path, fs::canonicalize(&repo).unwrap());
+
+        let _ = fs::remove_dir_all(&config_dir);
+        let _ = fs::remove_dir_all(&repo);
     }
 }
