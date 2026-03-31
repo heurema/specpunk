@@ -72,6 +72,14 @@ pub enum StepStatus {
     Skipped,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum QueueReadyError {
+    #[error("goal queue config error: {0}")]
+    Config(#[from] crate::config::ConfigError),
+    #[error("failed to queue goal step task: {0}")]
+    Write(#[from] std::io::Error),
+}
+
 // --- Storage ---
 
 fn goals_dir(bus: &Path) -> PathBuf {
@@ -268,13 +276,16 @@ fn extract_json_array(text: &str) -> Option<String> {
 }
 
 /// Queue the next ready steps of a goal as tasks.
-pub fn queue_ready_steps(bus: &Path, goal: &mut Goal) -> Vec<String> {
+pub fn queue_ready_steps(bus: &Path, goal: &mut Goal) -> Result<Vec<String>, QueueReadyError> {
     let mut queued = Vec::new();
 
     let plan = match goal.plan.as_mut() {
         Some(p) => p,
-        None => return queued,
+        None => return Ok(queued),
     };
+
+    let config_dir = crate::config::config_dir();
+    let cfg = crate::config::load_or_default(&config_dir)?;
 
     let done_steps: Vec<u32> = plan
         .steps
@@ -295,16 +306,9 @@ pub fn queue_ready_steps(bus: &Path, goal: &mut Goal) -> Vec<String> {
 
         // Create task file in bus queue
         let task_id = format!("{}-step{}", goal.id, step.step);
-        // Resolve project path from config, fallback to convention
-        let config_dir = crate::config::config_dir();
-        let project_path = crate::config::load(&config_dir)
-            .ok()
-            .and_then(|cfg| {
-                cfg.projects.projects.iter()
-                    .find(|p| p.id == goal.project)
-                    .map(|p| p.path.clone())
-            })
-            .unwrap_or_else(|| format!("~/personal/heurema/{}", goal.project));
+        let project_path = crate::resolver::resolve(&goal.project, None, Some(&cfg))
+            .map(|r| r.path.to_string_lossy().to_string())
+            .unwrap_or_else(|_| format!("~/personal/heurema/{}", goal.project));
 
         let task_json = serde_json::json!({
             "project": goal.project,
@@ -319,16 +323,15 @@ pub fn queue_ready_steps(bus: &Path, goal: &mut Goal) -> Vec<String> {
         });
 
         let queue_path = bus.join("new/p1").join(format!("{task_id}.json"));
-        if let Ok(data) = serde_json::to_string_pretty(&task_json) {
-            if fs::write(&queue_path, data).is_ok() {
-                step.status = StepStatus::Running;
-                step.task_id = Some(task_id.clone());
-                queued.push(task_id);
-            }
-        }
+        let data = serde_json::to_string_pretty(&task_json)
+            .map_err(std::io::Error::other)?;
+        fs::write(&queue_path, data)?;
+        step.status = StepStatus::Running;
+        step.task_id = Some(task_id.clone());
+        queued.push(task_id);
     }
 
-    queued
+    Ok(queued)
 }
 
 fn provider_from_agent(agent: &str) -> String {
@@ -632,7 +635,7 @@ mod tests {
 
                 handles.push(thread::spawn(move || {
                     barrier.wait();
-                    let queued = queue_ready_steps(&bus_clone, &mut goal_clone);
+                    let queued = queue_ready_steps(&bus_clone, &mut goal_clone).unwrap();
                     all_queued.lock().unwrap().extend(queued);
                 }));
             }

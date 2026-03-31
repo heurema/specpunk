@@ -1,5 +1,7 @@
+use std::path::{Path, PathBuf};
+
 use clap::{Parser, Subcommand};
-use punk_orch::{bus, config, context, daemon, diverge, doctor, goal, graph, morning, ops, panel, pipeline, ratchet, recall, skill};
+use punk_orch::{bus, config, context, daemon, diverge, doctor, goal, graph, morning, ops, panel, pipeline, ratchet, recall, resolver, skill};
 
 #[derive(Parser)]
 #[command(name = "punk-run", version, about = "Specpunk agent orchestration")]
@@ -175,6 +177,30 @@ enum Command {
         #[arg(long, default_value_t = 14)]
         since: i64,
     },
+    /// Pin a project alias to a local path
+    Use {
+        /// Project slug
+        name: String,
+        /// Path to project root
+        path: String,
+    },
+    /// Show how a project name resolves (resolution chain)
+    Resolve {
+        /// Project name
+        name: String,
+        /// Explicit path override
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Remove a pinned project alias from cache
+    Forget {
+        /// Project name to unpin
+        name: String,
+    },
+    /// List all known projects (TOML + cache + discovered)
+    Projects,
+    /// Generate config files from detected environment
+    Init,
 }
 
 #[derive(Subcommand)]
@@ -272,13 +298,11 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            // Wire policy.toml max_slots if CLI didn't override
+            // Wire policy max_slots if CLI didn't override
             let effective_slots = if slots != 5 {
                 slots
-            } else if let Ok(cfg) = config::load(&config::config_dir()) {
-                cfg.policy.defaults.max_slots
             } else {
-                slots
+                load_config_or_exit(&config::config_dir()).policy.defaults.max_slots
             };
             let dcfg = daemon::DaemonConfig {
                 shadow,
@@ -481,6 +505,11 @@ async fn main() -> anyhow::Result<()> {
                 println!("Re-run: punk-run goal create {} \"{}\"", g.project, g.objective);
             }
         },
+        Command::Use { name, path } => cmd_use(&name, &path),
+        Command::Resolve { name, path } => cmd_resolve(&name, path.as_deref()),
+        Command::Forget { name } => cmd_forget(&name),
+        Command::Projects => cmd_projects(),
+        Command::Init => cmd_init(),
     }
 
     Ok(())
@@ -595,81 +624,90 @@ fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {
 
 fn cmd_config() {
     let dir = config::config_dir();
-    println!("Config dir: {}\n", dir.display());
+    let status = config::config_status(&dir);
+    let label = if status.is_complete() {
+        "complete"
+    } else if status.is_empty() {
+        "using defaults"
+    } else {
+        "partial"
+    };
+    println!("Config dir: {} ({})\n", dir.display(), label);
 
-    match config::load(&dir) {
-        Ok(cfg) => {
-            let active: Vec<_> = cfg.projects.projects.iter().filter(|p| p.active).collect();
-            println!("Projects ({} active)", active.len());
-            println!(
-                "  {:<15} {:<40} {:<8} {:>8}",
-                "ID", "PATH", "STACK", "BUDGET"
-            );
-            for p in &active {
-                println!(
-                    "  {:<15} {:<40} {:<8} {:>7}",
-                    p.id,
-                    truncate(&p.path, 40),
-                    truncate(&p.stack, 8),
-                    format_cost(p.budget_usd)
-                );
-            }
-            println!();
+    let cfg = load_config_or_exit(&dir);
 
-            let mut agents: Vec<_> = cfg.agents.agents.iter().collect();
-            agents.sort_by_key(|(k, _)| (*k).clone());
-            println!("Agents ({})", agents.len());
+    let active: Vec<_> = cfg.projects.projects.iter().filter(|p| p.active).collect();
+    if !active.is_empty() {
+        println!("Projects ({} active)", active.len());
+        println!(
+            "  {:<15} {:<40} {:<8} {:>8}",
+            "ID", "PATH", "STACK", "BUDGET"
+        );
+        for p in &active {
             println!(
-                "  {:<22} {:<10} {:<16} {:<10} {:>8}",
-                "ID", "PROVIDER", "MODEL", "ROLE", "BUDGET"
+                "  {:<15} {:<40} {:<8} {:>7}",
+                p.id,
+                truncate(&p.path, 40),
+                truncate(&p.stack, 8),
+                format_cost(p.budget_usd)
             );
-            for (id, a) in &agents {
-                println!(
-                    "  {:<22} {:<10} {:<16} {:<10} {:>7}",
-                    id, a.provider, a.model, a.role,
-                    format_cost(a.budget_usd)
-                );
-            }
-            println!();
-
-            let d = &cfg.policy.defaults;
-            println!("Policy");
-            println!(
-                "  defaults: model={}, budget=${:.2}, timeout={}s, slots={}",
-                d.model, d.budget_usd, d.timeout_s, d.max_slots
-            );
-            let b = &cfg.policy.budget;
-            println!(
-                "  budget: ${:.0}/mo ceiling, {}% soft, {}% hard",
-                b.monthly_ceiling_usd, b.soft_alert_pct, b.hard_stop_pct
-            );
-            println!("  rules: {}", cfg.policy.rules.len());
-            for r in &cfg.policy.rules {
-                let m: Vec<_> = r.match_criteria.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                let s: Vec<_> = r.set.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                println!("    {} -> {}", m.join(", "), s.join(", "));
-            }
-
-            if !cfg.policy.features.is_empty() {
-                let enabled: Vec<_> = cfg.policy.features.iter()
-                    .filter(|(_, v)| v.as_bool() == Some(true))
-                    .map(|(k, _)| k.as_str()).collect();
-                let disabled: Vec<_> = cfg.policy.features.iter()
-                    .filter(|(_, v)| v.as_bool() == Some(false))
-                    .map(|(k, _)| k.as_str()).collect();
-                if !enabled.is_empty() {
-                    println!("  features ON: {}", enabled.join(", "));
-                }
-                if !disabled.is_empty() {
-                    println!("  features OFF: {}", disabled.join(", "));
-                }
-            }
         }
-        Err(e) => {
-            eprintln!("Error loading config: {e}");
-            eprintln!("Create config files in: {}", dir.display());
-            std::process::exit(1);
+        println!();
+    }
+
+    let mut agents: Vec<_> = cfg.agents.agents.iter().collect();
+    agents.sort_by_key(|(k, _)| (*k).clone());
+    let agents_label = if status.has_agents { "" } else { " (autodetected)" };
+    println!("Agents ({}){}", agents.len(), agents_label);
+    println!(
+        "  {:<22} {:<10} {:<16} {:<10} {:>8}",
+        "ID", "PROVIDER", "MODEL", "ROLE", "BUDGET"
+    );
+    for (id, a) in &agents {
+        println!(
+            "  {:<22} {:<10} {:<16} {:<10} {:>7}",
+            id, a.provider, a.model, a.role,
+            format_cost(a.budget_usd)
+        );
+    }
+    println!();
+
+    let d = &cfg.policy.defaults;
+    let policy_label = if status.has_policy { "" } else { " (defaults)" };
+    println!("Policy{policy_label}");
+    println!(
+        "  defaults: model={}, budget=${:.2}, timeout={}s, slots={}",
+        d.model, d.budget_usd, d.timeout_s, d.max_slots
+    );
+    let b = &cfg.policy.budget;
+    println!(
+        "  budget: ${:.0}/mo ceiling, {}% soft, {}% hard",
+        b.monthly_ceiling_usd, b.soft_alert_pct, b.hard_stop_pct
+    );
+    println!("  rules: {}", cfg.policy.rules.len());
+    for r in &cfg.policy.rules {
+        let m: Vec<_> = r.match_criteria.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let s: Vec<_> = r.set.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        println!("    {} -> {}", m.join(", "), s.join(", "));
+    }
+
+    if !cfg.policy.features.is_empty() {
+        let enabled: Vec<_> = cfg.policy.features.iter()
+            .filter(|(_, v)| v.as_bool() == Some(true))
+            .map(|(k, _)| k.as_str()).collect();
+        let disabled: Vec<_> = cfg.policy.features.iter()
+            .filter(|(_, v)| v.as_bool() == Some(false))
+            .map(|(k, _)| k.as_str()).collect();
+        if !enabled.is_empty() {
+            println!("  features ON: {}", enabled.join(", "));
         }
+        if !disabled.is_empty() {
+            println!("  features OFF: {}", disabled.join(", "));
+        }
+    }
+
+    if !status.is_complete() {
+        println!("\nHint: punk-run init  (generate config from detected environment)");
     }
 }
 
@@ -702,7 +740,7 @@ fn cmd_triage() {
 
 fn cmd_goal(project: &str, objective: &str, budget: f64, deadline: Option<&str>) {
     let bus_path = bus::bus_dir();
-    let config_dir = config::config_dir();
+    let cfg = load_config_or_exit(&config::config_dir());
 
     let mut g = match goal::create_goal(&bus_path, project, objective, deadline, budget) {
         Ok(g) => g,
@@ -721,23 +759,15 @@ fn cmd_goal(project: &str, objective: &str, budget: f64, deadline: Option<&str>)
     }
     println!();
 
-    // Resolve project path
-    let project_path = if let Ok(cfg) = config::load(&config_dir) {
-        cfg.projects
-            .projects
-            .iter()
-            .find(|p| p.id == project)
-            .map(|p| p.path.replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy()))
-            .unwrap_or_default()
-    } else {
-        String::new()
+    // Resolve project path via resolver chain
+    let project_path = match resolver::resolve(project, None, Some(&cfg)) {
+        Ok(r) => r.path.to_string_lossy().to_string(),
+        Err(_) => {
+            eprintln!("Warning: project '{project}' not found, skipping planner");
+            eprintln!("Hint: punk-run use {project} /path/to/project");
+            return;
+        }
     };
-
-    if project_path.is_empty() {
-        eprintln!("Warning: project '{}' not found in config, skipping planner", project);
-        println!("Add plan manually or configure project in ~/.config/punk/projects.toml");
-        return;
-    }
 
     // Generate plan via CLI
     println!("Generating plan...");
@@ -860,14 +890,20 @@ fn cmd_approve(goal_id: &str) {
         println!("\n  Total estimated: ${total_cost:.2} / ${:.2} budget", g.budget_usd);
     }
 
-    // Approve
+    // Queue first ready steps
+    let queued = match goal::queue_ready_steps(&bus_path, &mut g) {
+        Ok(queued) => queued,
+        Err(e) => {
+            eprintln!("Error queueing initial goal steps: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Approve only after queueing succeeds
     if let Some(ref mut plan) = g.plan {
         plan.approved_at = Some(punk_orch::chrono::Utc::now());
     }
     g.status = goal::GoalStatus::Active;
-
-    // Queue first ready steps
-    let queued = goal::queue_ready_steps(&bus_path, &mut g);
 
     if let Err(e) = goal::save_goal(&bus_path, &g) {
         eprintln!("Error saving goal: {e}");
@@ -878,19 +914,11 @@ fn cmd_approve(goal_id: &str) {
 }
 
 async fn cmd_diverge(project: &str, spec: &str, timeout: u64) {
-    let config_dir = config::config_dir();
-    let project_path = if let Ok(cfg) = config::load(&config_dir) {
-        cfg.projects.projects.iter()
-            .find(|p| p.id == project)
-            .map(|p| p.path.replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy()))
-    } else {
-        None
-    };
-
-    let path = match project_path {
-        Some(p) => std::path::PathBuf::from(p),
-        None => {
-            eprintln!("Project '{project}' not found in config");
+    let cfg = load_config_or_exit(&config::config_dir());
+    let path = match resolver::resolve(project, None, Some(&cfg)) {
+        Ok(r) => r.path,
+        Err(e) => {
+            eprintln!("{e}");
             std::process::exit(1);
         }
     };
@@ -959,57 +987,57 @@ fn cmd_ratchet() {
 }
 
 fn cmd_policy_check(project: &str, category: &str, priority: &str) {
-    let config_dir = config::config_dir();
-    match config::load(&config_dir) {
-        Ok(cfg) => {
-            let d = &cfg.policy.defaults;
-            let mut model = d.model.clone();
-            let mut budget = d.budget_usd;
-            let mut timeout = d.timeout_s;
+    let cfg = load_config_or_exit(&config::config_dir());
+    let d = &cfg.policy.defaults;
+    let mut model = d.model.clone();
+    let mut budget = d.budget_usd;
+    let mut timeout = d.timeout_s;
 
-            // Apply matching rules
-            for rule in &cfg.policy.rules {
-                let matches = rule.match_criteria.iter().all(|(k, v)| {
-                    match k.as_str() {
-                        "project" => v == project,
-                        "category" => v == category,
-                        "priority" => v == priority,
-                        _ => false,
-                    }
-                });
-                if matches {
-                    if let Some(m) = rule.set.get("model").and_then(|v| v.as_str()) {
-                        model = m.to_string();
-                    }
-                    if let Some(b) = rule.set.get("budget_usd").and_then(|v| v.as_float()) {
-                        budget = b;
-                    }
-                    if let Some(t) = rule.set.get("timeout_s").and_then(|v| v.as_integer()) {
-                        timeout = t as u64;
-                    }
-                }
+    // Apply matching rules
+    for rule in &cfg.policy.rules {
+        let matches = rule.match_criteria.iter().all(|(k, v)| {
+            match k.as_str() {
+                "project" => v == project,
+                "category" => v == category,
+                "priority" => v == priority,
+                _ => false,
             }
-
-            println!("Policy check (dry run)\n");
-            println!("  Input:    project={project}, category={category}, priority={priority}");
-            println!("  Resolved: model={model}, budget=${budget:.2}, timeout={timeout}s");
-            println!("  Slots:    {}/{}", 0, d.max_slots);
-
-            // Budget pressure
-            let bus_path = bus::bus_dir();
-            let (pressure, spent) = punk_orch::budget::check_pressure(&bus_path, cfg.policy.budget.monthly_ceiling_usd, cfg.policy.budget.soft_alert_pct, cfg.policy.budget.hard_stop_pct);
-            println!("  Budget:   ${spent:.2} / ${:.0} ({pressure:?})", cfg.policy.budget.monthly_ceiling_usd);
-
-            if !punk_orch::budget::priority_allowed(&pressure, priority) {
-                println!("\n  BLOCKED: priority {priority} not allowed at {pressure:?} pressure level");
-            } else {
-                println!("\n  OK: task would be dispatched");
+        });
+        if matches {
+            if let Some(m) = rule.set.get("model").and_then(|v| v.as_str()) {
+                model = m.to_string();
+            }
+            if let Some(b) = rule.set.get("budget_usd").and_then(|v| v.as_float()) {
+                budget = b;
+            }
+            if let Some(t) = rule.set.get("timeout_s").and_then(|v| v.as_integer()) {
+                timeout = t as u64;
             }
         }
-        Err(e) => {
-            eprintln!("Error loading config: {e}");
-            std::process::exit(1);
-        }
+    }
+
+    println!("Policy check (dry run)\n");
+    println!("  Input:    project={project}, category={category}, priority={priority}");
+    println!("  Resolved: model={model}, budget=${budget:.2}, timeout={timeout}s");
+    println!("  Slots:    {}/{}", 0, d.max_slots);
+
+    // Budget pressure
+    let bus_path = bus::bus_dir();
+    let (pressure, spent) = punk_orch::budget::check_pressure(
+        &bus_path,
+        cfg.policy.budget.monthly_ceiling_usd,
+        cfg.policy.budget.soft_alert_pct,
+        cfg.policy.budget.hard_stop_pct,
+    );
+    println!(
+        "  Budget:   ${spent:.2} / ${:.0} ({pressure:?})",
+        cfg.policy.budget.monthly_ceiling_usd
+    );
+
+    if !punk_orch::budget::priority_allowed(&pressure, priority) {
+        println!("\n  BLOCKED: priority {priority} not allowed at {pressure:?} pressure level");
+    } else {
+        println!("\n  OK: task would be dispatched");
     }
 }
 
@@ -1019,17 +1047,18 @@ fn cmd_queue(
     priority: &str, timeout: u64, budget: Option<f64>, worktree: bool, after: Option<&str>,
 ) {
     let bus_path = bus::bus_dir();
-    let config_dir = config::config_dir();
+    let cfg = load_config_or_exit(&config::config_dir());
 
-    // Resolve project path from config
-    let project_path = config::load(&config_dir)
-        .ok()
-        .and_then(|cfg| {
-            cfg.projects.projects.iter()
-                .find(|p| p.id == project)
-                .map(|p| p.path.clone())
-        })
-        .unwrap_or_else(|| format!("~/personal/heurema/{project}"));
+    // Resolve project path via resolution chain
+    let resolved = match resolver::resolve(project, None, Some(&cfg)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!("\nHint: punk-run use {project} /path/to/project");
+            std::process::exit(1);
+        }
+    };
+    let project_path = resolved.path.to_string_lossy().to_string();
 
     let task_id = format!("{}-{}", project, punk_orch::chrono::Utc::now().format("%Y%m%d-%H%M%S"));
 
@@ -1278,6 +1307,217 @@ fn cmd_goal_set_status(goal_id: &str, new_status: goal::GoalStatus) {
     println!("{goal_id}: {old} -> {new}");
 }
 
+// --- Phase 5: Zero-config commands ---
+
+fn cmd_use(name: &str, path: &str) {
+    let abs = expand_path(path);
+    if !abs.is_dir() {
+        eprintln!("Path does not exist: {}", abs.display());
+        std::process::exit(1);
+    }
+    match resolver::pin_project(name, &abs) {
+        Ok(()) => println!("Pinned: {name} -> {}", abs.display()),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_resolve(name: &str, cli_path: Option<&str>) {
+    match resolve_for_cli(name, cli_path, &config::config_dir()) {
+        Ok(r) => {
+            println!("Resolved: {}", r.id);
+            println!("  path:   {}", r.path.display());
+            println!("  source: {}", r.source);
+            if let Some(ref s) = r.stack {
+                println!("  stack:  {s}");
+            }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!("\nHint: punk-run use {name} /path/to/project");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn resolve_for_cli(
+    name: &str,
+    cli_path: Option<&str>,
+    config_dir: &Path,
+) -> Result<resolver::ResolvedProject, String> {
+    let path = cli_path.map(expand_path);
+    if path.is_some() {
+        return resolver::resolve(name, path.as_deref(), None).map_err(|e| e.to_string());
+    }
+    let cfg = config::load_or_default(config_dir).map_err(|e| format!("Config error in {}: {e}", config_dir.display()))?;
+    resolver::resolve(name, None, Some(&cfg)).map_err(|e| e.to_string())
+}
+
+fn cmd_forget(name: &str) {
+    match resolver::unpin_project(name) {
+        Ok(true) => println!("Unpinned: {name}"),
+        Ok(false) => println!("Not pinned: {name}"),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_projects() {
+    let cfg = load_config_or_exit(&config::config_dir());
+    let projects = resolver::list_known(Some(&cfg));
+
+    if projects.is_empty() {
+        println!("No projects found.");
+        println!("\nHint: punk-run use <name> /path/to/project");
+        return;
+    }
+
+    println!("Projects ({})\n", projects.len());
+    println!("  {:<15} {:<45} {:<10} SOURCE", "ID", "PATH", "STACK");
+    for p in &projects {
+        println!(
+            "  {:<15} {:<45} {:<10} {}",
+            p.id,
+            truncate(&p.path.to_string_lossy(), 45),
+            p.stack.as_deref().unwrap_or("-"),
+            p.source
+        );
+    }
+}
+
+fn cmd_init() {
+    let dir = config::config_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("Failed to initialize config dir {}: {e}", dir.display());
+        std::process::exit(1);
+    }
+
+    let status = config::config_status(&dir);
+    let agents = config::detect_agents();
+    let discovered = resolver::scan_all_roots();
+
+    let summary = match initialize_config_files(&dir, &status, &agents, &discovered) {
+        Ok(summary) => summary,
+        Err(e) => {
+            eprintln!("Failed to write config files in {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+    };
+
+    if summary.created.is_empty() && summary.notices.is_empty() {
+        println!("Config already complete: {}", dir.display());
+    } else {
+        for f in &summary.created {
+            println!("Created: {f}");
+        }
+        for notice in &summary.notices {
+            println!("{notice}");
+        }
+    }
+    println!(
+        "\nDetected {} agent(s), {} project(s)",
+        agents.agents.len(),
+        discovered.len()
+    );
+    println!("Config:  {}", dir.display());
+}
+
+fn load_config_or_exit(dir: &Path) -> config::Config {
+    match config::load_or_default(dir) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("Config error in {}: {e}", dir.display());
+            std::process::exit(1);
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct InitSummary {
+    created: Vec<String>,
+    notices: Vec<String>,
+}
+
+fn initialize_config_files(
+    dir: &Path,
+    status: &config::ConfigStatus,
+    agents: &config::AgentsFile,
+    discovered: &[resolver::ResolvedProject],
+) -> std::io::Result<InitSummary> {
+    let mut summary = InitSummary::default();
+
+    if !status.has_projects && !discovered.is_empty() {
+        let mut toml = String::from("# Auto-generated by punk-run init\n\n");
+        for p in discovered {
+            toml.push_str(&format!(
+                "[[projects]]\nid = \"{}\"\npath = \"{}\"\nstack = \"{}\"\n\n",
+                p.id,
+                p.path.display(),
+                p.stack.as_deref().unwrap_or("")
+            ));
+        }
+        std::fs::write(dir.join("projects.toml"), toml)?;
+        summary
+            .created
+            .push(format!("projects.toml ({} projects)", discovered.len()));
+    }
+
+    if !status.has_agents {
+        if agents.agents.is_empty() {
+            summary.notices.push(
+                "Skipped agents.toml: no supported agent CLI detected".to_string(),
+            );
+        } else {
+            let mut toml = String::from("# Auto-generated by punk-run init\n\n");
+            let mut agent_list: Vec<_> = agents.agents.iter().collect();
+            agent_list.sort_by_key(|(k, _)| (*k).clone());
+            for (id, a) in &agent_list {
+                toml.push_str(&format!(
+                    "[agents.{}]\nprovider = \"{}\"\nmodel = \"{}\"\nrole = \"{}\"\ninvoke = \"{}\"\nbudget_usd = {:.1}\n\n",
+                    id, a.provider, a.model, a.role, a.invoke, a.budget_usd
+                ));
+            }
+            std::fs::write(dir.join("agents.toml"), toml)?;
+            summary
+                .created
+                .push(format!("agents.toml ({} agents)", agent_list.len()));
+        }
+    }
+
+    if !status.has_policy {
+        let toml = "# Auto-generated by punk-run init\n\n\
+            [defaults]\n\
+            model = \"sonnet\"\n\
+            budget_usd = 1.0\n\
+            timeout_s = 600\n\
+            max_slots = 5\n\n\
+            [budget]\n\
+            monthly_ceiling_usd = 50.0\n\
+            soft_alert_pct = 80\n\
+            hard_stop_pct = 95\n";
+        std::fs::write(dir.join("policy.toml"), toml)?;
+        summary.created.push("policy.toml".to_string());
+    }
+
+    Ok(summary)
+}
+
+fn expand_path(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(rest)
+    } else {
+        PathBuf::from(p)
+    }
+}
+
+// --- Utilities ---
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -1291,5 +1531,124 @@ fn format_cost(usd: f64) -> String {
         "$0".to_string()
     } else {
         format!("${:.2}", usd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use punk_orch::config::{Agent, AgentsFile, ConfigStatus};
+    use punk_orch::resolver::{ResolveSource, ResolvedProject};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn sample_agents() -> AgentsFile {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "codex".to_string(),
+            Agent {
+                provider: "codex".to_string(),
+                model: "o4-mini".to_string(),
+                role: "engineer".to_string(),
+                invoke: "cli".to_string(),
+                budget_usd: 1.0,
+                system_prompt: None,
+                skills: vec![],
+            },
+        );
+        AgentsFile { agents }
+    }
+
+    fn empty_status(dir: &Path) -> ConfigStatus {
+        ConfigStatus {
+            dir: dir.to_path_buf(),
+            has_projects: false,
+            has_agents: false,
+            has_policy: false,
+        }
+    }
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{}-{}-{}", prefix, std::process::id(), nanos));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn initialize_config_files_surfaces_write_errors() {
+        let tmp = temp_test_dir("punk-run-init-write-error");
+        let bad_dir = tmp.join("blocked-config");
+        fs::write(&bad_dir, "not a directory").unwrap();
+
+        let err = initialize_config_files(&bad_dir, &empty_status(&bad_dir), &sample_agents(), &[])
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::Other
+                    | std::io::ErrorKind::PermissionDenied
+            ),
+            "unexpected error kind: {:?}",
+            err.kind()
+        );
+        let _ = fs::remove_file(&bad_dir);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn initialize_config_files_skips_agents_file_when_none_detected() {
+        let tmp = temp_test_dir("punk-run-init-no-agents");
+        let status = empty_status(&tmp);
+        let discovered = vec![ResolvedProject {
+            id: "punk".to_string(),
+            path: tmp.join("punk-project"),
+            source: ResolveSource::CliPath,
+            stack: Some("rust".to_string()),
+        }];
+
+        let summary = initialize_config_files(
+            &tmp,
+            &status,
+            &AgentsFile {
+                agents: HashMap::new(),
+            },
+            &discovered,
+        )
+        .unwrap();
+
+        assert!(tmp.join("projects.toml").is_file());
+        assert!(tmp.join("policy.toml").is_file());
+        assert!(!tmp.join("agents.toml").exists());
+        assert!(
+            summary
+                .notices
+                .iter()
+                .any(|n| n.contains("Skipped agents.toml"))
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_for_cli_path_bypasses_broken_config() {
+        let repo = temp_test_dir("punk-run-resolve-cli-path");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let config_dir = temp_test_dir("punk-run-broken-config");
+        fs::write(config_dir.join("agents.toml"), "[agents.claude").unwrap();
+
+        let resolved = resolve_for_cli("demo", Some(repo.to_string_lossy().as_ref()), &config_dir)
+            .expect("cli path should bypass broken config");
+        assert_eq!(resolved.source, ResolveSource::CliPath);
+        assert_eq!(resolved.path, fs::canonicalize(&repo).unwrap());
+
+        let _ = fs::remove_dir_all(&config_dir);
+        let _ = fs::remove_dir_all(&repo);
     }
 }

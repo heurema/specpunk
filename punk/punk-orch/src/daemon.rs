@@ -816,14 +816,20 @@ fn evaluate_goals(bus: &Path) {
 
         if changed {
             // Queue next ready steps (borrows &mut g, so drop plan ref first)
-            let queued = goal::queue_ready_steps(bus, &mut g);
-            if !queued.is_empty() {
-                eprintln!(
-                    "daemon: goal {} queued {} step(s): {}",
-                    g.id,
-                    queued.len(),
-                    queued.join(", ")
-                );
+            match goal::queue_ready_steps(bus, &mut g) {
+                Ok(queued) => {
+                    if !queued.is_empty() {
+                        eprintln!(
+                            "daemon: goal {} queued {} step(s): {}",
+                            g.id,
+                            queued.len(),
+                            queued.join(", ")
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("daemon: goal {} queue error: {}", g.id, e);
+                }
             }
 
             // Re-borrow plan for status checks
