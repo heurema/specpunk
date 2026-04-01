@@ -328,6 +328,23 @@ enum ResearchAction {
         #[arg(long = "unresolved")]
         unresolved: Vec<String>,
     },
+    /// Write one structured research artifact before synthesis
+    Artifact {
+        /// Research id
+        research_id: String,
+        /// Artifact kind
+        #[arg(long)]
+        kind: String,
+        /// Artifact title
+        #[arg(long)]
+        title: String,
+        /// Path to artifact content file
+        #[arg(long)]
+        file: String,
+        /// Evidence ref, can be repeated
+        #[arg(long = "evidence-ref")]
+        evidence_ref: Vec<String>,
+    },
     /// List frozen research runs for the current repo
     List,
 }
@@ -798,6 +815,13 @@ async fn main() -> anyhow::Result<()> {
                 &evidence_ref,
                 &unresolved,
             ),
+            ResearchAction::Artifact {
+                research_id,
+                kind,
+                title,
+                file,
+                evidence_ref,
+            } => cmd_research_artifact(&research_id, &kind, &title, &file, &evidence_ref),
             ResearchAction::List => cmd_research_list(),
         },
         Command::Goal { action } => match action {
@@ -2126,6 +2150,19 @@ fn parse_research_outcome(raw: &str) -> Result<research::ResearchOutcome, String
     }
 }
 
+fn parse_research_artifact_kind(raw: &str) -> Result<research::ResearchArtifactKind, String> {
+    match raw {
+        "note" => Ok(research::ResearchArtifactKind::Note),
+        "hypothesis" => Ok(research::ResearchArtifactKind::Hypothesis),
+        "comparison" => Ok(research::ResearchArtifactKind::Comparison),
+        "critique" => Ok(research::ResearchArtifactKind::Critique),
+        "synthesis-input" | "synthesis_input" => Ok(research::ResearchArtifactKind::SynthesisInput),
+        _ => Err(format!(
+            "unknown research artifact kind: {raw} (expected note, hypothesis, comparison, critique, or synthesis-input)"
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_research_start(
     kind: &str,
@@ -2267,6 +2304,48 @@ fn cmd_research_synthesize(
     println!("Research id: {}", write.record.research_id);
     println!("Status: {:?}", write.record.status);
     println!("Synthesis: {}", write.synthesis_path.display());
+}
+
+fn cmd_research_artifact(
+    research_id: &str,
+    kind: &str,
+    title: &str,
+    file: &str,
+    evidence_refs: &[String],
+) {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let kind = parse_research_artifact_kind(kind).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+    let content = std::fs::read_to_string(file).unwrap_or_else(|e| {
+        eprintln!("Error reading {file}: {e}");
+        std::process::exit(1);
+    });
+
+    let write = research::write_research_artifact(
+        &cwd,
+        research_id,
+        research::WriteResearchArtifactRequest {
+            kind,
+            title: title.to_string(),
+            content,
+            evidence_refs: evidence_refs.to_vec(),
+        },
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
+    println!("Research id: {}", write.artifact.research_id);
+    println!("Artifact: {}", write.artifact_path.display());
 }
 
 fn load_config_or_exit(dir: &Path) -> config::Config {

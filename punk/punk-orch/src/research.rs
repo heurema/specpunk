@@ -59,6 +59,16 @@ pub struct ResearchPacket {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ResearchArtifactKind {
+    Note,
+    Hypothesis,
+    Comparison,
+    Critique,
+    SynthesisInput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ResearchStatus {
     Frozen,
     Completed,
@@ -140,6 +150,30 @@ pub struct ResearchSynthesisWrite {
     pub record: ResearchRecord,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResearchArtifact {
+    pub research_id: String,
+    pub kind: ResearchArtifactKind,
+    pub title: String,
+    pub content: String,
+    pub evidence_refs: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WriteResearchArtifactRequest {
+    pub kind: ResearchArtifactKind,
+    pub title: String,
+    pub content: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResearchArtifactWrite {
+    pub artifact: ResearchArtifact,
+    pub artifact_path: PathBuf,
+}
+
 fn detect_repo_root(cwd: &Path) -> Result<PathBuf, String> {
     for (bin, args) in [
         ("jj", vec!["root"]),
@@ -193,6 +227,16 @@ fn default_output_schema_ref(kind: &ResearchKind) -> &'static str {
     }
 }
 
+fn artifact_kind_str(kind: &ResearchArtifactKind) -> &'static str {
+    match kind {
+        ResearchArtifactKind::Note => "note",
+        ResearchArtifactKind::Hypothesis => "hypothesis",
+        ResearchArtifactKind::Comparison => "comparison",
+        ResearchArtifactKind::Critique => "critique",
+        ResearchArtifactKind::SynthesisInput => "synthesis-input",
+    }
+}
+
 fn sanitize_fragment(raw: &str) -> String {
     let mut out = raw
         .chars()
@@ -224,6 +268,27 @@ fn make_research_id(project_id: &str, kind: &ResearchKind) -> String {
         sanitize_fragment(project_id),
         kind_str
     )
+}
+
+fn load_record(root_dir: &Path) -> Result<ResearchRecord, String> {
+    let record_path = root_dir.join("record.json");
+    let record_content = fs::read_to_string(&record_path).map_err(|e| e.to_string())?;
+    serde_json::from_str::<ResearchRecord>(&record_content).map_err(|e| e.to_string())
+}
+
+fn save_record(root_dir: &Path, record: &ResearchRecord) -> Result<(), String> {
+    let record_path = root_dir.join("record.json");
+    fs::write(
+        &record_path,
+        serde_json::to_string_pretty(record).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn load_packet(root_dir: &Path) -> Result<ResearchPacket, String> {
+    let packet_path = root_dir.join("packet.json");
+    let packet_content = fs::read_to_string(&packet_path).map_err(|e| e.to_string())?;
+    serde_json::from_str::<ResearchPacket>(&packet_content).map_err(|e| e.to_string())
 }
 
 pub fn start_research(cwd: &Path, request: StartResearchRequest) -> Result<ResearchStart, String> {
@@ -320,6 +385,66 @@ pub fn list_research_runs(cwd: &Path) -> Result<Vec<ResearchRecord>, String> {
     Ok(records)
 }
 
+pub fn write_research_artifact(
+    cwd: &Path,
+    research_id: &str,
+    request: WriteResearchArtifactRequest,
+) -> Result<ResearchArtifactWrite, String> {
+    if request.title.trim().is_empty() {
+        return Err("artifact title must be non-empty".to_string());
+    }
+    if request.content.trim().is_empty() {
+        return Err("artifact content must be non-empty".to_string());
+    }
+
+    let root_dir = research_dir(cwd, research_id)?;
+    let record = load_record(&root_dir)?;
+    if record.status != ResearchStatus::Frozen {
+        return Err(format!(
+            "research run is not open for artifact writes: {}",
+            record.research_id
+        ));
+    }
+    let packet = load_packet(&root_dir)?;
+    let artifacts_dir = root_dir.join("artifacts");
+    let existing_count = fs::read_dir(&artifacts_dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .count() as u32;
+    if existing_count >= packet.budget.max_artifacts {
+        return Err(format!(
+            "artifact budget exhausted for {} (max_artifacts={})",
+            packet.research_id, packet.budget.max_artifacts
+        ));
+    }
+
+    let artifact = ResearchArtifact {
+        research_id: research_id.to_string(),
+        kind: request.kind.clone(),
+        title: request.title,
+        content: request.content,
+        evidence_refs: request.evidence_refs,
+        created_at: Utc::now(),
+    };
+    let artifact_name = format!(
+        "{}-{}.json",
+        artifact.created_at.format("%Y%m%d%H%M%S%3f"),
+        artifact_kind_str(&artifact.kind)
+    );
+    let artifact_path = artifacts_dir.join(artifact_name);
+    fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&artifact).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(ResearchArtifactWrite {
+        artifact,
+        artifact_path,
+    })
+}
+
 pub fn synthesize_research(
     cwd: &Path,
     research_id: &str,
@@ -338,9 +463,7 @@ pub fn synthesize_research(
         return Err(format!("research run not found: {research_id}"));
     }
 
-    let record_content = fs::read_to_string(&record_path).map_err(|e| e.to_string())?;
-    let mut record =
-        serde_json::from_str::<ResearchRecord>(&record_content).map_err(|e| e.to_string())?;
+    let mut record = load_record(&root_dir)?;
     if record.status != ResearchStatus::Frozen {
         return Err(format!(
             "research run is not open for synthesis: {}",
@@ -371,11 +494,7 @@ pub fn synthesize_research(
     };
     record.synthesis_path = Some(synthesis_path.display().to_string());
     record.completed_at = Some(Utc::now());
-    fs::write(
-        &record_path,
-        serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    save_record(&root_dir, &record)?;
 
     Ok(ResearchSynthesisWrite {
         synthesis,
@@ -506,6 +625,101 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].research_id, second.record.research_id);
         assert_eq!(listed[1].research_id, first.record.research_id);
+    }
+
+    #[test]
+    fn write_research_artifact_writes_note_json() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let started = start_research(
+            &repo,
+            StartResearchRequest {
+                kind: ResearchKind::CleanupImpact,
+                project_id: "specpunk".into(),
+                subject_ref: None,
+                question: "Question".into(),
+                goal: "Goal".into(),
+                constraints: vec![],
+                success_criteria: vec!["note".into()],
+                budget: ResearchBudget::default(),
+                context_refs: vec![],
+                output_schema_ref: None,
+            },
+        )
+        .unwrap();
+
+        let written = write_research_artifact(
+            &repo,
+            &started.record.research_id,
+            WriteResearchArtifactRequest {
+                kind: ResearchArtifactKind::Note,
+                title: "Observed cleanup dependency".into(),
+                content: "Module A still imports deprecated helper B.".into(),
+                evidence_refs: vec!["receipt:abc".into()],
+            },
+        )
+        .unwrap();
+
+        assert!(written.artifact_path.exists());
+        assert_eq!(written.artifact.kind, ResearchArtifactKind::Note);
+        assert!(fs::read_to_string(&written.artifact_path)
+            .unwrap()
+            .contains("Observed cleanup dependency"));
+    }
+
+    #[test]
+    fn write_research_artifact_respects_max_artifacts_budget() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let mut budget = ResearchBudget::default();
+        budget.max_artifacts = 1;
+        let started = start_research(
+            &repo,
+            StartResearchRequest {
+                kind: ResearchKind::Architecture,
+                project_id: "specpunk".into(),
+                subject_ref: None,
+                question: "Question".into(),
+                goal: "Goal".into(),
+                constraints: vec![],
+                success_criteria: vec!["artifact".into()],
+                budget,
+                context_refs: vec![],
+                output_schema_ref: None,
+            },
+        )
+        .unwrap();
+
+        write_research_artifact(
+            &repo,
+            &started.record.research_id,
+            WriteResearchArtifactRequest {
+                kind: ResearchArtifactKind::Hypothesis,
+                title: "First".into(),
+                content: "One hypothesis".into(),
+                evidence_refs: vec![],
+            },
+        )
+        .unwrap();
+
+        let err = write_research_artifact(
+            &repo,
+            &started.record.research_id,
+            WriteResearchArtifactRequest {
+                kind: ResearchArtifactKind::Critique,
+                title: "Second".into(),
+                content: "Another artifact".into(),
+                evidence_refs: vec![],
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("artifact budget exhausted"));
     }
 
     #[test]
