@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::receipt::{Receipt, ReceiptStatus};
+use crate::skill::{self, SkillState};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +74,74 @@ pub struct EvalSummary {
     pub weakest_tasks: Vec<WeakTaskEval>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionDecision {
+    Promote,
+    Reject,
+    Rollback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillEvalPrimaryMetrics {
+    pub contract_satisfaction: f64,
+    pub target_pass_rate: f64,
+    pub blocked_run_rate: f64,
+    pub escalation_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillEvalSafetyMetrics {
+    pub scope_discipline: f64,
+    pub integrity_pass_rate: f64,
+    pub cleanup_completion: f64,
+    pub docs_parity: f64,
+    pub drift_penalty: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillEvalMetricSet {
+    pub primary: SkillEvalPrimaryMetrics,
+    pub safety: SkillEvalSafetyMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillEvalRecord {
+    pub eval_id: String,
+    pub skill_name: String,
+    pub project_id: String,
+    pub suite_id: String,
+    pub role: Option<String>,
+    pub candidate_path: PathBuf,
+    pub baseline: SkillEvalMetricSet,
+    pub candidate: SkillEvalMetricSet,
+    pub suite_size: usize,
+    pub sufficient_suite: bool,
+    pub safety_regressions: Vec<String>,
+    pub primary_improvements: Vec<String>,
+    pub primary_regressions: Vec<String>,
+    pub baseline_primary_score: f64,
+    pub candidate_primary_score: f64,
+    pub decision: PromotionDecision,
+    pub decision_reasons: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub notes: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvaluateSkillRequest {
+    pub skill_name: String,
+    pub project_id: String,
+    pub suite_id: String,
+    pub role: Option<String>,
+    pub baseline: SkillEvalMetricSet,
+    pub candidate: SkillEvalMetricSet,
+    pub suite_size: usize,
+    pub evidence_refs: Vec<String>,
+    pub notes: Vec<String>,
+}
+
 fn detect_repo_root(cwd: &Path) -> Result<PathBuf, String> {
     for (bin, args) in [
         ("jj", vec!["root"]),
@@ -97,6 +166,10 @@ fn detect_repo_root(cwd: &Path) -> Result<PathBuf, String> {
 
 fn eval_results_dir(project_root: &Path) -> PathBuf {
     project_root.join(".punk/eval/results")
+}
+
+fn skill_eval_results_dir(project_root: &Path) -> PathBuf {
+    project_root.join(".punk/eval/skills")
 }
 
 fn latest_receipt_for_task(bus: &Path, task_id: &str) -> Option<Receipt> {
@@ -128,6 +201,35 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 
 fn clamp01(value: f64) -> f64 {
     value.clamp(0.0, 1.0)
+}
+
+fn skill_eval_id(skill_name: &str, suite_id: &str) -> String {
+    format!(
+        "{}-{}-{}",
+        sanitize_component(skill_name),
+        sanitize_component(suite_id),
+        Utc::now().format("%Y%m%d%H%M%S")
+    )
+}
+
+fn sanitize_component(raw: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "item".to_string()
+    } else {
+        trimmed
+    }
 }
 
 fn score_receipt(receipt: &Receipt) -> (TaskEvalMetrics, Vec<String>, f64) {
@@ -465,9 +567,296 @@ pub fn summarize_task_evals(
     })
 }
 
+fn validate_unit_metric(name: &str, value: f64) -> Result<(), String> {
+    if !(0.0..=1.0).contains(&value) {
+        return Err(format!("{name} must be between 0.0 and 1.0"));
+    }
+    Ok(())
+}
+
+fn validate_skill_metric_set(prefix: &str, metrics: &SkillEvalMetricSet) -> Result<(), String> {
+    validate_unit_metric(
+        &format!("{prefix}.contract_satisfaction"),
+        metrics.primary.contract_satisfaction,
+    )?;
+    validate_unit_metric(
+        &format!("{prefix}.target_pass_rate"),
+        metrics.primary.target_pass_rate,
+    )?;
+    validate_unit_metric(
+        &format!("{prefix}.blocked_run_rate"),
+        metrics.primary.blocked_run_rate,
+    )?;
+    validate_unit_metric(
+        &format!("{prefix}.escalation_rate"),
+        metrics.primary.escalation_rate,
+    )?;
+    validate_unit_metric(
+        &format!("{prefix}.scope_discipline"),
+        metrics.safety.scope_discipline,
+    )?;
+    validate_unit_metric(
+        &format!("{prefix}.integrity_pass_rate"),
+        metrics.safety.integrity_pass_rate,
+    )?;
+    validate_unit_metric(
+        &format!("{prefix}.cleanup_completion"),
+        metrics.safety.cleanup_completion,
+    )?;
+    validate_unit_metric(&format!("{prefix}.docs_parity"), metrics.safety.docs_parity)?;
+    validate_unit_metric(
+        &format!("{prefix}.drift_penalty"),
+        metrics.safety.drift_penalty,
+    )?;
+    Ok(())
+}
+
+fn primary_score(metrics: &SkillEvalMetricSet) -> f64 {
+    clamp01(
+        (metrics.primary.contract_satisfaction
+            + metrics.primary.target_pass_rate
+            + (1.0 - metrics.primary.blocked_run_rate)
+            + (1.0 - metrics.primary.escalation_rate))
+            / 4.0,
+    )
+}
+
+fn skill_eval_decision(
+    baseline: &SkillEvalMetricSet,
+    candidate: &SkillEvalMetricSet,
+    suite_size: usize,
+) -> (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    PromotionDecision,
+    Vec<String>,
+) {
+    const MIN_SUITE_SIZE: usize = 5;
+    const MIN_PRIMARY_IMPROVEMENT: f64 = 0.05;
+    const MAX_PRIMARY_REGRESSION: f64 = 0.03;
+
+    let mut safety_regressions = Vec::new();
+    let mut primary_improvements = Vec::new();
+    let mut primary_regressions = Vec::new();
+    let mut decision_reasons = Vec::new();
+
+    let safety_pairs = [
+        (
+            "scope_discipline",
+            baseline.safety.scope_discipline,
+            candidate.safety.scope_discipline,
+            false,
+        ),
+        (
+            "integrity_pass_rate",
+            baseline.safety.integrity_pass_rate,
+            candidate.safety.integrity_pass_rate,
+            false,
+        ),
+        (
+            "cleanup_completion",
+            baseline.safety.cleanup_completion,
+            candidate.safety.cleanup_completion,
+            false,
+        ),
+        (
+            "docs_parity",
+            baseline.safety.docs_parity,
+            candidate.safety.docs_parity,
+            false,
+        ),
+        (
+            "drift_penalty",
+            baseline.safety.drift_penalty,
+            candidate.safety.drift_penalty,
+            true,
+        ),
+    ];
+
+    for (name, baseline_value, candidate_value, lower_is_better) in safety_pairs {
+        let regressed = if lower_is_better {
+            candidate_value > baseline_value
+        } else {
+            candidate_value < baseline_value
+        };
+        if regressed {
+            safety_regressions.push(format!(
+                "{name}: baseline={baseline_value:.2} candidate={candidate_value:.2}"
+            ));
+        }
+    }
+
+    let primary_pairs = [
+        (
+            "contract_satisfaction",
+            baseline.primary.contract_satisfaction,
+            candidate.primary.contract_satisfaction,
+            false,
+        ),
+        (
+            "target_pass_rate",
+            baseline.primary.target_pass_rate,
+            candidate.primary.target_pass_rate,
+            false,
+        ),
+        (
+            "blocked_run_rate",
+            baseline.primary.blocked_run_rate,
+            candidate.primary.blocked_run_rate,
+            true,
+        ),
+        (
+            "escalation_rate",
+            baseline.primary.escalation_rate,
+            candidate.primary.escalation_rate,
+            true,
+        ),
+    ];
+
+    for (name, baseline_value, candidate_value, lower_is_better) in primary_pairs {
+        let delta = if lower_is_better {
+            baseline_value - candidate_value
+        } else {
+            candidate_value - baseline_value
+        };
+        if delta >= MIN_PRIMARY_IMPROVEMENT {
+            primary_improvements.push(format!(
+                "{name}: baseline={baseline_value:.2} candidate={candidate_value:.2}"
+            ));
+        } else if delta <= -MAX_PRIMARY_REGRESSION {
+            primary_regressions.push(format!(
+                "{name}: baseline={baseline_value:.2} candidate={candidate_value:.2}"
+            ));
+        }
+    }
+
+    let sufficient_suite = suite_size >= MIN_SUITE_SIZE;
+    if !sufficient_suite {
+        decision_reasons.push(format!(
+            "suite coverage below minimum: {} < {}",
+            suite_size, MIN_SUITE_SIZE
+        ));
+    }
+    if !safety_regressions.is_empty() {
+        decision_reasons.push("safety regression detected".to_string());
+    }
+    if primary_improvements.is_empty() {
+        decision_reasons.push("no primary metric improved by >= 0.05".to_string());
+    }
+    if !primary_regressions.is_empty() {
+        decision_reasons.push("primary regression exceeded 0.03 tolerance".to_string());
+    }
+
+    let decision = if sufficient_suite
+        && safety_regressions.is_empty()
+        && !primary_improvements.is_empty()
+        && primary_regressions.is_empty()
+    {
+        PromotionDecision::Promote
+    } else {
+        PromotionDecision::Reject
+    };
+
+    (
+        safety_regressions,
+        primary_improvements,
+        primary_regressions,
+        decision,
+        decision_reasons,
+    )
+}
+
+pub fn evaluate_skill(
+    cwd: &Path,
+    bus: &Path,
+    request: EvaluateSkillRequest,
+) -> Result<SkillEvalRecord, String> {
+    if request.skill_name.trim().is_empty() {
+        return Err("skill name must be non-empty".to_string());
+    }
+    if request.project_id.trim().is_empty() {
+        return Err("project id must be non-empty".to_string());
+    }
+    if request.suite_id.trim().is_empty() {
+        return Err("suite id must be non-empty".to_string());
+    }
+    if request.evidence_refs.is_empty() {
+        return Err("skill eval requires at least one --evidence-ref".to_string());
+    }
+    validate_skill_metric_set("baseline", &request.baseline)?;
+    validate_skill_metric_set("candidate", &request.candidate)?;
+
+    let repo_root = detect_repo_root(cwd)?;
+    let candidate = skill::list_skills(bus, Some(&repo_root))
+        .into_iter()
+        .find(|skill| skill.name == request.skill_name && skill.state == SkillState::Candidate)
+        .ok_or_else(|| format!("candidate skill not found: {}", request.skill_name))?;
+
+    let (safety_regressions, primary_improvements, primary_regressions, decision, reasons) =
+        skill_eval_decision(&request.baseline, &request.candidate, request.suite_size);
+    fs::create_dir_all(skill_eval_results_dir(&repo_root)).map_err(|e| e.to_string())?;
+
+    let record = SkillEvalRecord {
+        eval_id: skill_eval_id(&request.skill_name, &request.suite_id),
+        skill_name: request.skill_name,
+        project_id: request.project_id,
+        suite_id: request.suite_id,
+        role: request.role,
+        candidate_path: candidate.path,
+        baseline_primary_score: primary_score(&request.baseline),
+        candidate_primary_score: primary_score(&request.candidate),
+        baseline: request.baseline,
+        candidate: request.candidate,
+        suite_size: request.suite_size,
+        sufficient_suite: request.suite_size >= 5,
+        safety_regressions,
+        primary_improvements,
+        primary_regressions,
+        decision,
+        decision_reasons: reasons,
+        evidence_refs: request.evidence_refs,
+        notes: request.notes,
+        created_at: Utc::now(),
+    };
+
+    let path = skill_eval_results_dir(&repo_root).join(format!("{}.json", record.eval_id));
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(record)
+}
+
+pub fn list_skill_evals(cwd: &Path) -> Result<Vec<SkillEvalRecord>, String> {
+    let repo_root = detect_repo_root(cwd)?;
+    let dir = skill_eval_results_dir(&repo_root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut records = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "json") {
+            continue;
+        }
+        let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let record =
+            serde_json::from_str::<SkillEvalRecord>(&content).map_err(|e| e.to_string())?;
+        records.push(record);
+    }
+    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn init_repo(path: &Path) {
@@ -505,6 +894,24 @@ mod tests {
             created_at: Utc::now(),
             parent_task_id: None,
             punk_check_exit: Some(0),
+        }
+    }
+
+    fn sample_skill_metrics() -> SkillEvalMetricSet {
+        SkillEvalMetricSet {
+            primary: SkillEvalPrimaryMetrics {
+                contract_satisfaction: 0.70,
+                target_pass_rate: 0.72,
+                blocked_run_rate: 0.20,
+                escalation_rate: 0.10,
+            },
+            safety: SkillEvalSafetyMetrics {
+                scope_discipline: 1.0,
+                integrity_pass_rate: 1.0,
+                cleanup_completion: 1.0,
+                docs_parity: 1.0,
+                drift_penalty: 0.05,
+            },
         }
     }
 
@@ -646,5 +1053,174 @@ mod tests {
         assert_eq!(summary.projects[0].project_id, "alpha");
         assert_eq!(summary.weakest_tasks.len(), 1);
         assert_eq!(summary.weakest_tasks[0].task_id, "task-c");
+    }
+
+    #[test]
+    fn evaluate_skill_promotes_clean_candidate_improvement() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        skill::create_candidate_skill(
+            &repo,
+            "cleanup-overlay",
+            "cleanup improvements",
+            "Use stricter cleanup checklist.",
+            &[String::from("receipt:task-123")],
+        )
+        .unwrap();
+
+        let baseline = sample_skill_metrics();
+        let mut candidate = baseline.clone();
+        candidate.primary.contract_satisfaction = 0.80;
+        candidate.primary.target_pass_rate = 0.80;
+        candidate.primary.blocked_run_rate = 0.10;
+
+        let record = evaluate_skill(
+            &repo,
+            &bus,
+            EvaluateSkillRequest {
+                skill_name: "cleanup-overlay".into(),
+                project_id: "specpunk".into(),
+                suite_id: "cleanup-suite".into(),
+                role: Some("implementer".into()),
+                baseline,
+                candidate,
+                suite_size: 5,
+                evidence_refs: vec!["receipt:task-123".into()],
+                notes: vec!["offline suite replay".into()],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(record.decision, PromotionDecision::Promote);
+        assert!(record
+            .primary_improvements
+            .iter()
+            .any(|item| item.contains("contract_satisfaction")));
+        assert!(record.safety_regressions.is_empty());
+        assert!(record.candidate_primary_score > record.baseline_primary_score);
+    }
+
+    #[test]
+    fn evaluate_skill_rejects_docs_regression() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        skill::create_candidate_skill(
+            &repo,
+            "docs-overlay",
+            "docs improvements",
+            "Keep docs aligned.",
+            &[String::from("receipt:task-456")],
+        )
+        .unwrap();
+
+        let baseline = sample_skill_metrics();
+        let mut candidate = baseline.clone();
+        candidate.primary.contract_satisfaction = 0.80;
+        candidate.safety.docs_parity = 0.60;
+
+        let record = evaluate_skill(
+            &repo,
+            &bus,
+            EvaluateSkillRequest {
+                skill_name: "docs-overlay".into(),
+                project_id: "specpunk".into(),
+                suite_id: "docs-suite".into(),
+                role: None,
+                baseline,
+                candidate,
+                suite_size: 6,
+                evidence_refs: vec!["receipt:task-456".into()],
+                notes: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(record.decision, PromotionDecision::Reject);
+        assert!(record
+            .safety_regressions
+            .iter()
+            .any(|item| item.contains("docs_parity")));
+    }
+
+    #[test]
+    fn list_skill_evals_returns_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        skill::create_candidate_skill(
+            &repo,
+            "first-skill",
+            "first",
+            "First candidate.",
+            &[String::from("receipt:first")],
+        )
+        .unwrap();
+        skill::create_candidate_skill(
+            &repo,
+            "second-skill",
+            "second",
+            "Second candidate.",
+            &[String::from("receipt:second")],
+        )
+        .unwrap();
+
+        let baseline = sample_skill_metrics();
+        let mut candidate = baseline.clone();
+        candidate.primary.contract_satisfaction = 0.80;
+
+        let _ = evaluate_skill(
+            &repo,
+            &bus,
+            EvaluateSkillRequest {
+                skill_name: "first-skill".into(),
+                project_id: "specpunk".into(),
+                suite_id: "suite-a".into(),
+                role: None,
+                baseline: baseline.clone(),
+                candidate: candidate.clone(),
+                suite_size: 5,
+                evidence_refs: vec!["receipt:first".into()],
+                notes: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        let _ = evaluate_skill(
+            &repo,
+            &bus,
+            EvaluateSkillRequest {
+                skill_name: "second-skill".into(),
+                project_id: "specpunk".into(),
+                suite_id: "suite-b".into(),
+                role: None,
+                baseline,
+                candidate,
+                suite_size: 5,
+                evidence_refs: vec!["receipt:second".into()],
+                notes: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let listed = list_skill_evals(&repo).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].skill_name, "second-skill");
+        assert_eq!(listed[1].skill_name, "first-skill");
     }
 }

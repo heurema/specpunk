@@ -371,8 +371,87 @@ enum EvalAction {
         /// Task id
         task_id: String,
     },
+    /// Evaluate one candidate skill patch against a baseline
+    Skill {
+        /// Candidate skill name
+        name: String,
+        /// Project id
+        #[arg(long)]
+        project: String,
+        /// Eval suite id
+        #[arg(long)]
+        suite: String,
+        /// Optional target role
+        #[arg(long)]
+        role: Option<String>,
+        /// Baseline contract satisfaction in [0.0, 1.0]
+        #[arg(long = "baseline-contract-satisfaction")]
+        baseline_contract_satisfaction: f64,
+        /// Candidate contract satisfaction in [0.0, 1.0]
+        #[arg(long = "candidate-contract-satisfaction")]
+        candidate_contract_satisfaction: f64,
+        /// Baseline target pass rate in [0.0, 1.0]
+        #[arg(long = "baseline-target-pass-rate")]
+        baseline_target_pass_rate: f64,
+        /// Candidate target pass rate in [0.0, 1.0]
+        #[arg(long = "candidate-target-pass-rate")]
+        candidate_target_pass_rate: f64,
+        /// Baseline blocked-run rate in [0.0, 1.0]
+        #[arg(long = "baseline-blocked-run-rate")]
+        baseline_blocked_run_rate: f64,
+        /// Candidate blocked-run rate in [0.0, 1.0]
+        #[arg(long = "candidate-blocked-run-rate")]
+        candidate_blocked_run_rate: f64,
+        /// Baseline escalation rate in [0.0, 1.0]
+        #[arg(long = "baseline-escalation-rate")]
+        baseline_escalation_rate: f64,
+        /// Candidate escalation rate in [0.0, 1.0]
+        #[arg(long = "candidate-escalation-rate")]
+        candidate_escalation_rate: f64,
+        /// Baseline scope discipline in [0.0, 1.0]
+        #[arg(long = "baseline-scope-discipline")]
+        baseline_scope_discipline: f64,
+        /// Candidate scope discipline in [0.0, 1.0]
+        #[arg(long = "candidate-scope-discipline")]
+        candidate_scope_discipline: f64,
+        /// Baseline integrity pass rate in [0.0, 1.0]
+        #[arg(long = "baseline-integrity-pass-rate")]
+        baseline_integrity_pass_rate: f64,
+        /// Candidate integrity pass rate in [0.0, 1.0]
+        #[arg(long = "candidate-integrity-pass-rate")]
+        candidate_integrity_pass_rate: f64,
+        /// Baseline cleanup completion in [0.0, 1.0]
+        #[arg(long = "baseline-cleanup-completion")]
+        baseline_cleanup_completion: f64,
+        /// Candidate cleanup completion in [0.0, 1.0]
+        #[arg(long = "candidate-cleanup-completion")]
+        candidate_cleanup_completion: f64,
+        /// Baseline docs parity in [0.0, 1.0]
+        #[arg(long = "baseline-docs-parity")]
+        baseline_docs_parity: f64,
+        /// Candidate docs parity in [0.0, 1.0]
+        #[arg(long = "candidate-docs-parity")]
+        candidate_docs_parity: f64,
+        /// Baseline drift penalty in [0.0, 1.0]
+        #[arg(long = "baseline-drift-penalty")]
+        baseline_drift_penalty: f64,
+        /// Candidate drift penalty in [0.0, 1.0]
+        #[arg(long = "candidate-drift-penalty")]
+        candidate_drift_penalty: f64,
+        /// Number of weighted suite cases
+        #[arg(long = "suite-size")]
+        suite_size: usize,
+        /// Evidence ref, can be repeated
+        #[arg(long = "evidence-ref")]
+        evidence_ref: Vec<String>,
+        /// Free-form note, can be repeated
+        #[arg(long = "note")]
+        note: Vec<String>,
+    },
     /// List stored task eval results
     List,
+    /// List stored skill eval results
+    SkillList,
     /// Aggregate stored task eval results
     Summary {
         /// Optional project filter
@@ -910,6 +989,60 @@ async fn main() -> anyhow::Result<()> {
         Command::Eval { action } => match action {
             EvalAction::Task { task_id } => cmd_eval_task(&task_id),
             EvalAction::List => cmd_eval_list(),
+            EvalAction::Skill {
+                name,
+                project,
+                suite,
+                role,
+                baseline_contract_satisfaction,
+                candidate_contract_satisfaction,
+                baseline_target_pass_rate,
+                candidate_target_pass_rate,
+                baseline_blocked_run_rate,
+                candidate_blocked_run_rate,
+                baseline_escalation_rate,
+                candidate_escalation_rate,
+                baseline_scope_discipline,
+                candidate_scope_discipline,
+                baseline_integrity_pass_rate,
+                candidate_integrity_pass_rate,
+                baseline_cleanup_completion,
+                candidate_cleanup_completion,
+                baseline_docs_parity,
+                candidate_docs_parity,
+                baseline_drift_penalty,
+                candidate_drift_penalty,
+                suite_size,
+                evidence_ref,
+                note,
+            } => cmd_eval_skill(
+                &name,
+                &project,
+                &suite,
+                role.as_deref(),
+                baseline_contract_satisfaction,
+                candidate_contract_satisfaction,
+                baseline_target_pass_rate,
+                candidate_target_pass_rate,
+                baseline_blocked_run_rate,
+                candidate_blocked_run_rate,
+                baseline_escalation_rate,
+                candidate_escalation_rate,
+                baseline_scope_discipline,
+                candidate_scope_discipline,
+                baseline_integrity_pass_rate,
+                candidate_integrity_pass_rate,
+                baseline_cleanup_completion,
+                candidate_cleanup_completion,
+                baseline_docs_parity,
+                candidate_docs_parity,
+                baseline_drift_penalty,
+                candidate_drift_penalty,
+                suite_size,
+                &evidence_ref,
+                &note,
+            ),
+            EvalAction::SkillList => cmd_eval_skill_list(),
             EvalAction::Summary { project, limit } => cmd_eval_summary(project.as_deref(), limit),
         },
         Command::Benchmark { action } => match action {
@@ -2595,6 +2728,180 @@ fn cmd_eval_list() {
             record.overall_score,
             format!("{:?}", record.gate_outcome).to_ascii_lowercase(),
             format!("{:?}", record.receipt_status).to_ascii_lowercase(),
+            record.created_at.to_rfc3339(),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_eval_skill(
+    name: &str,
+    project: &str,
+    suite: &str,
+    role: Option<&str>,
+    baseline_contract_satisfaction: f64,
+    candidate_contract_satisfaction: f64,
+    baseline_target_pass_rate: f64,
+    candidate_target_pass_rate: f64,
+    baseline_blocked_run_rate: f64,
+    candidate_blocked_run_rate: f64,
+    baseline_escalation_rate: f64,
+    candidate_escalation_rate: f64,
+    baseline_scope_discipline: f64,
+    candidate_scope_discipline: f64,
+    baseline_integrity_pass_rate: f64,
+    candidate_integrity_pass_rate: f64,
+    baseline_cleanup_completion: f64,
+    candidate_cleanup_completion: f64,
+    baseline_docs_parity: f64,
+    candidate_docs_parity: f64,
+    baseline_drift_penalty: f64,
+    candidate_drift_penalty: f64,
+    suite_size: usize,
+    evidence_refs: &[String],
+    notes: &[String],
+) {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let bus_path = bus::bus_dir();
+    let record = eval::evaluate_skill(
+        &cwd,
+        &bus_path,
+        eval::EvaluateSkillRequest {
+            skill_name: name.to_string(),
+            project_id: project.to_string(),
+            suite_id: suite.to_string(),
+            role: role.map(str::to_string),
+            baseline: eval::SkillEvalMetricSet {
+                primary: eval::SkillEvalPrimaryMetrics {
+                    contract_satisfaction: baseline_contract_satisfaction,
+                    target_pass_rate: baseline_target_pass_rate,
+                    blocked_run_rate: baseline_blocked_run_rate,
+                    escalation_rate: baseline_escalation_rate,
+                },
+                safety: eval::SkillEvalSafetyMetrics {
+                    scope_discipline: baseline_scope_discipline,
+                    integrity_pass_rate: baseline_integrity_pass_rate,
+                    cleanup_completion: baseline_cleanup_completion,
+                    docs_parity: baseline_docs_parity,
+                    drift_penalty: baseline_drift_penalty,
+                },
+            },
+            candidate: eval::SkillEvalMetricSet {
+                primary: eval::SkillEvalPrimaryMetrics {
+                    contract_satisfaction: candidate_contract_satisfaction,
+                    target_pass_rate: candidate_target_pass_rate,
+                    blocked_run_rate: candidate_blocked_run_rate,
+                    escalation_rate: candidate_escalation_rate,
+                },
+                safety: eval::SkillEvalSafetyMetrics {
+                    scope_discipline: candidate_scope_discipline,
+                    integrity_pass_rate: candidate_integrity_pass_rate,
+                    cleanup_completion: candidate_cleanup_completion,
+                    docs_parity: candidate_docs_parity,
+                    drift_penalty: candidate_drift_penalty,
+                },
+            },
+            suite_size,
+            evidence_refs: evidence_refs.to_vec(),
+            notes: notes.to_vec(),
+        },
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
+    println!("Skill: {}", record.skill_name);
+    println!("Project: {}", record.project_id);
+    println!("Suite: {}", record.suite_id);
+    if let Some(role) = &record.role {
+        println!("Role: {role}");
+    }
+    println!("Candidate path: {}", record.candidate_path.display());
+    println!(
+        "Decision: {}",
+        format!("{:?}", record.decision).to_ascii_lowercase()
+    );
+    println!(
+        "Primary score: baseline={:.2} candidate={:.2}",
+        record.baseline_primary_score, record.candidate_primary_score
+    );
+    println!(
+        "Suite coverage: {} ({})",
+        record.suite_size,
+        if record.sufficient_suite {
+            "sufficient"
+        } else {
+            "insufficient"
+        }
+    );
+    if record.primary_improvements.is_empty() {
+        println!("Primary improvements: none");
+    } else {
+        println!("Primary improvements:");
+        for item in &record.primary_improvements {
+            println!("  - {item}");
+        }
+    }
+    if record.primary_regressions.is_empty() {
+        println!("Primary regressions: none");
+    } else {
+        println!("Primary regressions:");
+        for item in &record.primary_regressions {
+            println!("  - {item}");
+        }
+    }
+    if record.safety_regressions.is_empty() {
+        println!("Safety regressions: none");
+    } else {
+        println!("Safety regressions:");
+        for item in &record.safety_regressions {
+            println!("  - {item}");
+        }
+    }
+    if record.decision_reasons.is_empty() {
+        println!("Decision reasons: none");
+    } else {
+        println!("Decision reasons:");
+        for reason in &record.decision_reasons {
+            println!("  - {reason}");
+        }
+    }
+}
+
+fn cmd_eval_skill_list() {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let records = eval::list_skill_evals(&cwd).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+    if records.is_empty() {
+        println!("No skill evals.");
+        return;
+    }
+
+    println!("Skill evals ({})\n", records.len());
+    for record in records {
+        println!(
+            "  {:<24} {:<16} suite={:<16} decision={} score={:.2}->{:.2} {}",
+            record.eval_id,
+            record.skill_name,
+            record.suite_id,
+            format!("{:?}", record.decision).to_ascii_lowercase(),
+            record.baseline_primary_score,
+            record.candidate_primary_score,
             record.created_at.to_rfc3339(),
         );
     }
