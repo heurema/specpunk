@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use punk_core::vcs::{detect_mode as detect_vcs_mode, enable_jj as enable_jj_for_repo, VcsMode};
 use punk_orch::{
     bus, config, context, daemon, diverge, doctor, goal, graph, morning, ops, panel, pipeline,
-    ratchet, recall, resolver, skill,
+    ratchet, recall, research, resolver, skill,
 };
 
 #[derive(Parser)]
@@ -181,6 +181,11 @@ enum Command {
         #[arg(long, default_value_t = 14)]
         since: i64,
     },
+    /// Bounded deep-research packet management
+    Research {
+        #[command(subcommand)]
+        action: ResearchAction,
+    },
     /// Pin a project alias to a local path
     Use {
         /// Project slug
@@ -258,6 +263,50 @@ enum VcsAction {
     Status,
     /// Enable jj for this Git repo explicitly
     EnableJj,
+}
+
+#[derive(Subcommand)]
+enum ResearchAction {
+    /// Freeze a new bounded research packet
+    Start {
+        /// Research kind
+        #[arg(long)]
+        kind: String,
+        /// Project id
+        #[arg(long)]
+        project: String,
+        /// Frozen research question
+        question: String,
+        /// Goal of the research run
+        #[arg(long)]
+        goal: String,
+        /// Optional subject reference
+        #[arg(long)]
+        subject_ref: Option<String>,
+        /// Constraint, can be repeated
+        #[arg(long = "constraint")]
+        constraint: Vec<String>,
+        /// Success criterion, can be repeated
+        #[arg(long = "success", required = true)]
+        success: Vec<String>,
+        /// Context reference, can be repeated
+        #[arg(long = "context-ref")]
+        context_ref: Vec<String>,
+        #[arg(long)]
+        max_rounds: Option<u32>,
+        #[arg(long)]
+        max_worker_slots: Option<u32>,
+        #[arg(long)]
+        max_duration_minutes: Option<u32>,
+        #[arg(long)]
+        max_artifacts: Option<u32>,
+        #[arg(long)]
+        max_cost_usd: Option<f64>,
+        #[arg(long)]
+        output_schema_ref: Option<String>,
+    },
+    /// List frozen research runs for the current repo
+    List,
 }
 
 #[derive(Subcommand)]
@@ -675,6 +724,42 @@ async fn main() -> anyhow::Result<()> {
                 _ => eprintln!("Unknown chart type: {chart_type}. Available: cost, project, gantt"),
             }
         }
+        Command::Research { action } => match action {
+            ResearchAction::Start {
+                kind,
+                project,
+                question,
+                goal,
+                subject_ref,
+                constraint,
+                success,
+                context_ref,
+                max_rounds,
+                max_worker_slots,
+                max_duration_minutes,
+                max_artifacts,
+                max_cost_usd,
+                output_schema_ref,
+            } => {
+                cmd_research_start(
+                    &kind,
+                    &project,
+                    &question,
+                    &goal,
+                    subject_ref.as_deref(),
+                    &constraint,
+                    &success,
+                    &context_ref,
+                    max_rounds,
+                    max_worker_slots,
+                    max_duration_minutes,
+                    max_artifacts,
+                    max_cost_usd,
+                    output_schema_ref.as_deref(),
+                );
+            }
+            ResearchAction::List => cmd_research_list(),
+        },
         Command::Goal { action } => match action {
             GoalAction::Create {
                 project,
@@ -1968,6 +2053,121 @@ fn cmd_vcs_enable_jj() {
             eprintln!("No Git or jj repo detected in the current directory.");
             std::process::exit(1);
         }
+    }
+}
+
+fn parse_research_kind(raw: &str) -> Result<research::ResearchKind, String> {
+    match raw {
+        "architecture" => Ok(research::ResearchKind::Architecture),
+        "migration-risk" | "migration_risk" => Ok(research::ResearchKind::MigrationRisk),
+        "cleanup-impact" | "cleanup_impact" => Ok(research::ResearchKind::CleanupImpact),
+        "skill-improvement" | "skill_improvement" => Ok(research::ResearchKind::SkillImprovement),
+        "model-protocol-comparison" | "model_protocol_comparison" => {
+            Ok(research::ResearchKind::ModelProtocolComparison)
+        }
+        _ => Err(format!(
+            "unknown research kind: {raw} (expected architecture, migration-risk, cleanup-impact, skill-improvement, or model-protocol-comparison)"
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_research_start(
+    kind: &str,
+    project: &str,
+    question: &str,
+    goal: &str,
+    subject_ref: Option<&str>,
+    constraints: &[String],
+    success: &[String],
+    context_refs: &[String],
+    max_rounds: Option<u32>,
+    max_worker_slots: Option<u32>,
+    max_duration_minutes: Option<u32>,
+    max_artifacts: Option<u32>,
+    max_cost_usd: Option<f64>,
+    output_schema_ref: Option<&str>,
+) {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let kind = parse_research_kind(kind).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
+    let mut budget = research::ResearchBudget::default();
+    if let Some(value) = max_rounds {
+        budget.max_rounds = value;
+    }
+    if let Some(value) = max_worker_slots {
+        budget.max_worker_slots = value;
+    }
+    if let Some(value) = max_duration_minutes {
+        budget.max_duration_minutes = value;
+    }
+    if let Some(value) = max_artifacts {
+        budget.max_artifacts = value;
+    }
+    budget.max_cost_usd = max_cost_usd;
+
+    let started = research::start_research(
+        &cwd,
+        research::StartResearchRequest {
+            kind,
+            project_id: project.to_string(),
+            subject_ref: subject_ref.map(|value| value.to_string()),
+            question: question.to_string(),
+            goal: goal.to_string(),
+            constraints: constraints.to_vec(),
+            success_criteria: success.to_vec(),
+            budget,
+            context_refs: context_refs.to_vec(),
+            output_schema_ref: output_schema_ref.map(|value| value.to_string()),
+        },
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
+    println!("Research id: {}", started.record.research_id);
+    println!("Status: frozen");
+    println!("Root dir: {}", started.root_dir.display());
+    println!("Packet: {}", started.record.packet_path);
+    println!("Artifacts: {}", started.record.artifacts_dir);
+}
+
+fn cmd_research_list() {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let runs = research::list_research_runs(&cwd).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+    if runs.is_empty() {
+        println!("No research runs.");
+        return;
+    }
+
+    println!("Research runs ({})\n", runs.len());
+    for run in runs {
+        println!(
+            "  {:<48} {:<10} {:<22} {}",
+            run.research_id,
+            "frozen",
+            run.project_id,
+            run.created_at.to_rfc3339()
+        );
     }
 }
 

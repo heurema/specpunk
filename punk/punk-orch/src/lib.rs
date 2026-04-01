@@ -19,6 +19,7 @@ pub mod queue;
 pub mod ratchet;
 pub mod recall;
 pub mod receipt;
+pub mod research;
 pub mod resolver;
 pub mod run;
 pub mod sanitize;
