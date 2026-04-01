@@ -305,6 +305,29 @@ enum ResearchAction {
         #[arg(long)]
         output_schema_ref: Option<String>,
     },
+    /// Write structured synthesis for a frozen research run
+    Synthesize {
+        /// Research id
+        research_id: String,
+        /// Structured outcome kind
+        #[arg(long)]
+        outcome: String,
+        /// Short synthesis title
+        #[arg(long)]
+        title: String,
+        /// Finding, can be repeated
+        #[arg(long = "finding", required = true)]
+        finding: Vec<String>,
+        /// Recommendation, can be repeated
+        #[arg(long = "recommendation")]
+        recommendation: Vec<String>,
+        /// Evidence ref, can be repeated
+        #[arg(long = "evidence-ref")]
+        evidence_ref: Vec<String>,
+        /// Unresolved question, can be repeated
+        #[arg(long = "unresolved")]
+        unresolved: Vec<String>,
+    },
     /// List frozen research runs for the current repo
     List,
 }
@@ -758,6 +781,23 @@ async fn main() -> anyhow::Result<()> {
                     output_schema_ref.as_deref(),
                 );
             }
+            ResearchAction::Synthesize {
+                research_id,
+                outcome,
+                title,
+                finding,
+                recommendation,
+                evidence_ref,
+                unresolved,
+            } => cmd_research_synthesize(
+                &research_id,
+                &outcome,
+                &title,
+                &finding,
+                &recommendation,
+                &evidence_ref,
+                &unresolved,
+            ),
             ResearchAction::List => cmd_research_list(),
         },
         Command::Goal { action } => match action {
@@ -2071,6 +2111,21 @@ fn parse_research_kind(raw: &str) -> Result<research::ResearchKind, String> {
     }
 }
 
+fn parse_research_outcome(raw: &str) -> Result<research::ResearchOutcome, String> {
+    match raw {
+        "answer" => Ok(research::ResearchOutcome::Answer),
+        "candidate-patch" | "candidate_patch" => Ok(research::ResearchOutcome::CandidatePatch),
+        "contract-patch" | "contract_patch" => Ok(research::ResearchOutcome::ContractPatch),
+        "adr-draft" | "adr_draft" => Ok(research::ResearchOutcome::AdrDraft),
+        "risk-memo" | "risk_memo" => Ok(research::ResearchOutcome::RiskMemo),
+        "eval-suite-patch" | "eval_suite_patch" => Ok(research::ResearchOutcome::EvalSuitePatch),
+        "escalate" => Ok(research::ResearchOutcome::Escalate),
+        _ => Err(format!(
+            "unknown research outcome: {raw} (expected answer, candidate-patch, contract-patch, adr-draft, risk-memo, eval-suite-patch, or escalate)"
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_research_start(
     kind: &str,
@@ -2169,6 +2224,49 @@ fn cmd_research_list() {
             run.created_at.to_rfc3339()
         );
     }
+}
+
+fn cmd_research_synthesize(
+    research_id: &str,
+    outcome: &str,
+    title: &str,
+    findings: &[String],
+    recommendations: &[String],
+    evidence_refs: &[String],
+    unresolved: &[String],
+) {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let outcome = parse_research_outcome(outcome).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
+    let write = research::synthesize_research(
+        &cwd,
+        research_id,
+        research::SynthesizeResearchRequest {
+            outcome,
+            title: title.to_string(),
+            findings: findings.to_vec(),
+            recommendations: recommendations.to_vec(),
+            evidence_refs: evidence_refs.to_vec(),
+            unresolved_questions: unresolved.to_vec(),
+        },
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
+    println!("Research id: {}", write.record.research_id);
+    println!("Status: {:?}", write.record.status);
+    println!("Synthesis: {}", write.synthesis_path.display());
 }
 
 fn load_config_or_exit(dir: &Path) -> config::Config {

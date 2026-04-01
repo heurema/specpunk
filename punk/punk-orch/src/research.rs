@@ -61,6 +61,8 @@ pub struct ResearchPacket {
 #[serde(rename_all = "snake_case")]
 pub enum ResearchStatus {
     Frozen,
+    Completed,
+    Escalated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -72,6 +74,42 @@ pub struct ResearchRecord {
     pub created_at: DateTime<Utc>,
     pub packet_path: String,
     pub artifacts_dir: String,
+    pub synthesis_path: Option<String>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchOutcome {
+    Answer,
+    CandidatePatch,
+    ContractPatch,
+    AdrDraft,
+    RiskMemo,
+    EvalSuitePatch,
+    Escalate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResearchSynthesis {
+    pub research_id: String,
+    pub outcome: ResearchOutcome,
+    pub title: String,
+    pub findings: Vec<String>,
+    pub recommendations: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub unresolved_questions: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SynthesizeResearchRequest {
+    pub outcome: ResearchOutcome,
+    pub title: String,
+    pub findings: Vec<String>,
+    pub recommendations: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub unresolved_questions: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +131,13 @@ pub struct ResearchStart {
     pub record: ResearchRecord,
     pub packet: ResearchPacket,
     pub root_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResearchSynthesisWrite {
+    pub synthesis: ResearchSynthesis,
+    pub synthesis_path: PathBuf,
+    pub record: ResearchRecord,
 }
 
 fn detect_repo_root(cwd: &Path) -> Result<PathBuf, String> {
@@ -119,6 +164,11 @@ fn detect_repo_root(cwd: &Path) -> Result<PathBuf, String> {
 
 fn research_root(project_root: &Path) -> PathBuf {
     project_root.join(".punk/research")
+}
+
+fn research_dir(cwd: &Path, research_id: &str) -> Result<PathBuf, String> {
+    let repo_root = detect_repo_root(cwd)?;
+    Ok(research_root(&repo_root).join(research_id))
 }
 
 fn default_stop_rules() -> Vec<String> {
@@ -231,6 +281,8 @@ pub fn start_research(cwd: &Path, request: StartResearchRequest) -> Result<Resea
         created_at: Utc::now(),
         packet_path: packet_path.display().to_string(),
         artifacts_dir: artifacts_dir.display().to_string(),
+        synthesis_path: None,
+        completed_at: None,
     };
     let record_path = root_dir.join("record.json");
     fs::write(
@@ -266,6 +318,70 @@ pub fn list_research_runs(cwd: &Path) -> Result<Vec<ResearchRecord>, String> {
     }
     records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(records)
+}
+
+pub fn synthesize_research(
+    cwd: &Path,
+    research_id: &str,
+    request: SynthesizeResearchRequest,
+) -> Result<ResearchSynthesisWrite, String> {
+    if request.title.trim().is_empty() {
+        return Err("synthesis title must be non-empty".to_string());
+    }
+    if request.findings.is_empty() {
+        return Err("at least one finding is required".to_string());
+    }
+
+    let root_dir = research_dir(cwd, research_id)?;
+    let record_path = root_dir.join("record.json");
+    if !record_path.exists() {
+        return Err(format!("research run not found: {research_id}"));
+    }
+
+    let record_content = fs::read_to_string(&record_path).map_err(|e| e.to_string())?;
+    let mut record =
+        serde_json::from_str::<ResearchRecord>(&record_content).map_err(|e| e.to_string())?;
+    if record.status != ResearchStatus::Frozen {
+        return Err(format!(
+            "research run is not open for synthesis: {}",
+            record.research_id
+        ));
+    }
+
+    let synthesis = ResearchSynthesis {
+        research_id: research_id.to_string(),
+        outcome: request.outcome.clone(),
+        title: request.title,
+        findings: request.findings,
+        recommendations: request.recommendations,
+        evidence_refs: request.evidence_refs,
+        unresolved_questions: request.unresolved_questions,
+        created_at: Utc::now(),
+    };
+    let synthesis_path = root_dir.join("synthesis.json");
+    fs::write(
+        &synthesis_path,
+        serde_json::to_string_pretty(&synthesis).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    record.status = match synthesis.outcome {
+        ResearchOutcome::Escalate => ResearchStatus::Escalated,
+        _ => ResearchStatus::Completed,
+    };
+    record.synthesis_path = Some(synthesis_path.display().to_string());
+    record.completed_at = Some(Utc::now());
+    fs::write(
+        &record_path,
+        serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(ResearchSynthesisWrite {
+        synthesis,
+        synthesis_path,
+        record,
+    })
 }
 
 #[cfg(test)]
@@ -309,6 +425,8 @@ mod tests {
         assert!(started.root_dir.join("record.json").exists());
         assert!(started.root_dir.join("artifacts").exists());
         assert_eq!(started.record.status, ResearchStatus::Frozen);
+        assert_eq!(started.record.synthesis_path, None);
+        assert_eq!(started.record.completed_at, None);
         assert_eq!(started.packet.question.project_id, "specpunk");
         assert_eq!(
             started.packet.output_schema_ref,
@@ -388,5 +506,91 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].research_id, second.record.research_id);
         assert_eq!(listed[1].research_id, first.record.research_id);
+    }
+
+    #[test]
+    fn synthesize_research_writes_synthesis_and_updates_record() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let started = start_research(
+            &repo,
+            StartResearchRequest {
+                kind: ResearchKind::Architecture,
+                project_id: "specpunk".into(),
+                subject_ref: None,
+                question: "Question".into(),
+                goal: "Goal".into(),
+                constraints: vec!["bounded".into()],
+                success_criteria: vec!["draft adr".into()],
+                budget: ResearchBudget::default(),
+                context_refs: vec!["receipt:abc".into()],
+                output_schema_ref: None,
+            },
+        )
+        .unwrap();
+
+        let write = synthesize_research(
+            &repo,
+            &started.record.research_id,
+            SynthesizeResearchRequest {
+                outcome: ResearchOutcome::AdrDraft,
+                title: "Adopt council-first architecture".into(),
+                findings: vec!["Existing slices already rely on councils".into()],
+                recommendations: vec!["Draft ADR with bounded rollout".into()],
+                evidence_refs: vec!["receipt:abc".into()],
+                unresolved_questions: vec!["Migration sequencing".into()],
+            },
+        )
+        .unwrap();
+
+        assert!(write.synthesis_path.exists());
+        assert_eq!(write.record.status, ResearchStatus::Completed);
+        assert_eq!(write.synthesis.outcome, ResearchOutcome::AdrDraft);
+        assert!(write.record.synthesis_path.is_some());
+        assert!(write.record.completed_at.is_some());
+    }
+
+    #[test]
+    fn synthesize_research_escalate_marks_record_escalated() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let started = start_research(
+            &repo,
+            StartResearchRequest {
+                kind: ResearchKind::MigrationRisk,
+                project_id: "specpunk".into(),
+                subject_ref: None,
+                question: "Question".into(),
+                goal: "Goal".into(),
+                constraints: vec![],
+                success_criteria: vec!["risk memo".into()],
+                budget: ResearchBudget::default(),
+                context_refs: vec![],
+                output_schema_ref: None,
+            },
+        )
+        .unwrap();
+
+        let write = synthesize_research(
+            &repo,
+            &started.record.research_id,
+            SynthesizeResearchRequest {
+                outcome: ResearchOutcome::Escalate,
+                title: "Need deeper migration review".into(),
+                findings: vec!["Ambiguity remains in compatibility matrix".into()],
+                recommendations: vec![],
+                evidence_refs: vec![],
+                unresolved_questions: vec!["Which downstream repos depend on v1?".into()],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(write.record.status, ResearchStatus::Escalated);
     }
 }
