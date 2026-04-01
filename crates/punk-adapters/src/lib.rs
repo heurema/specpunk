@@ -20,15 +20,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use context_pack::{
-    build_context_pack, ensure_retry_patch_seed, format_context_pack,
-    format_patch_context_pack,
+    build_context_pack, ensure_retry_patch_seed, format_context_pack, format_patch_context_pack,
     materialize_missing_entry_points, restore_missing_materialized_entry_points,
     restore_stale_entry_point_masks, scaffold_only_entry_points, ContextPack,
     EntryPointExcerptGuard,
 };
 use punk_domain::{Contract, DraftInput, DraftProposal, RefineInput};
-use serde::Deserialize;
-
 const BLOCKED_EXECUTION_SENTINEL: &str = "PUNK_EXECUTION_BLOCKED:";
 const SUCCESSFUL_EXECUTION_SENTINEL: &str = "PUNK_EXECUTION_COMPLETE:";
 
@@ -76,12 +73,10 @@ enum ExecutionLane {
     Manual,
 }
 
-#[derive(Debug, Deserialize)]
-struct PatchProposal {
-    summary: String,
-    patch: String,
-    #[serde(default)]
-    blocked_reason: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PatchLaneResponse {
+    Patch(String),
+    Blocked(String),
 }
 
 struct ProgressTracker {
@@ -423,11 +418,6 @@ impl CodexCliExecutor {
         let context_pack = build_context_pack(&input.repo_root, &input.contract)?;
         let mut excerpt_guard = EntryPointExcerptGuard::apply(&input.repo_root, &context_pack)?;
         let prompt = build_patch_apply_prompt(&input.contract, &context_pack);
-        let schema_path = patch_schema_path();
-        let output_path = patch_output_path();
-        let _ = fs::remove_file(&schema_path);
-        let _ = fs::remove_file(&output_path);
-        fs::write(&schema_path, serde_json::to_vec_pretty(&patch_schema())?)?;
 
         let mut command = Command::new("codex");
         command
@@ -437,11 +427,7 @@ impl CodexCliExecutor {
             .arg("-s")
             .arg("read-only")
             .arg("-C")
-            .arg(&input.repo_root)
-            .arg("--output-schema")
-            .arg(&schema_path)
-            .arg("-o")
-            .arg(&output_path);
+            .arg(&input.repo_root);
         if let Some(model) = &self.model {
             command.arg("-m").arg(model);
         }
@@ -469,16 +455,12 @@ impl CodexCliExecutor {
                 if let Some(guard) = excerpt_guard.as_mut() {
                     let _ = guard.restore();
                 }
-                let _ = fs::remove_file(&schema_path);
-                let _ = fs::remove_file(&output_path);
                 return Err(err);
             }
         };
         let stdout = String::from_utf8_lossy(&timed_output.output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&timed_output.output.stderr).to_string();
         if timed_output.timed_out {
-            let _ = fs::remove_file(&schema_path);
-            let _ = fs::remove_file(&output_path);
             return Ok(ExecuteOutput {
                 success: false,
                 summary: timeout_summary(codex_patch_lane_timeout(), &stdout, &stderr),
@@ -488,8 +470,6 @@ impl CodexCliExecutor {
             });
         }
         if timed_output.orphaned {
-            let _ = fs::remove_file(&schema_path);
-            let _ = fs::remove_file(&output_path);
             return Ok(ExecuteOutput {
                 success: false,
                 summary: orphan_summary(&stdout, &stderr),
@@ -499,8 +479,6 @@ impl CodexCliExecutor {
             });
         }
         if timed_output.stalled {
-            let _ = fs::remove_file(&schema_path);
-            let _ = fs::remove_file(&output_path);
             return Ok(ExecuteOutput {
                 success: false,
                 summary: stall_summary(codex_executor_stall_timeout(), &stdout, &stderr),
@@ -510,8 +488,6 @@ impl CodexCliExecutor {
             });
         }
         if !timed_output.output.status.success() {
-            let _ = fs::remove_file(&schema_path);
-            let _ = fs::remove_file(&output_path);
             let (success, summary) = classify_execution_result(false, &stdout, &stderr);
             return Ok(ExecuteOutput {
                 success,
@@ -522,66 +498,40 @@ impl CodexCliExecutor {
             });
         }
 
-        let proposal = match load_patch_proposal(&output_path, &stdout) {
-            Ok(proposal) => proposal,
+        let response = match load_patch_lane_response(&stdout, &stderr) {
+            Ok(response) => response,
             Err(err) => {
-                let _ = fs::remove_file(&schema_path);
-                let _ = fs::remove_file(&output_path);
                 append_log_text(
                     &input.stderr_path,
-                    &format!("\n[punk patch/apply] failed to parse patch proposal: {err}\n"),
+                    &format!("\n[punk patch/apply] failed to parse patch output: {err}\n"),
                 )?;
                 return Ok(ExecuteOutput {
                     success: false,
-                    summary: format!("patch/apply lane returned invalid patch proposal: {err}"),
+                    summary: format!("patch/apply lane returned invalid patch text: {err}"),
                     checks_run: Vec::new(),
                     cost_usd: None,
                     duration_ms: start.elapsed().as_millis() as u64,
                 });
             }
         };
-        let _ = fs::remove_file(&schema_path);
-        let _ = fs::remove_file(&output_path);
+        let patch = match response {
+            PatchLaneResponse::Blocked(reason) => {
+                append_log_text(
+                    &input.stderr_path,
+                    &format!("\n[punk patch/apply] blocked: {reason}\n"),
+                )?;
+                return Ok(ExecuteOutput {
+                    success: false,
+                    summary: reason,
+                    checks_run: Vec::new(),
+                    cost_usd: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+            PatchLaneResponse::Patch(patch) => patch,
+        };
 
-        let proposal_summary = proposal.summary.trim();
-        if !proposal_summary.is_empty() {
-            append_log_text(
-                &input.stdout_path,
-                &format!("\n[punk patch/apply] proposal: {proposal_summary}\n"),
-            )?;
-        }
-
-        if let Some(reason) = proposal
-            .blocked_reason
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        {
-            append_log_text(
-                &input.stderr_path,
-                &format!("\n[punk patch/apply] blocked: {reason}\n"),
-            )?;
-            return Ok(ExecuteOutput {
-                success: false,
-                summary: format!("{BLOCKED_EXECUTION_SENTINEL} {reason}"),
-                checks_run: Vec::new(),
-                cost_usd: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-
-        let patch = proposal.patch.trim();
-        if patch.is_empty() {
-            return Ok(ExecuteOutput {
-                success: false,
-                summary: "patch/apply lane returned an empty patch".to_string(),
-                checks_run: Vec::new(),
-                cost_usd: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-
-        let patch_paths = match validate_patch_scope(patch, &input.contract.allowed_scope) {
+        let patch_paths = match validate_patch_scope(&patch, &input.contract.allowed_scope) {
             Ok(paths) => paths,
             Err(err) => {
                 append_log_text(
@@ -598,7 +548,7 @@ impl CodexCliExecutor {
             }
         };
 
-        if let Err(err) = apply_patch_in_repo(&input.repo_root, patch) {
+        if let Err(err) = apply_patch_in_repo(&input.repo_root, &patch) {
             append_log_text(
                 &input.stderr_path,
                 &format!("\n[punk patch/apply] failed to apply patch: {err}\n"),
@@ -830,9 +780,11 @@ fn build_exec_prompt_with_mode(
 fn build_patch_apply_prompt(contract: &Contract, context_pack: &ContextPack) -> String {
     let context_pack_section = format_patch_context_pack(context_pack);
     format!(
-        "Produce a single git-style unified diff patch for the approved contract.\n\
-Return JSON only and match the provided schema exactly.\n\
-This step is controller-owned patch/apply lane generation. The repository is read-only for this step; do not modify files directly.\n\
+        "Produce plain text only for a controller-owned patch/apply lane.\n\
+Return exactly one of:\n\
+1. a single git-style unified diff patch starting with `diff --git`\n\
+2. a single line `{blocked}` followed by a concise reason\n\
+The repository is read-only for this step; do not modify files directly.\n\
 Contract id: {}\n\
 Behavior requirements: {}\n\
 Allowed scope: {}\n\
@@ -846,9 +798,8 @@ Requirements:\n\
 - touch only files inside allowed scope\n\
 - update existing files only; do not add, delete, move, or rename files in this lane\n\
 - prefer the smallest bounded patch that gets the implementation started and covers the approved behavior\n\
-- keep the patch concise and do not restate the prompt or bounded context in the output\n\
-- do not include markdown fences around the patch\n\
-- if implementation is blocked inside allowed scope, set `blocked_reason` and leave `patch` empty\n",
+- output patch text only; do not output JSON, commentary, bullets, or markdown fences\n\
+- if implementation is blocked inside allowed scope, output exactly one `{blocked}` line and nothing else\n",
         contract.id,
         contract.behavior_requirements.join("; "),
         contract.allowed_scope.join(", "),
@@ -857,6 +808,7 @@ Requirements:\n\
         contract.target_checks.join("; "),
         contract.integrity_checks.join("; "),
         context_pack_section,
+        blocked = blocked_execution_template(),
     )
 }
 
@@ -966,33 +918,12 @@ fn draft_schema() -> serde_json::Value {
     })
 }
 
-fn patch_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["summary", "patch", "blocked_reason"],
-        "properties": {
-            "summary": {"type": "string"},
-            "patch": {"type": "string"},
-            "blocked_reason": {"type": ["string", "null"]}
-        }
-    })
-}
-
 fn draft_schema_path() -> Result<PathBuf> {
     Ok(std::env::temp_dir().join(format!("punk-draft-schema-{}.json", std::process::id())))
 }
 
 fn draft_output_path() -> Result<PathBuf> {
     Ok(std::env::temp_dir().join(format!("punk-draft-output-{}.json", std::process::id())))
-}
-
-fn patch_schema_path() -> PathBuf {
-    std::env::temp_dir().join(format!("punk-patch-schema-{}.json", std::process::id()))
-}
-
-fn patch_output_path() -> PathBuf {
-    std::env::temp_dir().join(format!("punk-patch-output-{}.json", std::process::id()))
 }
 
 fn codex_executor_timeout() -> Duration {
@@ -1842,15 +1773,78 @@ fn unchanged_entry_point_paths(
     Ok(unchanged)
 }
 
-fn load_patch_proposal(output_path: &Path, stdout: &str) -> Result<PatchProposal> {
-    let payload = if output_path.exists() {
-        fs::read_to_string(output_path)
-            .with_context(|| format!("read patch proposal {}", output_path.display()))?
-    } else {
-        last_non_empty_line(stdout).ok_or_else(|| anyhow!("patch lane returned no JSON"))?
-    };
-    serde_json::from_str::<PatchProposal>(&payload)
-        .with_context(|| format!("parse patch proposal JSON: {payload}"))
+fn load_patch_lane_response(stdout: &str, stderr: &str) -> Result<PatchLaneResponse> {
+    if let Some(blocked) = blocked_execution_line(stdout, stderr) {
+        return Ok(PatchLaneResponse::Blocked(blocked));
+    }
+
+    extract_unified_diff(stdout)
+        .or_else(|| extract_unified_diff(stderr))
+        .or_else(|| extract_unified_diff(&format!("{stdout}\n{stderr}")))
+        .map(PatchLaneResponse::Patch)
+        .ok_or_else(|| anyhow!("patch lane returned no unified diff or blocked sentinel"))
+}
+
+fn extract_unified_diff(text: &str) -> Option<String> {
+    extract_fenced_unified_diff(text)
+        .or_else(|| extract_inline_unified_diff(text))
+        .map(|patch| normalize_patch_text(&patch))
+        .filter(|patch| !patch.trim().is_empty())
+}
+
+fn extract_fenced_unified_diff(text: &str) -> Option<String> {
+    let mut in_fence = false;
+    let mut fenced = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            if in_fence {
+                let candidate = fenced.join("\n");
+                if contains_unified_diff(&candidate) {
+                    return Some(candidate);
+                }
+                fenced.clear();
+                in_fence = false;
+            } else {
+                in_fence = true;
+                fenced.clear();
+            }
+            continue;
+        }
+        if in_fence {
+            fenced.push(line);
+        }
+    }
+    None
+}
+
+fn extract_inline_unified_diff(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| is_unified_diff_start(line.trim_start()))?;
+    Some(lines[start..].join("\n"))
+}
+
+fn contains_unified_diff(text: &str) -> bool {
+    text.lines()
+        .any(|line| is_unified_diff_start(line.trim_start()))
+}
+
+fn is_unified_diff_start(line: &str) -> bool {
+    line.starts_with("diff --git ") || line.starts_with("--- a/")
+}
+
+fn normalize_patch_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut normalized = trimmed.to_string();
+    if !normalized.ends_with('\n') {
+        normalized.push('\n');
+    }
+    normalized
 }
 
 fn validate_patch_scope(patch: &str, allowed_scope: &[String]) -> Result<Vec<String>> {
@@ -1876,7 +1870,9 @@ fn ensure_existing_file_only_patch(patch: &str) -> Result<()> {
             || line.starts_with("rename from ")
             || line.starts_with("rename to ")
         {
-            return Err(anyhow!("patch/apply lane only accepts existing-file updates"));
+            return Err(anyhow!(
+                "patch/apply lane only accepts existing-file updates"
+            ));
         }
     }
     Ok(())
@@ -2010,7 +2006,9 @@ fn run_contract_checks(
             return Err(format!(
                 "patch/apply lane check timed out: {check}{}",
                 last_non_empty_line(&String::from_utf8_lossy(&output.output.stderr))
-                    .or_else(|| last_non_empty_line(&String::from_utf8_lossy(&output.output.stdout)))
+                    .or_else(|| last_non_empty_line(&String::from_utf8_lossy(
+                        &output.output.stdout
+                    )))
                     .map(|line| format!(": {line}"))
                     .unwrap_or_default()
             ));
@@ -2124,6 +2122,32 @@ mod tests {
         assert!(prompt.contains("Do not perform broad repo-wide search."));
         assert!(prompt.contains(blocked_execution_template()));
         assert!(prompt.contains(successful_execution_template()));
+    }
+
+    #[test]
+    fn build_patch_apply_prompt_requests_plain_patch_text() {
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "x".into(),
+            entry_points: vec!["src/lib.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["public fn x".into()],
+            behavior_requirements: vec!["do x".into()],
+            allowed_scope: vec!["src/lib.rs".into()],
+            target_checks: vec!["cargo test".into()],
+            integrity_checks: vec!["cargo test".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let prompt = build_patch_apply_prompt(&contract, &ContextPack::default());
+        assert!(prompt.contains("single git-style unified diff patch"));
+        assert!(prompt.contains("do not output JSON"));
+        assert!(prompt.contains(blocked_execution_template()));
+        assert!(!prompt.contains("match the provided schema exactly"));
     }
 
     #[test]
@@ -2547,7 +2571,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("punk/punk-orch/src")).unwrap();
         fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
-        fs::write(root.join("punk/punk-orch/src/ratchet.rs"), "pub struct X;\n").unwrap();
+        fs::write(
+            root.join("punk/punk-orch/src/ratchet.rs"),
+            "pub struct X;\n",
+        )
+        .unwrap();
         fs::write(root.join("punk/punk-run/src/main.rs"), "fn main() {}\n").unwrap();
 
         let contract = Contract {
@@ -2564,7 +2592,7 @@ mod tests {
             import_paths: vec![],
             expected_interfaces: vec!["skill-eval ratchet bridge".into()],
             behavior_requirements: vec![
-                "add skill eval summary aggregation to ratchet output".into(),
+                "add skill eval summary aggregation to ratchet output".into()
             ],
             allowed_scope: vec![
                 "punk/punk-orch/src/ratchet.rs".into(),
@@ -2593,6 +2621,33 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("out-of-scope path src/lib.rs"));
+    }
+
+    #[test]
+    fn load_patch_lane_response_extracts_fenced_patch() {
+        let stdout = "```diff\ndiff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn old() {}\n+pub fn new() {}\n```\n";
+        let response = load_patch_lane_response(stdout, "").unwrap();
+        assert_eq!(
+            response,
+            PatchLaneResponse::Patch(
+                "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn old() {}\n+pub fn new() {}\n".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn load_patch_lane_response_prefers_blocked_sentinel() {
+        let response = load_patch_lane_response(
+            "",
+            "noise\nPUNK_EXECUTION_BLOCKED: waiting on missing interface details\n",
+        )
+        .unwrap();
+        assert_eq!(
+            response,
+            PatchLaneResponse::Blocked(
+                "PUNK_EXECUTION_BLOCKED: waiting on missing interface details".to_string()
+            )
+        );
     }
 
     #[test]
