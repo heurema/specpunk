@@ -10,6 +10,14 @@ use punk_domain::VcsKind;
 pub mod snapshot;
 pub use snapshot::current_snapshot_ref;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcsMode {
+    Jj,
+    GitOnly,
+    GitWithJjAvailableButDisabled,
+    NoVcs,
+}
+
 #[derive(Debug, Clone)]
 pub struct IsolatedChange {
     pub workspace_ref: String,
@@ -25,10 +33,7 @@ pub struct ProvenanceBaseline {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FileSnapshot {
     Missing,
-    Present {
-        len: u64,
-        modified_ns: Option<u128>,
-    },
+    Present { len: u64, modified_ns: Option<u128> },
 }
 
 pub trait VcsBackend {
@@ -63,6 +68,32 @@ pub fn detect_backend(path: impl AsRef<Path>) -> Result<Box<dyn VcsBackend>> {
     ))
 }
 
+pub fn detect_mode(path: impl AsRef<Path>) -> VcsMode {
+    let path = path.as_ref();
+    classify_mode(
+        JjBackend::is_repo(path),
+        GitBackend::is_repo(path),
+        is_jj_available(),
+    )
+}
+
+pub fn enable_jj(path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    match detect_mode(path) {
+        VcsMode::Jj => Ok(()),
+        VcsMode::GitWithJjAvailableButDisabled => {
+            run_capture(path, "jj", &["git", "init", "--colocate", "."])?;
+            Ok(())
+        }
+        VcsMode::GitOnly => Err(anyhow!(
+            "jj is not installed; cannot enable jj for this repo"
+        )),
+        VcsMode::NoVcs => Err(anyhow!(
+            "no supported VCS detected (jj preferred, git fallback)"
+        )),
+    }
+}
+
 pub struct JjBackend {
     root: PathBuf,
 }
@@ -83,6 +114,28 @@ impl JjBackend {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
+}
+
+fn classify_mode(is_jj_repo: bool, is_git_repo: bool, jj_available: bool) -> VcsMode {
+    if is_jj_repo {
+        VcsMode::Jj
+    } else if is_git_repo {
+        if jj_available {
+            VcsMode::GitWithJjAvailableButDisabled
+        } else {
+            VcsMode::GitOnly
+        }
+    } else {
+        VcsMode::NoVcs
+    }
+}
+
+fn is_jj_available() -> bool {
+    Command::new("jj")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 impl VcsBackend for JjBackend {
@@ -476,5 +529,23 @@ mod tests {
         assert_eq!(provenance_changed, expected_provenance);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn classify_mode_reports_git_with_jj_available_but_disabled() {
+        assert_eq!(
+            classify_mode(false, true, true),
+            VcsMode::GitWithJjAvailableButDisabled
+        );
+    }
+
+    #[test]
+    fn classify_mode_reports_git_only_without_jj() {
+        assert_eq!(classify_mode(false, true, false), VcsMode::GitOnly);
+    }
+
+    #[test]
+    fn classify_mode_prefers_jj() {
+        assert_eq!(classify_mode(true, true, true), VcsMode::Jj);
     }
 }
