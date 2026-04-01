@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
+use crate::receipt::{Receipt, ReceiptStatus};
 use crate::sanitize;
 
 /// A skill file (markdown with YAML frontmatter).
@@ -35,7 +36,11 @@ pub fn list_skills(bus: &Path, project_root: Option<&Path>) -> Vec<Skill> {
 
     collect_skills_from_dir(&mut skills, &skills_dir(bus), SkillState::Active);
     if let Some(root) = project_root {
-        collect_skills_from_dir(&mut skills, &candidate_skills_dir(root), SkillState::Candidate);
+        collect_skills_from_dir(
+            &mut skills,
+            &candidate_skills_dir(root),
+            SkillState::Candidate,
+        );
     }
 
     skills.sort_by(|a, b| {
@@ -129,6 +134,30 @@ pub fn create_candidate_skill(
     Ok(path)
 }
 
+pub fn propose_candidate_from_task(
+    bus: &Path,
+    cwd: &Path,
+    task_id: &str,
+    name_override: Option<&str>,
+) -> Result<PathBuf, String> {
+    let receipt = latest_receipt_for_task(bus, task_id)
+        .ok_or_else(|| format!("receipt not found for task: {task_id}"))?;
+
+    let suggested_name = name_override
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| default_candidate_name(&receipt));
+    let description = format!(
+        "Candidate overlay from {} task {} ({})",
+        receipt.project,
+        receipt.task_id,
+        receipt_status_label(&receipt.status)
+    );
+    let evidence_refs = build_evidence_refs(&receipt);
+    let content = build_candidate_content(&receipt);
+
+    create_candidate_skill(cwd, &suggested_name, &description, &content, &evidence_refs)
+}
+
 /// Security scan: check for prompt injection patterns.
 fn security_scan(content: &str) -> Option<String> {
     let patterns = [
@@ -180,6 +209,128 @@ fn extract_description(content: &str) -> String {
         .chars()
         .take(60)
         .collect()
+}
+
+fn latest_receipt_for_task(bus: &Path, task_id: &str) -> Option<Receipt> {
+    let index = bus.parent().unwrap_or(bus).join("receipts/index.jsonl");
+    let content = fs::read_to_string(index).ok()?;
+    content
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Receipt>(line).ok())
+        .find(|receipt| receipt.task_id == task_id)
+}
+
+fn build_evidence_refs(receipt: &Receipt) -> Vec<String> {
+    let mut refs = vec![
+        format!("task:{}", receipt.task_id),
+        format!("status:{}", receipt_status_label(&receipt.status)),
+        format!("project:{}", receipt.project),
+    ];
+
+    for artifact in receipt.artifacts.iter().take(3) {
+        refs.push(format!("artifact:{artifact}"));
+    }
+    refs
+}
+
+fn default_candidate_name(receipt: &Receipt) -> String {
+    let mut name = format!(
+        "{}-{}-candidate",
+        sanitize_name_fragment(&receipt.project),
+        sanitize_name_fragment(&receipt.task_id)
+    );
+    if name.len() > 80 {
+        name.truncate(80);
+    }
+    name
+}
+
+fn sanitize_name_fragment(raw: &str) -> String {
+    let mut out = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn build_candidate_content(receipt: &Receipt) -> String {
+    let summary = summarize_text(&receipt.summary, 240);
+    let errors = receipt
+        .errors
+        .iter()
+        .take(5)
+        .map(|error| format!("- {}", summarize_text(error, 160)))
+        .collect::<Vec<_>>();
+    let artifacts = receipt
+        .artifacts
+        .iter()
+        .take(5)
+        .map(|artifact| format!("- {artifact}"))
+        .collect::<Vec<_>>();
+
+    let mut out = String::new();
+    out.push_str("## Source Evidence\n\n");
+    out.push_str(&format!("- task: {}\n", receipt.task_id));
+    out.push_str(&format!("- project: {}\n", receipt.project));
+    out.push_str(&format!("- category: {}\n", receipt.category));
+    out.push_str(&format!(
+        "- status: {}\n",
+        receipt_status_label(&receipt.status)
+    ));
+    out.push_str(&format!("- model: {}\n", receipt.model));
+    out.push_str(&format!("- duration_ms: {}\n", receipt.duration_ms));
+    out.push_str(&format!("- cost_usd: {:.2}\n", receipt.cost_usd));
+    if !summary.is_empty() {
+        out.push_str(&format!("- summary: {summary}\n"));
+    }
+    if !errors.is_empty() {
+        out.push_str("\n### Errors\n");
+        out.push_str(&errors.join("\n"));
+        out.push('\n');
+    }
+    if !artifacts.is_empty() {
+        out.push_str("\n### Related Artifacts\n");
+        out.push_str(&artifacts.join("\n"));
+        out.push('\n');
+    }
+    out.push_str(
+        "\n## Candidate Patch\n\n### Add or improve\n- failure pattern:\n- checklist item:\n- anti-pattern warning:\n- routing hint:\n\n### Draft overlay text\n- When you see ...\n- Prefer ...\n- Avoid ...\n",
+    );
+    out
+}
+
+fn summarize_text(raw: &str, max_chars: usize) -> String {
+    let mut text = raw
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.len() > max_chars {
+        text.truncate(max_chars);
+        text.push('…');
+    }
+    text
+}
+
+fn receipt_status_label(status: &ReceiptStatus) -> &'static str {
+    match status {
+        ReceiptStatus::Success => "success",
+        ReceiptStatus::Failure => "failure",
+        ReceiptStatus::Timeout => "timeout",
+        ReceiptStatus::Cancelled => "cancelled",
+    }
 }
 
 fn extract_evidence_refs(content: &str) -> Vec<String> {
@@ -267,7 +418,8 @@ fn detect_repo_root(cwd: &Path) -> Result<PathBuf, String> {
             if output.status.success() {
                 let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !root.is_empty() {
-                    return Ok(PathBuf::from(root));
+                    let root_path = PathBuf::from(root);
+                    return Ok(root_path.canonicalize().unwrap_or(root_path));
                 }
             }
         }
@@ -317,9 +469,73 @@ mod tests {
     #[test]
     fn create_candidate_skill_requires_evidence() {
         let tmp = TempDir::new().unwrap();
-        let err =
-            create_candidate_skill(tmp.path(), "test", "desc", "content", &[]).unwrap_err();
+        let err = create_candidate_skill(tmp.path(), "test", "desc", "content", &[]).unwrap_err();
         assert!(err.contains("at least one --evidence"));
+    }
+
+    #[test]
+    fn propose_candidate_from_task_creates_repo_local_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+        let receipts_dir = tmp.path().join("receipts");
+        fs::create_dir_all(&receipts_dir).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .output()
+            .unwrap();
+
+        let receipt = serde_json::to_string(&Receipt {
+            schema_version: 1,
+            task_id: "task-123".into(),
+            status: ReceiptStatus::Failure,
+            agent: "claude".into(),
+            model: "sonnet".into(),
+            project: "specpunk".into(),
+            category: "fix".into(),
+            call_style: None,
+            tokens_used: 0,
+            cost_usd: 0.12,
+            duration_ms: 2_000,
+            exit_code: 1,
+            artifacts: vec!["runs/task-123/receipt.json".into()],
+            errors: vec!["compile error".into()],
+            summary: "candidate-worthy failure".into(),
+            created_at: chrono::Utc::now(),
+            parent_task_id: None,
+            punk_check_exit: None,
+        })
+        .unwrap();
+        fs::write(receipts_dir.join("index.jsonl"), receipt + "\n").unwrap();
+
+        let path = propose_candidate_from_task(&bus, &repo, "task-123", None).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let canonical_path = path.canonicalize().unwrap();
+        let canonical_candidates = repo.canonicalize().unwrap().join(".punk/skills/candidates");
+        assert!(canonical_path.starts_with(&canonical_candidates));
+        assert!(content.contains("state: candidate"));
+        assert!(content.contains("task:task-123"));
+        assert!(content.contains("candidate-worthy failure"));
+    }
+
+    #[test]
+    fn propose_candidate_from_task_requires_receipt() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .output()
+            .unwrap();
+
+        let err = propose_candidate_from_task(&bus, &repo, "missing-task", None).unwrap_err();
+        assert!(err.contains("receipt not found"));
     }
 
     #[test]

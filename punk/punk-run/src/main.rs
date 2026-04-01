@@ -237,6 +237,14 @@ enum SkillAction {
         #[arg(long = "evidence", required = true)]
         evidence: Vec<String>,
     },
+    /// Draft a candidate skill from an existing task receipt
+    Propose {
+        /// Task id to mine as evidence
+        task_id: String,
+        /// Optional explicit candidate skill name
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -574,6 +582,21 @@ async fn main() -> anyhow::Result<()> {
                 match skill::create_candidate_skill(&cwd, &name, &description, &content, &evidence)
                 {
                     Ok(path) => println!("Created candidate: {}", path.display()),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            SkillAction::Propose { task_id, name } => {
+                let bus_path = bus::bus_dir();
+                let cwd = std::env::current_dir().unwrap_or_else(|e| {
+                    eprintln!("Error reading current directory: {e}");
+                    std::process::exit(1);
+                });
+                match skill::propose_candidate_from_task(&bus_path, &cwd, &task_id, name.as_deref())
+                {
+                    Ok(path) => println!("Created candidate proposal: {}", path.display()),
                     Err(e) => {
                         eprintln!("Error: {e}");
                         std::process::exit(1);
@@ -1243,7 +1266,12 @@ async fn cmd_diverge(project: &str, spec: &str, timeout: u64) {
             }
             println!("\nWorktrees preserved:");
             for s in &report.solutions {
-                println!("  {} [{}] {}", s.label, s.provider, s.worktree_path.display());
+                println!(
+                    "  {} [{}] {}",
+                    s.label,
+                    s.provider,
+                    s.worktree_path.display()
+                );
             }
             println!("\nInspect with: git -C <worktree> diff HEAD");
         }
@@ -1269,8 +1297,7 @@ async fn cmd_panel(question: &str, timeout: u64) {
         println!(
             "### {} {} ({} ms, {} chars)",
             r.provider,
-            if r.exit_code == 0 { "" } else { "(FAILED)" }
-            ,
+            if r.exit_code == 0 { "" } else { "(FAILED)" },
             r.duration_ms,
             r.answer.chars().count()
         );
