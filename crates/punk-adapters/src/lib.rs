@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use context_pack::{
     build_context_pack, ensure_retry_patch_seed, format_context_pack,
+    format_patch_context_pack,
     materialize_missing_entry_points, restore_missing_materialized_entry_points,
     restore_stale_entry_point_masks, scaffold_only_entry_points, ContextPack,
     EntryPointExcerptGuard,
@@ -453,7 +454,7 @@ impl CodexCliExecutor {
 
         let timed_output = match run_patch_lane_command_with_timeout(
             &mut command,
-            codex_executor_timeout(),
+            codex_patch_lane_timeout(),
             input.stdout_path.clone(),
             input.stderr_path.clone(),
             input.executor_pid_path.clone(),
@@ -480,7 +481,7 @@ impl CodexCliExecutor {
             let _ = fs::remove_file(&output_path);
             return Ok(ExecuteOutput {
                 success: false,
-                summary: timeout_summary(codex_executor_timeout(), &stdout, &stderr),
+                summary: timeout_summary(codex_patch_lane_timeout(), &stdout, &stderr),
                 checks_run: Vec::new(),
                 cost_usd: None,
                 duration_ms: start.elapsed().as_millis() as u64,
@@ -827,7 +828,7 @@ fn build_exec_prompt_with_mode(
 }
 
 fn build_patch_apply_prompt(contract: &Contract, context_pack: &ContextPack) -> String {
-    let context_pack_section = format_context_pack(context_pack);
+    let context_pack_section = format_patch_context_pack(context_pack);
     format!(
         "Produce a single git-style unified diff patch for the approved contract.\n\
 Return JSON only and match the provided schema exactly.\n\
@@ -845,6 +846,7 @@ Requirements:\n\
 - touch only files inside allowed scope\n\
 - update existing files only; do not add, delete, move, or rename files in this lane\n\
 - prefer the smallest bounded patch that gets the implementation started and covers the approved behavior\n\
+- keep the patch concise and do not restate the prompt or bounded context in the output\n\
 - do not include markdown fences around the patch\n\
 - if implementation is blocked inside allowed scope, set `blocked_reason` and leave `patch` empty\n",
         contract.id,
@@ -999,6 +1001,15 @@ fn codex_executor_timeout() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(300);
+    Duration::from_secs(seconds)
+}
+
+fn codex_patch_lane_timeout() -> Duration {
+    let seconds = std::env::var("PUNK_CODEX_PATCH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(90);
     Duration::from_secs(seconds)
 }
 

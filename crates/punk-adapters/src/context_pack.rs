@@ -346,6 +346,76 @@ pub(crate) fn format_context_pack(pack: &ContextPack) -> String {
     sections.join("\n")
 }
 
+pub(crate) fn format_patch_context_pack(pack: &ContextPack) -> String {
+    let mut sections = Vec::new();
+
+    if !pack.files.is_empty() {
+        sections.push("Patch lane bounded context:".to_string());
+        for file in &pack.files {
+            sections.push(format!(
+                "- {} (lines {}-{}, truncated_at_test_boundary: {})",
+                file.path,
+                file.start_line,
+                file.end_line,
+                if file.truncated_at_test_boundary {
+                    "true"
+                } else {
+                    "false"
+                }
+            ));
+            sections.push("```rust".to_string());
+            sections.push(compact_patch_excerpt(&file.content, 80, 4000));
+            sections.push("```".to_string());
+        }
+    }
+
+    if !pack.missing_paths.is_empty() {
+        sections.push(format!(
+            "Missing entry-point files at baseline: {}",
+            pack.missing_paths.join(", ")
+        ));
+    }
+
+    if let Some(seed) = &pack.patch_seed {
+        sections.push("Controller-owned patch seed:".to_string());
+        sections.push(format!("- title: {}", seed.title));
+        sections.push(format!("- summary: {}", seed.summary));
+        for file in &seed.files {
+            sections.push(format!("- file: {} ({})", file.path, file.purpose));
+            sections.push("```rust".to_string());
+            sections.push(compact_patch_excerpt(&file.snippet, 60, 2500));
+            sections.push("```".to_string());
+        }
+    } else if let Some(seed) = &pack.recipe_seed {
+        sections.push("Controller-owned recipe seed:".to_string());
+        sections.push(format!("- title: {}", seed.title));
+        sections.push(format!("- summary: {}", seed.summary));
+        for file in &seed.files {
+            sections.push(format!(
+                "- file: {} ({}) targets: {}",
+                file.path,
+                file.role,
+                file.edit_targets.join("; ")
+            ));
+        }
+    }
+
+    sections.join("\n")
+}
+
+fn compact_patch_excerpt(content: &str, max_lines: usize, max_chars: usize) -> String {
+    let lines: Vec<&str> = content.lines().take(max_lines).collect();
+    let mut compact = lines.join("\n");
+    if content.lines().count() > max_lines {
+        compact.push_str("\n// ... excerpt truncated for patch lane");
+    }
+    if compact.len() > max_chars {
+        compact.truncate(max_chars.saturating_sub(33));
+        compact.push_str("\n// ... excerpt truncated for patch lane");
+    }
+    compact
+}
+
 fn build_recipe_seed(contract: &Contract) -> Option<ContextRecipeSeed> {
     if is_council_synthesis_recipe(contract) {
         return Some(council_synthesis_recipe_seed());
@@ -1166,6 +1236,30 @@ mod tests {
         };
         let rendered = format_context_pack(&pack);
         assert!(rendered.contains("Missing entry-point files at baseline: src/new_file.rs"));
+    }
+
+    #[test]
+    fn patch_formatter_compacts_large_excerpts() {
+        let large = (0..120)
+            .map(|idx| format!("pub fn line_{idx}() {{}}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pack = ContextPack {
+            files: vec![ContextFileExcerpt {
+                path: "src/lib.rs".into(),
+                start_line: 1,
+                end_line: 120,
+                truncated_at_test_boundary: false,
+                content: large,
+            }],
+            missing_paths: vec![],
+            recipe_seed: None,
+            patch_seed: None,
+        };
+        let rendered = format_patch_context_pack(&pack);
+        assert!(rendered.contains("Patch lane bounded context:"));
+        assert!(rendered.contains("src/lib.rs"));
+        assert!(rendered.contains("excerpt truncated for patch lane"));
     }
 
     #[test]
