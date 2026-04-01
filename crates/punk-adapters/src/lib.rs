@@ -573,6 +573,7 @@ impl CodexCliExecutor {
         let checks = collect_contract_checks(&input.contract);
         let checks_run = match run_contract_checks(
             &input.repo_root,
+            &input.contract,
             &checks,
             &input.stdout_path,
             &input.stderr_path,
@@ -2190,6 +2191,7 @@ fn collect_contract_checks(contract: &Contract) -> Vec<String> {
 
 fn run_contract_checks(
     repo_root: &Path,
+    contract: &Contract,
     checks: &[String],
     stdout_path: &Path,
     stderr_path: &Path,
@@ -2200,7 +2202,10 @@ fn run_contract_checks(
         append_log_text(stdout_path, &format!("\n[punk check] {check}\n"))
             .map_err(|err| err.to_string())?;
         let mut command = Command::new("/bin/zsh");
-        command.arg("-lc").arg(check).current_dir(repo_root);
+        command
+            .arg("-lc")
+            .arg(check)
+            .current_dir(resolve_check_workdir(repo_root, contract, check));
         if let Some(git_guard) = git_guard.as_ref() {
             git_guard.apply(&mut command);
         }
@@ -2233,6 +2238,65 @@ fn run_contract_checks(
         checks_run.push(check.clone());
     }
     Ok(checks_run)
+}
+
+fn resolve_check_workdir(repo_root: &Path, contract: &Contract, check: &str) -> PathBuf {
+    let trimmed = check.trim();
+    if !trimmed.starts_with("cargo ")
+        || trimmed.contains("cd ")
+        || trimmed.contains("&&")
+        || trimmed.contains(';')
+    {
+        return repo_root.to_path_buf();
+    }
+    infer_scoped_cargo_root(repo_root, contract).unwrap_or_else(|| repo_root.to_path_buf())
+}
+
+fn infer_scoped_cargo_root(repo_root: &Path, contract: &Contract) -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    for rel_path in contract
+        .entry_points
+        .iter()
+        .chain(contract.allowed_scope.iter())
+    {
+        let Some(root) = outermost_cargo_root_for_scope_path(repo_root, rel_path) else {
+            continue;
+        };
+        if !roots.iter().any(|existing: &PathBuf| existing == &root) {
+            roots.push(root);
+        }
+    }
+    if roots.len() == 1 {
+        roots.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn outermost_cargo_root_for_scope_path(repo_root: &Path, rel_path: &str) -> Option<PathBuf> {
+    let joined = repo_root.join(rel_path);
+    let mut cursor = if joined.is_dir() {
+        joined.as_path()
+    } else {
+        joined.parent()?
+    };
+    let mut candidate = None;
+    loop {
+        if cursor == repo_root && candidate.is_some() {
+            break;
+        }
+        if cursor.join("Cargo.toml").exists() {
+            candidate = Some(cursor.to_path_buf());
+        }
+        if cursor == repo_root {
+            break;
+        }
+        cursor = cursor.parent()?;
+        if !cursor.starts_with(repo_root) {
+            break;
+        }
+    }
+    candidate
 }
 
 fn append_log_text(path: &Path, text: &str) -> Result<()> {
@@ -2878,6 +2942,69 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.join("src/lib.rs")).unwrap(),
             "pub fn new() {}\n"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn infer_scoped_cargo_root_prefers_nested_workspace_root() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-check-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("punk/Cargo.toml"),
+            "[workspace]\nmembers=[\"punk-run\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("punk/punk-run/Cargo.toml"),
+            "[package]\nname=\"punk-run\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("punk/punk-run/src/main.rs"), "fn main() {}\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "x".into(),
+            entry_points: vec!["punk/punk-run/src/main.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["main".into()],
+            behavior_requirements: vec!["do x".into()],
+            allowed_scope: vec!["punk/punk-run/src/main.rs".into()],
+            target_checks: vec!["cargo test -p punk-run".into()],
+            integrity_checks: vec!["cargo build -p punk-run".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert_eq!(
+            infer_scoped_cargo_root(&root, &contract),
+            Some(root.join("punk"))
+        );
+        assert_eq!(
+            resolve_check_workdir(&root, &contract, "cargo test -p punk-run"),
+            root.join("punk")
+        );
+        assert_eq!(
+            resolve_check_workdir(&root, &contract, "cd punk && cargo test -p punk-run"),
+            root
         );
 
         let _ = fs::remove_dir_all(&root);
