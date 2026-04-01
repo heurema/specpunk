@@ -38,6 +38,41 @@ pub struct TaskEvalRecord {
     pub receipt_created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectEvalSummary {
+    pub project_id: String,
+    pub total: usize,
+    pub accept_count: usize,
+    pub reject_count: usize,
+    pub avg_score: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeakTaskEval {
+    pub task_id: String,
+    pub project_id: String,
+    pub overall_score: f64,
+    pub gate_outcome: GateOutcome,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalSummary {
+    pub total: usize,
+    pub accept_count: usize,
+    pub reject_count: usize,
+    pub avg_score: f64,
+    pub avg_contract_satisfaction: f64,
+    pub avg_scope_discipline: f64,
+    pub avg_target_pass_rate: f64,
+    pub avg_integrity_pass_rate: f64,
+    pub avg_cleanup_completion: f64,
+    pub avg_docs_parity: f64,
+    pub avg_drift_penalty: f64,
+    pub projects: Vec<ProjectEvalSummary>,
+    pub weakest_tasks: Vec<WeakTaskEval>,
+}
+
 fn detect_repo_root(cwd: &Path) -> Result<PathBuf, String> {
     for (bin, args) in [
         ("jj", vec!["root"]),
@@ -292,6 +327,144 @@ pub fn list_task_evals(cwd: &Path) -> Result<Vec<TaskEvalRecord>, String> {
     Ok(records)
 }
 
+pub fn summarize_task_evals(
+    cwd: &Path,
+    limit: Option<usize>,
+    project_filter: Option<&str>,
+) -> Result<EvalSummary, String> {
+    let mut records = list_task_evals(cwd)?;
+    if let Some(project) = project_filter {
+        records.retain(|record| record.project_id == project);
+    }
+    if let Some(limit) = limit {
+        records.truncate(limit);
+    }
+    if records.is_empty() {
+        return Err("no task evals found for summary".to_string());
+    }
+
+    let total = records.len();
+    let accept_count = records
+        .iter()
+        .filter(|record| record.gate_outcome == GateOutcome::Accept)
+        .count();
+    let reject_count = total - accept_count;
+
+    let avg_score = records
+        .iter()
+        .map(|record| record.overall_score)
+        .sum::<f64>()
+        / total as f64;
+    let avg_contract_satisfaction = records
+        .iter()
+        .map(|record| record.metrics.contract_satisfaction)
+        .sum::<f64>()
+        / total as f64;
+    let avg_scope_discipline = records
+        .iter()
+        .map(|record| record.metrics.scope_discipline)
+        .sum::<f64>()
+        / total as f64;
+    let avg_target_pass_rate = records
+        .iter()
+        .map(|record| record.metrics.target_pass_rate)
+        .sum::<f64>()
+        / total as f64;
+    let avg_integrity_pass_rate = records
+        .iter()
+        .map(|record| record.metrics.integrity_pass_rate)
+        .sum::<f64>()
+        / total as f64;
+    let avg_cleanup_completion = records
+        .iter()
+        .map(|record| record.metrics.cleanup_completion)
+        .sum::<f64>()
+        / total as f64;
+    let avg_docs_parity = records
+        .iter()
+        .map(|record| record.metrics.docs_parity)
+        .sum::<f64>()
+        / total as f64;
+    let avg_drift_penalty = records
+        .iter()
+        .map(|record| record.metrics.drift_penalty)
+        .sum::<f64>()
+        / total as f64;
+
+    let mut project_ids = records
+        .iter()
+        .map(|record| record.project_id.clone())
+        .collect::<Vec<_>>();
+    project_ids.sort();
+    project_ids.dedup();
+
+    let mut projects = Vec::new();
+    for project_id in project_ids {
+        let project_records = records
+            .iter()
+            .filter(|record| record.project_id == project_id)
+            .collect::<Vec<_>>();
+        let project_total = project_records.len();
+        let project_accept_count = project_records
+            .iter()
+            .filter(|record| record.gate_outcome == GateOutcome::Accept)
+            .count();
+        let project_reject_count = project_total - project_accept_count;
+        let project_avg_score = project_records
+            .iter()
+            .map(|record| record.overall_score)
+            .sum::<f64>()
+            / project_total as f64;
+        projects.push(ProjectEvalSummary {
+            project_id,
+            total: project_total,
+            accept_count: project_accept_count,
+            reject_count: project_reject_count,
+            avg_score: project_avg_score,
+        });
+    }
+    projects.sort_by(|a, b| {
+        a.avg_score
+            .partial_cmp(&b.avg_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.project_id.cmp(&b.project_id))
+    });
+
+    let mut weakest_tasks = records
+        .iter()
+        .map(|record| WeakTaskEval {
+            task_id: record.task_id.clone(),
+            project_id: record.project_id.clone(),
+            overall_score: record.overall_score,
+            gate_outcome: record.gate_outcome.clone(),
+            created_at: record.created_at,
+        })
+        .collect::<Vec<_>>();
+    weakest_tasks.sort_by(|a, b| {
+        a.overall_score
+            .partial_cmp(&b.overall_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+    weakest_tasks.truncate(3);
+
+    Ok(EvalSummary {
+        total,
+        accept_count,
+        reject_count,
+        avg_score,
+        avg_contract_satisfaction,
+        avg_scope_discipline,
+        avg_target_pass_rate,
+        avg_integrity_pass_rate,
+        avg_cleanup_completion,
+        avg_docs_parity,
+        avg_drift_penalty,
+        projects,
+        weakest_tasks,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +573,78 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].task_id, "task-2");
         assert_eq!(listed[1].task_id, "task-1");
+    }
+
+    #[test]
+    fn summarize_task_evals_aggregates_counts_and_averages() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        let mut success = sample_receipt(ReceiptStatus::Success);
+        success.task_id = "task-ok".into();
+        success.project = "specpunk".into();
+        write_receipt_index(&bus, &success);
+        let _ = evaluate_task(&repo, &bus, "task-ok").unwrap();
+
+        let mut failed = sample_receipt(ReceiptStatus::Failure);
+        failed.task_id = "task-bad".into();
+        failed.project = "specpunk".into();
+        failed.exit_code = 1;
+        failed.punk_check_exit = Some(1);
+        failed.summary = "stale docs and leftover v1 path".into();
+        write_receipt_index(&bus, &failed);
+        let _ = evaluate_task(&repo, &bus, "task-bad").unwrap();
+
+        let summary = summarize_task_evals(&repo, None, None).unwrap();
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.accept_count, 1);
+        assert_eq!(summary.reject_count, 1);
+        assert_eq!(summary.projects.len(), 1);
+        assert_eq!(summary.projects[0].project_id, "specpunk");
+        assert_eq!(summary.weakest_tasks[0].task_id, "task-bad");
+        assert!(summary.avg_score < 1.0);
+    }
+
+    #[test]
+    fn summarize_task_evals_applies_project_filter_and_limit() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        let mut first = sample_receipt(ReceiptStatus::Success);
+        first.task_id = "task-a".into();
+        first.project = "alpha".into();
+        write_receipt_index(&bus, &first);
+        let _ = evaluate_task(&repo, &bus, "task-a").unwrap();
+
+        let mut second = sample_receipt(ReceiptStatus::Failure);
+        second.task_id = "task-b".into();
+        second.project = "beta".into();
+        second.exit_code = 1;
+        second.punk_check_exit = Some(1);
+        write_receipt_index(&bus, &second);
+        let _ = evaluate_task(&repo, &bus, "task-b").unwrap();
+
+        let mut third = sample_receipt(ReceiptStatus::Success);
+        third.task_id = "task-c".into();
+        third.project = "alpha".into();
+        write_receipt_index(&bus, &third);
+        let _ = evaluate_task(&repo, &bus, "task-c").unwrap();
+
+        let summary = summarize_task_evals(&repo, Some(1), Some("alpha")).unwrap();
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.accept_count, 1);
+        assert_eq!(summary.reject_count, 0);
+        assert_eq!(summary.projects.len(), 1);
+        assert_eq!(summary.projects[0].project_id, "alpha");
+        assert_eq!(summary.weakest_tasks.len(), 1);
+        assert_eq!(summary.weakest_tasks[0].task_id, "task-c");
     }
 }

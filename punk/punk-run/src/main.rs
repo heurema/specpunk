@@ -368,6 +368,15 @@ enum EvalAction {
     },
     /// List stored task eval results
     List,
+    /// Aggregate stored task eval results
+    Summary {
+        /// Optional project filter
+        #[arg(long)]
+        project: Option<String>,
+        /// Limit to newest N eval records
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -849,6 +858,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Eval { action } => match action {
             EvalAction::Task { task_id } => cmd_eval_task(&task_id),
             EvalAction::List => cmd_eval_list(),
+            EvalAction::Summary { project, limit } => cmd_eval_summary(project.as_deref(), limit),
         },
         Command::Goal { action } => match action {
             GoalAction::Create {
@@ -2481,6 +2491,65 @@ fn cmd_eval_list() {
             format!("{:?}", record.gate_outcome).to_ascii_lowercase(),
             format!("{:?}", record.receipt_status).to_ascii_lowercase(),
             record.created_at.to_rfc3339(),
+        );
+    }
+}
+
+fn cmd_eval_summary(project_filter: Option<&str>, limit: Option<usize>) {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let summary = eval::summarize_task_evals(&cwd, limit, project_filter).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
+    println!("Eval summary");
+    if let Some(project) = project_filter {
+        println!("Project filter: {project}");
+    }
+    if let Some(limit) = limit {
+        println!("Limit: newest {limit}");
+    }
+    println!(
+        "Totals: total={} accept={} reject={}",
+        summary.total, summary.accept_count, summary.reject_count
+    );
+    println!("Average score: {:.2}", summary.avg_score);
+    println!(
+        "Average metrics: contract={:.2} scope={:.2} target={:.2} integrity={:.2} cleanup={:.2} docs={:.2} drift_penalty={:.2}",
+        summary.avg_contract_satisfaction,
+        summary.avg_scope_discipline,
+        summary.avg_target_pass_rate,
+        summary.avg_integrity_pass_rate,
+        summary.avg_cleanup_completion,
+        summary.avg_docs_parity,
+        summary.avg_drift_penalty,
+    );
+    println!("Projects:");
+    for project in &summary.projects {
+        println!(
+            "  - {:<18} total={} accept={} reject={} avg_score={:.2}",
+            project.project_id,
+            project.total,
+            project.accept_count,
+            project.reject_count,
+            project.avg_score,
+        );
+    }
+    println!("Weakest tasks:");
+    for task in &summary.weakest_tasks {
+        println!(
+            "  - {:<24} {:<18} score={:.2} gate={} {}",
+            task.task_id,
+            task.project_id,
+            task.overall_score,
+            format!("{:?}", task.gate_outcome).to_ascii_lowercase(),
+            task.created_at.to_rfc3339(),
         );
     }
 }
