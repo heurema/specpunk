@@ -1524,6 +1524,7 @@ async fn cmd_panel(question: &str, timeout: u64) {
 
 fn cmd_ratchet() {
     let bus_path = bus::bus_dir();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let current = ratchet::compute_metrics_window(&bus_path, 0, 7);
     let previous = ratchet::compute_metrics_window(&bus_path, 7, 14);
 
@@ -1532,7 +1533,11 @@ fn cmd_ratchet() {
     println!("  Last week:  {}", ratchet::format_metrics(&previous));
     println!();
 
-    let directives = ratchet::compare(&current, &previous);
+    let mut directives = ratchet::compare(&current, &previous);
+    let eval_summary = eval::summarize_task_evals(&cwd, Some(20), None).ok();
+    if let Some(summary) = &eval_summary {
+        directives.extend(ratchet::eval_directives(summary));
+    }
     let verdict = ratchet::verdict(&directives);
     println!("  Verdict:   {:?}\n", verdict);
 
@@ -1542,6 +1547,14 @@ fn cmd_ratchet() {
         for d in &directives {
             println!("  {}", ratchet::format_directive(d));
         }
+    }
+
+    if let Some(summary) = eval_summary {
+        println!();
+        println!(
+            "  Eval window: last {} stored evals, avg score {:.2}, drift {:.2}",
+            summary.total, summary.avg_score, summary.avg_drift_penalty
+        );
     }
 }
 

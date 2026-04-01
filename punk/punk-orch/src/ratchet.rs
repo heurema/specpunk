@@ -4,6 +4,8 @@ use std::path::Path;
 use chrono::{Duration, Utc};
 use serde_json::Value;
 
+use crate::eval::EvalSummary;
+
 /// Weekly performance metrics computed from receipts.
 #[derive(Debug, Clone)]
 pub struct WeeklyMetrics {
@@ -232,6 +234,73 @@ pub fn verdict(directives: &[RatchetDirective]) -> RatchetVerdict {
     }
 }
 
+pub fn eval_directives(summary: &EvalSummary) -> Vec<RatchetDirective> {
+    let mut directives = Vec::new();
+
+    if summary.avg_score < 0.7 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Warn,
+            metric: "eval_score",
+            message: format!("avg eval score is low at {:.2}", summary.avg_score),
+        });
+    } else if summary.avg_score >= 0.9 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Ok,
+            metric: "eval_score",
+            message: format!("avg eval score is strong at {:.2}", summary.avg_score),
+        });
+    }
+
+    if summary.avg_scope_discipline < 0.95 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Warn,
+            metric: "scope_discipline",
+            message: format!(
+                "scope discipline regressed to {:.2}",
+                summary.avg_scope_discipline
+            ),
+        });
+    }
+
+    if summary.avg_integrity_pass_rate < 0.99 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Warn,
+            metric: "integrity",
+            message: format!(
+                "integrity pass rate regressed to {:.2}",
+                summary.avg_integrity_pass_rate
+            ),
+        });
+    }
+
+    if summary.avg_docs_parity < 0.95 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Warn,
+            metric: "docs_parity",
+            message: format!("docs parity regressed to {:.2}", summary.avg_docs_parity),
+        });
+    }
+
+    if summary.avg_drift_penalty > 0.2 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Warn,
+            metric: "drift",
+            message: format!(
+                "drift penalty is elevated at {:.2}",
+                summary.avg_drift_penalty
+            ),
+        });
+    } else if summary.avg_drift_penalty == 0.0 && summary.avg_scope_discipline >= 0.99 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Ok,
+            metric: "drift",
+            message: "no drift penalty detected in recent evals".to_string(),
+        });
+    }
+
+    directives
+}
+
 pub fn format_directive(directive: &RatchetDirective) -> String {
     let prefix = match directive.level {
         DirectiveLevel::Ok => "OK",
@@ -300,6 +369,57 @@ mod tests {
 
         let directives = compare(&current, &previous);
         assert!(directives.iter().any(|d| d.level == DirectiveLevel::Ok));
+        assert_eq!(verdict(&directives), RatchetVerdict::Improving);
+    }
+
+    fn sample_eval_summary(
+        avg_score: f64,
+        avg_scope_discipline: f64,
+        avg_integrity_pass_rate: f64,
+        avg_docs_parity: f64,
+        avg_drift_penalty: f64,
+    ) -> EvalSummary {
+        EvalSummary {
+            total: 3,
+            accept_count: 2,
+            reject_count: 1,
+            avg_score,
+            avg_contract_satisfaction: 0.8,
+            avg_scope_discipline,
+            avg_target_pass_rate: 0.7,
+            avg_integrity_pass_rate,
+            avg_cleanup_completion: 0.8,
+            avg_docs_parity,
+            avg_drift_penalty,
+            projects: vec![],
+            weakest_tasks: vec![],
+        }
+    }
+
+    #[test]
+    fn eval_directives_warn_on_low_eval_health() {
+        let summary = sample_eval_summary(0.55, 0.7, 0.8, 0.6, 0.5);
+
+        let directives = eval_directives(&summary);
+        assert!(directives.iter().any(|d| d.metric == "eval_score"));
+        assert!(directives.iter().any(|d| d.metric == "scope_discipline"));
+        assert!(directives.iter().any(|d| d.metric == "integrity"));
+        assert!(directives.iter().any(|d| d.metric == "docs_parity"));
+        assert!(directives.iter().any(|d| d.metric == "drift"));
+        assert_eq!(verdict(&directives), RatchetVerdict::Degrading);
+    }
+
+    #[test]
+    fn eval_directives_emit_ok_for_clean_recent_evals() {
+        let summary = sample_eval_summary(0.95, 1.0, 1.0, 1.0, 0.0);
+
+        let directives = eval_directives(&summary);
+        assert!(directives
+            .iter()
+            .any(|d| d.metric == "eval_score" && d.level == DirectiveLevel::Ok));
+        assert!(directives
+            .iter()
+            .any(|d| d.metric == "drift" && d.level == DirectiveLevel::Ok));
         assert_eq!(verdict(&directives), RatchetVerdict::Improving);
     }
 }
