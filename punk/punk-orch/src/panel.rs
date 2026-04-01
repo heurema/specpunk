@@ -42,12 +42,20 @@ pub async fn ask_all(question: &str, timeout_s: u64) -> Vec<ProviderResponse> {
 }
 
 async fn ask_provider(provider: &str, question: &str, timeout_s: u64) -> ProviderResponse {
-    let tmp_out = std::env::temp_dir().join(format!("punk-panel-{provider}-{}.txt", std::process::id()));
+    let tmp_out =
+        std::env::temp_dir().join(format!("punk-panel-{provider}-{}.txt", std::process::id()));
 
     let result = match provider {
         "claude" => {
             let mut cmd = Command::new("claude");
-            cmd.args(["-p", question, "--output-format", "text", "--model", "sonnet"]);
+            cmd.args([
+                "-p",
+                question,
+                "--output-format",
+                "text",
+                "--model",
+                "sonnet",
+            ]);
             cmd.env_remove("CLAUDECODE");
             cmd.env_remove("ANTHROPIC_API_KEY");
             cmd.stdout(Stdio::piped());
@@ -57,10 +65,7 @@ async fn ask_provider(provider: &str, question: &str, timeout_s: u64) -> Provide
         "codex" => {
             let out_file = tmp_out.clone();
             let mut cmd = Command::new("codex");
-            cmd.args([
-                "exec", "--ephemeral", "-p", "fast",
-                "--output-last-message",
-            ]);
+            cmd.args(["exec", "--ephemeral", "-p", "fast", "--output-last-message"]);
             cmd.arg(&out_file);
             cmd.arg(question);
             cmd.stdout(Stdio::null());

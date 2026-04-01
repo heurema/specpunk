@@ -61,7 +61,11 @@ pub async fn run_diverge(
     }
 
     let base_commit = git_output(project_path, &["rev-parse", "HEAD"])?;
-    let run_id = format!("{}-{}", Utc::now().format("%Y%m%dT%H%M%S"), std::process::id());
+    let run_id = format!(
+        "{}-{}",
+        Utc::now().format("%Y%m%dT%H%M%S"),
+        std::process::id()
+    );
     let run_dir = std::env::temp_dir().join(format!("punk-diverge-{run_id}"));
     fs::create_dir_all(&run_dir).map_err(|e| e.to_string())?;
 

@@ -188,11 +188,11 @@ pub fn load_or_default(dir: &Path) -> Result<Config, ConfigError> {
     let projects = load_optional_toml::<ProjectsFile>(dir, "projects.toml")?
         .unwrap_or(ProjectsFile { projects: vec![] });
 
-    let agents = load_optional_toml::<AgentsFile>(dir, "agents.toml")?
-        .unwrap_or_else(detect_agents);
+    let agents =
+        load_optional_toml::<AgentsFile>(dir, "agents.toml")?.unwrap_or_else(detect_agents);
 
-    let policy = load_optional_toml::<PolicyFile>(dir, "policy.toml")?
-        .unwrap_or_else(default_policy);
+    let policy =
+        load_optional_toml::<PolicyFile>(dir, "policy.toml")?.unwrap_or_else(default_policy);
 
     Ok(Config {
         projects,
@@ -335,7 +335,11 @@ mod tests {
     #[test]
     fn load_or_default_rejects_invalid_existing_projects_toml() {
         let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("projects.toml"), "[[projects]\nid = \"broken\"").unwrap();
+        fs::write(
+            tmp.path().join("projects.toml"),
+            "[[projects]\nid = \"broken\"",
+        )
+        .unwrap();
 
         let err = load_or_default(tmp.path()).unwrap_err();
         match err {

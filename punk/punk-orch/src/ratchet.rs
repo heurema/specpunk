@@ -120,7 +120,8 @@ pub fn compare(current: &WeeklyMetrics, previous: &WeeklyMetrics) -> Vec<String>
     let mut directives = Vec::new();
 
     // Success rate degradation
-    if previous.success_rate_pct > 0.0 && current.success_rate_pct < previous.success_rate_pct - 10.0
+    if previous.success_rate_pct > 0.0
+        && current.success_rate_pct < previous.success_rate_pct - 10.0
     {
         directives.push(format!(
             "WARN: success rate dropped {:.0}% -> {:.0}%",
@@ -129,9 +130,7 @@ pub fn compare(current: &WeeklyMetrics, previous: &WeeklyMetrics) -> Vec<String>
     }
 
     // Cost increase
-    if previous.total_cost_usd > 0.0
-        && current.total_cost_usd > previous.total_cost_usd * 1.5
-    {
+    if previous.total_cost_usd > 0.0 && current.total_cost_usd > previous.total_cost_usd * 1.5 {
         directives.push(format!(
             "WARN: cost increased ${:.2} -> ${:.2} (+{:.0}%)",
             previous.total_cost_usd,
@@ -141,9 +140,7 @@ pub fn compare(current: &WeeklyMetrics, previous: &WeeklyMetrics) -> Vec<String>
     }
 
     // Duration increase
-    if previous.avg_duration_ms > 0
-        && current.avg_duration_ms > previous.avg_duration_ms * 2
-    {
+    if previous.avg_duration_ms > 0 && current.avg_duration_ms > previous.avg_duration_ms * 2 {
         directives.push(format!(
             "WARN: avg duration doubled {}ms -> {}ms",
             previous.avg_duration_ms, current.avg_duration_ms

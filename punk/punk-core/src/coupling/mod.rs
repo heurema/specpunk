@@ -33,7 +33,10 @@ pub struct CoupledFile {
 pub fn find_coupling(root: &Path, file: &str, min_confidence: f64) -> CouplingResult {
     let commits = get_commits_for_file(root, file);
     if commits.is_empty() {
-        return CouplingResult { file: file.to_string(), coupled_files: vec![] };
+        return CouplingResult {
+            file: file.to_string(),
+            coupled_files: vec![],
+        };
     }
 
     let mut co_change_counts: HashMap<String, usize> = HashMap::new();
@@ -62,52 +65,81 @@ pub fn find_coupling(root: &Path, file: &str, min_confidence: f64) -> CouplingRe
         .filter(|c| c.confidence >= min_confidence)
         .collect();
 
-    coupled.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    coupled.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     coupled.truncate(10);
 
-    CouplingResult { file: file.to_string(), coupled_files: coupled }
+    CouplingResult {
+        file: file.to_string(),
+        coupled_files: coupled,
+    }
 }
 
 fn get_commits_for_file(root: &Path, file: &str) -> Vec<String> {
     let output = Command::new("git")
-        .args(["-c", "core.quotepath=false", "log", "--format=%H", "--follow", "-n", "100", "--", file])
+        .args([
+            "-c",
+            "core.quotepath=false",
+            "log",
+            "--format=%H",
+            "--follow",
+            "-n",
+            "100",
+            "--",
+            file,
+        ])
         .current_dir(root)
         .output();
 
     match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect(),
         _ => vec![],
     }
 }
 
 fn get_files_in_commit(root: &Path, commit: &str) -> Vec<String> {
     let output = Command::new("git")
-        .args(["-c", "core.quotepath=false", "diff-tree", "--no-commit-id", "-r", "--name-only", commit])
+        .args([
+            "-c",
+            "core.quotepath=false",
+            "diff-tree",
+            "--no-commit-id",
+            "-r",
+            "--name-only",
+            commit,
+        ])
         .current_dir(root)
         .output();
 
     match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect(),
         _ => vec![],
     }
 }
 
 /// Filter out generated/noise files.
 fn is_noise_file(file: &str) -> bool {
-    let noise = ["Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-                  "go.sum", "poetry.lock", "Pipfile.lock", "Gemfile.lock"];
+    let noise = [
+        "Cargo.lock",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "go.sum",
+        "poetry.lock",
+        "Pipfile.lock",
+        "Gemfile.lock",
+    ];
     noise.iter().any(|n| file.ends_with(n))
         || file.contains("generated")
         || file.contains("__pycache__")
@@ -115,14 +147,24 @@ fn is_noise_file(file: &str) -> bool {
 
 pub fn render_coupling(result: &CouplingResult) -> String {
     if result.coupled_files.is_empty() {
-        return format!("punk coupling: no co-change patterns found for {}\n", result.file);
+        return format!(
+            "punk coupling: no co-change patterns found for {}\n",
+            result.file
+        );
     }
 
-    let mut out = format!("punk coupling: {} — {} coupled files\n\n", result.file, result.coupled_files.len());
+    let mut out = format!(
+        "punk coupling: {} — {} coupled files\n\n",
+        result.file,
+        result.coupled_files.len()
+    );
     for c in &result.coupled_files {
         out.push_str(&format!(
             "  {:.0}% {} ({}/{} commits)\n",
-            c.confidence * 100.0, c.path, c.co_changes, c.total_changes,
+            c.confidence * 100.0,
+            c.path,
+            c.co_changes,
+            c.total_changes,
         ));
     }
     out
@@ -148,7 +190,10 @@ mod tests {
 
     #[test]
     fn render_empty() {
-        let result = CouplingResult { file: "x.rs".into(), coupled_files: vec![] };
+        let result = CouplingResult {
+            file: "x.rs".into(),
+            coupled_files: vec![],
+        };
         let out = render_coupling(&result);
         assert!(out.contains("no co-change"));
     }
@@ -159,7 +204,9 @@ mod tests {
             file: "src/auth.rs".into(),
             coupled_files: vec![CoupledFile {
                 path: "src/middleware.rs".into(),
-                co_changes: 8, total_changes: 10, confidence: 0.8,
+                co_changes: 8,
+                total_changes: 10,
+                confidence: 0.8,
             }],
         };
         let out = render_coupling(&result);
@@ -172,8 +219,10 @@ mod tests {
         let result = CouplingResult {
             file: "a.rs".into(),
             coupled_files: vec![CoupledFile {
-                path: "b.rs".into(), co_changes: 5,
-                total_changes: 10, confidence: 0.5,
+                path: "b.rs".into(),
+                co_changes: 5,
+                total_changes: 10,
+                confidence: 0.5,
             }],
         };
         let json = serde_json::to_string(&result).unwrap();

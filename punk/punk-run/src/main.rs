@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use punk_orch::{bus, config, context, daemon, diverge, doctor, goal, graph, morning, ops, panel, pipeline, ratchet, recall, resolver, skill};
+use punk_core::vcs::{detect_mode as detect_vcs_mode, enable_jj as enable_jj_for_repo, VcsMode};
+use punk_orch::{
+    bus, config, context, daemon, diverge, doctor, goal, graph, morning, ops, panel, pipeline,
+    ratchet, recall, resolver, skill,
+};
 
 #[derive(Parser)]
 #[command(name = "punk-run", version, about = "Specpunk agent orchestration")]
@@ -201,6 +205,11 @@ enum Command {
     Projects,
     /// Generate config files from detected environment
     Init,
+    /// Version-control integration helpers
+    Vcs {
+        #[command(subcommand)]
+        action: VcsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -216,6 +225,14 @@ enum SkillAction {
         #[arg(long)]
         file: String,
     },
+}
+
+#[derive(Subcommand)]
+enum VcsAction {
+    /// Show the current VCS mode for this repo
+    Status,
+    /// Enable jj for this Git repo explicitly
+    EnableJj,
 }
 
 #[derive(Subcommand)]
@@ -279,22 +296,40 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Status { recent, project } => cmd_status(recent, project.as_deref()),
         Command::Config => cmd_config(),
-        Command::Daemon { shadow, slots, background } => {
+        Command::Daemon {
+            shadow,
+            slots,
+            background,
+        } => {
             if background {
                 // Fork to background
                 let exe = std::env::current_exe().unwrap();
                 let mut cmd = std::process::Command::new(exe);
                 cmd.args(["daemon"]);
-                if shadow { cmd.arg("--shadow"); }
-                if slots != 5 { cmd.args(["--slots", &slots.to_string()]); }
+                if shadow {
+                    cmd.arg("--shadow");
+                }
+                if slots != 5 {
+                    cmd.args(["--slots", &slots.to_string()]);
+                }
                 cmd.stdin(std::process::Stdio::null());
                 cmd.stdout(std::process::Stdio::null());
-                cmd.stderr(std::fs::File::create(
-                    bus::bus_dir().parent().unwrap_or(&bus::bus_dir()).join("daemon.log")
-                ).map(std::process::Stdio::from).unwrap_or(std::process::Stdio::null()));
+                cmd.stderr(
+                    std::fs::File::create(
+                        bus::bus_dir()
+                            .parent()
+                            .unwrap_or(&bus::bus_dir())
+                            .join("daemon.log"),
+                    )
+                    .map(std::process::Stdio::from)
+                    .unwrap_or(std::process::Stdio::null()),
+                );
                 match cmd.spawn() {
                     Ok(child) => println!("Daemon started (PID {})", child.id()),
-                    Err(e) => { eprintln!("Failed to start daemon: {e}"); std::process::exit(1); }
+                    Err(e) => {
+                        eprintln!("Failed to start daemon: {e}");
+                        std::process::exit(1);
+                    }
                 }
                 return Ok(());
             }
@@ -302,7 +337,10 @@ async fn main() -> anyhow::Result<()> {
             let effective_slots = if slots != 5 {
                 slots
             } else {
-                load_config_or_exit(&config::config_dir()).policy.defaults.max_slots
+                load_config_or_exit(&config::config_dir())
+                    .policy
+                    .defaults
+                    .max_slots
             };
             let dcfg = daemon::DaemonConfig {
                 shadow,
@@ -340,16 +378,39 @@ async fn main() -> anyhow::Result<()> {
         Command::Doctor => {
             let bus_path = bus::bus_dir();
             let config_dir = config::config_dir();
-            let report = doctor::check_all(&bus_path, &config_dir);
+            let repo_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let report = doctor::check_all(&bus_path, &config_dir, &repo_path);
             print!("{}", report.display());
         }
-        Command::PolicyCheck { project, category, priority } => {
+        Command::PolicyCheck {
+            project,
+            category,
+            priority,
+        } => {
             cmd_policy_check(&project, &category, &priority);
         }
         Command::Queue {
-            project, prompt, agent, category, priority, timeout, budget, worktree, after,
+            project,
+            prompt,
+            agent,
+            category,
+            priority,
+            timeout,
+            budget,
+            worktree,
+            after,
         } => {
-            cmd_queue(&project, &prompt, &agent, &category, &priority, timeout, budget, worktree, after.as_deref());
+            cmd_queue(
+                &project,
+                &prompt,
+                &agent,
+                &category,
+                &priority,
+                timeout,
+                budget,
+                worktree,
+                after.as_deref(),
+            );
         }
         Command::Receipts { project, since } => {
             cmd_receipts(project.as_deref(), since);
@@ -357,40 +418,66 @@ async fn main() -> anyhow::Result<()> {
         Command::Ask { question } => cmd_ask(&question),
         Command::Pipeline { action } => match action {
             PipelineAction::List => cmd_pipeline_list(),
-            PipelineAction::Add { project, contact, next_step, due, value } => {
+            PipelineAction::Add {
+                project,
+                contact,
+                next_step,
+                due,
+                value,
+            } => {
                 let bus_path = bus::bus_dir();
                 match pipeline::add(&bus_path, &project, &contact, &next_step, &due, value) {
-                    Ok(opp) => println!("Added: #{} {} ({}) -> {}", opp.id, opp.contact, opp.project, opp.next_step),
-                    Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                    Ok(opp) => println!(
+                        "Added: #{} {} ({}) -> {}",
+                        opp.id, opp.contact, opp.project, opp.next_step
+                    ),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
             PipelineAction::Advance { id } => {
                 let bus_path = bus::bus_dir();
                 match pipeline::advance(&bus_path, id) {
                     Ok(opp) => println!("#{}: -> {:?}", opp.id, opp.stage),
-                    Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
             PipelineAction::Win { id } => {
                 let bus_path = bus::bus_dir();
                 match pipeline::set_stage(&bus_path, id, pipeline::Stage::Won) {
                     Ok(opp) => println!("#{}: WON", opp.id),
-                    Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
             PipelineAction::Stale => {
                 let bus_path = bus::bus_dir();
                 let opps = pipeline::load_pipeline(&bus_path);
                 let today = punk_orch::chrono::Utc::now().format("%Y-%m-%d").to_string();
-                let stale: Vec<_> = opps.iter().filter(|o| {
-                    o.due < today && o.stage != pipeline::Stage::Won && o.stage != pipeline::Stage::Lost
-                }).collect();
+                let stale: Vec<_> = opps
+                    .iter()
+                    .filter(|o| {
+                        o.due < today
+                            && o.stage != pipeline::Stage::Won
+                            && o.stage != pipeline::Stage::Lost
+                    })
+                    .collect();
                 if stale.is_empty() {
                     println!("No stale opportunities.");
                 } else {
                     println!("Stale opportunities ({}):\n", stale.len());
                     for o in &stale {
-                        println!("  #{} {} ({}) — due {} — {:?}", o.id, o.contact, o.project, o.due, o.stage);
+                        println!(
+                            "  #{} {} ({}) — due {} — {:?}",
+                            o.id, o.contact, o.project, o.due, o.stage
+                        );
                     }
                 }
             }
@@ -398,11 +485,18 @@ async fn main() -> anyhow::Result<()> {
                 let bus_path = bus::bus_dir();
                 match pipeline::set_stage(&bus_path, id, pipeline::Stage::Lost) {
                     Ok(opp) => println!("#{}: LOST", opp.id),
-                    Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
         },
-        Command::Diverge { project, spec, timeout } => {
+        Command::Diverge {
+            project,
+            spec,
+            timeout,
+        } => {
             cmd_diverge(&project, &spec, timeout).await;
         }
         Command::Panel { question, timeout } => {
@@ -421,7 +515,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            SkillAction::Create { name, description, file } => {
+            SkillAction::Create {
+                name,
+                description,
+                file,
+            } => {
                 let bus_path = bus::bus_dir();
                 let content = std::fs::read_to_string(&file).unwrap_or_else(|e| {
                     eprintln!("Error reading {file}: {e}");
@@ -429,16 +527,26 @@ async fn main() -> anyhow::Result<()> {
                 });
                 match skill::create_skill(&bus_path, &name, &description, &content) {
                     Ok(path) => println!("Created: {}", path.display()),
-                    Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
                 }
             }
         },
         Command::Context { project } => {
             let bus_path = bus::bus_dir();
             let config_dir = config::config_dir();
-            print!("{}", context::format_context_report(&bus_path, &project, &config_dir));
+            print!(
+                "{}",
+                context::format_context_report(&bus_path, &project, &config_dir)
+            );
         }
-        Command::Recall { query, project, limit } => {
+        Command::Recall {
+            query,
+            project,
+            limit,
+        } => {
             let bus_path = bus::bus_dir();
             let events = recall::recall(&bus_path, &query, project.as_deref(), limit);
             if events.is_empty() {
@@ -447,7 +555,12 @@ async fn main() -> anyhow::Result<()> {
                 print!("{}", recall::format_recall(&events));
             }
         }
-        Command::Remember { project, context, why, kind } => {
+        Command::Remember {
+            project,
+            context,
+            why,
+            kind,
+        } => {
             let bus_path = bus::bus_dir();
             let event_kind = match kind.as_str() {
                 "invariant" => recall::EventKind::Invariant,
@@ -457,7 +570,10 @@ async fn main() -> anyhow::Result<()> {
             };
             match recall::add_manual(&bus_path, &project, event_kind, &context, &why) {
                 Ok(()) => println!("Remembered: [{kind}] {context}"),
-                Err(e) => { eprintln!("Error: {e}"); std::process::exit(1); }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Command::Ratchet => cmd_ratchet(),
@@ -479,15 +595,35 @@ async fn main() -> anyhow::Result<()> {
             GoalAction::List => cmd_goals(),
             GoalAction::Status { goal_id } => cmd_goal_status(&goal_id),
             GoalAction::Approve { goal_id } => cmd_approve(&goal_id),
-            GoalAction::Pause { goal_id } => cmd_goal_set_status(&goal_id, goal::GoalStatus::Paused),
-            GoalAction::Resume { goal_id } => cmd_goal_set_status(&goal_id, goal::GoalStatus::Active),
-            GoalAction::Cancel { goal_id } => cmd_goal_set_status(&goal_id, goal::GoalStatus::Failed),
+            GoalAction::Pause { goal_id } => {
+                cmd_goal_set_status(&goal_id, goal::GoalStatus::Paused)
+            }
+            GoalAction::Resume { goal_id } => {
+                cmd_goal_set_status(&goal_id, goal::GoalStatus::Active)
+            }
+            GoalAction::Cancel { goal_id } => {
+                cmd_goal_set_status(&goal_id, goal::GoalStatus::Failed)
+            }
             GoalAction::Budget { goal_id, usd } => {
                 let bus_path = bus::bus_dir();
                 let mut g = match goal::load_goal(&bus_path, &goal_id) {
                     Some(g) => g,
-                    None => { eprintln!("Goal not found: {goal_id}"); std::process::exit(1); }
+                    None => {
+                        eprintln!("Goal not found: {goal_id}");
+                        std::process::exit(1);
+                    }
                 };
+                if usd < 0.0 {
+                    eprintln!("Budget must be non-negative.");
+                    std::process::exit(1);
+                }
+                if usd < g.spent_usd {
+                    eprintln!(
+                        "Budget ${usd:.2} cannot be lower than already spent ${:.2}.",
+                        g.spent_usd
+                    );
+                    std::process::exit(1);
+                }
                 g.budget_usd = usd;
                 goal::save_goal(&bus_path, &g).ok();
                 println!("{goal_id}: budget -> ${usd:.2}");
@@ -496,13 +632,24 @@ async fn main() -> anyhow::Result<()> {
                 let bus_path = bus::bus_dir();
                 let mut g = match goal::load_goal(&bus_path, &goal_id) {
                     Some(g) => g,
-                    None => { eprintln!("Goal not found: {goal_id}"); std::process::exit(1); }
+                    None => {
+                        eprintln!("Goal not found: {goal_id}");
+                        std::process::exit(1);
+                    }
                 };
+                if goal_has_inflight_steps(&g) {
+                    eprintln!("Cannot replan while queued or running goal steps still exist.");
+                    std::process::exit(1);
+                }
                 g.plan = None;
                 g.status = goal::GoalStatus::Planning;
+                g.completed_at = None;
                 goal::save_goal(&bus_path, &g).ok();
                 println!("{goal_id}: plan cleared, status -> planning");
-                println!("Re-run: punk-run goal create {} \"{}\"", g.project, g.objective);
+                println!(
+                    "Re-run: punk-run goal create {} \"{}\"",
+                    g.project, g.objective
+                );
             }
         },
         Command::Use { name, path } => cmd_use(&name, &path),
@@ -510,6 +657,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Forget { name } => cmd_forget(&name),
         Command::Projects => cmd_projects(),
         Command::Init => cmd_init(),
+        Command::Vcs { action } => match action {
+            VcsAction::Status => cmd_vcs_status(),
+            VcsAction::EnableJj => cmd_vcs_enable_jj(),
+        },
     }
 
     Ok(())
@@ -623,6 +774,7 @@ fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {
 }
 
 fn cmd_config() {
+    maybe_warn_jj_degraded_mode();
     let dir = config::config_dir();
     let status = config::config_status(&dir);
     let label = if status.is_complete() {
@@ -657,7 +809,11 @@ fn cmd_config() {
 
     let mut agents: Vec<_> = cfg.agents.agents.iter().collect();
     agents.sort_by_key(|(k, _)| (*k).clone());
-    let agents_label = if status.has_agents { "" } else { " (autodetected)" };
+    let agents_label = if status.has_agents {
+        ""
+    } else {
+        " (autodetected)"
+    };
     println!("Agents ({}){}", agents.len(), agents_label);
     println!(
         "  {:<22} {:<10} {:<16} {:<10} {:>8}",
@@ -666,7 +822,10 @@ fn cmd_config() {
     for (id, a) in &agents {
         println!(
             "  {:<22} {:<10} {:<16} {:<10} {:>7}",
-            id, a.provider, a.model, a.role,
+            id,
+            a.provider,
+            a.model,
+            a.role,
             format_cost(a.budget_usd)
         );
     }
@@ -686,18 +845,30 @@ fn cmd_config() {
     );
     println!("  rules: {}", cfg.policy.rules.len());
     for r in &cfg.policy.rules {
-        let m: Vec<_> = r.match_criteria.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let m: Vec<_> = r
+            .match_criteria
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
         let s: Vec<_> = r.set.iter().map(|(k, v)| format!("{k}={v}")).collect();
         println!("    {} -> {}", m.join(", "), s.join(", "));
     }
 
     if !cfg.policy.features.is_empty() {
-        let enabled: Vec<_> = cfg.policy.features.iter()
+        let enabled: Vec<_> = cfg
+            .policy
+            .features
+            .iter()
             .filter(|(_, v)| v.as_bool() == Some(true))
-            .map(|(k, _)| k.as_str()).collect();
-        let disabled: Vec<_> = cfg.policy.features.iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        let disabled: Vec<_> = cfg
+            .policy
+            .features
+            .iter()
             .filter(|(_, v)| v.as_bool() == Some(false))
-            .map(|(k, _)| k.as_str()).collect();
+            .map(|(k, _)| k.as_str())
+            .collect();
         if !enabled.is_empty() {
             println!("  features ON: {}", enabled.join(", "));
         }
@@ -740,6 +911,14 @@ fn cmd_triage() {
 
 fn cmd_goal(project: &str, objective: &str, budget: f64, deadline: Option<&str>) {
     let bus_path = bus::bus_dir();
+    let latest = punk_orch::run::latest_run_triage(&bus_path, project);
+    if latest.verdict == punk_orch::run::TriageVerdict::StillAlive {
+        eprintln!(
+            "{}",
+            format_still_alive_guard(&latest, project, "goal planning")
+        );
+        std::process::exit(1);
+    }
     let cfg = load_config_or_exit(&config::config_dir());
 
     let mut g = match goal::create_goal(&bus_path, project, objective, deadline, budget) {
@@ -774,7 +953,14 @@ fn cmd_goal(project: &str, objective: &str, budget: f64, deadline: Option<&str>)
     let prompt = goal::build_planner_prompt(&g, std::path::Path::new(&project_path));
 
     let output = std::process::Command::new("claude")
-        .args(["-p", &prompt, "--output-format", "text", "--model", "sonnet"])
+        .args([
+            "-p",
+            &prompt,
+            "--output-format",
+            "text",
+            "--model",
+            "sonnet",
+        ])
         .env_remove("CLAUDECODE")
         .env_remove("ANTHROPIC_API_KEY")
         .output();
@@ -790,7 +976,10 @@ fn cmd_goal(project: &str, objective: &str, budget: f64, deadline: Option<&str>)
                     g.status = goal::GoalStatus::AwaitingApproval;
                     goal::save_goal(&bus_path, &g).ok();
 
-                    println!("Plan generated: {} steps, ${:.2} estimated\n", step_count, est_cost);
+                    println!(
+                        "Plan generated: {} steps, ${:.2} estimated\n",
+                        step_count, est_cost
+                    );
                     println!("Review and approve:");
                     println!("  punk-run approve {}", g.id);
                 }
@@ -836,7 +1025,11 @@ fn cmd_goals() {
             truncate(&g.objective, 40)
         );
         if let Some(ref plan) = g.plan {
-            let done = plan.steps.iter().filter(|s| s.status == goal::StepStatus::Done).count();
+            let done = plan
+                .steps
+                .iter()
+                .filter(|s| s.status == goal::StepStatus::Done)
+                .count();
             let total = plan.steps.len();
             println!("    plan v{}: {done}/{total} steps done", plan.version);
         }
@@ -853,6 +1046,15 @@ fn cmd_approve(goal_id: &str) {
             std::process::exit(1);
         }
     };
+
+    let latest = punk_orch::run::latest_run_triage(&bus_path, &g.project);
+    if latest.verdict == punk_orch::run::TriageVerdict::StillAlive {
+        eprintln!(
+            "{}",
+            format_still_alive_guard(&latest, &g.project, "goal approval")
+        );
+        std::process::exit(1);
+    }
 
     if g.plan.is_none() {
         eprintln!("Goal has no plan yet. Run planner first.");
@@ -887,7 +1089,10 @@ fn cmd_approve(goal_id: &str) {
             );
             total_cost += step.est_cost_usd;
         }
-        println!("\n  Total estimated: ${total_cost:.2} / ${:.2} budget", g.budget_usd);
+        println!(
+            "\n  Total estimated: ${total_cost:.2} / ${:.2} budget",
+            g.budget_usd
+        );
     }
 
     // Queue first ready steps
@@ -903,6 +1108,10 @@ fn cmd_approve(goal_id: &str) {
     if let Some(ref mut plan) = g.plan {
         plan.approved_at = Some(punk_orch::chrono::Utc::now());
     }
+    if queued.is_empty() && !goal_has_inflight_steps(&g) {
+        eprintln!("No runnable goal steps were queued; refusing activation.");
+        std::process::exit(1);
+    }
     g.status = goal::GoalStatus::Active;
 
     if let Err(e) = goal::save_goal(&bus_path, &g) {
@@ -910,7 +1119,35 @@ fn cmd_approve(goal_id: &str) {
         std::process::exit(1);
     }
 
-    println!("\nApproved. {} step(s) queued: {}", queued.len(), queued.join(", "));
+    println!(
+        "\nApproved. {} step(s) queued: {}",
+        queued.len(),
+        queued.join(", ")
+    );
+}
+
+fn format_still_alive_guard(
+    triage: &punk_orch::run::RunTriage,
+    project: &str,
+    action: &str,
+) -> String {
+    let mut out = format!(
+        "Latest run for project '{project}' is still alive; refusing {action}.\nrun: {}",
+        triage.run_id
+    );
+    if let Some(age_s) = triage.age_s {
+        out.push_str(&format!(", age={}s", age_s));
+    }
+    if let Some(heartbeat_age_s) = triage.heartbeat_age_s {
+        out.push_str(&format!(", heartbeat={}s", heartbeat_age_s));
+    }
+    if !triage.stderr_tail.is_empty() {
+        out.push_str(&format!(
+            "\nstderr: {}",
+            triage.stderr_tail.replace('\n', " ")
+        ));
+    }
+    out
 }
 
 async fn cmd_diverge(project: &str, spec: &str, timeout: u64) {
@@ -924,15 +1161,25 @@ async fn cmd_diverge(project: &str, spec: &str, timeout: u64) {
     };
 
     let strategies = diverge::Strategy::defaults();
-    println!("Diverge: dispatching to {} providers...\n", strategies.len());
+    println!(
+        "Diverge: dispatching to {} providers...\n",
+        strategies.len()
+    );
 
     match diverge::run_diverge(&path, spec, &strategies, timeout).await {
         Ok(solutions) => {
-            println!("{:<6} {:<10} {:<6} {:>6} {:>6} FILES", "LABEL", "PROVIDER", "EXIT", "+LINES", "-LINES");
+            println!(
+                "{:<6} {:<10} {:<6} {:>6} {:>6} FILES",
+                "LABEL", "PROVIDER", "EXIT", "+LINES", "-LINES"
+            );
             for s in &solutions {
                 println!(
                     "{:<6} {:<10} {:<6} {:>6} {:>6} {}",
-                    s.label, s.provider, s.exit_code, s.lines_added, s.lines_removed,
+                    s.label,
+                    s.provider,
+                    s.exit_code,
+                    s.lines_added,
+                    s.lines_removed,
                     s.files_changed.len()
                 );
             }
@@ -951,7 +1198,11 @@ async fn cmd_panel(question: &str, timeout: u64) {
     let responses = panel::ask_all(question, timeout).await;
 
     for r in &responses {
-        println!("### {} {}", r.provider, if r.exit_code == 0 { "" } else { "(FAILED)" });
+        println!(
+            "### {} {}",
+            r.provider,
+            if r.exit_code == 0 { "" } else { "(FAILED)" }
+        );
         if let Some(ref err) = r.error {
             println!("  Error: {err}");
         } else {
@@ -995,13 +1246,11 @@ fn cmd_policy_check(project: &str, category: &str, priority: &str) {
 
     // Apply matching rules
     for rule in &cfg.policy.rules {
-        let matches = rule.match_criteria.iter().all(|(k, v)| {
-            match k.as_str() {
-                "project" => v == project,
-                "category" => v == category,
-                "priority" => v == priority,
-                _ => false,
-            }
+        let matches = rule.match_criteria.iter().all(|(k, v)| match k.as_str() {
+            "project" => v == project,
+            "category" => v == category,
+            "priority" => v == priority,
+            _ => false,
         });
         if matches {
             if let Some(m) = rule.set.get("model").and_then(|v| v.as_str()) {
@@ -1043,8 +1292,15 @@ fn cmd_policy_check(project: &str, category: &str, priority: &str) {
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_queue(
-    project: &str, prompt: &str, agent: &str, category: &str,
-    priority: &str, timeout: u64, budget: Option<f64>, worktree: bool, after: Option<&str>,
+    project: &str,
+    prompt: &str,
+    agent: &str,
+    category: &str,
+    priority: &str,
+    timeout: u64,
+    budget: Option<f64>,
+    worktree: bool,
+    after: Option<&str>,
 ) {
     let bus_path = bus::bus_dir();
     let cfg = load_config_or_exit(&config::config_dir());
@@ -1060,7 +1316,11 @@ fn cmd_queue(
     };
     let project_path = resolved.path.to_string_lossy().to_string();
 
-    let task_id = format!("{}-{}", project, punk_orch::chrono::Utc::now().format("%Y%m%d-%H%M%S"));
+    let task_id = format!(
+        "{}-{}",
+        project,
+        punk_orch::chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    );
 
     let mut task_json = serde_json::json!({
         "project": project,
@@ -1108,7 +1368,10 @@ fn cmd_queue(
 
 fn cmd_receipts(project_filter: Option<&str>, since_days: i64) {
     let bus_path = bus::bus_dir();
-    let index = bus_path.parent().unwrap_or(&bus_path).join("receipts/index.jsonl");
+    let index = bus_path
+        .parent()
+        .unwrap_or(&bus_path)
+        .join("receipts/index.jsonl");
 
     let content = match std::fs::read_to_string(&index) {
         Ok(c) => c,
@@ -1118,7 +1381,8 @@ fn cmd_receipts(project_filter: Option<&str>, since_days: i64) {
         }
     };
 
-    let cutoff = (punk_orch::chrono::Utc::now() - punk_orch::chrono::Duration::days(since_days)).to_rfc3339();
+    let cutoff = (punk_orch::chrono::Utc::now() - punk_orch::chrono::Duration::days(since_days))
+        .to_rfc3339();
 
     println!(
         "{:<40} {:<12} {:<8} {:<9} {:>7} {:>6}",
@@ -1132,26 +1396,45 @@ fn cmd_receipts(project_filter: Option<&str>, since_days: i64) {
             Err(_) => continue,
         };
 
-        let ts = v.get("created_at").or_else(|| v.get("completed_at"))
-            .and_then(|t| t.as_str()).unwrap_or("");
-        if ts < cutoff.as_str() { continue; }
+        let ts = v
+            .get("created_at")
+            .or_else(|| v.get("completed_at"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if ts < cutoff.as_str() {
+            continue;
+        }
 
         let proj = v.get("project").and_then(|v| v.as_str()).unwrap_or("");
         if let Some(filter) = project_filter {
-            if proj != filter { continue; }
+            if proj != filter {
+                continue;
+            }
         }
 
         let task_id = v.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
         let model = v.get("model").and_then(|v| v.as_str()).unwrap_or("");
         let status = v.get("status").and_then(|v| v.as_str()).unwrap_or("");
         let cost = v.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let dur = v.get("duration_ms").and_then(|v| v.as_u64())
-            .or_else(|| v.get("duration_seconds").and_then(|v| v.as_u64()).map(|s| s * 1000))
-            .unwrap_or(0) / 1000;
+        let dur = v
+            .get("duration_ms")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                v.get("duration_seconds")
+                    .and_then(|v| v.as_u64())
+                    .map(|s| s * 1000)
+            })
+            .unwrap_or(0)
+            / 1000;
 
         println!(
             "{:<40} {:<12} {:<8} {:<9} {:>7} {:>5}s",
-            truncate(task_id, 40), proj, model, status, format_cost(cost), dur
+            truncate(task_id, 40),
+            proj,
+            model,
+            status,
+            format_cost(cost),
+            dur
         );
         count += 1;
     }
@@ -1163,8 +1446,12 @@ fn cmd_ask(question: &str) {
     let state = bus::read_state(&bus_path, 20);
 
     // Build deterministic data snapshot
-    let mut context = format!("Data snapshot ({}):\n", punk_orch::chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S"));
-    context.push_str(&format!("- Recent: {} tasks ({} ok)\n",
+    let mut context = format!(
+        "Data snapshot ({}):\n",
+        punk_orch::chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S")
+    );
+    context.push_str(&format!(
+        "- Recent: {} tasks ({} ok)\n",
         state.done.len(),
         state.done.iter().filter(|t| t.status == "success").count()
     ));
@@ -1175,7 +1462,10 @@ fn cmd_ask(question: &str) {
         context.push_str(&format!("- Queued: {} tasks\n", state.queued.len()));
     }
     if !state.failed.is_empty() {
-        context.push_str(&format!("- Failed: {} tasks pending triage\n", state.failed.len()));
+        context.push_str(&format!(
+            "- Failed: {} tasks pending triage\n",
+            state.failed.len()
+        ));
         for t in &state.failed {
             context.push_str(&format!("  - {} ({}, {})\n", t.id, t.project, t.model));
         }
@@ -1184,7 +1474,10 @@ fn cmd_ask(question: &str) {
     if !goals.is_empty() {
         context.push_str(&format!("- Goals: {}\n", goals.len()));
         for g in &goals {
-            context.push_str(&format!("  - {} ({:?}, ${:.2}/${:.2})\n", g.id, g.status, g.spent_usd, g.budget_usd));
+            context.push_str(&format!(
+                "  - {} ({:?}, ${:.2}/${:.2})\n",
+                g.id, g.status, g.spent_usd, g.budget_usd
+            ));
         }
     }
 
@@ -1256,7 +1549,10 @@ fn cmd_goal_status(goal_id: &str) {
     println!("  project:   {}", g.project);
     println!("  objective: {}", g.objective);
     println!("  status:    {:?}", g.status);
-    println!("  budget:    ${:.2} (spent: ${:.2})", g.budget_usd, g.spent_usd);
+    println!(
+        "  budget:    ${:.2} (spent: ${:.2})",
+        g.budget_usd, g.spent_usd
+    );
     if let Some(ref d) = g.deadline {
         println!("  deadline:  {d}");
     }
@@ -1267,8 +1563,10 @@ fn cmd_goal_status(goal_id: &str) {
         for step in &plan.steps {
             let status_icon = match step.status {
                 goal::StepStatus::Done => "[x]",
+                goal::StepStatus::Queued => "[~]",
                 goal::StepStatus::Running => "[>]",
                 goal::StepStatus::Blocked => "[!]",
+                goal::StepStatus::Failed => "[f]",
                 goal::StepStatus::Pending => "[ ]",
                 goal::StepStatus::Skipped => "[-]",
             };
@@ -1295,6 +1593,26 @@ fn cmd_goal_set_status(goal_id: &str, new_status: goal::GoalStatus) {
         }
     };
 
+    if let Err(message) = validate_goal_status_transition(&g, &new_status) {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+
+    if new_status == goal::GoalStatus::Failed {
+        for task_id in goal_inflight_task_ids(&g) {
+            if let Err(err) = ops::cancel_task(&bus_path, &task_id) {
+                eprintln!("Failed to cancel goal task {task_id}: {err}");
+                std::process::exit(1);
+            }
+        }
+        g.completed_at = Some(punk_orch::chrono::Utc::now());
+    } else if matches!(
+        new_status,
+        goal::GoalStatus::Active | goal::GoalStatus::Paused | goal::GoalStatus::Planning
+    ) {
+        g.completed_at = None;
+    }
+
     let old = format!("{:?}", g.status);
     g.status = new_status;
     let new = format!("{:?}", g.status);
@@ -1305,6 +1623,64 @@ fn cmd_goal_set_status(goal_id: &str, new_status: goal::GoalStatus) {
     }
 
     println!("{goal_id}: {old} -> {new}");
+}
+
+fn goal_has_inflight_steps(goal: &goal::Goal) -> bool {
+    goal.plan.as_ref().is_some_and(|plan| {
+        plan.steps.iter().any(|step| {
+            matches!(
+                step.status,
+                goal::StepStatus::Queued | goal::StepStatus::Running
+            )
+        })
+    })
+}
+
+fn goal_inflight_task_ids(goal: &goal::Goal) -> Vec<String> {
+    goal.plan
+        .as_ref()
+        .map(|plan| {
+            plan.steps
+                .iter()
+                .filter(|step| {
+                    matches!(
+                        step.status,
+                        goal::StepStatus::Queued | goal::StepStatus::Running
+                    )
+                })
+                .filter_map(|step| step.task_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn validate_goal_status_transition(
+    goal: &goal::Goal,
+    new_status: &goal::GoalStatus,
+) -> Result<(), &'static str> {
+    use goal::GoalStatus::*;
+
+    if goal.status == *new_status {
+        return Err("Goal is already in that status.");
+    }
+
+    match (&goal.status, new_status) {
+        (Done, _) | (Failed, Active) | (Failed, Paused) | (Failed, AwaitingApproval) => {
+            Err("Cannot transition a terminal goal to that status.")
+        }
+        (Planning, Paused) | (Planning, Active) => {
+            Err("Planning goals must be approved before they can be paused or activated.")
+        }
+        (AwaitingApproval, Active) => Err("Use goal approve instead of setting active directly."),
+        (Active, Active) | (Paused, Paused) => Err("Goal is already in that status."),
+        (Active, AwaitingApproval) | (Paused, AwaitingApproval) => {
+            Err("Cannot move an existing plan back to awaiting approval.")
+        }
+        (_, Done) => Err("Goal completion is daemon-owned; do not set done manually."),
+        (_, Planning) => Err("Use goal replan to return a goal to planning."),
+        (Active, Paused) | (Paused, Active) | (_, Failed) => Ok(()),
+        _ => Err("Unsupported goal status transition."),
+    }
 }
 
 // --- Phase 5: Zero-config commands ---
@@ -1351,7 +1727,8 @@ fn resolve_for_cli(
     if path.is_some() {
         return resolver::resolve(name, path.as_deref(), None).map_err(|e| e.to_string());
     }
-    let cfg = config::load_or_default(config_dir).map_err(|e| format!("Config error in {}: {e}", config_dir.display()))?;
+    let cfg = config::load_or_default(config_dir)
+        .map_err(|e| format!("Config error in {}: {e}", config_dir.display()))?;
     resolver::resolve(name, None, Some(&cfg)).map_err(|e| e.to_string())
 }
 
@@ -1367,6 +1744,7 @@ fn cmd_forget(name: &str) {
 }
 
 fn cmd_projects() {
+    maybe_warn_jj_degraded_mode();
     let cfg = load_config_or_exit(&config::config_dir());
     let projects = resolver::list_known(Some(&cfg));
 
@@ -1390,6 +1768,7 @@ fn cmd_projects() {
 }
 
 fn cmd_init() {
+    maybe_warn_jj_degraded_mode();
     let dir = config::config_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("Failed to initialize config dir {}: {e}", dir.display());
@@ -1424,6 +1803,49 @@ fn cmd_init() {
         discovered.len()
     );
     println!("Config:  {}", dir.display());
+}
+
+fn cmd_vcs_status() {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mode = detect_vcs_mode(&cwd);
+    println!("{}", format_vcs_status(mode));
+}
+
+fn cmd_vcs_enable_jj() {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match detect_vcs_mode(&cwd) {
+        VcsMode::Jj => {
+            println!("jj is already enabled for this repo.");
+        }
+        VcsMode::GitWithJjAvailableButDisabled => match enable_jj_for_repo(&cwd) {
+            Ok(()) => println!("Enabled jj for this repo."),
+            Err(e) => {
+                eprintln!("Failed to enable jj: {e}");
+                std::process::exit(1);
+            }
+        },
+        VcsMode::GitOnly => {
+            eprintln!("jj is not installed; cannot enable jj for this repo.");
+            std::process::exit(1);
+        }
+        VcsMode::NoVcs => {
+            eprintln!("No Git or jj repo detected in the current directory.");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn load_config_or_exit(dir: &Path) -> config::Config {
@@ -1468,9 +1890,9 @@ fn initialize_config_files(
 
     if !status.has_agents {
         if agents.agents.is_empty() {
-            summary.notices.push(
-                "Skipped agents.toml: no supported agent CLI detected".to_string(),
-            );
+            summary
+                .notices
+                .push("Skipped agents.toml: no supported agent CLI detected".to_string());
         } else {
             let mut toml = String::from("# Auto-generated by punk-run init\n\n");
             let mut agent_list: Vec<_> = agents.agents.iter().collect();
@@ -1516,6 +1938,37 @@ fn expand_path(p: &str) -> PathBuf {
     }
 }
 
+fn maybe_warn_jj_degraded_mode() {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return,
+    };
+    if should_warn_about_disabled_jj(detect_vcs_mode(&cwd)) {
+        eprintln!("{}", format_jj_degraded_mode_warning("."));
+    }
+}
+
+fn should_warn_about_disabled_jj(mode: VcsMode) -> bool {
+    mode == VcsMode::GitWithJjAvailableButDisabled
+}
+
+fn format_vcs_status(mode: VcsMode) -> &'static str {
+    match mode {
+        VcsMode::Jj => "VCS mode: jj",
+        VcsMode::GitOnly => "VCS mode: git-only",
+        VcsMode::GitWithJjAvailableButDisabled => {
+            "VCS mode: git-only (degraded; run `punk-run vcs enable-jj`)"
+        }
+        VcsMode::NoVcs => "VCS mode: no VCS detected",
+    }
+}
+
+fn format_jj_degraded_mode_warning(enable_target: &str) -> String {
+    format!(
+        "Warning: running in degraded git-only mode; enable jj for fuller punk functionality with `punk-run vcs enable-jj` (cwd: {enable_target})"
+    )
+}
+
 // --- Utilities ---
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1538,6 +1991,7 @@ fn format_cost(usd: f64) -> String {
 mod tests {
     use super::*;
 
+    use punk_core::vcs::VcsMode;
     use punk_orch::config::{Agent, AgentsFile, ConfigStatus};
     use punk_orch::resolver::{ResolveSource, ResolvedProject};
     use std::collections::HashMap;
@@ -1626,12 +2080,10 @@ mod tests {
         assert!(tmp.join("projects.toml").is_file());
         assert!(tmp.join("policy.toml").is_file());
         assert!(!tmp.join("agents.toml").exists());
-        assert!(
-            summary
-                .notices
-                .iter()
-                .any(|n| n.contains("Skipped agents.toml"))
-        );
+        assert!(summary
+            .notices
+            .iter()
+            .any(|n| n.contains("Skipped agents.toml")));
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -1650,5 +2102,149 @@ mod tests {
 
         let _ = fs::remove_dir_all(&config_dir);
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn jj_degraded_mode_warning_mentions_degraded_mode_and_enable_action() {
+        let warning = format_jj_degraded_mode_warning(".");
+        assert!(warning.contains("degraded git-only mode"));
+        assert!(warning.contains("punk-run vcs enable-jj"));
+        assert!(warning.contains("fuller punk functionality"));
+    }
+
+    #[test]
+    fn only_git_with_jj_disabled_emits_warning_message() {
+        assert!(should_warn_about_disabled_jj(
+            VcsMode::GitWithJjAvailableButDisabled
+        ));
+        assert!(!should_warn_about_disabled_jj(VcsMode::GitOnly));
+        assert!(!should_warn_about_disabled_jj(VcsMode::Jj));
+        assert!(!should_warn_about_disabled_jj(VcsMode::NoVcs));
+    }
+
+    #[test]
+    fn vcs_status_marks_degraded_git_mode() {
+        assert_eq!(
+            format_vcs_status(VcsMode::GitWithJjAvailableButDisabled),
+            "VCS mode: git-only (degraded; run `punk-run vcs enable-jj`)"
+        );
+        assert_eq!(format_vcs_status(VcsMode::Jj), "VCS mode: jj");
+    }
+}
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn still_alive_guard_message_mentions_project_and_run() {
+        let triage = punk_orch::run::RunTriage {
+            run_id: "run_123".to_string(),
+            status: Some(punk_orch::run::RunStatus::Running),
+            age_s: Some(12),
+            heartbeat_age_s: Some(4),
+            has_receipt: false,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            verdict: punk_orch::run::TriageVerdict::StillAlive,
+        };
+
+        let msg = format_still_alive_guard(&triage, "specpunk", "goal planning");
+        assert!(msg.contains("specpunk"));
+        assert!(msg.contains("run_123"));
+        assert!(msg.contains("still alive"));
+    }
+}
+
+#[cfg(test)]
+mod cli_goal_tests {
+    use super::*;
+    use punk_orch::chrono::Utc;
+
+    fn sample_goal(status: goal::GoalStatus, step_statuses: &[goal::StepStatus]) -> goal::Goal {
+        goal::Goal {
+            id: "goal-1".into(),
+            project: "specpunk".into(),
+            objective: "ship".into(),
+            deadline: None,
+            budget_usd: 5.0,
+            spent_usd: 1.0,
+            status,
+            plan: Some(goal::Plan {
+                version: 1,
+                created_by: "test".into(),
+                approved_at: None,
+                steps: step_statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, status)| goal::Step {
+                        step: idx as u32 + 1,
+                        category: "fix".into(),
+                        prompt: format!("step {}", idx + 1),
+                        agent: "claude-sonnet".into(),
+                        est_cost_usd: 0.5,
+                        depends_on: vec![],
+                        status: *status,
+                        task_id: Some(format!("task-{}", idx + 1)),
+                        sub_tasks: vec![],
+                    })
+                    .collect(),
+            }),
+            created_at: Utc::now(),
+            completed_at: None,
+        }
+    }
+
+    #[test]
+    fn validate_goal_status_transition_blocks_invalid_moves() {
+        let planning = sample_goal(goal::GoalStatus::Planning, &[goal::StepStatus::Pending]);
+        assert!(validate_goal_status_transition(&planning, &goal::GoalStatus::Paused).is_err());
+        assert!(validate_goal_status_transition(&planning, &goal::GoalStatus::Active).is_err());
+
+        let awaiting = sample_goal(
+            goal::GoalStatus::AwaitingApproval,
+            &[goal::StepStatus::Pending],
+        );
+        assert!(validate_goal_status_transition(&awaiting, &goal::GoalStatus::Active).is_err());
+
+        let done = sample_goal(goal::GoalStatus::Done, &[goal::StepStatus::Done]);
+        assert!(validate_goal_status_transition(&done, &goal::GoalStatus::Paused).is_err());
+    }
+
+    #[test]
+    fn validate_goal_status_transition_allows_pause_resume_cancel() {
+        let active = sample_goal(goal::GoalStatus::Active, &[goal::StepStatus::Running]);
+        assert!(validate_goal_status_transition(&active, &goal::GoalStatus::Paused).is_ok());
+        assert!(validate_goal_status_transition(&active, &goal::GoalStatus::Failed).is_ok());
+
+        let paused = sample_goal(goal::GoalStatus::Paused, &[goal::StepStatus::Queued]);
+        assert!(validate_goal_status_transition(&paused, &goal::GoalStatus::Active).is_ok());
+        assert!(validate_goal_status_transition(&paused, &goal::GoalStatus::Failed).is_ok());
+    }
+
+    #[test]
+    fn goal_has_inflight_steps_detects_queued_and_running() {
+        let goal = sample_goal(
+            goal::GoalStatus::Active,
+            &[
+                goal::StepStatus::Done,
+                goal::StepStatus::Queued,
+                goal::StepStatus::Running,
+            ],
+        );
+        assert!(goal_has_inflight_steps(&goal));
+        assert_eq!(
+            goal_inflight_task_ids(&goal),
+            vec!["task-2".to_string(), "task-3".to_string()]
+        );
+
+        let settled = sample_goal(
+            goal::GoalStatus::Failed,
+            &[
+                goal::StepStatus::Done,
+                goal::StepStatus::Blocked,
+                goal::StepStatus::Failed,
+            ],
+        );
+        assert!(!goal_has_inflight_steps(&settled));
     }
 }

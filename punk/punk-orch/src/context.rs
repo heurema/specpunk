@@ -1,11 +1,11 @@
 use std::fs;
 use std::path::Path;
 
+use crate::goal;
+use crate::ratchet;
 use crate::recall;
 use crate::session;
 use crate::skill;
-use crate::ratchet;
-use crate::goal;
 
 /// Unified context assembled before agent dispatch.
 /// Combines: agent guidance + skills + recall + session + project stats.
@@ -55,6 +55,14 @@ impl ContextPack {
             sections.push(stats);
         }
 
+        // 6. Latest run triage for fix/goal/planning flows.
+        if matches!(category, "fix" | "goal" | "plan" | "planning") {
+            let triage = crate::run::latest_run_triage(bus, project);
+            if triage.verdict != crate::run::TriageVerdict::NoActiveRun {
+                sections.push(format_latest_run_triage(&triage));
+            }
+        }
+
         Self { sections }
     }
 
@@ -100,8 +108,8 @@ fn match_skills(bus: &Path, project: &str, category: &str) -> String {
             if let Some(triggers) = extract_triggers(&content) {
                 let cat_match = triggers.categories.is_empty()
                     || triggers.categories.iter().any(|c| c == category);
-                let proj_match = triggers.projects.is_empty()
-                    || triggers.projects.iter().any(|p| p == project);
+                let proj_match =
+                    triggers.projects.is_empty() || triggers.projects.iter().any(|p| p == project);
 
                 if cat_match && proj_match {
                     // Extract body (after frontmatter)
@@ -147,7 +155,10 @@ fn extract_triggers(content: &str) -> Option<SkillTriggers> {
         }
     }
 
-    Some(SkillTriggers { categories, projects })
+    Some(SkillTriggers {
+        categories,
+        projects,
+    })
 }
 
 fn parse_yaml_list(val: &str) -> Vec<String> {
@@ -167,9 +178,10 @@ fn parse_yaml_list(val: &str) -> Vec<String> {
 fn project_stats(bus: &Path, project: &str) -> String {
     let metrics = ratchet::compute_metrics(bus, 7);
     let goals = goal::list_goals(bus);
-    let active_goals: Vec<_> = goals.iter().filter(|g| {
-        g.project == project && g.status == goal::GoalStatus::Active
-    }).collect();
+    let active_goals: Vec<_> = goals
+        .iter()
+        .filter(|g| g.project == project && g.status == goal::GoalStatus::Active)
+        .collect();
 
     if metrics.total_tasks == 0 && active_goals.is_empty() {
         return String::new();
@@ -179,16 +191,25 @@ fn project_stats(bus: &Path, project: &str) -> String {
     if metrics.total_tasks > 0 {
         out.push_str(&format!(
             "- {} tasks ({} ok, {} fail), ${:.2}, {:.0}% success\n",
-            metrics.total_tasks, metrics.success_count, metrics.failure_count,
-            metrics.total_cost_usd, metrics.success_rate_pct
+            metrics.total_tasks,
+            metrics.success_count,
+            metrics.failure_count,
+            metrics.total_cost_usd,
+            metrics.success_rate_pct
         ));
     }
     for g in &active_goals {
         if let Some(ref plan) = g.plan {
-            let done = plan.steps.iter().filter(|s| s.status == goal::StepStatus::Done).count();
+            let done = plan
+                .steps
+                .iter()
+                .filter(|s| s.status == goal::StepStatus::Done)
+                .count();
             out.push_str(&format!(
                 "- Goal: {} ({}/{} steps)\n",
-                g.objective, done, plan.steps.len()
+                g.objective,
+                done,
+                plan.steps.len()
             ));
         }
     }
@@ -202,4 +223,95 @@ pub fn format_context_report(bus: &Path, project: &str, config_dir: &Path) -> St
         return format!("No context for project: {project}\n");
     }
     pack.sections.join("\n")
+}
+
+fn format_latest_run_triage(triage: &crate::run::RunTriage) -> String {
+    let mut out = String::from("## Latest run triage\n");
+    out.push_str(&format!("- Verdict: {:?}\n", triage.verdict));
+    if !triage.run_id.is_empty() {
+        out.push_str(&format!("- Run: {}\n", triage.run_id));
+    }
+    if let Some(ref status) = triage.status {
+        out.push_str(&format!("- Status: {:?}\n", status));
+    }
+    if let Some(age_s) = triage.age_s {
+        out.push_str(&format!("- Age: {}s\n", age_s));
+    }
+    if let Some(heartbeat_age_s) = triage.heartbeat_age_s {
+        out.push_str(&format!("- Heartbeat age: {}s\n", heartbeat_age_s));
+    }
+    if !triage.stdout_tail.is_empty() {
+        out.push_str(&format!(
+            "- Stdout tail: {}\n",
+            triage.stdout_tail.replace('\n', " ")
+        ));
+    }
+    if !triage.stderr_tail.is_empty() {
+        out.push_str(&format!(
+            "- Stderr tail: {}\n",
+            triage.stderr_tail.replace('\n', " ")
+        ));
+    }
+    out
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use tempfile::tempdir;
+
+    #[test]
+    fn fix_context_includes_latest_run_triage() {
+        let bus_dir = tempdir().unwrap();
+        let cfg_dir = tempdir().unwrap();
+        let bus = bus_dir.path();
+        let task_id = "specpunk-20260331-120003";
+
+        fs::create_dir_all(bus.join("cur")).unwrap();
+        fs::write(
+            bus.join("cur").join(format!("{task_id}.json")),
+            serde_json::json!({
+                "project": "specpunk",
+                "model": "claude",
+                "category": "fix"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        fs::create_dir_all(bus.join("runs").join(task_id)).unwrap();
+        let run = crate::run::Run {
+            run_id: format!("{task_id}-1"),
+            task_id: task_id.to_string(),
+            attempt: 1,
+            retry_of: None,
+            slot_id: 1,
+            agent: "claude".to_string(),
+            model: "sonnet".to_string(),
+            invoke_tier: crate::run::InvokeTier::Cli,
+            status: crate::run::RunStatus::Running,
+            error_type: None,
+            termination_reason: None,
+            claimed_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            duration_ms: 0,
+            exit_code: 0,
+            pid: Some(1),
+            stdout_path: None,
+            stderr_path: None,
+        };
+        fs::write(
+            bus.join("runs").join(task_id).join("run-1.json"),
+            serde_json::to_string_pretty(&run).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(bus.join(".heartbeats")).unwrap();
+        fs::write(bus.join(".heartbeats").join(format!("{task_id}.hb")), "").unwrap();
+
+        let pack = ContextPack::build(bus, "specpunk", "fix", "claude", cfg_dir.path());
+        let joined = pack.sections.join("\n");
+        assert!(joined.contains("## Latest run triage"));
+        assert!(joined.contains("StillAlive") || joined.contains("Still Alive"));
+    }
 }

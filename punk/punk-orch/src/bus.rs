@@ -210,10 +210,18 @@ fn parse_failed_dir(dir: &Path) -> Option<FailedTask> {
     let (project, model, category) = if let Ok(data) = fs::read_to_string(dir.join("receipt.json"))
     {
         let v: Value = serde_json::from_str(&data).unwrap_or_default();
-        (json_str(&v, "project"), json_str(&v, "model"), json_str(&v, "category"))
+        (
+            json_str(&v, "project"),
+            json_str(&v, "model"),
+            json_str(&v, "category"),
+        )
     } else if let Ok(data) = fs::read_to_string(dir.join("task.json")) {
         let v: Value = serde_json::from_str(&data).unwrap_or_default();
-        (json_str(&v, "project"), json_str(&v, "model"), json_str(&v, "category"))
+        (
+            json_str(&v, "project"),
+            json_str(&v, "model"),
+            json_str(&v, "category"),
+        )
     } else {
         return None;
     };

@@ -4,15 +4,15 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 
 use punk_core::audit::{self, render_audit_short};
-use punk_core::check::{self, CheckOptions, render_check};
-use punk_core::init::run_init;
-use punk_core::plan::{run_plan_headless, save_contract, PlanOptions};
-use punk_core::plan::contract::{Feedback, FeedbackOutcome};
+use punk_core::check::{self, render_check, CheckOptions};
 use punk_core::holdout::{self, render_holdout_short};
-use punk_core::repair;
+use punk_core::init::run_init;
 use punk_core::mechanic::{self, render_baseline_short, render_mechanic_short};
 use punk_core::pack;
-use punk_core::receipt::{self, ReceiptOptions, render_receipt_md, render_receipt_short};
+use punk_core::plan::contract::{Feedback, FeedbackOutcome};
+use punk_core::plan::{run_plan_headless, save_contract, PlanOptions};
+use punk_core::receipt::{self, render_receipt_md, render_receipt_short, ReceiptOptions};
+use punk_core::repair;
 
 #[derive(Parser)]
 #[command(
@@ -235,11 +235,11 @@ async fn main() {
 
             // Resolve LLM provider: env vars → config file → guided setup
             let resolved = punk_core::config::resolve_provider();
-            let http_provider = resolved.map(|p| {
-                punk_core::plan::llm::HttpProvider::new(p.endpoint, p.api_key)
-            });
-            let provider_ref: Option<&dyn punk_core::plan::LlmProvider> =
-                http_provider.as_ref().map(|p| p as &dyn punk_core::plan::LlmProvider);
+            let http_provider =
+                resolved.map(|p| punk_core::plan::llm::HttpProvider::new(p.endpoint, p.api_key));
+            let provider_ref: Option<&dyn punk_core::plan::LlmProvider> = http_provider
+                .as_ref()
+                .map(|p| p as &dyn punk_core::plan::LlmProvider);
 
             if !manual && provider_ref.is_none() {
                 eprintln!("punk plan: no LLM provider configured");
@@ -316,8 +316,8 @@ async fn main() {
                         if let Err(e) = std::fs::create_dir_all(&dir) {
                             eprintln!("punk plan: could not create feedback dir: {e}");
                         } else {
-                            let fb_json = serde_json::to_string_pretty(&feedback)
-                                .unwrap_or_default();
+                            let fb_json =
+                                serde_json::to_string_pretty(&feedback).unwrap_or_default();
                             let _ = std::fs::write(dir.join("feedback.json"), fb_json);
                         }
                         println!("punk plan: contract rejected and discarded");
@@ -344,9 +344,7 @@ async fn main() {
                             eprintln!("punk plan: could not write temp file: {e}");
                             continue;
                         }
-                        let status = std::process::Command::new(&editor)
-                            .arg(&tmp)
-                            .status();
+                        let status = std::process::Command::new(&editor).arg(&tmp).status();
                         match status {
                             Ok(s) if s.success() => {
                                 // Re-read and re-validate
@@ -354,24 +352,30 @@ async fn main() {
                                     Ok(raw) => match serde_json::from_str(&raw) {
                                         Ok(edited) => {
                                             contract = edited;
-                                            let new_quality = punk_core::plan::quality::check_quality(
-                                                &contract.acceptance_criteria,
-                                                &contract.scope.touch,
-                                                &contract.scope.dont_touch,
-                                            );
-                                            let new_summary = punk_core::plan::render::render_summary(
-                                                &contract,
-                                                &new_quality,
-                                            );
+                                            let new_quality =
+                                                punk_core::plan::quality::check_quality(
+                                                    &contract.acceptance_criteria,
+                                                    &contract.scope.touch,
+                                                    &contract.scope.dont_touch,
+                                                );
+                                            let new_summary =
+                                                punk_core::plan::render::render_summary(
+                                                    &contract,
+                                                    &new_quality,
+                                                );
                                             println!("{new_summary}");
                                             let feedback = Feedback {
                                                 outcome: FeedbackOutcome::ApproveWithEdit,
                                                 timestamp: chrono::Utc::now().to_rfc3339(),
                                                 note: Some("edited in $EDITOR".to_string()),
                                             };
-                                            match save_contract(&punk_dir, &mut contract, &feedback) {
+                                            match save_contract(&punk_dir, &mut contract, &feedback)
+                                            {
                                                 Ok((cp, _)) => {
-                                                    println!("punk plan: edited contract saved to {}", cp.display());
+                                                    println!(
+                                                        "punk plan: edited contract saved to {}",
+                                                        cp.display()
+                                                    );
                                                     break;
                                                 }
                                                 Err(e) => {
@@ -406,8 +410,8 @@ async fn main() {
                         // Log quit feedback
                         let dir = punk_dir.join("contracts").join(&contract.change_id);
                         if let Ok(()) = std::fs::create_dir_all(&dir) {
-                            let fb_json = serde_json::to_string_pretty(&feedback)
-                                .unwrap_or_default();
+                            let fb_json =
+                                serde_json::to_string_pretty(&feedback).unwrap_or_default();
                             let _ = std::fs::write(dir.join("feedback.json"), fb_json);
                         }
                         println!("punk plan: quit");
@@ -442,9 +446,11 @@ async fn main() {
                 }
                 Err(check::CheckError::NoContract(msg)) => {
                     if json {
-                        println!(r#"{{"status":"ERROR","code":{},"message":{}}}"#,
+                        println!(
+                            r#"{{"status":"ERROR","code":{},"message":{}}}"#,
                             check::EXIT_NO_CONTRACT,
-                            serde_json::to_string(&msg).unwrap_or_default());
+                            serde_json::to_string(&msg).unwrap_or_default()
+                        );
                     } else {
                         eprintln!("punk check: {msg}");
                     }
@@ -452,9 +458,11 @@ async fn main() {
                 }
                 Err(check::CheckError::NotApproved(msg)) => {
                     if json {
-                        println!(r#"{{"status":"ERROR","code":{},"message":{}}}"#,
+                        println!(
+                            r#"{{"status":"ERROR","code":{},"message":{}}}"#,
                             check::EXIT_NOT_APPROVED,
-                            serde_json::to_string(&msg).unwrap_or_default());
+                            serde_json::to_string(&msg).unwrap_or_default()
+                        );
                     } else {
                         eprintln!("punk check: {msg}");
                     }
@@ -463,9 +471,11 @@ async fn main() {
                 Err(e) => {
                     let msg = e.to_string();
                     if json {
-                        println!(r#"{{"status":"ERROR","code":{},"message":{}}}"#,
+                        println!(
+                            r#"{{"status":"ERROR","code":{},"message":{}}}"#,
                             check::EXIT_INTERNAL,
-                            serde_json::to_string(&msg).unwrap_or_default());
+                            serde_json::to_string(&msg).unwrap_or_default()
+                        );
                     } else {
                         eprintln!("punk check: {msg}");
                     }
@@ -541,7 +551,10 @@ async fn main() {
                     );
 
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&brief).unwrap_or_default());
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&brief).unwrap_or_default()
+                        );
                     } else {
                         print!("{}", repair::render_brief(&brief));
                     }
@@ -584,7 +597,10 @@ async fn main() {
                     match audit::run_audit(&audit_input) {
                         Ok(report) => {
                             if json {
-                                println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                                );
                             } else {
                                 print!("{}", render_audit_short(&report));
                             }
@@ -654,7 +670,10 @@ async fn main() {
                     };
                     std::process::exit(exit_code);
                 }
-                Err(e) => { eprintln!("punk critique: {e}"); std::process::exit(2); }
+                Err(e) => {
+                    eprintln!("punk critique: {e}");
+                    std::process::exit(2);
+                }
             }
         }
         Commands::DepCheck { files } => {
@@ -673,12 +692,19 @@ async fn main() {
             for file in &scan_files {
                 let path = root.join(file);
                 if let Ok(content) = std::fs::read_to_string(&path) {
-                    let lang = if file.ends_with(".rs") { "rust" }
-                        else if file.ends_with(".py") { "python" }
-                        else if file.ends_with(".ts") || file.ends_with(".tsx") { "typescript" }
-                        else if file.ends_with(".js") || file.ends_with(".jsx") { "javascript" }
-                        else if file.ends_with(".go") { "go" }
-                        else { continue };
+                    let lang = if file.ends_with(".rs") {
+                        "rust"
+                    } else if file.ends_with(".py") {
+                        "python"
+                    } else if file.ends_with(".ts") || file.ends_with(".tsx") {
+                        "typescript"
+                    } else if file.ends_with(".js") || file.ends_with(".jsx") {
+                        "javascript"
+                    } else if file.ends_with(".go") {
+                        "go"
+                    } else {
+                        continue;
+                    };
                     all_imports.extend(punk_core::depcheck::extract_imports(&content, lang));
                 }
             }
@@ -701,7 +727,11 @@ async fn main() {
 
             let report = punk_core::testquality::scan_test_files(&root, &scan_files);
             print!("{}", punk_core::testquality::render_test_quality(&report));
-            std::process::exit(if report.zero_assertion_count > 0 { 1 } else { 0 });
+            std::process::exit(if report.zero_assertion_count > 0 {
+                1
+            } else {
+                0
+            });
         }
         Commands::Supersede => {
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -713,12 +743,17 @@ async fn main() {
             match check::resolve_contract(&root) {
                 Ok((contract, _, _)) => {
                     let report = punk_core::cleanup::run_cleanup(
-                        &root, &contract.removals, &contract.cleanup_obligations,
+                        &root,
+                        &contract.removals,
+                        &contract.cleanup_obligations,
                     );
                     print!("{}", punk_core::cleanup::render_cleanup(&report));
                     std::process::exit(if report.all_passed { 0 } else { 1 });
                 }
-                Err(e) => { eprintln!("punk cleanup: {e}"); std::process::exit(2); }
+                Err(e) => {
+                    eprintln!("punk cleanup: {e}");
+                    std::process::exit(2);
+                }
             }
         }
         Commands::Session => {
@@ -726,12 +761,20 @@ async fn main() {
             let pack = punk_core::session::build_context_pack(&root);
             print!("{}", punk_core::session::render_context_pack(&pack));
         }
-        Commands::Coupling { file, min_confidence } => {
+        Commands::Coupling {
+            file,
+            min_confidence,
+        } => {
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let result = punk_core::coupling::find_coupling(&root, &file, min_confidence);
             print!("{}", punk_core::coupling::render_coupling(&result));
         }
-        Commands::Explain { what, why, risks, confirm } => {
+        Commands::Explain {
+            what,
+            why,
+            risks,
+            confirm,
+        } => {
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             match check::resolve_contract(&root) {
                 Ok((contract, contract_dir, _)) => {
@@ -756,7 +799,10 @@ async fn main() {
                         let why = why.unwrap_or_else(|| "(explain why this approach)".into());
                         let risks = risks.unwrap_or_else(|| "(what can break)".into());
                         let e = punk_core::explain::create_draft(
-                            &contract.change_id, &what, &why, &risks,
+                            &contract.change_id,
+                            &what,
+                            &why,
+                            &risks,
                         );
                         if let Err(err) = punk_core::explain::save(&e, &contract_dir) {
                             eprintln!("punk explain: {err}");
@@ -765,7 +811,10 @@ async fn main() {
                         print!("{}", punk_core::explain::render_explanation(&e));
                     }
                 }
-                Err(e) => { eprintln!("punk explain: {e}"); std::process::exit(2); }
+                Err(e) => {
+                    eprintln!("punk explain: {e}");
+                    std::process::exit(2);
+                }
             }
         }
         Commands::Recall { query, limit } => {
@@ -778,11 +827,17 @@ async fn main() {
                 print!("{output}");
             }
         }
-        Commands::Remember { description, reason } => {
+        Commands::Remember {
+            description,
+            reason,
+        } => {
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             match punk_core::recall::remember(&root, &description, reason.as_deref()) {
                 Ok(event) => {
-                    println!("punk remember: saved invariant '{}' ({})", event.context, event.id);
+                    println!(
+                        "punk remember: saved invariant '{}' ({})",
+                        event.context, event.id
+                    );
                 }
                 Err(e) => {
                     eprintln!("punk remember: {e}");
@@ -798,9 +853,15 @@ async fn main() {
                 let config_path = root.join(".punk").join("config.toml");
                 if let Ok(raw) = std::fs::read_to_string(&config_path) {
                     #[derive(serde::Deserialize)]
-                    struct C { #[serde(default)] project: P }
+                    struct C {
+                        #[serde(default)]
+                        project: P,
+                    }
                     #[derive(serde::Deserialize, Default)]
-                    struct P { #[serde(default)] primary_language: Option<String> }
+                    struct P {
+                        #[serde(default)]
+                        primary_language: Option<String>,
+                    }
                     toml::from_str::<C>(&raw)
                         .ok()
                         .and_then(|c| c.project.primary_language)
@@ -813,7 +874,8 @@ async fn main() {
             let report = punk_core::scan::scan_conventions(&root, &language);
 
             if agents_md {
-                let project_name = root.file_name()
+                let project_name = root
+                    .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "project".to_string());
                 let md = punk_core::scan::generate_agents_md(&report, &project_name);
@@ -824,13 +886,26 @@ async fn main() {
                 }
                 println!("punk scan: AGENTS.md written ({} bytes)", md.len());
             } else if json {
-                println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                );
             } else {
-                println!("punk scan: {} ({} findings)", report.language, report.findings.len());
-                println!("  naming:  fn={}, types={}", report.naming.functions, report.naming.types);
+                println!(
+                    "punk scan: {} ({} findings)",
+                    report.language,
+                    report.findings.len()
+                );
+                println!(
+                    "  naming:  fn={}, types={}",
+                    report.naming.functions, report.naming.types
+                );
                 println!("  imports: {}", report.imports.style);
                 println!("  errors:  {}", report.errors.style);
-                println!("  tests:   {} ({})", report.tests.framework, report.tests.style);
+                println!(
+                    "  tests:   {} ({})",
+                    report.tests.framework, report.tests.style
+                );
                 if !report.imports.top_imports.is_empty() {
                     println!("  top deps: {}", report.imports.top_imports.join(", "));
                 }
@@ -855,13 +930,14 @@ async fn main() {
                         std::process::exit(1);
                     }
                     let audit_raw = std::fs::read_to_string(&audit_path).unwrap_or_default();
-                    let audit_report: punk_core::audit::AuditReport = match serde_json::from_str(&audit_raw) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            eprintln!("punk pack: invalid audit.json: {e}");
-                            std::process::exit(1);
-                        }
-                    };
+                    let audit_report: punk_core::audit::AuditReport =
+                        match serde_json::from_str(&audit_raw) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("punk pack: invalid audit.json: {e}");
+                                std::process::exit(1);
+                            }
+                        };
 
                     // Get diff
                     let diff = punk_core::vcs::detect(&root)
@@ -876,7 +952,9 @@ async fn main() {
                     let holdout_path = contract_dir.join("holdout.json");
                     let (ho_total, ho_passed) = if holdout_path.exists() {
                         let raw = std::fs::read_to_string(&holdout_path).unwrap_or_default();
-                        if let Ok(r) = serde_json::from_str::<punk_core::holdout::HoldoutReport>(&raw) {
+                        if let Ok(r) =
+                            serde_json::from_str::<punk_core::holdout::HoldoutReport>(&raw)
+                        {
                             (r.total, r.passed)
                         } else {
                             (0, 0)
@@ -886,8 +964,13 @@ async fn main() {
                     };
 
                     let proofpack = pack::assemble(
-                        &contract_dir, &contract_raw, &stripped_json, &diff,
-                        &audit_report, ho_total, ho_passed,
+                        &contract_dir,
+                        &contract_raw,
+                        &stripped_json,
+                        &diff,
+                        &audit_report,
+                        ho_total,
+                        ho_passed,
                     );
 
                     match pack::save(&proofpack, &contract_dir) {
@@ -918,16 +1001,25 @@ async fn main() {
                 let change_id = punk_core::vcs::detect(&root)
                     .and_then(|v| v.change_id())
                     .unwrap_or_default();
-                root.join(".punk").join("contracts").join(&change_id).join("proofpack.json")
+                root.join(".punk")
+                    .join("contracts")
+                    .join(&change_id)
+                    .join("proofpack.json")
             };
 
             match pack::ci_gate(&pack_path) {
                 Ok((code, summary)) => {
                     if json {
-                        println!(r#"{{"code":{},"verdict":"{}","summary":{}}}"#,
+                        println!(
+                            r#"{{"code":{},"verdict":"{}","summary":{}}}"#,
                             code,
-                            match code { 0 => "PROMOTE", 1 => "REJECT", _ => "HOLD" },
-                            serde_json::to_string(&summary).unwrap_or_default());
+                            match code {
+                                0 => "PROMOTE",
+                                1 => "REJECT",
+                                _ => "HOLD",
+                            },
+                            serde_json::to_string(&summary).unwrap_or_default()
+                        );
                     } else {
                         println!("{summary}");
                     }
@@ -956,8 +1048,13 @@ async fn main() {
                 Ok(baseline) => {
                     print!("{}", render_baseline_short(&baseline));
                     for check in &baseline.checks {
-                        println!("  {} (exit {}): {} failures, {}ms",
-                            check.name, check.exit_code, check.failures.len(), check.duration_ms);
+                        println!(
+                            "  {} (exit {}): {} failures, {}ms",
+                            check.name,
+                            check.exit_code,
+                            check.failures.len(),
+                            check.duration_ms
+                        );
                     }
                 }
                 Err(e) => {
@@ -1087,71 +1184,79 @@ async fn main() {
                 }
             }
         }
-        Commands::Config { action } => {
-            match action {
-                ConfigAction::SetProvider { name, endpoint, api_key, model } => {
-                    match punk_core::config::set_provider(&name, &endpoint, &api_key, model.as_deref()) {
-                        Ok(()) => {
-                            println!("Provider '{name}' saved to {}", punk_core::config::providers_path().display());
-                        }
-                        Err(e) => {
-                            eprintln!("punk config: {e}");
-                            std::process::exit(1);
-                        }
+        Commands::Config { action } => match action {
+            ConfigAction::SetProvider {
+                name,
+                endpoint,
+                api_key,
+                model,
+            } => {
+                match punk_core::config::set_provider(&name, &endpoint, &api_key, model.as_deref())
+                {
+                    Ok(()) => {
+                        println!(
+                            "Provider '{name}' saved to {}",
+                            punk_core::config::providers_path().display()
+                        );
                     }
-                }
-                ConfigAction::RemoveProvider { name } => {
-                    match punk_core::config::remove_provider(&name) {
-                        Ok(()) => println!("Provider '{name}' removed"),
-                        Err(e) => {
-                            eprintln!("punk config: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                ConfigAction::List => {
-                    match punk_core::config::load_config() {
-                        Ok(config) => {
-                            if config.providers.is_empty() {
-                                println!("No providers configured.");
-                                println!("  punk config set-provider <name> <endpoint> <api-key>");
-                            } else {
-                                let default = config.default_provider.as_deref().unwrap_or("");
-                                for (name, p) in &config.providers {
-                                    let marker = if name == default { " (default)" } else { "" };
-                                    let model_str = p.model.as_deref().unwrap_or("-");
-                                    println!("  {name}{marker}: {endpoint} model={model_str}",
-                                        endpoint = p.endpoint);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("punk config: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                ConfigAction::Show => {
-                    match punk_core::config::resolve_provider() {
-                        Some(p) => {
-                            println!("Active provider:");
-                            println!("  Endpoint: {}", p.endpoint);
-                            println!("  API key:  {}...{}", &p.api_key[..4.min(p.api_key.len())],
-                                &p.api_key[p.api_key.len().saturating_sub(4)..]);
-                            if let Some(model) = &p.model {
-                                println!("  Model:    {model}");
-                            }
-                        }
-                        None => {
-                            println!("No active provider. Resolution order:");
-                            println!("  1. PUNK_LLM_ENDPOINT + PUNK_LLM_API_KEY env vars");
-                            println!("  2. ANTHROPIC_API_KEY or OPENAI_API_KEY env vars");
-                            println!("  3. ~/.config/punk/providers.toml (default provider)");
-                        }
+                    Err(e) => {
+                        eprintln!("punk config: {e}");
+                        std::process::exit(1);
                     }
                 }
             }
-        }
+            ConfigAction::RemoveProvider { name } => {
+                match punk_core::config::remove_provider(&name) {
+                    Ok(()) => println!("Provider '{name}' removed"),
+                    Err(e) => {
+                        eprintln!("punk config: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            ConfigAction::List => match punk_core::config::load_config() {
+                Ok(config) => {
+                    if config.providers.is_empty() {
+                        println!("No providers configured.");
+                        println!("  punk config set-provider <name> <endpoint> <api-key>");
+                    } else {
+                        let default = config.default_provider.as_deref().unwrap_or("");
+                        for (name, p) in &config.providers {
+                            let marker = if name == default { " (default)" } else { "" };
+                            let model_str = p.model.as_deref().unwrap_or("-");
+                            println!(
+                                "  {name}{marker}: {endpoint} model={model_str}",
+                                endpoint = p.endpoint
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("punk config: {e}");
+                    std::process::exit(1);
+                }
+            },
+            ConfigAction::Show => match punk_core::config::resolve_provider() {
+                Some(p) => {
+                    println!("Active provider:");
+                    println!("  Endpoint: {}", p.endpoint);
+                    println!(
+                        "  API key:  {}...{}",
+                        &p.api_key[..4.min(p.api_key.len())],
+                        &p.api_key[p.api_key.len().saturating_sub(4)..]
+                    );
+                    if let Some(model) = &p.model {
+                        println!("  Model:    {model}");
+                    }
+                }
+                None => {
+                    println!("No active provider. Resolution order:");
+                    println!("  1. PUNK_LLM_ENDPOINT + PUNK_LLM_API_KEY env vars");
+                    println!("  2. ANTHROPIC_API_KEY or OPENAI_API_KEY env vars");
+                    println!("  3. ~/.config/punk/providers.toml (default provider)");
+                }
+            },
+        },
     }
 }
 
@@ -1159,8 +1264,8 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use punk_core::init::{run_init, GreenFieldAnswers, InitMode};
-    use tempfile::TempDir;
     use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn init_greenfield_cli() {
@@ -1187,7 +1292,11 @@ mod tests {
 
         // Create enough source files for brownfield detection
         fs::create_dir_all(dir.join("src")).unwrap();
-        fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\nversion=\"0.1.0\"\nedition=\"2021\"\n").unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
         for i in 0..6 {
             fs::write(dir.join(format!("src/f{i}.rs")), "pub fn f() {}").unwrap();
         }

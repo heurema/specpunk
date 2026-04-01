@@ -10,11 +10,21 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DepStatus { Ok, Deprecated, Yanked, NotFound, Unknown }
+pub enum DepStatus {
+    Ok,
+    Deprecated,
+    Yanked,
+    NotFound,
+    Unknown,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DepSeverity { HardFail, Warning, Info }
+pub enum DepSeverity {
+    HardFail,
+    Warning,
+    Info,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepFinding {
@@ -51,8 +61,12 @@ pub fn extract_imports(content: &str, language: &str) -> Vec<(String, String)> {
                 if let Some(rest) = trimmed.strip_prefix("use ") {
                     if let Some(crate_name) = rest.split("::").next() {
                         let name = crate_name.trim_end_matches(';').trim();
-                        if name != "std" && name != "core" && name != "alloc"
-                            && name != "crate" && name != "self" && name != "super"
+                        if name != "std"
+                            && name != "core"
+                            && name != "alloc"
+                            && name != "crate"
+                            && name != "self"
+                            && name != "super"
                         {
                             imports.push((name.to_string(), "cargo".to_string()));
                         }
@@ -63,12 +77,24 @@ pub fn extract_imports(content: &str, language: &str) -> Vec<(String, String)> {
                 // import requests → "requests"
                 // from flask import Flask → "flask"
                 if let Some(rest) = trimmed.strip_prefix("import ") {
-                    let pkg = rest.split_whitespace().next().unwrap_or("").split('.').next().unwrap_or("");
+                    let pkg = rest
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .split('.')
+                        .next()
+                        .unwrap_or("");
                     if !pkg.is_empty() {
                         imports.push((pkg.to_string(), "pypi".to_string()));
                     }
                 } else if let Some(rest) = trimmed.strip_prefix("from ") {
-                    let pkg = rest.split_whitespace().next().unwrap_or("").split('.').next().unwrap_or("");
+                    let pkg = rest
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .split('.')
+                        .next()
+                        .unwrap_or("");
                     if !pkg.is_empty() && !pkg.starts_with('.') {
                         imports.push((pkg.to_string(), "pypi".to_string()));
                     }
@@ -76,9 +102,13 @@ pub fn extract_imports(content: &str, language: &str) -> Vec<(String, String)> {
             }
             "typescript" | "javascript" => {
                 // import { x } from 'package'; → "package"
-                if trimmed.starts_with("import ") || trimmed.starts_with("const ") || trimmed.starts_with("require(") {
+                if trimmed.starts_with("import ")
+                    || trimmed.starts_with("const ")
+                    || trimmed.starts_with("require(")
+                {
                     if let Some(from_idx) = trimmed.find("from ") {
-                        let module = trimmed[from_idx + 5..].trim()
+                        let module = trimmed[from_idx + 5..]
+                            .trim()
                             .trim_matches(|c| c == '\'' || c == '"' || c == ';');
                         if !module.starts_with('.') && !module.starts_with('/') {
                             let pkg = module.split('/').next().unwrap_or(module);
@@ -139,7 +169,10 @@ pub fn check_package_depsdev(name: &str, ecosystem: &str) -> (DepStatus, bool) {
         Ok(o) if o.status.success() => {
             let full = String::from_utf8_lossy(&o.stdout).to_string();
             let lines: Vec<&str> = full.trim().rsplitn(2, '\n').collect();
-            let status_code = lines.first().and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+            let status_code = lines
+                .first()
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(0);
 
             match status_code {
                 200 => {
@@ -169,60 +202,129 @@ pub fn check_imports(imports: &[(String, String)]) -> DepReport {
     let mut checked = 0;
 
     // Skip stdlib/common packages
-    let skip = ["os", "sys", "re", "json", "pathlib", "typing", "collections",
-                 "datetime", "io", "math", "functools", "itertools", "hashlib",
-                 "time", "string", "abc", "dataclasses", "enum", "copy",
-                 "react", "react-dom", "next", "vue", "path", "fs", "http", "url",
-                 "fmt", "net", "context", "sync", "errors", "strings", "testing"];
+    let skip = [
+        "os",
+        "sys",
+        "re",
+        "json",
+        "pathlib",
+        "typing",
+        "collections",
+        "datetime",
+        "io",
+        "math",
+        "functools",
+        "itertools",
+        "hashlib",
+        "time",
+        "string",
+        "abc",
+        "dataclasses",
+        "enum",
+        "copy",
+        "react",
+        "react-dom",
+        "next",
+        "vue",
+        "path",
+        "fs",
+        "http",
+        "url",
+        "fmt",
+        "net",
+        "context",
+        "sync",
+        "errors",
+        "strings",
+        "testing",
+    ];
 
     for (name, ecosystem) in imports {
-        if skip.contains(&name.as_str()) { continue; }
+        if skip.contains(&name.as_str()) {
+            continue;
+        }
         checked += 1;
 
         let (status, available) = check_package_depsdev(name, ecosystem);
-        if !available { api_available = false; }
+        if !available {
+            api_available = false;
+        }
 
         let (severity, message) = match &status {
-            DepStatus::NotFound => (DepSeverity::HardFail,
-                format!("package '{name}' not found on {ecosystem}")),
-            DepStatus::Deprecated => (DepSeverity::Warning,
-                format!("package '{name}' is deprecated on {ecosystem}")),
-            DepStatus::Yanked => (DepSeverity::Warning,
-                format!("package '{name}' version yanked on {ecosystem}")),
+            DepStatus::NotFound => (
+                DepSeverity::HardFail,
+                format!("package '{name}' not found on {ecosystem}"),
+            ),
+            DepStatus::Deprecated => (
+                DepSeverity::Warning,
+                format!("package '{name}' is deprecated on {ecosystem}"),
+            ),
+            DepStatus::Yanked => (
+                DepSeverity::Warning,
+                format!("package '{name}' version yanked on {ecosystem}"),
+            ),
             DepStatus::Ok => continue,
-            DepStatus::Unknown => (DepSeverity::Info,
-                format!("could not verify '{name}' on {ecosystem}")),
+            DepStatus::Unknown => (
+                DepSeverity::Info,
+                format!("could not verify '{name}' on {ecosystem}"),
+            ),
         };
 
         findings.push(DepFinding {
             package: name.clone(),
             ecosystem: ecosystem.clone(),
-            status, severity, message,
+            status,
+            severity,
+            message,
         });
     }
 
-    let hard_fail_count = findings.iter().filter(|f| f.severity == DepSeverity::HardFail).count();
-    let warning_count = findings.iter().filter(|f| f.severity == DepSeverity::Warning).count();
+    let hard_fail_count = findings
+        .iter()
+        .filter(|f| f.severity == DepSeverity::HardFail)
+        .count();
+    let warning_count = findings
+        .iter()
+        .filter(|f| f.severity == DepSeverity::Warning)
+        .count();
 
-    DepReport { packages_checked: checked, findings, hard_fail_count, warning_count, api_available }
+    DepReport {
+        packages_checked: checked,
+        findings,
+        hard_fail_count,
+        warning_count,
+        api_available,
+    }
 }
 
 pub fn render_dep_report(report: &DepReport) -> String {
     if report.findings.is_empty() {
-        return format!("punk deps: {} packages checked, all OK{}\n",
+        return format!(
+            "punk deps: {} packages checked, all OK{}\n",
             report.packages_checked,
-            if report.api_available { "" } else { " (offline mode)" });
+            if report.api_available {
+                ""
+            } else {
+                " (offline mode)"
+            }
+        );
     }
 
-    let mut out = format!("punk deps: {} checked, {} issues\n",
-        report.packages_checked, report.findings.len());
+    let mut out = format!(
+        "punk deps: {} checked, {} issues\n",
+        report.packages_checked,
+        report.findings.len()
+    );
 
     if !report.api_available {
         out.push_str("  WARNING: deps.dev API unreachable, results may be incomplete\n");
     }
 
     for f in &report.findings {
-        out.push_str(&format!("  {:?} {} ({})\n", f.severity, f.message, f.ecosystem));
+        out.push_str(&format!(
+            "  {:?} {} ({})\n",
+            f.severity, f.message, f.ecosystem
+        ));
     }
     out
 }
@@ -256,7 +358,8 @@ mod tests {
 
     #[test]
     fn extract_js_imports() {
-        let content = "import { useState } from 'react';\nimport axios from 'axios';\nimport './local';\n";
+        let content =
+            "import { useState } from 'react';\nimport axios from 'axios';\nimport './local';\n";
         let imports = extract_imports(content, "javascript");
         assert!(imports.iter().any(|(n, _)| n == "react"));
         assert!(imports.iter().any(|(n, _)| n == "axios"));
@@ -285,8 +388,11 @@ mod tests {
     #[test]
     fn dep_report_roundtrip() {
         let r = DepReport {
-            packages_checked: 5, findings: vec![], hard_fail_count: 0,
-            warning_count: 0, api_available: true,
+            packages_checked: 5,
+            findings: vec![],
+            hard_fail_count: 0,
+            warning_count: 0,
+            api_available: true,
         };
         let j = serde_json::to_string(&r).unwrap();
         let back: DepReport = serde_json::from_str(&j).unwrap();
@@ -296,8 +402,11 @@ mod tests {
     #[test]
     fn render_clean() {
         let r = DepReport {
-            packages_checked: 3, findings: vec![], hard_fail_count: 0,
-            warning_count: 0, api_available: true,
+            packages_checked: 3,
+            findings: vec![],
+            hard_fail_count: 0,
+            warning_count: 0,
+            api_available: true,
         };
         let out = render_dep_report(&r);
         assert!(out.contains("all OK"));
@@ -306,8 +415,11 @@ mod tests {
     #[test]
     fn render_offline() {
         let r = DepReport {
-            packages_checked: 1, findings: vec![], hard_fail_count: 0,
-            warning_count: 0, api_available: false,
+            packages_checked: 1,
+            findings: vec![],
+            hard_fail_count: 0,
+            warning_count: 0,
+            api_available: false,
         };
         let out = render_dep_report(&r);
         assert!(out.contains("offline"));

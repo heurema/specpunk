@@ -68,7 +68,13 @@ fn extract_action_items(text: &str) -> Vec<String> {
 
         // Pattern: "Follow-up: ..." or "Also need to: ..."
         let lower = trimmed.to_lowercase();
-        for prefix in &["follow-up:", "follow up:", "also need to:", "next step:", "action item:"] {
+        for prefix in &[
+            "follow-up:",
+            "follow up:",
+            "also need to:",
+            "next step:",
+            "action item:",
+        ] {
             if lower.starts_with(prefix) {
                 let item = &trimmed[prefix.len()..].trim();
                 if item.len() > 10 {
@@ -142,7 +148,10 @@ mod tests {
 
     #[test]
     fn cap_at_5() {
-        let text = (0..10).map(|i| format!("TODO: follow-up action item number {i} needs to be done")).collect::<Vec<_>>().join("\n");
+        let text = (0..10)
+            .map(|i| format!("TODO: follow-up action item number {i} needs to be done"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let items = extract_action_items(&text);
         assert!(items.len() <= 5);
     }

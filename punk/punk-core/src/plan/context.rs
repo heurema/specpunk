@@ -92,9 +92,7 @@ fn load_intent(punk_dir: &Path) -> Result<String, ContextError> {
     }
 }
 
-fn load_conventions_and_scan(
-    punk_dir: &Path,
-) -> Result<(String, Option<String>), ContextError> {
+fn load_conventions_and_scan(punk_dir: &Path) -> Result<(String, Option<String>), ContextError> {
     // Load conventions.json
     let conv_path = punk_dir.join("conventions.json");
     let conventions_summary = if conv_path.exists() {
@@ -134,18 +132,14 @@ fn load_file_inventory(punk_dir: &Path) -> Result<Vec<String>, ContextError> {
         return Ok(vec![]);
     }
     let raw = std::fs::read_to_string(&scan_path)?;
-    let scan: ScanJson = serde_json::from_str(&raw)
-        .map_err(|e| ContextError::Parse(format!("scan.json: {e}")))?;
+    let scan: ScanJson =
+        serde_json::from_str(&raw).map_err(|e| ContextError::Parse(format!("scan.json: {e}")))?;
 
     // Flatten dir_map into a file list — no source content, just paths
     let mut files: Vec<String> = scan
         .dir_map
         .iter()
-        .flat_map(|(dir, names)| {
-            names
-                .iter()
-                .map(move |n| format!("{dir}/{n}"))
-        })
+        .flat_map(|(dir, names)| names.iter().map(move |n| format!("{dir}/{n}")))
         .collect();
     files.sort();
     Ok(files)
@@ -215,10 +209,7 @@ pub fn build_prompt_context(ctx: &ProjectContext) -> String {
     if !ctx.conventions_summary.is_empty()
         && ctx.conventions_summary != "(no conventions.json found)"
     {
-        parts.push(format!(
-            "## Conventions\n{}",
-            ctx.conventions_summary
-        ));
+        parts.push(format!("## Conventions\n{}", ctx.conventions_summary));
     }
 
     if !ctx.file_inventory.is_empty() {
@@ -226,7 +217,11 @@ pub fn build_prompt_context(ctx: &ProjectContext) -> String {
         parts.push(format!(
             "## File Inventory ({} files, showing up to 50)\n{}",
             ctx.file_inventory.len(),
-            preview.iter().map(|s| format!("- {s}")).collect::<Vec<_>>().join("\n")
+            preview
+                .iter()
+                .map(|s| format!("- {s}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         ));
     }
 
@@ -302,7 +297,11 @@ mod tests {
             "unwrap_density": 0.0,
             "logging_crate": null
         });
-        fs::write(punk.join("scan.json"), serde_json::to_string_pretty(&scan).unwrap()).unwrap();
+        fs::write(
+            punk.join("scan.json"),
+            serde_json::to_string_pretty(&scan).unwrap(),
+        )
+        .unwrap();
 
         let ctx = load_context(tmp.path()).unwrap();
         let prompt = build_prompt_context(&ctx);
@@ -350,7 +349,11 @@ mod tests {
             "unwrap_density": 0.0,
             "logging_crate": null
         });
-        fs::write(punk.join("scan.json"), serde_json::to_string_pretty(&scan).unwrap()).unwrap();
+        fs::write(
+            punk.join("scan.json"),
+            serde_json::to_string_pretty(&scan).unwrap(),
+        )
+        .unwrap();
 
         let ctx = load_context(tmp.path()).unwrap();
         assert!(

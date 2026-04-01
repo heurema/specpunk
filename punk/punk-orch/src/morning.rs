@@ -88,12 +88,7 @@ pub fn briefing(bus_path: &Path, config_dir: &Path) -> String {
             return out;
         }
     };
-    let active_projects: Vec<_> = cfg
-        .projects
-        .projects
-        .iter()
-        .filter(|p| p.active)
-        .collect();
+    let active_projects: Vec<_> = cfg.projects.projects.iter().filter(|p| p.active).collect();
 
     // Checkpoints coming up
     let upcoming: Vec<_> = active_projects

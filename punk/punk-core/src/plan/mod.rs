@@ -16,11 +16,11 @@ use crate::vcs;
 use self::ceremony::{detect_ceremony, CeremonyLevel, ModelTier};
 use self::context::{build_prompt_context, load_context, ContextError};
 pub use self::contract::FeedbackOutcome;
-pub use self::llm::LlmProvider;
 use self::contract::{
-    AcceptanceCriterion, Contract, ContextInheritance, Feedback, RiskLevel,
-    RoutingMetadata, Scope, CONTRACT_VERSION,
+    AcceptanceCriterion, ContextInheritance, Contract, Feedback, RiskLevel, RoutingMetadata, Scope,
+    CONTRACT_VERSION,
 };
+pub use self::llm::LlmProvider;
 use self::llm::{LlmError, MockProvider};
 use self::quality::{check_quality, QualityReport};
 use self::render::render_summary;
@@ -46,7 +46,11 @@ impl std::fmt::Display for PlanError {
             PlanError::Serialize(s) => write!(f, "serialization error: {s}"),
             PlanError::EmptyTask => write!(f, "task description must not be empty"),
             PlanError::QualityFailed(r) => {
-                write!(f, "spec quality check failed (score {}): {:?}", r.score, r.errors)
+                write!(
+                    f,
+                    "spec quality check failed (score {}): {:?}",
+                    r.score, r.errors
+                )
             }
             PlanError::Aborted => write!(f, "plan aborted by user"),
         }
@@ -156,8 +160,8 @@ pub fn save_contract(
     // Set approval_hash
     contract.approval_hash = Some(sha256_hex(canonical.as_bytes()));
 
-    let final_json = serde_json::to_string_pretty(contract)
-        .map_err(|e| PlanError::Serialize(e.to_string()))?;
+    let final_json =
+        serde_json::to_string_pretty(contract).map_err(|e| PlanError::Serialize(e.to_string()))?;
 
     let contract_path = dir.join("contract.json");
     let feedback_path = dir.join("feedback.json");
@@ -225,15 +229,13 @@ pub fn parse_llm_response(
     model_tier: &ModelTier,
     latency_ms: u64,
 ) -> Result<Contract, PlanError> {
-    let v: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| PlanError::Llm(LlmError::MalformedResponse(
-            format!("JSON parse error: {e}"),
-        )))?;
+    let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+        PlanError::Llm(LlmError::MalformedResponse(format!(
+            "JSON parse error: {e}"
+        )))
+    })?;
 
-    let goal = v["goal"]
-        .as_str()
-        .unwrap_or(task)
-        .to_string();
+    let goal = v["goal"].as_str().unwrap_or(task).to_string();
 
     let scope = {
         let touch = v["scope"]["touch"]
@@ -265,7 +267,12 @@ pub fn parse_llm_response(
                     let id = item["id"].as_str()?.to_string();
                     let description = item["description"].as_str()?.to_string();
                     let verify = item["verify"].as_str().map(|s| s.to_string());
-                    Some(AcceptanceCriterion { id, description, verify, verify_steps: vec![] })
+                    Some(AcceptanceCriterion {
+                        id,
+                        description,
+                        verify,
+                        verify_steps: vec![],
+                    })
                 })
                 .collect()
         })
@@ -360,7 +367,12 @@ fn detect_verify_command(root: &Path) -> String {
 }
 
 /// Build a pre-filled JSON template for --manual mode.
-pub fn build_manual_template(task: &str, context_text: &str, change_id: &str, root: &Path) -> String {
+pub fn build_manual_template(
+    task: &str,
+    context_text: &str,
+    change_id: &str,
+    root: &Path,
+) -> String {
     let verify = detect_verify_command(root);
     serde_json::to_string_pretty(&serde_json::json!({
         "version": CONTRACT_VERSION,
@@ -402,7 +414,9 @@ pub struct PlanOptions<'a> {
 ///
 /// This function does NOT do the interactive approval loop — the CLI layer owns stdin/stdout.
 /// It returns the contract + rendered summary so the caller can present it.
-pub async fn run_plan_headless(opts: &PlanOptions<'_>) -> Result<(Contract, QualityReport, String), PlanError> {
+pub async fn run_plan_headless(
+    opts: &PlanOptions<'_>,
+) -> Result<(Contract, QualityReport, String), PlanError> {
     let task = opts.task.trim();
     if task.is_empty() {
         return Err(PlanError::EmptyTask);
@@ -440,9 +454,7 @@ pub async fn run_plan_headless(opts: &PlanOptions<'_>) -> Result<(Contract, Qual
         )?
     } else {
         let fallback = MockProvider::success("{}");
-        let provider_ref: &dyn LlmProvider = opts
-            .provider
-            .unwrap_or(&fallback);
+        let provider_ref: &dyn LlmProvider = opts.provider.unwrap_or(&fallback);
 
         let prompt = build_generation_prompt(&context_text, task);
         let start = std::time::Instant::now();
@@ -491,7 +503,11 @@ mod tests {
         let punk = tmp.path().join(".punk");
         fs::create_dir_all(&punk).unwrap();
         fs::write(punk.join("intent.md"), "# Intent\nBuild auth system").unwrap();
-        fs::write(punk.join("conventions.json"), r#"[{"name":"errors","value":"Result<T,E>","confidence":"high","source":"scan"}]"#).unwrap();
+        fs::write(
+            punk.join("conventions.json"),
+            r#"[{"name":"errors","value":"Result<T,E>","confidence":"high","source":"scan"}]"#,
+        )
+        .unwrap();
         punk
     }
 
@@ -619,16 +635,23 @@ mod tests {
         // approval_hash must be present and non-empty
         let hash = v["approval_hash"].as_str().expect("approval_hash missing");
         assert!(!hash.is_empty(), "approval_hash must not be empty");
-        assert_eq!(hash.len(), 64, "SHA-256 hex is 64 chars, got {}", hash.len());
+        assert_eq!(
+            hash.len(),
+            64,
+            "SHA-256 hex is 64 chars, got {}",
+            hash.len()
+        );
 
         // Verify the hash is correct
         let without_hash: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let mut canonical_contract = contract.clone();
         canonical_contract.approval_hash = None;
-        let canonical =
-            serde_json::to_string_pretty(&canonical_contract).unwrap();
+        let canonical = serde_json::to_string_pretty(&canonical_contract).unwrap();
         let expected_hash = sha256_hex(canonical.as_bytes());
-        assert_eq!(hash, expected_hash, "approval_hash does not match SHA-256 of canonical JSON");
+        assert_eq!(
+            hash, expected_hash,
+            "approval_hash does not match SHA-256 of canonical JSON"
+        );
     }
 
     #[tokio::test]
@@ -645,7 +668,11 @@ mod tests {
 
         // manual mode should succeed without an LLM provider
         let result = run_plan_headless(&opts).await;
-        assert!(result.is_ok(), "manual mode should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "manual mode should succeed: {:?}",
+            result.err()
+        );
         let (contract, _, _) = result.unwrap();
         // Goal should be our task
         assert!(contract.goal.contains("add feature X") || !contract.goal.is_empty());

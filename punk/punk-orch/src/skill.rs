@@ -67,9 +67,7 @@ pub fn create_skill(
     let dir = skills_dir(bus);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let skill_content = format!(
-        "---\nname: {name}\ndescription: {description}\n---\n\n{content}"
-    );
+    let skill_content = format!("---\nname: {name}\ndescription: {description}\n---\n\n{content}");
 
     let path = dir.join(format!("{name}.md"));
 
@@ -84,11 +82,20 @@ pub fn create_skill(
 /// Security scan: check for prompt injection patterns.
 fn security_scan(content: &str) -> Option<String> {
     let patterns = [
-        (r"(?i)ignore\s+(all\s+)?previous\s+instructions", "prompt injection: ignore instructions"),
-        (r"(?i)you\s+are\s+now\s+a", "prompt injection: role override"),
+        (
+            r"(?i)ignore\s+(all\s+)?previous\s+instructions",
+            "prompt injection: ignore instructions",
+        ),
+        (
+            r"(?i)you\s+are\s+now\s+a",
+            "prompt injection: role override",
+        ),
         (r"(?i)system\s*:\s*", "prompt injection: system role"),
         (r"\x00|\x01|\x02", "invisible control characters"),
-        (r"[\u{200B}\u{200C}\u{200D}\u{FEFF}]", "zero-width Unicode characters"),
+        (
+            r"[\u{200B}\u{200C}\u{200D}\u{FEFF}]",
+            "zero-width Unicode characters",
+        ),
     ];
 
     for (pattern, description) in &patterns {

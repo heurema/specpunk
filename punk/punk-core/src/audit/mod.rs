@@ -40,7 +40,11 @@ pub struct Finding {
 impl Finding {
     /// Compute stable fingerprint: sha256(category + file + normalized_message)[:8]
     pub fn compute_fingerprint(category: &str, file: Option<&str>, message: &str) -> String {
-        let normalized = message.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized = message
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         let input = format!("{}{}{}", category, file.unwrap_or(""), normalized);
         sha256_hex(input.as_bytes())[..8].to_string()
     }
@@ -240,9 +244,10 @@ fn run_gemini_review(goal: &str, diff: &str) -> ReviewResult {
     let err_file = std::env::temp_dir().join("punk-gemini-stderr.txt");
     let result = Command::new("gemini")
         .args(["-p", &prompt, "-o", "text"])
-        .stderr(std::fs::File::create(&err_file).unwrap_or_else(|_| {
-            std::fs::File::create("/dev/null").unwrap()
-        }))
+        .stderr(
+            std::fs::File::create(&err_file)
+                .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap()),
+        )
         .output();
 
     let duration_ms = start.elapsed().as_millis() as u64;
@@ -324,9 +329,7 @@ fn parse_review_response(provider: &str, response: &str, duration_ms: u64) -> Re
                     (None, None, rest.to_string())
                 };
 
-                let fingerprint = Finding::compute_fingerprint(
-                    sev, file.as_deref(), &message,
-                );
+                let fingerprint = Finding::compute_fingerprint(sev, file.as_deref(), &message);
 
                 findings.push(Finding {
                     provider: provider.to_string(),
@@ -369,23 +372,37 @@ pub fn synthesize(
 ) -> (AuditDecision, ReleaseVerdict, ConfidenceScores, f64) {
     // AUTO_BLOCK conditions
     let has_regressions = mechanic_regressions > 0;
-    let has_reject = reviews.iter().any(|r| r.verdict == Some(ReviewVerdict::Reject));
-    let has_critical = reviews.iter().flat_map(|r| &r.findings)
+    let has_reject = reviews
+        .iter()
+        .any(|r| r.verdict == Some(ReviewVerdict::Reject));
+    let has_critical = reviews
+        .iter()
+        .flat_map(|r| &r.findings)
         .any(|f| f.severity == Severity::Critical);
 
     if has_regressions || has_reject || has_critical {
         let confidence = compute_confidence(0.0, mechanic_regressions, holdout_pass_rate, reviews);
-        let coverage = compute_evidence_coverage(ac_verified, ac_total, files_reviewed, files_total);
-        return (AuditDecision::AutoBlock, ReleaseVerdict::Reject, confidence, coverage);
+        let coverage =
+            compute_evidence_coverage(ac_verified, ac_total, files_reviewed, files_total);
+        return (
+            AuditDecision::AutoBlock,
+            ReleaseVerdict::Reject,
+            confidence,
+            coverage,
+        );
     }
 
     // AUTO_OK conditions
-    let all_approve = reviews.iter()
+    let all_approve = reviews
+        .iter()
         .filter(|r| r.available && r.error.is_none())
         .all(|r| r.verdict == Some(ReviewVerdict::Approve));
-    let no_major = !reviews.iter().flat_map(|r| &r.findings)
+    let no_major = !reviews
+        .iter()
+        .flat_map(|r| &r.findings)
         .any(|f| matches!(f.severity, Severity::Major | Severity::Critical));
-    let valid_review_count = reviews.iter()
+    let valid_review_count = reviews
+        .iter()
         .filter(|r| r.available && r.error.is_none() && r.verdict.is_some())
         .count();
 
@@ -395,8 +412,10 @@ pub fn synthesize(
         } else {
             75.0
         };
-        let confidence = compute_confidence(health, mechanic_regressions, holdout_pass_rate, reviews);
-        let coverage = compute_evidence_coverage(ac_verified, ac_total, files_reviewed, files_total);
+        let confidence =
+            compute_confidence(health, mechanic_regressions, holdout_pass_rate, reviews);
+        let coverage =
+            compute_evidence_coverage(ac_verified, ac_total, files_reviewed, files_total);
 
         let verdict = if coverage >= 0.7 {
             ReleaseVerdict::Promote
@@ -409,7 +428,12 @@ pub fn synthesize(
     // HUMAN_REVIEW: everything else
     let confidence = compute_confidence(50.0, mechanic_regressions, holdout_pass_rate, reviews);
     let coverage = compute_evidence_coverage(ac_verified, ac_total, files_reviewed, files_total);
-    (AuditDecision::HumanReview, ReleaseVerdict::Hold, confidence, coverage)
+    (
+        AuditDecision::HumanReview,
+        ReleaseVerdict::Hold,
+        confidence,
+        coverage,
+    )
 }
 
 fn compute_confidence(
@@ -424,7 +448,8 @@ fn compute_confidence(
     let review_score = if reviews.is_empty() {
         50.0
     } else {
-        let approve_count = reviews.iter()
+        let approve_count = reviews
+            .iter()
             .filter(|r| r.verdict == Some(ReviewVerdict::Approve))
             .count();
         (approve_count as f64 / reviews.len() as f64) * 100.0
@@ -500,19 +525,21 @@ pub fn run_audit(input: &AuditInput) -> Result<AuditReport, AuditError> {
     }
 
     // Collect all findings
-    let all_findings: Vec<Finding> = reviews.iter()
-        .flat_map(|r| r.findings.clone())
-        .collect();
+    let all_findings: Vec<Finding> = reviews.iter().flat_map(|r| r.findings.clone()).collect();
 
-    let files_reviewed = all_findings.iter()
+    let files_reviewed = all_findings
+        .iter()
         .filter_map(|f| f.file.as_ref())
         .collect::<std::collections::HashSet<_>>()
         .len();
 
     // Count in-scope files from diff
-    let files_total = input.diff.lines()
+    let files_total = input
+        .diff
+        .lines()
         .filter(|l| l.starts_with("+++ b/") || l.starts_with("--- a/"))
-        .count() / 2;
+        .count()
+        / 2;
 
     // Synthesize decision
     let (decision, release_verdict, confidence, evidence_coverage) = synthesize(
@@ -542,10 +569,14 @@ pub fn run_audit(input: &AuditInput) -> Result<AuditReport, AuditError> {
     };
 
     // Save report
-    let dir = input.root.join(".punk").join("contracts").join(input.contract_id);
+    let dir = input
+        .root
+        .join(".punk")
+        .join("contracts")
+        .join(input.contract_id);
     if dir.exists() {
-        let json = serde_json::to_string_pretty(&report)
-            .map_err(|e| AuditError::Parse(e.to_string()))?;
+        let json =
+            serde_json::to_string_pretty(&report).map_err(|e| AuditError::Parse(e.to_string()))?;
         let target = dir.join("audit.json");
         let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
         std::io::Write::write_all(&mut tmp, json.as_bytes())?;
@@ -562,8 +593,10 @@ pub fn run_audit(input: &AuditInput) -> Result<AuditReport, AuditError> {
 pub fn render_audit_short(report: &AuditReport) -> String {
     let mut out = format!(
         "punk audit: {:?} → {:?} (confidence: {:.0}%, coverage: {:.0}%)\n",
-        report.decision, report.release_verdict,
-        report.confidence.overall, report.evidence_coverage * 100.0,
+        report.decision,
+        report.release_verdict,
+        report.confidence.overall,
+        report.evidence_coverage * 100.0,
     );
 
     for r in &report.reviews {
@@ -574,8 +607,13 @@ pub fn render_audit_short(report: &AuditReport) -> String {
         } else {
             "N/A".to_string()
         };
-        out.push_str(&format!("  {} ({}) — {} findings, {}ms\n",
-            r.provider, status, r.findings.len(), r.duration_ms));
+        out.push_str(&format!(
+            "  {} ({}) — {} findings, {}ms\n",
+            r.provider,
+            status,
+            r.findings.len(),
+            r.duration_ms
+        ));
     }
 
     if !report.all_findings.is_empty() {
@@ -586,8 +624,10 @@ pub fn render_audit_short(report: &AuditReport) -> String {
                 (Some(file), None) => format!("[{file}]"),
                 _ => String::new(),
             };
-            out.push_str(&format!("  {:?} {} {} ({})\n",
-                f.severity, loc, f.message, f.fingerprint));
+            out.push_str(&format!(
+                "  {:?} {} {} ({})\n",
+                f.severity, loc, f.message, f.fingerprint
+            ));
         }
     }
 
@@ -669,7 +709,8 @@ VERDICT: REJECT";
                 provider: "codex".to_string(),
                 severity: Severity::Critical,
                 category: "CRITICAL".to_string(),
-                file: None, line: None,
+                file: None,
+                line: None,
                 message: "bad".to_string(),
                 fingerprint: "abc".to_string(),
             }],
@@ -717,22 +758,28 @@ VERDICT: REJECT";
     fn synthesize_human_review_on_disagreement() {
         let reviews = vec![
             ReviewResult {
-                provider: "codex".to_string(), available: true,
+                provider: "codex".to_string(),
+                available: true,
                 verdict: Some(ReviewVerdict::Approve),
-                findings: vec![], error: None, duration_ms: 100,
+                findings: vec![],
+                error: None,
+                duration_ms: 100,
             },
             ReviewResult {
-                provider: "gemini".to_string(), available: true,
+                provider: "gemini".to_string(),
+                available: true,
                 verdict: Some(ReviewVerdict::Conditional),
                 findings: vec![Finding {
                     provider: "gemini".to_string(),
                     severity: Severity::Major,
                     category: "MAJOR".to_string(),
-                    file: None, line: None,
+                    file: None,
+                    line: None,
                     message: "concern".to_string(),
                     fingerprint: "xyz".to_string(),
                 }],
-                error: None, duration_ms: 200,
+                error: None,
+                duration_ms: 200,
             },
         ];
         let (decision, _, _, _) = synthesize(&reviews, 0, 1.0, 3, 3, 2, 2);
@@ -753,9 +800,12 @@ VERDICT: REJECT";
     #[test]
     fn confidence_scoring() {
         let reviews = vec![ReviewResult {
-            provider: "codex".to_string(), available: true,
+            provider: "codex".to_string(),
+            available: true,
             verdict: Some(ReviewVerdict::Approve),
-            findings: vec![], error: None, duration_ms: 100,
+            findings: vec![],
+            error: None,
+            duration_ms: 100,
         }];
         let c = compute_confidence(90.0, 0, 1.0, &reviews);
         // 0.25*90 + 0.15*100 + 0.35*100 + 0.25*100 = 22.5 + 15 + 35 + 25 = 97.5
@@ -797,16 +847,21 @@ VERDICT: REJECT";
             contract_id: "abc".to_string(),
             tier: AssuranceTier::T3,
             reviews: vec![ReviewResult {
-                provider: "codex".to_string(), available: true,
+                provider: "codex".to_string(),
+                available: true,
                 verdict: Some(ReviewVerdict::Approve),
-                findings: vec![], error: None, duration_ms: 100,
+                findings: vec![],
+                error: None,
+                duration_ms: 100,
             }],
             all_findings: vec![],
             decision: AuditDecision::AutoOk,
             release_verdict: ReleaseVerdict::Promote,
             confidence: ConfidenceScores {
-                execution_health: 90.0, baseline_stability: 100.0,
-                behavioral_evidence: 80.0, review_alignment: 100.0,
+                execution_health: 90.0,
+                baseline_stability: 100.0,
+                behavioral_evidence: 80.0,
+                review_alignment: 100.0,
                 overall: 92.0,
             },
             evidence_coverage: 0.85,

@@ -2,6 +2,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
+use punk_core::vcs::{detect_mode as detect_vcs_mode, VcsMode};
+
 /// Provider health check result.
 #[derive(Debug)]
 pub struct ProviderHealth {
@@ -14,7 +16,7 @@ pub struct ProviderHealth {
 }
 
 /// Run health checks on all providers + bus.
-pub fn check_all(bus_path: &Path, config_dir: &Path) -> HealthReport {
+pub fn check_all(bus_path: &Path, config_dir: &Path, repo_path: &Path) -> HealthReport {
     let providers = vec![
         check_provider("claude", &["--version"]),
         check_provider("codex", &["--version"]),
@@ -22,9 +24,16 @@ pub fn check_all(bus_path: &Path, config_dir: &Path) -> HealthReport {
     ];
 
     let bus_ok = bus_path.join("new").is_dir() && bus_path.join("cur").is_dir();
-    let config_ok = config_dir.join("projects.toml").is_file()
-        && config_dir.join("agents.toml").is_file()
-        && config_dir.join("policy.toml").is_file();
+    let status = crate::config::config_status(config_dir);
+    // Config is always valid now (defaults work at L0). Report detail level.
+    let config_ok = true; // defaults are valid
+    let config_detail = if status.is_complete() {
+        "complete".to_string()
+    } else if status.is_empty() {
+        "defaults".to_string()
+    } else {
+        format!("partial ({}/3)", status.present_count())
+    };
 
     let slots_dir = bus_path.join(".slots");
     let occupied_slots = std::fs::read_dir(&slots_dir)
@@ -34,13 +43,17 @@ pub fn check_all(bus_path: &Path, config_dir: &Path) -> HealthReport {
         .filter(|e| e.path().is_dir())
         .count() as u32;
 
+    let vcs_mode = detect_vcs_mode(repo_path);
+
     HealthReport {
         providers,
         bus_ok,
         bus_path: bus_path.to_string_lossy().to_string(),
         config_ok,
+        config_detail,
         config_path: config_dir.to_string_lossy().to_string(),
         occupied_slots,
+        vcs_mode,
     }
 }
 
@@ -50,8 +63,10 @@ pub struct HealthReport {
     pub bus_ok: bool,
     pub bus_path: String,
     pub config_ok: bool,
+    pub config_detail: String,
     pub config_path: String,
     pub occupied_slots: u32,
+    pub vcs_mode: VcsMode,
 }
 
 impl HealthReport {
@@ -85,15 +100,22 @@ impl HealthReport {
         let bus_status = if self.bus_ok { "ok" } else { "NOT FOUND" };
         out.push_str(&format!("Bus:    {} ({})\n", bus_status, self.bus_path));
         let cfg_status = if self.config_ok { "ok" } else { "INCOMPLETE" };
-        out.push_str(&format!("Config: {} ({})\n", cfg_status, self.config_path));
+        out.push_str(&format!(
+            "Config: {} ({}, {})\n",
+            cfg_status, self.config_detail, self.config_path
+        ));
+        out.push_str(&format!("VCS:    {}\n", format_vcs_mode(self.vcs_mode)));
         out.push_str(&format!("Slots:  {}/5 occupied\n\n", self.occupied_slots));
 
         let healthy = self.providers.iter().filter(|p| p.binary_found).count();
         let total = self.providers.len();
-        if healthy == total && self.bus_ok && self.config_ok {
+        if healthy == total && self.bus_ok && self.config_ok && !vcs_mode_is_degraded(self.vcs_mode)
+        {
             out.push_str("Overall: HEALTHY\n");
         } else {
-            out.push_str(&format!("Overall: DEGRADED ({healthy}/{total} providers)\n"));
+            out.push_str(&format!(
+                "Overall: DEGRADED ({healthy}/{total} providers)\n"
+            ));
             for p in &self.providers {
                 if !p.binary_found {
                     let url = match p.name.as_str() {
@@ -106,10 +128,10 @@ impl HealthReport {
                 }
             }
             if !self.config_ok {
-                out.push_str(&format!(
-                    "  config: create files in {}\n",
-                    self.config_path
-                ));
+                out.push_str("  config: punk-run init  (generate from environment)\n");
+            }
+            if self.vcs_mode == VcsMode::GitWithJjAvailableButDisabled {
+                out.push_str("  vcs: punk-run vcs enable-jj  (enable fuller punk functionality)\n");
             }
         }
 
@@ -117,13 +139,26 @@ impl HealthReport {
     }
 }
 
+fn format_vcs_mode(mode: VcsMode) -> &'static str {
+    match mode {
+        VcsMode::Jj => "jj",
+        VcsMode::GitOnly => "git-only",
+        VcsMode::GitWithJjAvailableButDisabled => "git-only (degraded; jj available but disabled)",
+        VcsMode::NoVcs => "no VCS detected",
+    }
+}
+
+fn vcs_mode_is_degraded(mode: VcsMode) -> bool {
+    matches!(
+        mode,
+        VcsMode::GitWithJjAvailableButDisabled | VcsMode::NoVcs
+    )
+}
+
 fn check_provider(name: &str, version_args: &[&str]) -> ProviderHealth {
     let which = Command::new("which").arg(name).output();
 
-    let binary_found = which
-        .as_ref()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let binary_found = which.as_ref().map(|o| o.status.success()).unwrap_or(false);
 
     if !binary_found {
         return ProviderHealth {
@@ -160,5 +195,66 @@ fn check_provider(name: &str, version_args: &[&str]) -> ProviderHealth {
         auth_ok: true, // version check doesn't test auth, full smoke test is Phase 3
         latency_ms: Some(latency),
         error: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_provider(name: &str) -> ProviderHealth {
+        ProviderHealth {
+            name: name.to_string(),
+            binary_found: true,
+            version: "1.0".to_string(),
+            auth_ok: true,
+            latency_ms: Some(1),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn doctor_display_shows_degraded_vcs_hint() {
+        let report = HealthReport {
+            providers: vec![
+                sample_provider("claude"),
+                sample_provider("codex"),
+                sample_provider("gemini"),
+            ],
+            bus_ok: true,
+            bus_path: "/tmp/bus".to_string(),
+            config_ok: true,
+            config_detail: "complete".to_string(),
+            config_path: "/tmp/config".to_string(),
+            occupied_slots: 0,
+            vcs_mode: VcsMode::GitWithJjAvailableButDisabled,
+        };
+
+        let rendered = report.display();
+        assert!(rendered.contains("VCS:    git-only (degraded; jj available but disabled)"));
+        assert!(rendered.contains("punk-run vcs enable-jj"));
+        assert!(rendered.contains("Overall: DEGRADED"));
+    }
+
+    #[test]
+    fn doctor_display_reports_healthy_with_jj_mode() {
+        let report = HealthReport {
+            providers: vec![
+                sample_provider("claude"),
+                sample_provider("codex"),
+                sample_provider("gemini"),
+            ],
+            bus_ok: true,
+            bus_path: "/tmp/bus".to_string(),
+            config_ok: true,
+            config_detail: "complete".to_string(),
+            config_path: "/tmp/config".to_string(),
+            occupied_slots: 0,
+            vcs_mode: VcsMode::Jj,
+        };
+
+        let rendered = report.display();
+        assert!(rendered.contains("VCS:    jj"));
+        assert!(rendered.contains("Overall: HEALTHY"));
     }
 }

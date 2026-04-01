@@ -56,8 +56,7 @@ pub enum EventSource {
 /// Append an event to .punk/.events.jsonl (gitignored).
 pub fn append_event(root: &Path, event: &Event) -> Result<(), std::io::Error> {
     let events_path = root.join(".punk").join(".events.jsonl");
-    let line = serde_json::to_string(event)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let line = serde_json::to_string(event).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
@@ -71,8 +70,7 @@ pub fn append_event(root: &Path, event: &Event) -> Result<(), std::io::Error> {
 /// Append a curated decision to .punk/decisions.jsonl (git-tracked).
 pub fn append_decision(root: &Path, event: &Event) -> Result<(), std::io::Error> {
     let path = root.join(".punk").join("decisions.jsonl");
-    let line = serde_json::to_string(event)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let line = serde_json::to_string(event).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
@@ -106,9 +104,12 @@ pub fn load_all(root: &Path) -> Vec<Event> {
 /// Capture a scope violation event.
 pub fn capture_scope_violation(root: &Path, files: &[String], contract_id: &str) {
     let event = Event {
-        id: format!("ev-{}", &crate::plan::sha256_hex(
-            format!("scope-{}-{}", contract_id, Utc::now().timestamp()).as_bytes()
-        )[..8]),
+        id: format!(
+            "ev-{}",
+            &crate::plan::sha256_hex(
+                format!("scope-{}-{}", contract_id, Utc::now().timestamp()).as_bytes()
+            )[..8]
+        ),
         kind: EventKind::ScopeViolation,
         date: Utc::now().to_rfc3339(),
         paths: files.to_vec(),
@@ -124,9 +125,12 @@ pub fn capture_scope_violation(root: &Path, files: &[String], contract_id: &str)
 /// Capture an audit failure event.
 pub fn capture_audit_fail(root: &Path, contract_id: &str, decision: &str, findings_count: usize) {
     let event = Event {
-        id: format!("ev-{}", &crate::plan::sha256_hex(
-            format!("audit-{}-{}", contract_id, Utc::now().timestamp()).as_bytes()
-        )[..8]),
+        id: format!(
+            "ev-{}",
+            &crate::plan::sha256_hex(
+                format!("audit-{}-{}", contract_id, Utc::now().timestamp()).as_bytes()
+            )[..8]
+        ),
         kind: EventKind::AuditFail,
         date: Utc::now().to_rfc3339(),
         paths: vec![],
@@ -142,9 +146,12 @@ pub fn capture_audit_fail(root: &Path, contract_id: &str, decision: &str, findin
 /// Capture a contract rejection event.
 pub fn capture_contract_reject(root: &Path, contract_id: &str, reason: &str) {
     let event = Event {
-        id: format!("ev-{}", &crate::plan::sha256_hex(
-            format!("reject-{}-{}", contract_id, Utc::now().timestamp()).as_bytes()
-        )[..8]),
+        id: format!(
+            "ev-{}",
+            &crate::plan::sha256_hex(
+                format!("reject-{}-{}", contract_id, Utc::now().timestamp()).as_bytes()
+            )[..8]
+        ),
         kind: EventKind::ContractReject,
         date: Utc::now().to_rfc3339(),
         paths: vec![],
@@ -171,7 +178,11 @@ pub fn recall(root: &Path, query: &str, limit: usize) -> Vec<Event> {
         .into_iter()
         .filter_map(|e| {
             let score = score_event(&e, &query_parts);
-            if score > 0.0 { Some((score, e)) } else { None }
+            if score > 0.0 {
+                Some((score, e))
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -191,7 +202,8 @@ fn score_event(event: &Event, query_parts: &[&str]) -> f64 {
         event.context,
         event.why,
         kind_str,
-    ).to_lowercase();
+    )
+    .to_lowercase();
 
     for part in query_parts {
         if searchable.contains(part) {
@@ -212,11 +224,18 @@ fn score_event(event: &Event, query_parts: &[&str]) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// Create a human invariant.
-pub fn remember(root: &Path, description: &str, reason: Option<&str>) -> Result<Event, std::io::Error> {
+pub fn remember(
+    root: &Path,
+    description: &str,
+    reason: Option<&str>,
+) -> Result<Event, std::io::Error> {
     let event = Event {
-        id: format!("inv-{}", &crate::plan::sha256_hex(
-            format!("inv-{}-{}", description, Utc::now().timestamp()).as_bytes()
-        )[..8]),
+        id: format!(
+            "inv-{}",
+            &crate::plan::sha256_hex(
+                format!("inv-{}-{}", description, Utc::now().timestamp()).as_bytes()
+            )[..8]
+        ),
         kind: EventKind::Invariant,
         date: Utc::now().to_rfc3339(),
         paths: vec![],
@@ -243,8 +262,10 @@ pub fn render_recall(events: &[Event]) -> String {
     for e in events {
         out.push_str(&format!(
             "  [{:?}] {} — {}\n    {}\n",
-            e.kind, e.date.split('T').next().unwrap_or(&e.date),
-            e.context, e.why,
+            e.kind,
+            e.date.split('T').next().unwrap_or(&e.date),
+            e.context,
+            e.why,
         ));
         if !e.paths.is_empty() {
             out.push_str(&format!("    files: {}\n", e.paths.join(", ")));
@@ -272,10 +293,14 @@ mod tests {
         setup(&tmp);
 
         let event = Event {
-            id: "ev-1".into(), kind: EventKind::ScopeViolation,
-            date: "2026-03-25".into(), paths: vec!["src/auth.rs".into()],
-            context: "contract abc".into(), risk_tier: None,
-            why: "out of scope".into(), source: EventSource::Auto,
+            id: "ev-1".into(),
+            kind: EventKind::ScopeViolation,
+            date: "2026-03-25".into(),
+            paths: vec!["src/auth.rs".into()],
+            context: "contract abc".into(),
+            risk_tier: None,
+            why: "out of scope".into(),
+            source: EventSource::Auto,
             replacement: None,
         };
         append_event(tmp.path(), &event).unwrap();
@@ -291,10 +316,14 @@ mod tests {
         setup(&tmp);
 
         let event = Event {
-            id: "dec-1".into(), kind: EventKind::Decision,
-            date: "2026-03-25".into(), paths: vec![],
-            context: "use thiserror".into(), risk_tier: None,
-            why: "team convention".into(), source: EventSource::Human,
+            id: "dec-1".into(),
+            kind: EventKind::Decision,
+            date: "2026-03-25".into(),
+            paths: vec![],
+            context: "use thiserror".into(),
+            risk_tier: None,
+            why: "team convention".into(),
+            source: EventSource::Human,
             replacement: None,
         };
         append_decision(tmp.path(), &event).unwrap();
@@ -309,21 +338,37 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         setup(&tmp);
 
-        append_event(tmp.path(), &Event {
-            id: "ev-1".into(), kind: EventKind::ScopeViolation,
-            date: "2026-03-25".into(), paths: vec!["src/auth.rs".into()],
-            context: "contract abc".into(), risk_tier: None,
-            why: "touched auth".into(), source: EventSource::Auto,
-            replacement: None,
-        }).unwrap();
+        append_event(
+            tmp.path(),
+            &Event {
+                id: "ev-1".into(),
+                kind: EventKind::ScopeViolation,
+                date: "2026-03-25".into(),
+                paths: vec!["src/auth.rs".into()],
+                context: "contract abc".into(),
+                risk_tier: None,
+                why: "touched auth".into(),
+                source: EventSource::Auto,
+                replacement: None,
+            },
+        )
+        .unwrap();
 
-        append_event(tmp.path(), &Event {
-            id: "ev-2".into(), kind: EventKind::AuditFail,
-            date: "2026-03-25".into(), paths: vec!["src/billing.rs".into()],
-            context: "contract def".into(), risk_tier: None,
-            why: "billing bug".into(), source: EventSource::Audit,
-            replacement: None,
-        }).unwrap();
+        append_event(
+            tmp.path(),
+            &Event {
+                id: "ev-2".into(),
+                kind: EventKind::AuditFail,
+                date: "2026-03-25".into(),
+                paths: vec!["src/billing.rs".into()],
+                context: "contract def".into(),
+                risk_tier: None,
+                why: "billing bug".into(),
+                source: EventSource::Audit,
+                replacement: None,
+            },
+        )
+        .unwrap();
 
         let results = recall(tmp.path(), "auth", 10);
         assert_eq!(results.len(), 1);
@@ -344,7 +389,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         setup(&tmp);
 
-        let event = remember(tmp.path(), "never store tokens in localStorage", Some("security")).unwrap();
+        let event = remember(
+            tmp.path(),
+            "never store tokens in localStorage",
+            Some("security"),
+        )
+        .unwrap();
         assert_eq!(event.kind, EventKind::Invariant);
         assert_eq!(event.source, EventSource::Human);
 
@@ -374,21 +424,37 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         setup(&tmp);
 
-        append_event(tmp.path(), &Event {
-            id: "ev-1".into(), kind: EventKind::ScopeViolation,
-            date: "2026-03-25".into(), paths: vec!["auth.rs".into()],
-            context: "auth issue".into(), risk_tier: None,
-            why: "scope".into(), source: EventSource::Auto,
-            replacement: None,
-        }).unwrap();
+        append_event(
+            tmp.path(),
+            &Event {
+                id: "ev-1".into(),
+                kind: EventKind::ScopeViolation,
+                date: "2026-03-25".into(),
+                paths: vec!["auth.rs".into()],
+                context: "auth issue".into(),
+                risk_tier: None,
+                why: "scope".into(),
+                source: EventSource::Auto,
+                replacement: None,
+            },
+        )
+        .unwrap();
 
-        append_decision(tmp.path(), &Event {
-            id: "inv-1".into(), kind: EventKind::Invariant,
-            date: "2026-03-25".into(), paths: vec![],
-            context: "auth must use JWT".into(), risk_tier: None,
-            why: "policy".into(), source: EventSource::Human,
-            replacement: None,
-        }).unwrap();
+        append_decision(
+            tmp.path(),
+            &Event {
+                id: "inv-1".into(),
+                kind: EventKind::Invariant,
+                date: "2026-03-25".into(),
+                paths: vec![],
+                context: "auth must use JWT".into(),
+                risk_tier: None,
+                why: "policy".into(),
+                source: EventSource::Human,
+                replacement: None,
+            },
+        )
+        .unwrap();
 
         let results = recall(tmp.path(), "auth", 10);
         assert_eq!(results.len(), 2);
@@ -399,10 +465,14 @@ mod tests {
     #[test]
     fn event_roundtrip() {
         let event = Event {
-            id: "test".into(), kind: EventKind::Decision,
-            date: "2026-03-25".into(), paths: vec!["a.rs".into()],
-            context: "ctx".into(), risk_tier: Some("T2".into()),
-            why: "reason".into(), source: EventSource::Ci,
+            id: "test".into(),
+            kind: EventKind::Decision,
+            date: "2026-03-25".into(),
+            paths: vec!["a.rs".into()],
+            context: "ctx".into(),
+            risk_tier: Some("T2".into()),
+            why: "reason".into(),
+            source: EventSource::Ci,
             replacement: Some("use X instead".into()),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -414,11 +484,14 @@ mod tests {
     #[test]
     fn render_output() {
         let events = vec![Event {
-            id: "ev-1".into(), kind: EventKind::AuditFail,
+            id: "ev-1".into(),
+            kind: EventKind::AuditFail,
             date: "2026-03-25T10:00:00Z".into(),
             paths: vec!["src/auth.rs".into()],
-            context: "contract abc".into(), risk_tier: None,
-            why: "3 critical findings".into(), source: EventSource::Audit,
+            context: "contract abc".into(),
+            risk_tier: None,
+            why: "3 critical findings".into(),
+            source: EventSource::Audit,
             replacement: None,
         }];
         let out = render_recall(&events);

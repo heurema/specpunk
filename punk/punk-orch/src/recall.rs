@@ -65,8 +65,7 @@ pub fn capture(bus: &Path, event: KnowledgeEvent) -> std::io::Result<()> {
     let dir = knowledge_dir(bus);
     fs::create_dir_all(&dir)?;
     let path = events_path(bus);
-    let line = serde_json::to_string(&event)
-        .map_err(std::io::Error::other)?;
+    let line = serde_json::to_string(&event).map_err(std::io::Error::other)?;
     fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -147,7 +146,10 @@ pub fn recall(bus: &Path, query: &str, project: Option<&str>, limit: usize) -> V
             // Score by keyword match
             let searchable = format!(
                 "{} {} {} {}",
-                e.context, e.why, e.paths.join(" "), e.evidence
+                e.context,
+                e.why,
+                e.paths.join(" "),
+                e.evidence
             )
             .to_lowercase();
 
@@ -264,8 +266,22 @@ mod tests {
         let bus = tmp.path().join("bus");
         fs::create_dir_all(&bus).unwrap();
 
-        capture_from_failure(&bus, "task-1", "signum", "Provider429", "rate limit exceeded", &["src/api.rs".into()]);
-        capture_from_failure(&bus, "task-2", "signum", "Timeout", "process killed after 600s", &[]);
+        capture_from_failure(
+            &bus,
+            "task-1",
+            "signum",
+            "Provider429",
+            "rate limit exceeded",
+            &["src/api.rs".into()],
+        );
+        capture_from_failure(
+            &bus,
+            "task-2",
+            "signum",
+            "Timeout",
+            "process killed after 600s",
+            &[],
+        );
         capture_from_failure(&bus, "task-3", "mycel", "AuthExpired", "token expired", &[]);
 
         // Recall for signum
@@ -290,7 +306,14 @@ mod tests {
         let bus = tmp.path().join("bus");
         fs::create_dir_all(&bus).unwrap();
 
-        add_manual(&bus, "signum", EventKind::Invariant, "Never modify .env files", "Production secrets leaked in PR #42").unwrap();
+        add_manual(
+            &bus,
+            "signum",
+            EventKind::Invariant,
+            "Never modify .env files",
+            "Production secrets leaked in PR #42",
+        )
+        .unwrap();
 
         let events = list_events(&bus, 10);
         assert_eq!(events.len(), 1);

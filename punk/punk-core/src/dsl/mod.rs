@@ -85,18 +85,23 @@ pub struct DslRunResult {
 
 /// Binaries allowed in exec steps. No shell interpreters.
 const EXEC_WHITELIST: &[&str] = &[
-    "test", "ls", "wc", "cat", "jq", "grep", "head", "tail",
-    "diff", "stat", "file", "echo", "true", "false", "sort", "uniq",
-    "curl",
+    "test", "ls", "wc", "cat", "jq", "grep", "head", "tail", "diff", "stat", "file", "echo",
+    "true", "false", "sort", "uniq", "curl",
 ];
 
 /// Validate that a URL targets localhost only.
 fn is_localhost_url(url: &str) -> bool {
     let lower = url.to_lowercase();
-    if let Some(after_scheme) = lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://")) {
+    if let Some(after_scheme) = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+    {
         let host_port = after_scheme.split('/').next().unwrap_or("");
         let host = host_port.split(':').next().unwrap_or("");
-        matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0")
+        matches!(
+            host,
+            "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0"
+        )
     } else {
         false
     }
@@ -121,7 +126,8 @@ pub fn validate_steps(steps: &[DslStep]) -> Result<(), DslError> {
             DslStep::Http { url, capture, .. } => {
                 if !is_localhost_url(url) {
                     return Err(DslError::SecurityViolation(format!(
-                        "step {}: URL must target localhost, got '{url}'", i + 1
+                        "step {}: URL must target localhost, got '{url}'",
+                        i + 1
                     )));
                 }
                 if let Some(name) = capture {
@@ -130,12 +136,17 @@ pub fn validate_steps(steps: &[DslStep]) -> Result<(), DslError> {
             }
             DslStep::Exec { argv, capture, .. } => {
                 if argv.is_empty() {
-                    return Err(DslError::InvalidStep(format!("step {}: exec argv is empty", i + 1)));
+                    return Err(DslError::InvalidStep(format!(
+                        "step {}: exec argv is empty",
+                        i + 1
+                    )));
                 }
                 if !is_whitelisted_binary(&argv[0]) {
                     return Err(DslError::SecurityViolation(format!(
                         "step {}: binary '{}' not in whitelist. Allowed: {:?}",
-                        i + 1, argv[0], EXEC_WHITELIST
+                        i + 1,
+                        argv[0],
+                        EXEC_WHITELIST
                     )));
                 }
                 if let Some(name) = capture {
@@ -166,7 +177,11 @@ pub enum DslError {
     InvalidStep(String),
     ExecutionFailed(String),
     Timeout(usize),
-    ExpectFailed { step: usize, expected: String, actual: String },
+    ExpectFailed {
+        step: usize,
+        expected: String,
+        actual: String,
+    },
 }
 
 impl std::fmt::Display for DslError {
@@ -176,7 +191,11 @@ impl std::fmt::Display for DslError {
             DslError::InvalidStep(m) => write!(f, "invalid step: {m}"),
             DslError::ExecutionFailed(m) => write!(f, "execution failed: {m}"),
             DslError::Timeout(step) => write!(f, "step {step} timed out"),
-            DslError::ExpectFailed { step, expected, actual } => {
+            DslError::ExpectFailed {
+                step,
+                expected,
+                actual,
+            } => {
                 write!(f, "step {step}: expected {expected}, got {actual}")
             }
         }
@@ -246,17 +265,27 @@ fn execute_step(
     working_dir: &Path,
 ) -> Result<StepResult, DslError> {
     match step {
-        DslStep::Http { method, url, body, .. } => {
-            execute_http(method, url, body.as_deref())
-        }
-        DslStep::Exec { argv, .. } => {
-            execute_exec(argv, working_dir)
-        }
-        DslStep::Expect { source, json_path, exit_code, equals, contains } => {
-            let captured = captures.get(source).ok_or_else(|| {
-                DslError::InvalidStep(format!("capture '{source}' not found"))
-            })?;
-            execute_expect(captured, json_path.as_deref(), *exit_code, equals.as_ref(), contains.as_deref())
+        DslStep::Http {
+            method, url, body, ..
+        } => execute_http(method, url, body.as_deref()),
+        DslStep::Exec { argv, .. } => execute_exec(argv, working_dir),
+        DslStep::Expect {
+            source,
+            json_path,
+            exit_code,
+            equals,
+            contains,
+        } => {
+            let captured = captures
+                .get(source)
+                .ok_or_else(|| DslError::InvalidStep(format!("capture '{source}' not found")))?;
+            execute_expect(
+                captured,
+                json_path.as_deref(),
+                *exit_code,
+                equals.as_ref(),
+                contains.as_deref(),
+            )
         }
     }
 }
@@ -285,7 +314,8 @@ fn execute_http(
 
     cmd.arg(url);
 
-    let output = cmd.output()
+    let output = cmd
+        .output()
         .map_err(|e| DslError::ExecutionFailed(format!("curl: {e}")))?;
 
     let full_output = String::from_utf8_lossy(&output.stdout).to_string();
@@ -312,7 +342,8 @@ fn execute_exec(argv: &[String], working_dir: &Path) -> Result<StepResult, DslEr
     }
     cmd.current_dir(working_dir);
 
-    let output = cmd.output()
+    let output = cmd
+        .output()
         .map_err(|e| DslError::ExecutionFailed(format!("{}: {e}", argv[0])))?;
 
     Ok(StepResult {
@@ -344,8 +375,8 @@ fn execute_expect(
             let parsed: serde_json::Value = serde_json::from_str(&captured.body)
                 .map_err(|e| DslError::ExecutionFailed(format!("JSON parse: {e}")))?;
 
-            let extracted = navigate_json_path(&parsed, path)
-                .ok_or_else(|| DslError::ExpectFailed {
+            let extracted =
+                navigate_json_path(&parsed, path).ok_or_else(|| DslError::ExpectFailed {
                     step: 0,
                     expected: format!("value at {path}"),
                     actual: "path not found".to_string(),
@@ -389,8 +420,13 @@ fn execute_expect(
 }
 
 /// Simple JSON path navigator. Supports `$.field.nested[0].key` syntax.
-fn navigate_json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
-    let path = path.strip_prefix("$.").unwrap_or(path.strip_prefix("$").unwrap_or(path));
+fn navigate_json_path<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let path = path
+        .strip_prefix("$.")
+        .unwrap_or(path.strip_prefix("$").unwrap_or(path));
     let mut current = value;
 
     for segment in path.split('.') {
@@ -525,7 +561,11 @@ mod tests {
 
         let steps = vec![
             DslStep::Exec {
-                argv: vec!["test".to_string(), "-f".to_string(), "exists.txt".to_string()],
+                argv: vec![
+                    "test".to_string(),
+                    "-f".to_string(),
+                    "exists.txt".to_string(),
+                ],
                 capture: Some("f".to_string()),
                 timeout_ms: None,
             },
@@ -546,7 +586,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let steps = vec![
             DslStep::Exec {
-                argv: vec!["test".to_string(), "-f".to_string(), "missing.txt".to_string()],
+                argv: vec![
+                    "test".to_string(),
+                    "-f".to_string(),
+                    "missing.txt".to_string(),
+                ],
                 capture: Some("f".to_string()),
                 timeout_ms: None,
             },
@@ -568,9 +612,18 @@ mod tests {
             "users": [{"id": 1, "name": "alice"}, {"id": 2, "name": "bob"}],
             "status": "ok"
         });
-        assert_eq!(navigate_json_path(&val, "$.status"), Some(&serde_json::json!("ok")));
-        assert_eq!(navigate_json_path(&val, "$.users[0].name"), Some(&serde_json::json!("alice")));
-        assert_eq!(navigate_json_path(&val, "$.users[1].id"), Some(&serde_json::json!(2)));
+        assert_eq!(
+            navigate_json_path(&val, "$.status"),
+            Some(&serde_json::json!("ok"))
+        );
+        assert_eq!(
+            navigate_json_path(&val, "$.users[0].name"),
+            Some(&serde_json::json!("alice"))
+        );
+        assert_eq!(
+            navigate_json_path(&val, "$.users[1].id"),
+            Some(&serde_json::json!(2))
+        );
         assert_eq!(navigate_json_path(&val, "$.nonexistent"), None);
     }
 
@@ -597,7 +650,16 @@ mod tests {
 
     #[test]
     fn security_rejects_shell_interpreters() {
-        for bin in &["bash", "sh", "zsh", "cmd", "powershell", "python3", "node", "ruby"] {
+        for bin in &[
+            "bash",
+            "sh",
+            "zsh",
+            "cmd",
+            "powershell",
+            "python3",
+            "node",
+            "ruby",
+        ] {
             assert!(!is_whitelisted_binary(bin), "{bin} should be rejected");
         }
     }

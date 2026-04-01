@@ -1,3 +1,6 @@
+use std::fs;
+use std::path::Path;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -193,9 +196,7 @@ pub fn classify_failure(exit_code: i32, stderr: &str) -> TerminationReason {
     }
 
     // Server errors
-    if stderr_lower.contains("529")
-        || stderr_lower.contains("503")
-        || stderr_lower.contains("502")
+    if stderr_lower.contains("529") || stderr_lower.contains("503") || stderr_lower.contains("502")
     {
         return TerminationReason::Provider529;
     }
@@ -350,6 +351,192 @@ impl CircuitBreaker {
             self.state = CircuitState::HalfOpen;
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriageVerdict {
+    NoActiveRun,
+    Completed,
+    StillAlive,
+    Stale,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunTriage {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<RunStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_s: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_age_s: Option<u64>,
+    pub has_receipt: bool,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+    pub verdict: TriageVerdict,
+}
+
+impl RunTriage {
+    fn no_active_run() -> Self {
+        Self {
+            run_id: String::new(),
+            status: None,
+            age_s: None,
+            heartbeat_age_s: None,
+            has_receipt: false,
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            verdict: TriageVerdict::NoActiveRun,
+        }
+    }
+}
+
+pub fn latest_run_triage(bus: &Path, project: &str) -> RunTriage {
+    latest_run_triage_with_threshold(bus, project, 90)
+}
+
+pub fn latest_run_triage_with_threshold(
+    bus: &Path,
+    project: &str,
+    stale_after_s: u64,
+) -> RunTriage {
+    if let Some(task_id) = latest_active_task_id(bus, project) {
+        return triage_for_active_task(bus, &task_id, stale_after_s);
+    }
+    if let Some(task_id) = latest_completed_task_id(bus, project) {
+        return triage_for_completed_task(bus, &task_id);
+    }
+    RunTriage::no_active_run()
+}
+
+fn latest_active_task_id(bus: &Path, project: &str) -> Option<String> {
+    let mut task_ids: Vec<String> = fs::read_dir(bus.join("cur"))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                return None;
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
+            if value.get("project").and_then(|v| v.as_str()) != Some(project) {
+                return None;
+            }
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+        })
+        .collect();
+    task_ids.sort();
+    task_ids.pop()
+}
+
+fn latest_completed_task_id(bus: &Path, project: &str) -> Option<String> {
+    let mut task_ids: Vec<String> = fs::read_dir(bus.join("done"))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let receipt_path = path.join("receipt.json");
+            let value: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(receipt_path).ok()?).ok()?;
+            if value.get("project").and_then(|v| v.as_str()) != Some(project) {
+                return None;
+            }
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .collect();
+    task_ids.sort();
+    task_ids.pop()
+}
+
+fn triage_for_active_task(bus: &Path, task_id: &str, stale_after_s: u64) -> RunTriage {
+    let run = latest_run_record(bus, task_id);
+    let heartbeat_age_s = file_age_s(&bus.join(".heartbeats").join(format!("{task_id}.hb")));
+    let stdout_tail = run
+        .as_ref()
+        .and_then(|run| run.stdout_path.as_deref())
+        .map(|path| read_tail(Path::new(path), 500))
+        .unwrap_or_default();
+    let stderr_tail = run
+        .as_ref()
+        .and_then(|run| run.stderr_path.as_deref())
+        .map(|path| read_tail(Path::new(path), 500))
+        .unwrap_or_default();
+    let verdict = match heartbeat_age_s {
+        Some(age) if age <= stale_after_s => TriageVerdict::StillAlive,
+        _ => TriageVerdict::Stale,
+    };
+
+    RunTriage {
+        run_id: run
+            .as_ref()
+            .map(|run| run.run_id.clone())
+            .unwrap_or_else(|| task_id.to_string()),
+        status: run.as_ref().map(|run| run.status.clone()),
+        age_s: run
+            .as_ref()
+            .map(|run| run.started_at.unwrap_or(run.claimed_at))
+            .and_then(|started| u64::try_from((Utc::now() - started).num_seconds()).ok()),
+        heartbeat_age_s,
+        has_receipt: false,
+        stdout_tail,
+        stderr_tail,
+        verdict,
+    }
+}
+
+fn triage_for_completed_task(bus: &Path, task_id: &str) -> RunTriage {
+    let done_dir = bus.join("done").join(task_id);
+    RunTriage {
+        run_id: task_id.to_string(),
+        status: Some(RunStatus::Success),
+        age_s: None,
+        heartbeat_age_s: None,
+        has_receipt: done_dir.join("receipt.json").exists(),
+        stdout_tail: read_tail(&done_dir.join("stdout.json"), 500),
+        stderr_tail: read_tail(&done_dir.join("stderr.log"), 500),
+        verdict: TriageVerdict::Completed,
+    }
+}
+
+fn latest_run_record(bus: &Path, task_id: &str) -> Option<Run> {
+    let mut paths: Vec<_> = fs::read_dir(bus.join("runs").join(task_id))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("run-"))
+        })
+        .collect();
+    paths.sort();
+    let latest = paths.pop()?;
+    serde_json::from_str(&fs::read_to_string(latest).ok()?).ok()
+}
+
+fn file_age_s(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    modified.elapsed().ok().map(|elapsed| elapsed.as_secs())
+}
+
+fn read_tail(path: &Path, max_chars: usize) -> String {
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| {
+            let chars: Vec<char> = text.chars().collect();
+            if chars.len() <= max_chars {
+                text
+            } else {
+                chars[chars.len() - max_chars..].iter().collect()
+            }
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -530,9 +717,18 @@ mod tests {
     #[test]
     fn adversarial_classify_failure_case_insensitive_patterns() {
         // All pattern matching uses to_lowercase(), verify case variants
-        assert_eq!(classify_failure(1, "AUTH FAILURE"), TerminationReason::AuthExpired);
-        assert_eq!(classify_failure(1, "RATE LIMIT EXCEEDED"), TerminationReason::Provider429);
-        assert_eq!(classify_failure(1, "SERVER OVERLOADED"), TerminationReason::ProviderOverloaded);
+        assert_eq!(
+            classify_failure(1, "AUTH FAILURE"),
+            TerminationReason::AuthExpired
+        );
+        assert_eq!(
+            classify_failure(1, "RATE LIMIT EXCEEDED"),
+            TerminationReason::Provider429
+        );
+        assert_eq!(
+            classify_failure(1, "SERVER OVERLOADED"),
+            TerminationReason::ProviderOverloaded
+        );
     }
 
     #[test]
@@ -577,7 +773,10 @@ mod tests {
         cb.state = CircuitState::Open;
         cb.opened_at = None;
         // allows() returns true when opened_at is None (else branch)
-        assert!(cb.allows(), "Open circuit with no opened_at should allow (else branch)");
+        assert!(
+            cb.allows(),
+            "Open circuit with no opened_at should allow (else branch)"
+        );
     }
 
     #[test]
@@ -629,6 +828,127 @@ mod tests {
         assert_eq!(run.status, RunStatus::Success);
         assert_eq!(run.exit_code, 0);
         // error_type remains from mark_failed — stale state
-        assert!(run.error_type.is_some(), "error_type not cleared by mark_success");
+        assert!(
+            run.error_type.is_some(),
+            "error_type not cleared by mark_success"
+        );
+    }
+}
+#[cfg(test)]
+mod triage_tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    fn write_json(path: &Path, value: &serde_json::Value) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+    }
+
+    fn write_run(bus: &Path, task_id: &str, run: &Run) {
+        let dir = bus.join("runs").join(task_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(format!("run-{}.json", run.attempt)),
+            serde_json::to_string_pretty(run).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn triage_no_active_run() {
+        let tmp = tempdir().unwrap();
+        let triage = latest_run_triage_with_threshold(tmp.path(), "specpunk", 90);
+        assert_eq!(triage.verdict, TriageVerdict::NoActiveRun);
+        assert!(triage.run_id.is_empty());
+    }
+
+    #[test]
+    fn triage_active_run_fresh_heartbeat() {
+        let tmp = tempdir().unwrap();
+        let bus = tmp.path();
+        let task_id = "specpunk-20260331-120000";
+        write_json(
+            &bus.join("cur").join(format!("{task_id}.json")),
+            &serde_json::json!({
+                "project": "specpunk",
+                "model": "claude",
+                "category": "fix"
+            }),
+        );
+
+        let stdout_path = bus.join("active-stdout.log");
+        let stderr_path = bus.join("active-stderr.log");
+        fs::write(&stdout_path, "stdout tail alive").unwrap();
+        fs::write(&stderr_path, "stderr tail alive").unwrap();
+
+        let mut run = Run::new(task_id, 1, 1, "claude", "sonnet");
+        run.mark_started(123);
+        run.stdout_path = Some(stdout_path.to_string_lossy().to_string());
+        run.stderr_path = Some(stderr_path.to_string_lossy().to_string());
+        write_run(bus, task_id, &run);
+
+        fs::create_dir_all(bus.join(".heartbeats")).unwrap();
+        fs::write(bus.join(".heartbeats").join(format!("{task_id}.hb")), "").unwrap();
+
+        let triage = latest_run_triage_with_threshold(bus, "specpunk", 90);
+        assert_eq!(triage.verdict, TriageVerdict::StillAlive);
+        assert_eq!(triage.status, Some(RunStatus::Running));
+        assert!(triage.stdout_tail.contains("alive"));
+        assert!(triage.heartbeat_age_s.is_some());
+    }
+
+    #[test]
+    fn triage_stale_without_heartbeat() {
+        let tmp = tempdir().unwrap();
+        let bus = tmp.path();
+        let task_id = "specpunk-20260331-120001";
+        write_json(
+            &bus.join("cur").join(format!("{task_id}.json")),
+            &serde_json::json!({
+                "project": "specpunk",
+                "model": "claude",
+                "category": "fix"
+            }),
+        );
+
+        let mut run = Run::new(task_id, 1, 1, "claude", "sonnet");
+        run.mark_started(123);
+        write_run(bus, task_id, &run);
+
+        let triage = latest_run_triage_with_threshold(bus, "specpunk", 90);
+        assert_eq!(triage.verdict, TriageVerdict::Stale);
+        assert_eq!(triage.status, Some(RunStatus::Running));
+        assert_eq!(triage.heartbeat_age_s, None);
+    }
+
+    #[test]
+    fn triage_completed_with_receipt() {
+        let tmp = tempdir().unwrap();
+        let bus = tmp.path();
+        let task_id = "specpunk-20260331-120002";
+
+        let done_dir = bus.join("done").join(task_id);
+        fs::create_dir_all(&done_dir).unwrap();
+        fs::write(done_dir.join("stdout.json"), "{\"result\":\"ok\"}").unwrap();
+        fs::write(done_dir.join("stderr.log"), "no errors").unwrap();
+        write_json(
+            &done_dir.join("receipt.json"),
+            &serde_json::json!({
+                "task_id": task_id,
+                "status": "success",
+                "project": "specpunk",
+                "created_at": Utc::now().to_rfc3339(),
+            }),
+        );
+
+        let triage = latest_run_triage_with_threshold(bus, "specpunk", 90);
+        assert_eq!(triage.verdict, TriageVerdict::Completed);
+        assert!(triage.has_receipt);
+        assert!(triage.stdout_tail.contains("ok"));
+        assert!(triage.stderr_tail.contains("no errors"));
     }
 }

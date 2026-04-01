@@ -8,7 +8,10 @@ pub fn render_summary(contract: &Contract, quality: &QualityReport) -> String {
     let mut out = Vec::new();
 
     out.push("╔══════════════════════════════════════════════════════════╗".to_string());
-    out.push(format!("║  punk plan -- contract v{}                                ║", contract.version));
+    out.push(format!(
+        "║  punk plan -- contract v{}                                ║",
+        contract.version
+    ));
     out.push("╚══════════════════════════════════════════════════════════╝".to_string());
     out.push(String::new());
 
@@ -54,7 +57,11 @@ pub fn render_summary(contract: &Contract, quality: &QualityReport) -> String {
         out.push(String::new());
     }
 
-    let quality_label = if quality.is_acceptable() { "PASS" } else { "FAIL" };
+    let quality_label = if quality.is_acceptable() {
+        "PASS"
+    } else {
+        "FAIL"
+    };
     out.push(format!(
         "QUALITY: {quality_label} (score {}/100)",
         quality.score
@@ -94,7 +101,7 @@ mod tests {
     use super::*;
     use crate::plan::ceremony::{CeremonyLevel, ModelTier};
     use crate::plan::contract::{
-        AcceptanceCriterion, Contract, ContextInheritance, RiskLevel, RoutingMetadata, Scope,
+        AcceptanceCriterion, ContextInheritance, Contract, RiskLevel, RoutingMetadata, Scope,
     };
     use crate::plan::quality::check_quality;
 
@@ -153,7 +160,10 @@ mod tests {
         assert!(rendered.contains("SCOPE"), "missing SCOPE section");
         assert!(rendered.contains("src/auth.rs"), "missing touch file");
         assert!(rendered.contains("migrations/"), "missing dont_touch file");
-        assert!(rendered.contains("ACCEPTANCE CRITERIA"), "missing ACs section");
+        assert!(
+            rendered.contains("ACCEPTANCE CRITERIA"),
+            "missing ACs section"
+        );
         assert!(rendered.contains("AC-01"), "missing AC id");
         assert!(rendered.contains("WARNINGS"), "missing WARNINGS section");
         assert!(rendered.contains("QUALITY"), "missing QUALITY section");

@@ -78,12 +78,7 @@ fn format_suggestions(suggestions: &[String]) -> String {
 
 // --- Scan roots ---
 
-const SCAN_ROOTS: &[&str] = &[
-    "~/personal/heurema",
-    "~/works",
-    "~/contrib",
-    "~/personal",
-];
+const SCAN_ROOTS: &[&str] = &["~/personal/heurema", "~/works", "~/contrib", "~/personal"];
 
 fn expand_tilde(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
@@ -99,7 +94,11 @@ fn expand_tilde(p: &str) -> PathBuf {
 
 pub fn cache_path() -> PathBuf {
     dirs::cache_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".cache"))
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".cache")
+        })
         .join("punk/projects.json")
 }
 
@@ -116,8 +115,7 @@ pub fn save_cache(cache: &ProjectCache) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_string_pretty(cache)
-        .map_err(std::io::Error::other)?;
+    let data = serde_json::to_string_pretty(cache).map_err(std::io::Error::other)?;
     fs::write(&path, data)
 }
 
@@ -465,7 +463,10 @@ mod tests {
 
     #[test]
     fn stale_toml_path_is_an_explicit_error() {
-        let missing = format!("/tmp/specpunk-missing-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default());
+        let missing = format!(
+            "/tmp/specpunk-missing-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
         let cfg = crate::config::Config {
             projects: crate::config::ProjectsFile {
                 projects: vec![crate::config::Project {
@@ -563,7 +564,8 @@ mod tests {
         fs::write(&cache_file, data).unwrap();
 
         // Verify cache round-trip
-        let loaded: ProjectCache = serde_json::from_str(&fs::read_to_string(&cache_file).unwrap()).unwrap();
+        let loaded: ProjectCache =
+            serde_json::from_str(&fs::read_to_string(&cache_file).unwrap()).unwrap();
         assert_eq!(loaded.projects.len(), 1);
         assert_eq!(loaded.projects[0].id, "testproj");
         assert!(loaded.projects[0].pinned);

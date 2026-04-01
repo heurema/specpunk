@@ -152,7 +152,10 @@ pub fn assemble(
 }
 
 /// Save proofpack atomically.
-pub fn save(proofpack: &Proofpack, contract_dir: &Path) -> Result<std::path::PathBuf, std::io::Error> {
+pub fn save(
+    proofpack: &Proofpack,
+    contract_dir: &Path,
+) -> Result<std::path::PathBuf, std::io::Error> {
     let json = serde_json::to_string_pretty(proofpack)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let target = contract_dir.join("proofpack.json");
@@ -170,8 +173,8 @@ pub fn save(proofpack: &Proofpack, contract_dir: &Path) -> Result<std::path::Pat
 pub fn ci_gate(proofpack_path: &Path) -> Result<(i32, String), String> {
     let raw = std::fs::read_to_string(proofpack_path)
         .map_err(|e| format!("cannot read proofpack: {e}"))?;
-    let pack: Proofpack = serde_json::from_str(&raw)
-        .map_err(|e| format!("invalid proofpack JSON: {e}"))?;
+    let pack: Proofpack =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid proofpack JSON: {e}"))?;
 
     let (code, label) = match pack.release_verdict {
         ReleaseVerdict::Promote => (CI_PROMOTE, "PROMOTE"),
@@ -181,7 +184,10 @@ pub fn ci_gate(proofpack_path: &Path) -> Result<(i32, String), String> {
 
     let summary = format!(
         "punk ci: {} (confidence={:.0}%, coverage={:.0}%, decision={:?})",
-        label, pack.confidence.overall, pack.evidence_coverage * 100.0, pack.decision,
+        label,
+        pack.confidence.overall,
+        pack.evidence_coverage * 100.0,
+        pack.decision,
     );
 
     Ok((code, summary))
@@ -194,12 +200,22 @@ pub fn ci_gate(proofpack_path: &Path) -> Result<(i32, String), String> {
 pub fn render_pack_short(pack: &Proofpack) -> String {
     let mut out = format!(
         "punk pack: {:?} → {:?} (confidence={:.0}%, coverage={:.0}%)\n",
-        pack.decision, pack.release_verdict,
-        pack.confidence.overall, pack.evidence_coverage * 100.0,
+        pack.decision,
+        pack.release_verdict,
+        pack.confidence.overall,
+        pack.evidence_coverage * 100.0,
     );
     out.push_str(&format!("  run:      {}\n", pack.run_id));
-    out.push_str(&format!("  contract: {} ({})\n", &pack.contract.sha256[..16], pack.contract.status));
-    out.push_str(&format!("  diff:     {} ({})\n", &pack.diff.sha256[..16], pack.diff.status));
+    out.push_str(&format!(
+        "  contract: {} ({})\n",
+        &pack.contract.sha256[..16],
+        pack.contract.status
+    ));
+    out.push_str(&format!(
+        "  diff:     {} ({})\n",
+        &pack.diff.sha256[..16],
+        pack.diff.status
+    ));
     out.push_str(&format!("  scope:    {}\n", pack.checks.scope.status));
     out.push_str(&format!("  mechanic: {}\n", pack.checks.mechanic.status));
     out.push_str(&format!(

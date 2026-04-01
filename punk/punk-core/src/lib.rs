@@ -23,4 +23,4 @@ pub mod supersede;
 pub mod testquality;
 pub mod vcs;
 
-pub use vcs::{Vcs, VcsError, VcsType, detect};
+pub use vcs::{detect, Vcs, VcsError, VcsType};

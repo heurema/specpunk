@@ -8,6 +8,15 @@ pub enum VcsType {
     Git,
 }
 
+/// User-facing VCS operating mode for the current repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcsMode {
+    Jj,
+    GitOnly,
+    GitWithJjAvailableButDisabled,
+    NoVcs,
+}
+
 /// Errors returned by VCS operations.
 #[derive(Debug)]
 pub enum VcsError {
@@ -48,12 +57,67 @@ pub trait Vcs {
 pub fn detect(path: &Path) -> Result<Box<dyn Vcs>, VcsError> {
     // Check jj first — it takes priority over git
     if is_jj_repo(path) {
-        return Ok(Box::new(JjVcs { root: path.to_path_buf() }));
+        return Ok(Box::new(JjVcs {
+            root: path.to_path_buf(),
+        }));
     }
     if is_git_repo(path) {
-        return Ok(Box::new(GitVcs { root: path.to_path_buf() }));
+        return Ok(Box::new(GitVcs {
+            root: path.to_path_buf(),
+        }));
     }
     Err(VcsError::NotDetected)
+}
+
+/// Detect the current user-facing VCS mode for a repository path.
+pub fn detect_mode(path: &Path) -> VcsMode {
+    classify_mode(is_jj_repo(path), is_git_repo(path), is_jj_available())
+}
+
+/// Explicitly enable jj for an existing Git repo without auto-mutating on detection.
+pub fn enable_jj(path: &Path) -> Result<(), VcsError> {
+    match detect_mode(path) {
+        VcsMode::Jj => Ok(()),
+        VcsMode::GitWithJjAvailableButDisabled => {
+            let out = Command::new("jj")
+                .args(["git", "init", "--colocate", "."])
+                .current_dir(path)
+                .output()
+                .map_err(|e| VcsError::CommandFailed(e.to_string()))?;
+            if !out.status.success() {
+                return Err(VcsError::CommandFailed(
+                    String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        VcsMode::GitOnly => Err(VcsError::CommandFailed(
+            "jj is not installed; cannot enable jj for this repo".to_string(),
+        )),
+        VcsMode::NoVcs => Err(VcsError::NotDetected),
+    }
+}
+
+fn classify_mode(is_jj_repo: bool, is_git_repo: bool, jj_available: bool) -> VcsMode {
+    if is_jj_repo {
+        VcsMode::Jj
+    } else if is_git_repo {
+        if jj_available {
+            VcsMode::GitWithJjAvailableButDisabled
+        } else {
+            VcsMode::GitOnly
+        }
+    } else {
+        VcsMode::NoVcs
+    }
+}
+
+fn is_jj_available() -> bool {
+    Command::new("jj")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn is_jj_repo(path: &Path) -> bool {
@@ -140,6 +204,44 @@ impl Vcs for JjVcs {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{classify_mode, VcsMode};
+
+    #[test]
+    fn classify_mode_prefers_jj_repo() {
+        assert_eq!(classify_mode(true, true, true), VcsMode::Jj);
+    }
+
+    #[test]
+    fn classify_mode_reports_git_with_jj_available_but_disabled() {
+        assert_eq!(
+            classify_mode(false, true, true),
+            VcsMode::GitWithJjAvailableButDisabled
+        );
+    }
+
+    #[test]
+    fn classify_mode_reports_git_only_without_jj() {
+        assert_eq!(classify_mode(false, true, false), VcsMode::GitOnly);
+    }
+
+    #[test]
+    fn classify_mode_reports_no_vcs() {
+        assert_eq!(classify_mode(false, false, true), VcsMode::NoVcs);
+    }
+
+    #[test]
+    fn enable_jj_preconditions_are_mode_gated() {
+        assert_eq!(
+            classify_mode(false, true, true),
+            VcsMode::GitWithJjAvailableButDisabled
+        );
+        assert_eq!(classify_mode(false, true, false), VcsMode::GitOnly);
+        assert_eq!(classify_mode(true, true, true), VcsMode::Jj);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Git implementation
 // ---------------------------------------------------------------------------
@@ -188,7 +290,13 @@ impl Vcs for GitVcs {
 
     fn untracked_files(&self) -> Result<Vec<String>, VcsError> {
         let out = Command::new("git")
-            .args(["-c", "core.quotepath=false", "ls-files", "--others", "--exclude-standard"])
+            .args([
+                "-c",
+                "core.quotepath=false",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+            ])
             .current_dir(&self.root)
             .output()
             .map_err(|e| VcsError::CommandFailed(e.to_string()))?;

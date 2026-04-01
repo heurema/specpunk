@@ -142,7 +142,15 @@ mod tests {
         let bus = tmp.path().join("bus");
         fs::create_dir_all(&bus).unwrap();
 
-        let opp = add(&bus, "signum", "Alice", "Send intro", "2026-04-01", Some(5000)).unwrap();
+        let opp = add(
+            &bus,
+            "signum",
+            "Alice",
+            "Send intro",
+            "2026-04-01",
+            Some(5000),
+        )
+        .unwrap();
         assert_eq!(opp.id, 1);
         assert_eq!(opp.stage, Stage::Lead);
 

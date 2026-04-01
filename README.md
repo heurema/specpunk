@@ -1,147 +1,156 @@
-```
-                       __
-    ____  __  ______  / /__
-   / __ \/ / / / __ \/ //_/
-  / /_/ / /_/ / / / / ,<
- / .___/\__,_/_/ /_/_/|_|
-/_/
-```
+# punk
 
-**Agent orchestration platform for solo founders running AI agent fleets.**
+Local-first, stewarded multi-agent engineering runtime.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-334%20passing-brightgreen.svg)]()
+`punk` is the new target shape of this repo: one CLI, one vocabulary, one runtime.
 
-> Think Paperclip, but CLI-first. No dashboard, no database, no API keys required.
+It combines:
+- **orchestration** from specpunk
+- **deliberation** ideas from arbiter
+- **assurance / proof** ideas from signum
+- **modal shell UX** inspired by forgecode
+- **skill/eval ratchet** direction informed by project-skill work such as skillpulse-style tracking
 
----
+## Status
 
-## Install
+This repo is in a **design reset / rebuild** phase.
 
-```sh
-cargo install --git https://github.com/heurema/specpunk punk-run
-```
+- current code still contains legacy nested workspace pieces under `punk/`
+- those crates are treated as **source material for extraction**
+- docs in `docs/product/` describe the **target architecture**, not a finished released implementation
 
-Or build from source:
+No backward compatibility is required. The project has not launched, so the repo is being reshaped toward the cleanest final design.
 
-```sh
-git clone https://github.com/heurema/specpunk
-cd specpunk/punk
-cargo install --path punk-run
-```
+## Product thesis
 
-## Quick Start
+`punk` is a local-first runtime for AI-driven engineering work across repositories.
 
-```sh
-# 1. Check providers are available
-punk-run doctor
+It has four pillars:
+- **Kernel** — small, stable Rust core with replaceable edges
+- **Stewardship** — goal, scope, cleanup, docs, and project coherence
+- **Council** — selective multi-model, multi-role deliberation for high-stakes decisions
+- **Skill/Eval ratchet** — project-specific skills improved through evidence and evaluation
 
-# 2. Configure projects and agents
-mkdir -p ~/.config/punk
-# Edit ~/.config/punk/projects.toml, agents.toml, policy.toml
+It is built around three runtime modes:
+- **`plot`** — shape work, inspect the repo, draft/refine contracts
+- **`cut`** — execute bounded changes in isolated VCS context
+- **`gate`** — verify, decide, and produce proof artifacts
 
-# 3. Queue a task
-punk-run queue myproject "add input validation to the API" --agent claude
+These are not tone presets. They are **permission boundaries**.
 
-# 4. Start the daemon (dispatches tasks to AI agents)
-punk-run daemon
+## Core model
 
-# 5. Check status
-punk-run status
-punk-run morning
-```
+Canonical object chain:
 
-## What It Does
-
-Specpunk dispatches tasks to AI coding agents (Claude, Codex, Gemini), tracks their work through structured receipts, enforces budgets, and runs autonomous goal-driven execution.
-
-**25 commands across 6 areas:**
-
-```sh
-# Task dispatch
-punk-run queue <project> "prompt"         # one-off task
-punk-run daemon                           # start dispatcher
-punk-run status                           # what's running
-
-# Goals (autonomous cycle)
-punk-run goal create <project> "objective" # planner generates steps
-punk-run goal approve <id>                # human approves, daemon executes
-punk-run goal list                        # track progress
-
-# Operations
-punk-run morning                          # daily briefing
-punk-run triage                           # review failed tasks
-punk-run ask "what is blocking signum?"   # AI query over state
-punk-run receipts --since 7               # receipt history
-
-# Multi-model
-punk-run diverge <project> "spec"         # 3 providers, compare solutions
-punk-run panel "question"                 # ask all, compare answers
-
-# Pipeline CRM
-punk-run pipeline list                    # opportunities
-punk-run pipeline add <project> <contact> # new lead
-
-# System
-punk-run doctor                           # health check
-punk-run config                           # show configuration
-punk-run policy-check <project>           # test routing rules
-punk-run ratchet                          # weekly performance comparison
-punk-run graph cost                       # cost chart
+```text
+Project
+  -> Goal
+    -> Feature
+      -> Contract
+        -> Task
+          -> Run
+            -> Receipt
+            -> DecisionObject
+            -> Proofpack
 ```
 
-## How It Works
+Key rules:
+- **one CLI**: `punk`
+- **one vocabulary**: `plot / cut / gate`
+- **one state truth**: append-only event log + materialized views
+- **one decision writer**: only `gate` writes final `DecisionObject`
+- **VCS-aware, not git-bound**: `jj` preferred, `git` fallback
+- **feature-centric, not PR-centric**
+- **skills improve through curated ratchet, not silent mutation**
 
-```
-You (CEO)
-  |
-  punk-run goal signum "prepare checkpoint"
-  |
-  Planner (Claude Opus) --> generates 5-15 step plan
-  |
-  You approve plan
-  |
-  Daemon dispatches steps autonomously:
-    Step 1 --> codex-auto (research)
-    Step 2 --> claude-coder (implement)
-    Step 3 --> claude-reviewer (review)
-    ...
-  |
-  punk-run morning   <-- daily briefing
-  punk-run status    <-- what happened
-```
+## What makes `punk` different
 
-**Key design choices:**
-- **Flat files, no database** - state lives in JSONL + JSON files, grep-able
-- **Subscription billing** - uses CLI tools on flat-rate plans, not per-token API
-- **Filesystem bus** - directories as state machine (new/ -> cur/ -> done/)
-- **Receipt-driven** - every task produces a structured receipt with cost, duration, status
+`punk` is not just another agent runner.
 
-## Configuration
+It is meant to ensure AI agents do not merely write code, but leave the project in a cleaner and more coherent state:
+- bounded scope
+- superseded code removed or explicitly retained
+- docs/config/manifests updated
+- migrations actually finished
+- high-stakes decisions reviewed through structured council protocols when needed
 
-```
-~/.config/punk/
-  projects.toml   # which codebases agents work on
-  agents.toml     # agent configurations (provider + model + role)
-  policy.toml     # routing rules, budgets, feature flags
+## First vertical slice
+
+The first usable version is intentionally narrow:
+
+```text
+plot contract -> approve -> cut run -> gate run -> proof
 ```
 
-## Architecture
+Initial commands:
 
+```bash
+punk plot contract "<prompt>"
+punk plot approve <contract-id>
+punk cut run <contract-id>
+punk gate run <run-id>
+punk gate proof <run-id|decision-id>
+punk status [id]
+punk inspect <id> --json
 ```
-specpunk/punk/
-  punk-core/    # verification library (14K LOC, frozen)
-  punk-cli/     # punk binary (init, plan, check, receipt)
-  punk-orch/    # orchestration library (22 modules)
-  punk-run/     # punk-run binary (25 commands)
+
+What is explicitly out of scope for v0:
+- daemon
+- queue
+- goals as user-facing flow
+- council (`panel / quorum / verify`)
+- diverge
+- benchmark subsystem
+- plugin marketplace
+- skill auto-promotion
+
+## Docs
+
+- `docs/product/VISION.md` — product boundary and laws
+- `docs/product/ARCHITECTURE.md` — kernel, stewardship, council, skills/eval architecture
+- `docs/product/COUNCIL.md` — advisory multi-model deliberation protocols
+- `docs/product/SKILLS.md` — skill packets, overlays, and candidate skill patches
+- `docs/product/EVAL.md` — task eval, skill eval, and promotion decisions
+- `docs/product/RESEARCH.md` — bounded deep-research protocols
+- `docs/product/DOGFOODING.md` — bounded self-hosting and trust-separation rules
+- `docs/product/CLI.md` — command surface and shell UX
+- `docs/product/MASTER-PLAN.md` — staged build plan
+- `docs/product/CONTINUE-PROMPT.md` — handoff prompt for the next build session
+
+## Target repo shape
+
+```text
+specpunk/
+├── Cargo.toml
+├── crates/
+│   ├── punk-cli/
+│   ├── punk-shell/
+│   ├── punk-domain/
+│   ├── punk-events/
+│   ├── punk-vcs/
+│   ├── punk-core/
+│   ├── punk-orch/
+│   ├── punk-gate/
+│   ├── punk-proof/
+│   ├── punk-adapters/
+│   ├── punk-council/
+│   ├── punk-skills/
+│   ├── punk-eval/
+│   └── punk-research/
+├── docs/
+└── .punk/
 ```
 
-## Requirements
+## Current practical note
 
-- Rust stable
-- At least one AI CLI: [Claude Code](https://claude.ai/download), [Codex](https://github.com/openai/codex), or [Gemini CLI](https://github.com/google-gemini/gemini-cli)
-- Subscription plan (Claude Max, ChatGPT Pro, or Google AI Pro)
+Today the repo still has a legacy Rust workspace inside `punk/`.
+
+That is **not** the target architecture anymore.
+
+It should be treated as:
+- code to extract
+- code to relocate
+- code to delete when replaced
 
 ## License
 

@@ -1,0 +1,238 @@
+# punk Dogfooding
+
+## Summary
+
+`punk` should be built with `punk` itself as soon as the base loop is usable.
+
+But this must be done as **bounded self-hosting**, not blind self-trust.
+
+Core rule:
+- `punk` may operate on `specpunk`
+- but `punk` must not become the sole unquestioned authority over its own meta-level changes
+
+Dogfooding is a product strategy, not a license for circular validation.
+
+---
+
+## Why dogfood at all
+
+Building `punk` with `punk` is the fastest way to get:
+- real contracts
+- real receipts
+- real gate decisions
+- real failure patterns
+- real cleanup obligations
+- real skill patches
+- real eval evidence
+
+Dogfooding gives better signals than synthetic examples because it exposes:
+- scope drift
+- stale docs/configs
+- cleanup misses
+- duplicate v1/v2 paths
+- weak contracts
+- weak checks
+- weak council packets
+
+---
+
+## Dogfooding law
+
+Use `punk` on `specpunk`, but under **split trust**.
+
+### Allowed
+`punk` may dogfood itself for:
+- feature work in the repo
+- contract drafting and refinement
+- bounded implementation runs
+- deterministic gate checks
+- proof generation
+- doc cleanup
+- replacement/removal obligations
+- skill candidate generation
+- eval evidence collection
+- research packet generation
+
+### Not trusted by default
+`punk` must not fully self-authorize changes to:
+- gate semantics
+- promotion policy
+- eval scoring rules
+- event schema
+- artifact ownership model
+- other kernel-level trust rules
+
+Meta-level changes require stronger review than ordinary feature work.
+
+---
+
+## Trust domains
+
+### 1. Execution trust
+`punk` can write code in itself.
+
+Examples:
+- improve `plot`
+- add runtime checks
+- update docs
+- add bounded council code
+
+### 2. Acceptance trust
+`gate` can still decide on normal feature work, but changes touching core trust surfaces need extra scrutiny.
+
+For example:
+- changes to gate decision logic
+- changes to event truth model
+- changes to promotion policy
+- changes to dogfooding safety rules
+
+These should use stricter review paths, ideally including:
+- explicit human review
+- fixed eval suites
+- optional external or stronger council path
+
+### 3. Improvement trust
+Skills, eval, and research may propose improvements, but may not silently promote themselves.
+
+All self-improvement must go through:
+- evidence
+- baseline comparison
+- promotion decision
+- rollback path
+
+---
+
+## Self-hosting stages
+
+### Stage A — bounded dogfood
+Use the base `plot -> cut -> gate -> proof` loop on `specpunk` itself.
+
+Allowed in this stage:
+- ordinary runtime improvements
+- doc reconciliation
+- bounded refactors
+- cleanup obligations
+
+Rules:
+- operator remains in the loop
+- no auto-promotion
+- no silent trust-model changes
+
+### Stage B — council-assisted self-hosting
+After `punk-council` exists, use councils for:
+- architecture changes
+- risky refactors
+- contract hardening
+- difficult review situations
+
+Rules:
+- council remains advisory
+- gate remains final
+- no council may self-certify core policy changes alone
+
+### Stage C — skill-ratchet self-improvement
+After `punk-skills` and `punk-eval` exist, allow dogfood runs to generate:
+- candidate skill patches
+- project overlays
+- eval evidence
+
+Rules:
+- no promotion from one successful run
+- no safety regression allowed
+- rollback remains mandatory
+
+### Stage D — bounded research-on-self
+After `punk-research` exists, allow controlled research on `punk` itself for:
+- architecture questions
+- migration risks
+- cleanup impact
+- skill improvement ideas
+- model/protocol comparison
+
+Rules:
+- research is bounded
+- research is advisory
+- research does not directly rewrite policy truth
+
+---
+
+## Meta-change categories
+
+### Ordinary dogfoodable changes
+These may use normal dogfooding flow:
+- implementation features
+- docs updates
+- contract improvements
+- non-core checks
+- cleanup/removal work
+- bounded council protocol code
+
+### Sensitive self-hosting changes
+These require stricter handling:
+- gate semantics
+- eval thresholds
+- promotion policy
+- event schema
+- core packet schemas
+- artifact truth model
+- dogfooding safety rules
+
+### High-trust path for sensitive changes
+For sensitive self-hosting changes, require:
+- explicit contract with scope called out as meta-level
+- stronger review than usual
+- fixed before/after eval evidence where possible
+- human signoff before treating the change as trusted baseline
+
+---
+
+## How dogfooding feeds the other pillars
+
+### Council
+Dogfooding generates real council use cases:
+- architecture proposals for real subsystem work
+- real review disagreements
+- real synthesis needs
+
+### Skills
+Dogfooding reveals project-specific competence gaps:
+- missing heuristics
+- missing cleanup rules
+- missing docs-update rules
+- repeated failure patterns
+
+### Eval
+Dogfooding provides real evidence for:
+- task eval
+- skill eval
+- promotion decisions
+- rollback triggers
+
+### Research
+Dogfooding creates realistic high-value research prompts:
+- why a contract failed
+- why a cleanup obligation was missed
+- which model/protocol is more reliable
+- where migration risk hides in the repo
+
+---
+
+## Default operating rules
+
+1. Prefer real dogfood tasks over toy examples.
+2. Keep dogfood tasks bounded and contract-first.
+3. Record receipts, decisions, and proof artifacts for dogfood runs.
+4. Treat dogfood failures as learning input, not embarrassment.
+5. Never let the system silently self-promote from anecdotal success.
+6. Separate ordinary feature trust from meta-level trust.
+7. When in doubt, require stronger review for self-referential changes.
+
+---
+
+## Test scenarios
+
+1. `punk` completes an ordinary feature in `specpunk` using the normal base loop.
+2. A cleanup-heavy self-change detects and removes superseded paths.
+3. A candidate skill patch is proposed from a failed dogfood run but not promoted automatically.
+4. A sensitive meta-level change is blocked from normal self-certification and requires stronger review.
+5. A research-on-self run produces structured advisory output without changing trusted policy by itself.

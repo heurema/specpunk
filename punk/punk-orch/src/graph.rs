@@ -60,7 +60,12 @@ pub fn cost_chart(bus: &Path, days: i64) -> String {
             0
         };
         let bar: String = "#".repeat(bar_len);
-        out.push_str(&format!("  {} {:>6} {}\n", &day[5..], format_usd(**cost), bar));
+        out.push_str(&format!(
+            "  {} {:>6} {}\n",
+            &day[5..],
+            format_usd(**cost),
+            bar
+        ));
     }
 
     let total: f64 = daily_cost.values().sum();
