@@ -1195,13 +1195,22 @@ async fn cmd_diverge(project: &str, spec: &str, timeout: u64) {
 async fn cmd_panel(question: &str, timeout: u64) {
     println!("Panel: asking all providers...\n");
 
-    let responses = panel::ask_all(question, timeout).await;
+    let report = panel::ask_all(question, timeout).await;
+    if report.available_providers.is_empty() {
+        eprintln!("Panel failed: no supported providers detected");
+        std::process::exit(1);
+    }
 
-    for r in &responses {
+    println!("Providers: {}\n", report.available_providers.join(", "));
+
+    for r in &report.responses {
         println!(
-            "### {} {}",
+            "### {} {} ({} ms, {} chars)",
             r.provider,
             if r.exit_code == 0 { "" } else { "(FAILED)" }
+            ,
+            r.duration_ms,
+            r.answer.chars().count()
         );
         if let Some(ref err) = r.error {
             println!("  Error: {err}");
@@ -1213,8 +1222,11 @@ async fn cmd_panel(question: &str, timeout: u64) {
         println!();
     }
 
-    let ok_count = responses.iter().filter(|r| r.exit_code == 0).count();
-    println!("Panel: {ok_count}/{} providers responded", responses.len());
+    let summary = panel::summarize(&report);
+    println!(
+        "Panel: {}/{} providers responded, {} failed, {} timed out",
+        summary.responded, summary.available, summary.failed, summary.timed_out
+    );
 }
 
 fn cmd_ratchet() {
