@@ -1254,11 +1254,14 @@ fn cmd_ratchet() {
     println!();
 
     let directives = ratchet::compare(&current, &previous);
+    let verdict = ratchet::verdict(&directives);
+    println!("  Verdict:   {:?}\n", verdict);
+
     if directives.is_empty() {
         println!("  No significant changes.");
     } else {
         for d in &directives {
-            println!("  {d}");
+            println!("  {}", ratchet::format_directive(d));
         }
     }
 }
