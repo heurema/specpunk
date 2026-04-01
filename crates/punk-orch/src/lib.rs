@@ -95,16 +95,31 @@ impl OrchService {
 
         let project_id = project_id(&self.paths.repo_root)?;
         let project_path = self.paths.dot_punk.join("project.json");
-        if project_path.exists() {
-            return read_json(&project_path);
-        }
-        let vcs_backend = detect_backend(&self.paths.repo_root)
+        let current_path = self.paths.repo_root.display().to_string();
+        let current_vcs_backend = detect_backend(&self.paths.repo_root)
             .ok()
             .map(|backend| backend.kind());
+        if project_path.exists() {
+            let mut project: Project = read_json(&project_path)?;
+            let mut changed = false;
+            if project.path != current_path {
+                project.path = current_path.clone();
+                changed = true;
+            }
+            if project.vcs_backend != current_vcs_backend {
+                project.vcs_backend = current_vcs_backend.clone();
+                changed = true;
+            }
+            if changed {
+                project.updated_at = now_rfc3339();
+                write_json(&project_path, &project)?;
+            }
+            return Ok(project);
+        }
         let project = Project {
             id: project_id,
-            path: self.paths.repo_root.display().to_string(),
-            vcs_backend,
+            path: current_path,
+            vcs_backend: current_vcs_backend,
             created_at: now_rfc3339(),
             updated_at: now_rfc3339(),
         };
@@ -1927,6 +1942,85 @@ mod tests {
         assert_eq!(run_inspect["id"].as_str(), Some(run.id.as_str()));
         assert_eq!(run_inspect["live_vcs"]["backend"].as_str(), Some("git"));
         assert!(run_inspect["live_vcs"]["ref"].as_str().is_some());
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn bootstrap_project_refreshes_persisted_vcs_backend_after_jj_enable() {
+        if std::process::Command::new("jj")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-bootstrap-jj-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-bootstrap-jj-refresh-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let project = service.bootstrap_project().unwrap();
+        assert_eq!(project.vcs_backend, Some(VcsKind::Git));
+
+        std::process::Command::new("jj")
+            .args(["git", "init", "--colocate", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let refreshed = service.bootstrap_project().unwrap();
+        assert_eq!(refreshed.vcs_backend, Some(VcsKind::Jj));
+
+        let persisted: Project = read_json(&service.paths.dot_punk.join("project.json")).unwrap();
+        assert_eq!(persisted.vcs_backend, Some(VcsKind::Jj));
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);

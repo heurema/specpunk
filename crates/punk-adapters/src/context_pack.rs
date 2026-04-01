@@ -630,32 +630,55 @@ fn generic_existing_file_patch_seed(
     let patch_files: Vec<_> = files
         .iter()
         .take(3)
-        .map(|file| ContextPatchSeedFile {
+        .enumerate()
+        .map(|(idx, file)| ContextPatchSeedFile {
             path: file.path.clone(),
             purpose: "edit target".to_string(),
-            snippet: generic_patch_seed_snippet(contract, file),
+            snippet: generic_patch_seed_snippet(contract, file, idx + 1, files.len()),
         })
         .collect();
 
     Some(ContextPatchSeed {
         title: "Existing-file bounded retry patch seed".to_string(),
-        summary: "Start editing these files directly on the second pass. Use the anchors and required symbols below instead of rereading the same context.".to_string(),
+        summary: "Start editing these files directly on the second pass. Follow the ordered file targets, begin at the highest-confidence symbol anchors below, and make the first in-place diff before any further orientation.".to_string(),
         files: patch_files,
     })
 }
 
-fn generic_patch_seed_snippet(contract: &Contract, file: &ContextFileExcerpt) -> String {
-    let anchors = likely_anchor_lines(&file.content);
-    let anchors_text = if anchors.is_empty() {
-        "No anchor lines detected; edit near the top-level module declarations already shown in the excerpt."
+fn generic_patch_seed_snippet(
+    contract: &Contract,
+    file: &ContextFileExcerpt,
+    position: usize,
+    total_files: usize,
+) -> String {
+    let contract_targets = contract_target_lines(contract);
+    let symbol_targets = highest_confidence_symbols(contract, file);
+    let anchors_text = if symbol_targets.is_empty() {
+        "No high-confidence symbol anchors detected; edit near the first top-level declarations already shown in the excerpt."
             .to_string()
     } else {
         format!(
-            "Likely anchors already present in this file:\n{}",
-            anchors
-                .into_iter()
-                .take(4)
-                .map(|line| format!("// - {line}"))
+            "Highest-confidence symbols already present in this file:\n{}",
+            symbol_targets
+                .iter()
+                .take(3)
+                .map(|anchor| format!(
+                    "// - line {}: {} (score={})",
+                    anchor.line_number, anchor.signature, anchor.score
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let anchor_excerpt_text = if symbol_targets.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nAnchor excerpts to edit in place:\n{}",
+            symbol_targets
+                .iter()
+                .take(2)
+                .map(|anchor| render_anchor_excerpt(file, anchor))
                 .collect::<Vec<_>>()
                 .join("\n")
         )
@@ -674,32 +697,148 @@ fn generic_patch_seed_snippet(contract: &Contract, file: &ContextFileExcerpt) ->
         .map(|item| format!("// - {item}"))
         .collect::<Vec<_>>()
         .join("\n");
+    let targets = contract_targets
+        .iter()
+        .map(|item| format!("// - {item}"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
-        "// Retry patch seed for {path}\n// Required interfaces for this slice:\n{interfaces}\n// Behavior requirements to satisfy here first:\n{requirements}\n{anchors_text}\n// Make the first minimal in-place edit in this file now. Do not reread the same bounded context before editing.",
+        "// Retry patch seed for {path}\n// Ordered file target: {position} of {total_files}\n// First action: open this file in place and edit the first matching anchor below before any more orientation.\n// Contract-derived symbol or behavior targets:\n{targets}\n// Required interfaces for this slice:\n{interfaces}\n// Behavior requirements to satisfy here first:\n{requirements}\n{anchors_text}{anchor_excerpt_text}\n// Make the first minimal in-place edit in this file now. Do not reread the same bounded context before editing.",
         path = file.path,
+        position = position,
+        total_files = total_files,
+        targets = targets,
         interfaces = interfaces,
         requirements = requirements,
         anchors_text = anchors_text,
+        anchor_excerpt_text = anchor_excerpt_text,
     )
 }
 
-fn likely_anchor_lines(content: &str) -> Vec<String> {
-    content
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SymbolAnchor {
+    line_number: usize,
+    signature: String,
+    score: usize,
+}
+
+fn contract_target_lines(contract: &Contract) -> Vec<String> {
+    let mut targets = Vec::new();
+    for item in contract
+        .expected_interfaces
+        .iter()
+        .chain(contract.behavior_requirements.iter())
+    {
+        let trimmed = item.trim();
+        if !trimmed.is_empty() && !targets.iter().any(|existing| existing == trimmed) {
+            targets.push(trimmed.to_string());
+        }
+    }
+    if targets.is_empty() {
+        let prompt = contract.prompt_source.trim();
+        if !prompt.is_empty() {
+            targets.push(prompt.to_string());
+        }
+    }
+    targets.into_iter().take(4).collect()
+}
+
+fn highest_confidence_symbols(contract: &Contract, file: &ContextFileExcerpt) -> Vec<SymbolAnchor> {
+    let contract_terms = contract_terms(contract);
+    let mut anchors: Vec<_> = file
+        .content
         .lines()
-        .map(str::trim)
-        .filter(|line| {
-            line.starts_with("pub struct ")
-                || line.starts_with("pub enum ")
-                || line.starts_with("pub fn ")
-                || line.starts_with("fn ")
-                || line.starts_with("impl ")
-                || line.starts_with("pub mod ")
-                || line.starts_with("mod ")
-                || line.starts_with("use ")
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let signature = line.trim();
+            if !looks_like_symbol_anchor(signature) {
+                return None;
+            }
+            let score = anchor_score(signature, &contract_terms, &file.path);
+            Some(SymbolAnchor {
+                line_number: idx + file.start_line,
+                signature: signature.to_string(),
+                score,
+            })
         })
-        .map(ToString::to_string)
+        .collect();
+
+    anchors.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.line_number.cmp(&right.line_number))
+    });
+    anchors
+}
+
+fn contract_terms(contract: &Contract) -> Vec<String> {
+    let combined = format!(
+        "{}\n{}\n{}\n{}",
+        contract.prompt_source,
+        contract.expected_interfaces.join("\n"),
+        contract.behavior_requirements.join("\n"),
+        contract.entry_points.join("\n")
+    );
+    combined
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter_map(|token| {
+            let token = token.trim().to_ascii_lowercase();
+            if token.len() >= 3 {
+                Some(token)
+            } else {
+                None
+            }
+        })
         .collect()
+}
+
+fn looks_like_symbol_anchor(line: &str) -> bool {
+    line.starts_with("pub struct ")
+        || line.starts_with("struct ")
+        || line.starts_with("pub enum ")
+        || line.starts_with("enum ")
+        || line.starts_with("pub fn ")
+        || line.starts_with("fn ")
+        || line.starts_with("impl ")
+        || line.starts_with("pub mod ")
+        || line.starts_with("mod ")
+        || line.starts_with("pub use ")
+}
+
+fn anchor_score(signature: &str, contract_terms: &[String], path: &str) -> usize {
+    let signature_lc = signature.to_ascii_lowercase();
+    let mut score = 0usize;
+    for term in contract_terms {
+        if signature_lc.contains(term) {
+            score += 2;
+        }
+        if path.to_ascii_lowercase().contains(term) {
+            score += 1;
+        }
+    }
+    if signature.starts_with("pub fn ") || signature.starts_with("fn ") {
+        score += 1;
+    }
+    if signature.starts_with("impl ") {
+        score += 1;
+    }
+    score
+}
+
+fn render_anchor_excerpt(file: &ContextFileExcerpt, anchor: &SymbolAnchor) -> String {
+    let lines: Vec<&str> = file.content.lines().collect();
+    let local_index = anchor.line_number.saturating_sub(file.start_line);
+    let start = local_index.saturating_sub(1);
+    let end = std::cmp::min(lines.len(), local_index + 2);
+    let excerpt = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| format!("// {:>4} | {}", start + offset + file.start_line, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{excerpt}")
 }
 
 fn council_synthesis_recipe_seed() -> ContextRecipeSeed {
@@ -1282,7 +1421,14 @@ mod tests {
         assert!(seed.files[0]
             .snippet
             .contains("Retry patch seed for src/lib.rs"));
-        assert!(seed.files[0].snippet.contains("Likely anchors"));
+        assert!(seed.files[0]
+            .snippet
+            .contains("Ordered file target: 1 of 1"));
+        assert!(seed.files[0]
+            .snippet
+            .contains("Highest-confidence symbols"));
+        assert!(seed.files[0].snippet.contains("Anchor excerpts to edit in place"));
+        assert!(seed.files[0].snippet.contains("line 2: pub fn existing()"));
 
         let _ = fs::remove_dir_all(&root);
     }
