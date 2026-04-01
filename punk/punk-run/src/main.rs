@@ -1162,28 +1162,42 @@ async fn cmd_diverge(project: &str, spec: &str, timeout: u64) {
 
     let strategies = diverge::Strategy::defaults();
     println!(
-        "Diverge: dispatching to {} providers...\n",
+        "Diverge: dispatching to up to {} providers...\n",
         strategies.len()
     );
 
     match diverge::run_diverge(&path, spec, &strategies, timeout).await {
-        Ok(solutions) => {
+        Ok(report) => {
+            println!("Run dir:   {}", report.run_dir.display());
+            println!("Base ref:  {}\n", report.base_commit);
             println!(
-                "{:<6} {:<10} {:<6} {:>6} {:>6} FILES",
-                "LABEL", "PROVIDER", "EXIT", "+LINES", "-LINES"
+                "{:<6} {:<10} {:<9} {:<6} {:>6} {:>6} FILES",
+                "LABEL", "PROVIDER", "STATUS", "EXIT", "+LINES", "-LINES"
             );
-            for s in &solutions {
+            for s in &report.solutions {
+                let status = if s.timed_out {
+                    "timeout"
+                } else if s.exit_code == 0 {
+                    "ok"
+                } else {
+                    "failed"
+                };
                 println!(
-                    "{:<6} {:<10} {:<6} {:>6} {:>6} {}",
+                    "{:<6} {:<10} {:<9} {:<6} {:>6} {:>6} {}",
                     s.label,
                     s.provider,
+                    status,
                     s.exit_code,
                     s.lines_added,
                     s.lines_removed,
                     s.files_changed.len()
                 );
             }
-            println!("\nWorktrees preserved. Inspect with: git -C <worktree> diff HEAD");
+            println!("\nWorktrees preserved:");
+            for s in &report.solutions {
+                println!("  {} [{}] {}", s.label, s.provider, s.worktree_path.display());
+            }
+            println!("\nInspect with: git -C <worktree> diff HEAD");
         }
         Err(e) => {
             eprintln!("Diverge failed: {e}");
