@@ -26,6 +26,7 @@ use context_pack::{
     EntryPointExcerptGuard,
 };
 use punk_domain::{Contract, DraftInput, DraftProposal, RefineInput};
+use serde::Deserialize;
 
 const BLOCKED_EXECUTION_SENTINEL: &str = "PUNK_EXECUTION_BLOCKED:";
 const SUCCESSFUL_EXECUTION_SENTINEL: &str = "PUNK_EXECUTION_COMPLETE:";
@@ -65,6 +66,21 @@ struct EntryPointSnapshot {
 struct AttemptOutcome {
     timed_output: TimedOutput,
     restored_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionLane {
+    Exec,
+    PatchApply,
+    Manual,
+}
+
+#[derive(Debug, Deserialize)]
+struct PatchProposal {
+    summary: String,
+    patch: String,
+    #[serde(default)]
+    blocked_reason: Option<String>,
 }
 
 struct ProgressTracker {
@@ -166,14 +182,22 @@ impl Executor for CodexCliExecutor {
     }
 
     fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
-        if let Some(summary) = manual_mode_block_summary(&input.contract) {
-            return Ok(ExecuteOutput {
-                success: false,
-                summary,
-                checks_run: Vec::new(),
-                cost_usd: None,
-                duration_ms: 0,
-            });
+        match execution_lane_for_contract(&input.repo_root, &input.contract) {
+            ExecutionLane::Manual => {
+                let summary = manual_mode_block_summary(&input.contract)
+                    .unwrap_or_else(|| "PUNK_EXECUTION_BLOCKED: manual lane required".to_string());
+                return Ok(ExecuteOutput {
+                    success: false,
+                    summary,
+                    checks_run: Vec::new(),
+                    cost_usd: None,
+                    duration_ms: 0,
+                });
+            }
+            ExecutionLane::PatchApply => {
+                return self.execute_patch_apply_contract(input);
+            }
+            ExecutionLane::Exec => {}
         }
         let start = Instant::now();
         restore_stale_entry_point_masks(&input.repo_root)?;
@@ -392,6 +416,245 @@ impl CodexCliContractDrafter {
 }
 
 impl CodexCliExecutor {
+    fn execute_patch_apply_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+        let start = Instant::now();
+        restore_stale_entry_point_masks(&input.repo_root)?;
+        let context_pack = build_context_pack(&input.repo_root, &input.contract)?;
+        let mut excerpt_guard = EntryPointExcerptGuard::apply(&input.repo_root, &context_pack)?;
+        let prompt = build_patch_apply_prompt(&input.contract, &context_pack);
+        let schema_path = patch_schema_path();
+        let output_path = patch_output_path();
+        let _ = fs::remove_file(&schema_path);
+        let _ = fs::remove_file(&output_path);
+        fs::write(&schema_path, serde_json::to_vec_pretty(&patch_schema())?)?;
+
+        let mut command = Command::new("codex");
+        command
+            .arg("exec")
+            .arg("--full-auto")
+            .arg("--ephemeral")
+            .arg("-s")
+            .arg("read-only")
+            .arg("-C")
+            .arg(&input.repo_root)
+            .arg("--output-schema")
+            .arg(&schema_path)
+            .arg("-o")
+            .arg(&output_path);
+        if let Some(model) = &self.model {
+            command.arg("-m").arg(model);
+        }
+        if let Some(reasoning_effort) = codex_executor_reasoning_effort(&input.contract) {
+            command
+                .arg("-c")
+                .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""));
+        }
+        command.arg(prompt);
+
+        let timed_output = match run_command_with_timeout_and_tee(
+            &mut command,
+            codex_executor_timeout(),
+            codex_executor_stall_timeout(),
+            codex_executor_no_progress_timeout(),
+            codex_executor_scaffold_progress_timeout(),
+            codex_executor_orphan_grace_timeout(),
+            input.stdout_path.clone(),
+            input.stderr_path.clone(),
+            input.executor_pid_path.clone(),
+            None,
+            None,
+        ) {
+            Ok(output) => {
+                if let Some(guard) = excerpt_guard.as_mut() {
+                    guard.restore()?;
+                }
+                output
+            }
+            Err(err) => {
+                if let Some(guard) = excerpt_guard.as_mut() {
+                    let _ = guard.restore();
+                }
+                let _ = fs::remove_file(&schema_path);
+                let _ = fs::remove_file(&output_path);
+                return Err(err);
+            }
+        };
+        let stdout = String::from_utf8_lossy(&timed_output.output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&timed_output.output.stderr).to_string();
+        if timed_output.timed_out {
+            let _ = fs::remove_file(&schema_path);
+            let _ = fs::remove_file(&output_path);
+            return Ok(ExecuteOutput {
+                success: false,
+                summary: timeout_summary(codex_executor_timeout(), &stdout, &stderr),
+                checks_run: Vec::new(),
+                cost_usd: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+        if timed_output.orphaned {
+            let _ = fs::remove_file(&schema_path);
+            let _ = fs::remove_file(&output_path);
+            return Ok(ExecuteOutput {
+                success: false,
+                summary: orphan_summary(&stdout, &stderr),
+                checks_run: Vec::new(),
+                cost_usd: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+        if timed_output.stalled {
+            let _ = fs::remove_file(&schema_path);
+            let _ = fs::remove_file(&output_path);
+            return Ok(ExecuteOutput {
+                success: false,
+                summary: stall_summary(codex_executor_stall_timeout(), &stdout, &stderr),
+                checks_run: Vec::new(),
+                cost_usd: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+        if !timed_output.output.status.success() {
+            let _ = fs::remove_file(&schema_path);
+            let _ = fs::remove_file(&output_path);
+            let (success, summary) = classify_execution_result(false, &stdout, &stderr);
+            return Ok(ExecuteOutput {
+                success,
+                summary,
+                checks_run: Vec::new(),
+                cost_usd: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        let proposal = match load_patch_proposal(&output_path, &stdout) {
+            Ok(proposal) => proposal,
+            Err(err) => {
+                let _ = fs::remove_file(&schema_path);
+                let _ = fs::remove_file(&output_path);
+                append_log_text(
+                    &input.stderr_path,
+                    &format!("\n[punk patch/apply] failed to parse patch proposal: {err}\n"),
+                )?;
+                return Ok(ExecuteOutput {
+                    success: false,
+                    summary: format!("patch/apply lane returned invalid patch proposal: {err}"),
+                    checks_run: Vec::new(),
+                    cost_usd: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+        let _ = fs::remove_file(&schema_path);
+        let _ = fs::remove_file(&output_path);
+
+        let proposal_summary = proposal.summary.trim();
+        if !proposal_summary.is_empty() {
+            append_log_text(
+                &input.stdout_path,
+                &format!("\n[punk patch/apply] proposal: {proposal_summary}\n"),
+            )?;
+        }
+
+        if let Some(reason) = proposal
+            .blocked_reason
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            append_log_text(
+                &input.stderr_path,
+                &format!("\n[punk patch/apply] blocked: {reason}\n"),
+            )?;
+            return Ok(ExecuteOutput {
+                success: false,
+                summary: format!("{BLOCKED_EXECUTION_SENTINEL} {reason}"),
+                checks_run: Vec::new(),
+                cost_usd: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        let patch = proposal.patch.trim();
+        if patch.is_empty() {
+            return Ok(ExecuteOutput {
+                success: false,
+                summary: "patch/apply lane returned an empty patch".to_string(),
+                checks_run: Vec::new(),
+                cost_usd: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        let patch_paths = match validate_patch_scope(patch, &input.contract.allowed_scope) {
+            Ok(paths) => paths,
+            Err(err) => {
+                append_log_text(
+                    &input.stderr_path,
+                    &format!("\n[punk patch/apply] invalid patch scope: {err}\n"),
+                )?;
+                return Ok(ExecuteOutput {
+                    success: false,
+                    summary: format!("patch/apply lane rejected patch: {err}"),
+                    checks_run: Vec::new(),
+                    cost_usd: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        if let Err(err) = apply_patch_in_repo(&input.repo_root, patch) {
+            append_log_text(
+                &input.stderr_path,
+                &format!("\n[punk patch/apply] failed to apply patch: {err}\n"),
+            )?;
+            return Ok(ExecuteOutput {
+                success: false,
+                summary: format!("patch/apply lane failed to apply patch: {err}"),
+                checks_run: Vec::new(),
+                cost_usd: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+        append_log_text(
+            &input.stdout_path,
+            &format!(
+                "\n[punk patch/apply] applied patch for: {}\n",
+                patch_paths.join(", ")
+            ),
+        )?;
+
+        let checks = collect_contract_checks(&input.contract);
+        let checks_run = match run_contract_checks(
+            &input.repo_root,
+            &checks,
+            &input.stdout_path,
+            &input.stderr_path,
+        ) {
+            Ok(checks_run) => checks_run,
+            Err(summary) => {
+                return Ok(ExecuteOutput {
+                    success: false,
+                    summary,
+                    checks_run: Vec::new(),
+                    cost_usd: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        Ok(ExecuteOutput {
+            success: true,
+            summary: format!(
+                "{SUCCESSFUL_EXECUTION_SENTINEL} patch/apply lane succeeded after applying patch for {}",
+                patch_paths.join(", ")
+            ),
+            checks_run,
+            cost_usd: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
     fn run_execution_attempt(
         &self,
         input: &ExecuteInput,
@@ -569,6 +832,38 @@ fn build_exec_prompt_with_mode(
     )
 }
 
+fn build_patch_apply_prompt(contract: &Contract, context_pack: &ContextPack) -> String {
+    let context_pack_section = format_context_pack(context_pack);
+    format!(
+        "Produce a single git-style unified diff patch for the approved contract.\n\
+Return JSON only and match the provided schema exactly.\n\
+This step is controller-owned patch/apply lane generation. The repository is read-only for this step; do not modify files directly.\n\
+Contract id: {}\n\
+Behavior requirements: {}\n\
+Allowed scope: {}\n\
+Entry points: {}\n\
+Expected interfaces: {}\n\
+Target checks to satisfy after apply: {}\n\
+Integrity checks to keep passing after apply: {}\n\
+{}\n\
+Requirements:\n\
+- emit a non-empty unified diff patch when implementation is possible\n\
+- touch only files inside allowed scope\n\
+- update existing files only; do not add, delete, move, or rename files in this lane\n\
+- prefer the smallest bounded patch that gets the implementation started and covers the approved behavior\n\
+- do not include markdown fences around the patch\n\
+- if implementation is blocked inside allowed scope, set `blocked_reason` and leave `patch` empty\n",
+        contract.id,
+        contract.behavior_requirements.join("; "),
+        contract.allowed_scope.join(", "),
+        contract.entry_points.join(", "),
+        contract.expected_interfaces.join("; "),
+        contract.target_checks.join("; "),
+        contract.integrity_checks.join("; "),
+        context_pack_section,
+    )
+}
+
 fn build_draft_prompt(input: &DraftInput) -> String {
     format!(
         "Draft an approve-ready contract proposal for the current repository.\n\
@@ -675,12 +970,33 @@ fn draft_schema() -> serde_json::Value {
     })
 }
 
+fn patch_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary", "patch", "blocked_reason"],
+        "properties": {
+            "summary": {"type": "string"},
+            "patch": {"type": "string"},
+            "blocked_reason": {"type": ["string", "null"]}
+        }
+    })
+}
+
 fn draft_schema_path() -> Result<PathBuf> {
     Ok(std::env::temp_dir().join(format!("punk-draft-schema-{}.json", std::process::id())))
 }
 
 fn draft_output_path() -> Result<PathBuf> {
     Ok(std::env::temp_dir().join(format!("punk-draft-output-{}.json", std::process::id())))
+}
+
+fn patch_schema_path() -> PathBuf {
+    std::env::temp_dir().join(format!("punk-patch-schema-{}.json", std::process::id()))
+}
+
+fn patch_output_path() -> PathBuf {
+    std::env::temp_dir().join(format!("punk-patch-output-{}.json", std::process::id()))
 }
 
 fn codex_executor_timeout() -> Duration {
@@ -749,6 +1065,16 @@ fn codex_executor_reasoning_effort(contract: &Contract) -> Option<&'static str> 
     }
 }
 
+fn execution_lane_for_contract(repo_root: &Path, contract: &Contract) -> ExecutionLane {
+    if is_self_referential_reliability_slice(contract) {
+        return ExecutionLane::Manual;
+    }
+    if is_patch_apply_lane_candidate(repo_root, contract) {
+        return ExecutionLane::PatchApply;
+    }
+    ExecutionLane::Exec
+}
+
 fn is_explicit_repo_file_scope(path: &str) -> bool {
     let trimmed = path.trim();
     if trimmed.is_empty() || trimmed.ends_with('/') {
@@ -795,6 +1121,57 @@ fn is_fail_closed_scope_task(contract: &Contract) -> bool {
             contract.risk_level.trim().to_ascii_lowercase().as_str(),
             "low" | "medium"
         )
+}
+
+fn is_patch_apply_lane_candidate(repo_root: &Path, contract: &Contract) -> bool {
+    if !is_fail_closed_scope_task(contract) {
+        return false;
+    }
+    if contract.allowed_scope.len() > 2 || contract.entry_points.len() > 2 {
+        return false;
+    }
+    if contract.allowed_scope.is_empty() || contract.entry_points.is_empty() {
+        return false;
+    }
+    if !contract
+        .allowed_scope
+        .iter()
+        .all(|path| repo_root.join(path).exists())
+    {
+        return false;
+    }
+    if !contract
+        .entry_points
+        .iter()
+        .all(|path| repo_root.join(path).exists())
+    {
+        return false;
+    }
+
+    let mut text = contract.prompt_source.to_ascii_lowercase();
+    for item in contract
+        .expected_interfaces
+        .iter()
+        .chain(contract.behavior_requirements.iter())
+    {
+        text.push('\n');
+        text.push_str(&item.to_ascii_lowercase());
+    }
+
+    [
+        "bridge",
+        "wiring",
+        "summary",
+        "status",
+        "aggregation",
+        "ratchet",
+        "report",
+        "cli",
+        "output",
+        "surface",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn manual_mode_block_summary(contract: &Contract) -> Option<String> {
@@ -1415,6 +1792,215 @@ fn unchanged_entry_point_paths(
     Ok(unchanged)
 }
 
+fn load_patch_proposal(output_path: &Path, stdout: &str) -> Result<PatchProposal> {
+    let payload = if output_path.exists() {
+        fs::read_to_string(output_path)
+            .with_context(|| format!("read patch proposal {}", output_path.display()))?
+    } else {
+        last_non_empty_line(stdout).ok_or_else(|| anyhow!("patch lane returned no JSON"))?
+    };
+    serde_json::from_str::<PatchProposal>(&payload)
+        .with_context(|| format!("parse patch proposal JSON: {payload}"))
+}
+
+fn validate_patch_scope(patch: &str, allowed_scope: &[String]) -> Result<Vec<String>> {
+    ensure_existing_file_only_patch(patch)?;
+    let paths = extract_patch_paths(patch);
+    if paths.is_empty() {
+        return Err(anyhow!("patch did not declare any modified file paths"));
+    }
+    for path in &paths {
+        if !path_is_in_allowed_scope(path, allowed_scope) {
+            return Err(anyhow!("patch touched out-of-scope path {path}"));
+        }
+    }
+    Ok(paths)
+}
+
+fn ensure_existing_file_only_patch(patch: &str) -> Result<()> {
+    for line in patch.lines() {
+        if line.starts_with("new file mode ")
+            || line.starts_with("deleted file mode ")
+            || line == "--- /dev/null"
+            || line == "+++ /dev/null"
+            || line.starts_with("rename from ")
+            || line.starts_with("rename to ")
+        {
+            return Err(anyhow!("patch/apply lane only accepts existing-file updates"));
+        }
+    }
+    Ok(())
+}
+
+fn extract_patch_paths(patch: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            if let Some((_, after)) = rest.split_once(" b/") {
+                push_unique_string(&mut paths, after.trim().to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("+++ b/") {
+            push_unique_string(&mut paths, rest.trim().to_string());
+        }
+    }
+    paths
+}
+
+fn push_unique_string(items: &mut Vec<String>, value: String) {
+    if !items.iter().any(|existing| existing == &value) {
+        items.push(value);
+    }
+}
+
+fn apply_patch_in_repo(repo_root: &Path, patch: &str) -> Result<()> {
+    let patch_path = std::env::temp_dir().join(format!(
+        "punk-apply-patch-{}-{}.diff",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::write(&patch_path, patch).with_context(|| format!("write {}", patch_path.display()))?;
+    let mut check = Command::new("git");
+    check
+        .arg("apply")
+        .arg("--check")
+        .arg("--recount")
+        .arg(&patch_path)
+        .current_dir(repo_root);
+    let check_output = run_command_with_timeout(&mut check, codex_executor_timeout())?;
+    if check_output.timed_out {
+        let _ = fs::remove_file(&patch_path);
+        return Err(anyhow!(
+            "git apply --check timed out after {}s",
+            codex_executor_timeout().as_secs()
+        ));
+    }
+    if !check_output.output.status.success() {
+        let stdout = String::from_utf8_lossy(&check_output.output.stdout);
+        let stderr = String::from_utf8_lossy(&check_output.output.stderr);
+        let _ = fs::remove_file(&patch_path);
+        return Err(anyhow!(
+            "{}",
+            last_non_empty_line(&stderr)
+                .or_else(|| last_non_empty_line(&stdout))
+                .unwrap_or_else(|| "git apply --check failed".to_string())
+        ));
+    }
+
+    let mut apply = Command::new("git");
+    apply
+        .arg("apply")
+        .arg("--recount")
+        .arg(&patch_path)
+        .current_dir(repo_root);
+    let apply_output = run_command_with_timeout(&mut apply, codex_executor_timeout())?;
+    let _ = fs::remove_file(&patch_path);
+    if apply_output.timed_out {
+        return Err(anyhow!(
+            "git apply timed out after {}s",
+            codex_executor_timeout().as_secs()
+        ));
+    }
+    if !apply_output.output.status.success() {
+        let stdout = String::from_utf8_lossy(&apply_output.output.stdout);
+        let stderr = String::from_utf8_lossy(&apply_output.output.stderr);
+        return Err(anyhow!(
+            "{}",
+            last_non_empty_line(&stderr)
+                .or_else(|| last_non_empty_line(&stdout))
+                .unwrap_or_else(|| "git apply failed".to_string())
+        ));
+    }
+    Ok(())
+}
+
+fn collect_contract_checks(contract: &Contract) -> Vec<String> {
+    let mut checks = Vec::new();
+    for check in contract
+        .target_checks
+        .iter()
+        .chain(contract.integrity_checks.iter())
+    {
+        let trimmed = check.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !checks.iter().any(|existing| existing == trimmed) {
+            checks.push(trimmed.to_string());
+        }
+    }
+    checks
+}
+
+fn run_contract_checks(
+    repo_root: &Path,
+    checks: &[String],
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> std::result::Result<Vec<String>, String> {
+    let git_guard = GitGuardEnv::install().map_err(|err| err.to_string())?;
+    let mut checks_run = Vec::new();
+    for check in checks {
+        append_log_text(stdout_path, &format!("\n[punk check] {check}\n"))
+            .map_err(|err| err.to_string())?;
+        let mut command = Command::new("/bin/zsh");
+        command.arg("-lc").arg(check).current_dir(repo_root);
+        if let Some(git_guard) = git_guard.as_ref() {
+            git_guard.apply(&mut command);
+        }
+        let output = run_command_with_timeout(&mut command, codex_executor_timeout())
+            .map_err(|err| format!("failed to run check `{check}`: {err}"))?;
+        append_log_bytes(stdout_path, &output.output.stdout).map_err(|err| err.to_string())?;
+        append_log_bytes(stderr_path, &output.output.stderr).map_err(|err| err.to_string())?;
+        if output.timed_out {
+            return Err(format!(
+                "patch/apply lane check timed out: {check}{}",
+                last_non_empty_line(&String::from_utf8_lossy(&output.output.stderr))
+                    .or_else(|| last_non_empty_line(&String::from_utf8_lossy(&output.output.stdout)))
+                    .map(|line| format!(": {line}"))
+                    .unwrap_or_default()
+            ));
+        }
+        if !output.output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.output.stdout);
+            let stderr = String::from_utf8_lossy(&output.output.stderr);
+            return Err(format!(
+                "patch/apply lane check failed: {check}{}",
+                last_non_empty_line(&stderr)
+                    .or_else(|| last_non_empty_line(&stdout))
+                    .map(|line| format!(": {line}"))
+                    .unwrap_or_default()
+            ));
+        }
+        checks_run.push(check.clone());
+    }
+    Ok(checks_run)
+}
+
+fn append_log_text(path: &Path, text: &str) -> Result<()> {
+    append_log_bytes(path, text.as_bytes())
+}
+
+fn append_log_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open log {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("append log {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("flush log {}", path.display()))?;
+    Ok(())
+}
+
 fn path_is_in_allowed_scope(path: &str, allowed_scope: &[String]) -> bool {
     allowed_scope.iter().any(|scope| {
         path == scope
@@ -1894,6 +2480,94 @@ mod tests {
         assert!(!root.join("stdout.log").exists());
         assert!(!root.join("stderr.log").exists());
         assert!(!root.join("executor.json").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn execution_lane_uses_patch_apply_for_existing_file_glue_slice() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-patch-lane-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("punk/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
+        fs::write(root.join("punk/punk-orch/src/ratchet.rs"), "pub struct X;\n").unwrap();
+        fs::write(root.join("punk/punk-run/src/main.rs"), "fn main() {}\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_skill_bridge".into(),
+            feature_id: "feat_skill_bridge".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Bridge skill eval summaries into the nested punk ratchet surface"
+                .into(),
+            entry_points: vec![
+                "punk/punk-orch/src/ratchet.rs".into(),
+                "punk/punk-run/src/main.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["skill-eval ratchet bridge".into()],
+            behavior_requirements: vec![
+                "add skill eval summary aggregation to ratchet output".into(),
+            ],
+            allowed_scope: vec![
+                "punk/punk-orch/src/ratchet.rs".into(),
+                "punk/punk-run/src/main.rs".into(),
+            ],
+            target_checks: vec!["cargo test -p punk-orch".into()],
+            integrity_checks: vec!["cargo test -p punk-run".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert_eq!(
+            execution_lane_for_contract(&root, &contract),
+            ExecutionLane::PatchApply
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_patch_scope_rejects_out_of_scope_paths() {
+        let err = validate_patch_scope(
+            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@\n-pub fn old() {}\n+pub fn new() {}\n",
+            &[String::from("src/main.rs")],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("out-of-scope path src/lib.rs"));
+    }
+
+    #[test]
+    fn apply_patch_in_repo_applies_unified_diff() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-apply-patch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        let mut init = Command::new("git");
+        init.arg("init").current_dir(&root);
+        assert!(init.status().unwrap().success());
+        fs::write(root.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
+
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn old() {}\n+pub fn new() {}\n";
+        apply_patch_in_repo(&root, patch).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "pub fn new() {}\n"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
