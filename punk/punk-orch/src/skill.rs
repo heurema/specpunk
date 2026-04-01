@@ -158,6 +158,35 @@ pub fn propose_candidate_from_task(
     create_candidate_skill(cwd, &suggested_name, &description, &content, &evidence_refs)
 }
 
+pub fn promote_candidate_skill(bus: &Path, cwd: &Path, name: &str) -> Result<PathBuf, String> {
+    sanitize::safe_id(name)?;
+
+    let root = detect_repo_root(cwd)?;
+    let candidate_path = candidate_skills_dir(&root).join(format!("{name}.md"));
+    if !candidate_path.exists() {
+        return Err(format!("candidate skill not found: {name}"));
+    }
+
+    let content = fs::read_to_string(&candidate_path).map_err(|e| e.to_string())?;
+    if let Some(issue) = security_scan(&content) {
+        return Err(format!("security scan failed (candidate): {issue}"));
+    }
+
+    let active_dir = skills_dir(bus);
+    fs::create_dir_all(&active_dir).map_err(|e| e.to_string())?;
+    let active_path = active_dir.join(format!("{name}.md"));
+    if active_path.exists() {
+        return Err(format!("active skill already exists: {name}"));
+    }
+
+    let normalized = strip_candidate_state(&content);
+    let tmp_path = active_dir.join(format!(".{name}.tmp"));
+    fs::write(&tmp_path, normalized).map_err(|e| e.to_string())?;
+    fs::rename(&tmp_path, &active_path).map_err(|e| e.to_string())?;
+    fs::remove_file(&candidate_path).map_err(|e| e.to_string())?;
+    Ok(active_path)
+}
+
 /// Security scan: check for prompt injection patterns.
 fn security_scan(content: &str) -> Option<String> {
     let patterns = [
@@ -331,6 +360,22 @@ fn receipt_status_label(status: &ReceiptStatus) -> &'static str {
         ReceiptStatus::Timeout => "timeout",
         ReceiptStatus::Cancelled => "cancelled",
     }
+}
+
+fn strip_candidate_state(content: &str) -> String {
+    if let Some(rest) = content.strip_prefix("---") {
+        if let Some(end) = rest.find("---") {
+            let frontmatter = &rest[..end];
+            let body = &rest[end + 3..];
+            let filtered = frontmatter
+                .lines()
+                .filter(|line| line.trim() != "state: candidate")
+                .collect::<Vec<_>>()
+                .join("\n");
+            return format!("---\n{filtered}\n---{body}");
+        }
+    }
+    content.to_string()
 }
 
 fn extract_evidence_refs(content: &str) -> Vec<String> {
@@ -536,6 +581,55 @@ mod tests {
 
         let err = propose_candidate_from_task(&bus, &repo, "missing-task", None).unwrap_err();
         assert!(err.contains("receipt not found"));
+    }
+
+    #[test]
+    fn promote_candidate_skill_moves_candidate_to_active_dir() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .output()
+            .unwrap();
+
+        let candidate = create_candidate_skill(
+            &repo,
+            "receipt-failure",
+            "Candidate from receipt",
+            "## Candidate Patch\n- rule\n",
+            &["task:task-123".to_string()],
+        )
+        .unwrap();
+        assert!(candidate.exists());
+
+        let active = promote_candidate_skill(&bus, &repo, "receipt-failure").unwrap();
+        let content = fs::read_to_string(&active).unwrap();
+        assert!(active.starts_with(tmp.path().join("skills")));
+        assert!(!candidate.exists());
+        assert!(!content.contains("state: candidate"));
+        assert!(content.contains("evidence:"));
+        assert!(content.contains("task:task-123"));
+    }
+
+    #[test]
+    fn promote_candidate_skill_requires_existing_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .output()
+            .unwrap();
+
+        let err = promote_candidate_skill(&bus, &repo, "missing-skill").unwrap_err();
+        assert!(err.contains("candidate skill not found"));
     }
 
     #[test]

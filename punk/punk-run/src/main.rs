@@ -245,6 +245,11 @@ enum SkillAction {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Promote a repo-local candidate skill into active skills
+    Promote {
+        /// Candidate skill name
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -597,6 +602,20 @@ async fn main() -> anyhow::Result<()> {
                 match skill::propose_candidate_from_task(&bus_path, &cwd, &task_id, name.as_deref())
                 {
                     Ok(path) => println!("Created candidate proposal: {}", path.display()),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            SkillAction::Promote { name } => {
+                let bus_path = bus::bus_dir();
+                let cwd = std::env::current_dir().unwrap_or_else(|e| {
+                    eprintln!("Error reading current directory: {e}");
+                    std::process::exit(1);
+                });
+                match skill::promote_candidate_skill(&bus_path, &cwd, &name) {
+                    Ok(path) => println!("Promoted candidate to active skill: {}", path.display()),
                     Err(e) => {
                         eprintln!("Error: {e}");
                         std::process::exit(1);
