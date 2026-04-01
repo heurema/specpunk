@@ -17,7 +17,6 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{collections::HashMap, ops::RangeInclusive};
 
 use anyhow::{anyhow, Context, Result};
 use context_pack::{
@@ -54,6 +53,13 @@ struct TimedOutput {
     no_progress_paths: Vec<String>,
     scaffold_only_paths: Vec<String>,
     post_check_zero_progress_paths: Vec<String>,
+}
+
+struct PatchLaneTimedOutput {
+    output: std::process::Output,
+    timed_out: bool,
+    orphaned: bool,
+    response: Option<PatchLaneResponse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,7 +467,11 @@ impl CodexCliExecutor {
         };
         let stdout = String::from_utf8_lossy(&timed_output.output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&timed_output.output.stderr).to_string();
-        if timed_output.timed_out {
+        let response = timed_output
+            .response
+            .clone()
+            .or_else(|| load_patch_lane_response(&stdout, &stderr).ok());
+        if timed_output.timed_out && response.is_none() {
             return Ok(ExecuteOutput {
                 success: false,
                 summary: timeout_summary(codex_patch_lane_timeout(), &stdout, &stderr),
@@ -479,16 +489,7 @@ impl CodexCliExecutor {
                 duration_ms: start.elapsed().as_millis() as u64,
             });
         }
-        if timed_output.stalled {
-            return Ok(ExecuteOutput {
-                success: false,
-                summary: stall_summary(codex_executor_stall_timeout(), &stdout, &stderr),
-                checks_run: Vec::new(),
-                cost_usd: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-        if !timed_output.output.status.success() {
+        if !timed_output.output.status.success() && response.is_none() {
             let (success, summary) = classify_execution_result(false, &stdout, &stderr);
             return Ok(ExecuteOutput {
                 success,
@@ -499,9 +500,10 @@ impl CodexCliExecutor {
             });
         }
 
-        let response = match load_patch_lane_response(&stdout, &stderr) {
-            Ok(response) => response,
-            Err(err) => {
+        let response = match response {
+            Some(response) => response,
+            None => {
+                let err = anyhow!("patch lane returned no complete patch artifact");
                 append_log_text(
                     &input.stderr_path,
                     &format!("\n[punk patch/apply] failed to parse patch output: {err}\n"),
@@ -532,8 +534,8 @@ impl CodexCliExecutor {
             PatchLaneResponse::Patch(patch) => patch,
         };
 
-        let patch_paths = match validate_patch_scope(&patch, &input.contract.allowed_scope) {
-            Ok(paths) => paths,
+        let updates = match validate_patch_scope(&patch, &input.contract.allowed_scope) {
+            Ok(updates) => updates,
             Err(err) => {
                 append_log_text(
                     &input.stderr_path,
@@ -548,8 +550,12 @@ impl CodexCliExecutor {
                 });
             }
         };
+        let patch_paths = updates
+            .iter()
+            .map(|update| update.path.clone())
+            .collect::<Vec<_>>();
 
-        if let Err(err) = apply_patch_in_repo(&input.repo_root, &patch) {
+        if let Err(err) = apply_patch_in_repo(&input.repo_root, &updates) {
             append_log_text(
                 &input.stderr_path,
                 &format!("\n[punk patch/apply] failed to apply patch: {err}\n"),
@@ -784,7 +790,7 @@ fn build_patch_apply_prompt(contract: &Contract, context_pack: &ContextPack) -> 
     format!(
         "Produce plain text only for a controller-owned patch/apply lane.\n\
 Return exactly one of:\n\
-1. a single git-style unified diff patch starting with `diff --git`\n\
+1. a single apply_patch-style patch starting with `*** Begin Patch` and ending with `*** End Patch`\n\
 2. a single line `{blocked}` followed by a concise reason\n\
 The repository is read-only for this step; do not modify files directly.\n\
 Contract id: {}\n\
@@ -796,9 +802,11 @@ Target checks to satisfy after apply: {}\n\
 Integrity checks to keep passing after apply: {}\n\
 {}\n\
 Requirements:\n\
-- emit a non-empty unified diff patch when implementation is possible\n\
+- emit one complete `apply_patch` envelope when implementation is possible\n\
 - touch only files inside allowed scope\n\
-- update existing files only; do not add, delete, move, or rename files in this lane\n\
+- use only `*** Update File:` sections in this lane\n\
+- do not add, delete, move, or rename files in this lane\n\
+- each update hunk must include enough unchanged or removed context lines for deterministic controller-side application\n\
 - prefer the smallest bounded patch that gets the implementation started and covers the approved behavior\n\
 - output patch text only; do not output JSON, commentary, bullets, or markdown fences\n\
 - if implementation is blocked inside allowed scope, output exactly one `{blocked}` line and nothing else\n",
@@ -1216,43 +1224,75 @@ fn run_patch_lane_command_with_timeout(
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     executor_pid_path: PathBuf,
-) -> Result<TimedOutput> {
+) -> Result<PatchLaneTimedOutput> {
+    #[cfg(unix)]
+    command.process_group(0);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn()?;
-    write_executor_pid(&executor_pid_path, child.id())?;
+    let child_pid = child.id();
+    write_executor_pid(&executor_pid_path, child_pid)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("child stdout pipe unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("child stderr pipe unavailable"))?;
+    let progress = Arc::new(ProgressTracker::new());
+    let stdout_live = Arc::new(Mutex::new(Vec::new()));
+    let stderr_live = Arc::new(Mutex::new(Vec::new()));
+    let stdout_handle = spawn_stream_tee_with_live_capture(
+        stdout,
+        stdout_path,
+        progress.clone(),
+        true,
+        Some(stdout_live.clone()),
+    );
+    let stderr_handle = spawn_stream_tee_with_live_capture(
+        stderr,
+        stderr_path,
+        progress,
+        false,
+        Some(stderr_live.clone()),
+    );
     let start = Instant::now();
-    loop {
+    let (timed_out, orphaned, response) = loop {
+        if let Some(response) = detect_patch_lane_response(&stdout_live, &stderr_live) {
+            terminate_process_tree(&mut child, child_pid);
+            break (false, false, Some(response));
+        }
         if child.try_wait()?.is_some() {
-            let output = child.wait_with_output()?;
-            fs::write(&stdout_path, &output.stdout)?;
-            fs::write(&stderr_path, &output.stderr)?;
-            return Ok(TimedOutput {
-                output,
-                timed_out: false,
-                stalled: false,
-                orphaned: false,
-                no_progress_paths: Vec::new(),
-                scaffold_only_paths: Vec::new(),
-                post_check_zero_progress_paths: Vec::new(),
-            });
+            if !wait_for_stream_completion(
+                &stdout_handle,
+                &stderr_handle,
+                codex_executor_orphan_grace_timeout(),
+            ) {
+                terminate_process_tree(&mut child, child_pid);
+                break (false, true, None);
+            }
+            break (false, false, None);
         }
         if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            fs::write(&stdout_path, &output.stdout)?;
-            fs::write(&stderr_path, &output.stderr)?;
-            return Ok(TimedOutput {
-                output,
-                timed_out: true,
-                stalled: false,
-                orphaned: false,
-                no_progress_paths: Vec::new(),
-                scaffold_only_paths: Vec::new(),
-                post_check_zero_progress_paths: Vec::new(),
-            });
+            let response = detect_patch_lane_response(&stdout_live, &stderr_live);
+            terminate_process_tree(&mut child, child_pid);
+            break (response.is_none(), false, response);
         }
         thread::sleep(Duration::from_millis(200));
-    }
+    };
+    let status = child.wait()?;
+    let stdout = join_stream_tee(stdout_handle)?;
+    let stderr = join_stream_tee(stderr_handle)?;
+    Ok(PatchLaneTimedOutput {
+        output: std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+        timed_out,
+        orphaned,
+        response,
+    })
 }
 
 fn run_command_with_timeout_and_tee(
@@ -1370,11 +1410,26 @@ fn run_command_with_timeout_and_tee(
     })
 }
 
-fn spawn_stream_tee<R>(
+fn detect_patch_lane_response(
+    stdout: &Arc<Mutex<Vec<u8>>>,
+    stderr: &Arc<Mutex<Vec<u8>>>,
+) -> Option<PatchLaneResponse> {
+    let stdout = snapshot_live_output(stdout)?;
+    let stderr = snapshot_live_output(stderr)?;
+    load_patch_lane_response(&stdout, &stderr).ok()
+}
+
+fn snapshot_live_output(buffer: &Arc<Mutex<Vec<u8>>>) -> Option<String> {
+    let bytes = buffer.lock().ok()?.clone();
+    Some(String::from_utf8_lossy(&bytes).to_string())
+}
+
+fn spawn_stream_tee_with_live_capture<R>(
     mut reader: R,
     path: PathBuf,
     progress: Arc<ProgressTracker>,
     is_stdout: bool,
+    live_capture: Option<Arc<Mutex<Vec<u8>>>>,
 ) -> thread::JoinHandle<Result<Vec<u8>>>
 where
     R: Read + Send + 'static,
@@ -1391,10 +1446,27 @@ where
             file.write_all(&buffer[..read])?;
             file.flush()?;
             captured.extend_from_slice(&buffer[..read]);
+            if let Some(live_capture) = live_capture.as_ref() {
+                if let Ok(mut live) = live_capture.lock() {
+                    live.extend_from_slice(&buffer[..read]);
+                }
+            }
             progress.record(read as u64, is_stdout);
         }
         Ok(captured)
     })
+}
+
+fn spawn_stream_tee<R>(
+    reader: R,
+    path: PathBuf,
+    progress: Arc<ProgressTracker>,
+    is_stdout: bool,
+) -> thread::JoinHandle<Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    spawn_stream_tee_with_live_capture(reader, path, progress, is_stdout, None)
 }
 
 fn join_stream_tee(handle: thread::JoinHandle<Result<Vec<u8>>>) -> Result<Vec<u8>> {
@@ -1775,66 +1847,58 @@ fn unchanged_entry_point_paths(
     Ok(unchanged)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApplyPatchUpdate {
+    path: String,
+    hunks: Vec<ApplyPatchHunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApplyPatchHunk {
+    header: Option<String>,
+    lines: Vec<String>,
+    eof: bool,
+}
+
 fn load_patch_lane_response(stdout: &str, stderr: &str) -> Result<PatchLaneResponse> {
     if let Some(blocked) = blocked_execution_line(stdout, stderr) {
         return Ok(PatchLaneResponse::Blocked(blocked));
     }
 
-    extract_unified_diff(stdout)
-        .or_else(|| extract_unified_diff(stderr))
-        .or_else(|| extract_unified_diff(&format!("{stdout}\n{stderr}")))
+    extract_apply_patch_envelope(stdout)
+        .or_else(|| extract_apply_patch_envelope(stderr))
+        .or_else(|| extract_apply_patch_envelope(&format!("{stdout}\n{stderr}")))
         .map(PatchLaneResponse::Patch)
-        .ok_or_else(|| anyhow!("patch lane returned no unified diff or blocked sentinel"))
+        .ok_or_else(|| anyhow!("patch lane returned no complete patch artifact or blocked sentinel"))
 }
 
-fn extract_unified_diff(text: &str) -> Option<String> {
-    extract_fenced_unified_diff(text)
-        .or_else(|| extract_inline_unified_diff(text))
-        .map(|patch| normalize_patch_text(&patch))
-        .filter(|patch| !patch.trim().is_empty())
+fn extract_apply_patch_envelope(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let (start, end) = find_apply_patch_boundaries(&lines)?;
+    let patch = lines[start..=end].join("\n");
+    let patch = normalize_patch_text(&patch);
+    if patch.trim().is_empty() {
+        None
+    } else {
+        Some(patch)
+    }
 }
 
-fn extract_fenced_unified_diff(text: &str) -> Option<String> {
-    let mut in_fence = false;
-    let mut fenced = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            if in_fence {
-                let candidate = fenced.join("\n");
-                if contains_unified_diff(&candidate) {
-                    return Some(candidate);
-                }
-                fenced.clear();
-                in_fence = false;
-            } else {
-                in_fence = true;
-                fenced.clear();
+fn find_apply_patch_boundaries(lines: &[&str]) -> Option<(usize, usize)> {
+    let mut begin = None;
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if begin.is_none() {
+            if trimmed == "*** Begin Patch" {
+                begin = Some(idx);
             }
             continue;
         }
-        if in_fence {
-            fenced.push(line);
+        if trimmed == "*** End Patch" {
+            return Some((begin.expect("begin set above"), idx));
         }
     }
     None
-}
-
-fn extract_inline_unified_diff(text: &str) -> Option<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines
-        .iter()
-        .position(|line| is_unified_diff_start(line.trim_start()))?;
-    Some(lines[start..].join("\n"))
-}
-
-fn contains_unified_diff(text: &str) -> bool {
-    text.lines()
-        .any(|line| is_unified_diff_start(line.trim_start()))
-}
-
-fn is_unified_diff_start(line: &str) -> bool {
-    line.starts_with("diff --git ") || line.starts_with("--- a/")
 }
 
 fn normalize_patch_text(text: &str) -> String {
@@ -1849,326 +1913,283 @@ fn normalize_patch_text(text: &str) -> String {
     normalized
 }
 
-fn validate_patch_scope(patch: &str, allowed_scope: &[String]) -> Result<Vec<String>> {
-    ensure_existing_file_only_patch(patch)?;
-    let paths = extract_patch_paths(patch);
-    if paths.is_empty() {
+fn validate_patch_scope(patch: &str, allowed_scope: &[String]) -> Result<Vec<ApplyPatchUpdate>> {
+    let updates = parse_apply_patch_updates(patch)?;
+    if updates.is_empty() {
         return Err(anyhow!("patch did not declare any modified file paths"));
     }
-    for path in &paths {
-        if !path_is_in_allowed_scope(path, allowed_scope) {
-            return Err(anyhow!("patch touched out-of-scope path {path}"));
+    for update in &updates {
+        if !path_is_in_allowed_scope(&update.path, allowed_scope) {
+            return Err(anyhow!("patch touched out-of-scope path {}", update.path));
         }
     }
-    Ok(paths)
+    Ok(updates)
 }
 
-fn ensure_existing_file_only_patch(patch: &str) -> Result<()> {
-    for line in patch.lines() {
-        if line.starts_with("new file mode ")
-            || line.starts_with("deleted file mode ")
-            || line == "--- /dev/null"
-            || line == "+++ /dev/null"
-            || line.starts_with("rename from ")
-            || line.starts_with("rename to ")
-        {
-            return Err(anyhow!(
-                "patch/apply lane only accepts existing-file updates"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn extract_patch_paths(patch: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    for line in patch.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git a/") {
-            if let Some((_, after)) = rest.split_once(" b/") {
-                push_unique_string(&mut paths, after.trim().to_string());
-            }
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("+++ b/") {
-            push_unique_string(&mut paths, rest.trim().to_string());
-        }
-    }
-    paths
-}
-
-fn push_unique_string(items: &mut Vec<String>, value: String) {
-    if !items.iter().any(|existing| existing == &value) {
-        items.push(value);
-    }
-}
-
-fn apply_patch_in_repo(repo_root: &Path, patch: &str) -> Result<()> {
-    match apply_patch_in_repo_once(repo_root, patch) {
-        Ok(()) => Ok(()),
-        Err(initial_err) => {
-            let Some(rebased_patch) = rebase_patch_hunks_to_repo(repo_root, patch)? else {
-                return Err(initial_err);
-            };
-            if rebased_patch.trim() == patch.trim() {
-                return Err(initial_err);
-            }
-            apply_patch_in_repo_once(repo_root, &rebased_patch)
-                .with_context(|| format!("initial apply error: {initial_err}"))
-        }
-    }
-}
-
-fn apply_patch_in_repo_once(repo_root: &Path, patch: &str) -> Result<()> {
-    let patch_path = temp_patch_path()?;
-    fs::write(&patch_path, patch).with_context(|| format!("write {}", patch_path.display()))?;
-    let check_result = run_git_apply_check(repo_root, &patch_path);
-    if let Err(err) = check_result {
-        let _ = fs::remove_file(&patch_path);
-        return Err(err);
-    }
-    let apply_result = run_git_apply(repo_root, &patch_path);
-    let _ = fs::remove_file(&patch_path);
-    apply_result
-}
-
-fn temp_patch_path() -> Result<PathBuf> {
-    Ok(std::env::temp_dir().join(format!(
-        "punk-apply-patch-{}-{}.diff",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    )))
-}
-
-fn run_git_apply_check(repo_root: &Path, patch_path: &Path) -> Result<()> {
-    let mut check = Command::new("git");
-    check
-        .arg("apply")
-        .arg("--check")
-        .arg("--recount")
-        .arg(patch_path)
-        .current_dir(repo_root);
-    let check_output = run_command_with_timeout(&mut check, codex_executor_timeout())?;
-    if check_output.timed_out {
-        return Err(anyhow!(
-            "git apply --check timed out after {}s",
-            codex_executor_timeout().as_secs()
-        ));
-    }
-    if !check_output.output.status.success() {
-        let stdout = String::from_utf8_lossy(&check_output.output.stdout);
-        let stderr = String::from_utf8_lossy(&check_output.output.stderr);
-        return Err(anyhow!(
-            "{}",
-            last_non_empty_line(&stderr)
-                .or_else(|| last_non_empty_line(&stdout))
-                .unwrap_or_else(|| "git apply --check failed".to_string())
-        ));
-    }
-    Ok(())
-}
-
-fn run_git_apply(repo_root: &Path, patch_path: &Path) -> Result<()> {
-    let mut apply = Command::new("git");
-    apply
-        .arg("apply")
-        .arg("--recount")
-        .arg(patch_path)
-        .current_dir(repo_root);
-    let apply_output = run_command_with_timeout(&mut apply, codex_executor_timeout())?;
-    if apply_output.timed_out {
-        return Err(anyhow!(
-            "git apply timed out after {}s",
-            codex_executor_timeout().as_secs()
-        ));
-    }
-    if !apply_output.output.status.success() {
-        let stdout = String::from_utf8_lossy(&apply_output.output.stdout);
-        let stderr = String::from_utf8_lossy(&apply_output.output.stderr);
-        return Err(anyhow!(
-            "{}",
-            last_non_empty_line(&stderr)
-                .or_else(|| last_non_empty_line(&stdout))
-                .unwrap_or_else(|| "git apply failed".to_string())
-        ));
-    }
-    Ok(())
-}
-
-fn rebase_patch_hunks_to_repo(repo_root: &Path, patch: &str) -> Result<Option<String>> {
-    let mut file_cache: HashMap<String, Vec<String>> = HashMap::new();
+fn parse_apply_patch_updates(patch: &str) -> Result<Vec<ApplyPatchUpdate>> {
+    let patch = normalize_patch_text(patch);
     let lines: Vec<&str> = patch.lines().collect();
-    let mut rewritten = Vec::with_capacity(lines.len());
-    let mut current_path: Option<String> = None;
-    let mut changed = false;
-    let mut i = 0usize;
-    while i < lines.len() {
-        let line = lines[i];
-        if let Some(rest) = line.strip_prefix("diff --git a/") {
-            if let Some((_, after)) = rest.split_once(" b/") {
-                current_path = Some(after.trim().to_string());
+    let (begin, end) =
+        find_apply_patch_boundaries(&lines).ok_or_else(|| anyhow!("patch envelope is incomplete"))?;
+    if begin != 0 || end + 1 != lines.len() {
+        return Err(anyhow!(
+            "patch lane output must contain only one apply_patch envelope"
+        ));
+    }
+
+    let mut updates = Vec::new();
+    let mut i = begin + 1;
+    while i < end {
+        let line = lines[i].trim_end();
+        if let Some(path) = line.strip_prefix("*** Update File: ") {
+            if Path::new(path).is_absolute() {
+                return Err(anyhow!("patch path must be repo-relative: {path}"));
             }
-            rewritten.push(line.to_string());
             i += 1;
-            continue;
-        }
-        if let Some((old_range, _new_range, suffix)) = parse_unified_hunk_header(line) {
-            let path = current_path.clone();
-            i += 1;
-            let mut hunk_lines = Vec::new();
-            while i < lines.len() {
-                let candidate = lines[i];
-                if candidate.starts_with("diff --git ")
-                    || parse_unified_hunk_header(candidate).is_some()
+            if i < end && lines[i].trim_end().starts_with("*** Move to: ") {
+                return Err(anyhow!(
+                    "patch/apply lane only accepts existing-file updates"
+                ));
+            }
+            let mut hunks = Vec::new();
+            while i < end {
+                let line = lines[i].trim_end();
+                if line.starts_with("*** Update File: ")
+                    || line.starts_with("*** Add File: ")
+                    || line.starts_with("*** Delete File: ")
                 {
                     break;
                 }
-                hunk_lines.push(candidate.to_string());
-                i += 1;
-            }
-            let rewritten_header = match path.as_deref() {
-                Some(path) => {
-                    let file_lines = load_repo_file_lines(repo_root, path, &mut file_cache)?;
-                    rebase_hunk_header(path, &old_range, &suffix, &hunk_lines, file_lines)
-                        .unwrap_or_else(|| line.to_string())
+                if !line.starts_with("@@") {
+                    return Err(anyhow!("expected hunk header for {path}, got `{line}`"));
                 }
-                None => line.to_string(),
-            };
-            if rewritten_header != line {
-                changed = true;
+                let header = line
+                    .strip_prefix("@@")
+                    .map(str::trim)
+                    .filter(|header| !header.is_empty())
+                    .map(|header| header.to_string());
+                i += 1;
+                let mut hunk_lines = Vec::new();
+                let mut eof = false;
+                while i < end {
+                    let line = lines[i];
+                    let trimmed = line.trim_end();
+                    if trimmed.starts_with("@@")
+                        || trimmed.starts_with("*** Update File: ")
+                        || trimmed.starts_with("*** Add File: ")
+                        || trimmed.starts_with("*** Delete File: ")
+                    {
+                        break;
+                    }
+                    if trimmed == "*** End of File" {
+                        eof = true;
+                        i += 1;
+                        break;
+                    }
+                    match line.chars().next() {
+                        Some(' ') | Some('+') | Some('-') => hunk_lines.push(line.to_string()),
+                        _ => {
+                            return Err(anyhow!(
+                                "invalid hunk line for {}: `{}`",
+                                path,
+                                line
+                            ))
+                        }
+                    }
+                    i += 1;
+                }
+                if hunk_lines.is_empty() {
+                    return Err(anyhow!("empty hunk body for {path}"));
+                }
+                hunks.push(ApplyPatchHunk {
+                    header,
+                    lines: hunk_lines,
+                    eof,
+                });
             }
-            rewritten.push(rewritten_header);
-            rewritten.extend(hunk_lines);
+            if hunks.is_empty() {
+                return Err(anyhow!("update file section for {path} had no hunks"));
+            }
+            updates.push(ApplyPatchUpdate {
+                path: path.to_string(),
+                hunks,
+            });
             continue;
         }
-        rewritten.push(line.to_string());
-        i += 1;
+        if let Some(path) = line.strip_prefix("*** Add File: ") {
+            return Err(anyhow!(
+                "patch/apply lane only accepts existing-file updates, got add file {path}"
+            ));
+        }
+        if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            return Err(anyhow!(
+                "patch/apply lane only accepts existing-file updates, got delete file {path}"
+            ));
+        }
+        return Err(anyhow!("unexpected patch line `{line}`"));
     }
-    if !changed {
-        return Ok(None);
-    }
-    let mut patch_text = rewritten.join("\n");
-    patch_text.push('\n');
-    Ok(Some(patch_text))
+
+    Ok(updates)
 }
 
-fn load_repo_file_lines<'a>(
-    repo_root: &Path,
-    path: &str,
-    cache: &'a mut HashMap<String, Vec<String>>,
-) -> Result<&'a Vec<String>> {
-    if !cache.contains_key(path) {
-        let file_path = repo_root.join(path);
-        let content = fs::read_to_string(&file_path)
-            .with_context(|| format!("read patch target {}", file_path.display()))?;
-        cache.insert(
-            path.to_string(),
-            content.lines().map(|line| line.to_string()).collect(),
-        );
+fn apply_patch_in_repo(repo_root: &Path, updates: &[ApplyPatchUpdate]) -> Result<()> {
+    for update in updates {
+        apply_update_in_repo(repo_root, update)?;
     }
-    Ok(cache.get(path).expect("cache entry inserted"))
+    Ok(())
 }
 
-fn rebase_hunk_header(
-    _path: &str,
-    old_range: &RangeInclusive<usize>,
-    suffix: &str,
-    hunk_lines: &[String],
-    file_lines: &[String],
-) -> Option<String> {
-    let old_lines: Vec<String> = hunk_old_lines(hunk_lines);
-    if old_lines.is_empty() {
-        return None;
+fn apply_update_in_repo(repo_root: &Path, update: &ApplyPatchUpdate) -> Result<()> {
+    let file_path = repo_root.join(&update.path);
+    if !file_path.exists() {
+        return Err(anyhow!("patch target does not exist: {}", update.path));
     }
-    let matches = find_exact_line_sequence(file_lines, &old_lines);
-    if matches.len() != 1 {
-        return None;
+    let original = fs::read_to_string(&file_path)
+        .with_context(|| format!("read patch target {}", file_path.display()))?;
+    let had_trailing_newline = original.ends_with('\n');
+    let mut lines: Vec<String> = original.lines().map(|line| line.to_string()).collect();
+    let mut cursor = 0usize;
+    for hunk in &update.hunks {
+        apply_hunk_to_lines(&mut lines, hunk, &mut cursor)
+            .with_context(|| format!("apply hunk in {}", update.path))?;
     }
-    let start_line = matches[0] + 1;
-    let old_count = hunk_old_count(hunk_lines);
-    let new_count = hunk_new_count(hunk_lines);
-    let original_start = *old_range.start();
-    if start_line == original_start {
-        return None;
+    let mut new_content = lines.join("\n");
+    if had_trailing_newline || !new_content.is_empty() {
+        new_content.push('\n');
     }
-    Some(format!(
-        "@@ -{} +{} @@{}",
-        format_unified_range(start_line, old_count),
-        format_unified_range(start_line, new_count),
-        suffix
-    ))
+    fs::write(&file_path, new_content)
+        .with_context(|| format!("write patch target {}", file_path.display()))?;
+    Ok(())
 }
 
-fn parse_unified_hunk_header(
-    line: &str,
-) -> Option<(RangeInclusive<usize>, RangeInclusive<usize>, String)> {
-    let rest = line.strip_prefix("@@ -")?;
-    let (ranges, suffix) = rest.split_once(" @@")?;
-    let (old_range, new_range) = ranges.split_once(" +")?;
-    let (old_start, old_count) = parse_unified_range(old_range)?;
-    let (new_start, new_count) = parse_unified_range(new_range)?;
-    Some((
-        old_start..=old_start + old_count.saturating_sub(1),
-        new_start..=new_start + new_count.saturating_sub(1),
-        suffix.to_string(),
-    ))
+fn apply_hunk_to_lines(
+    file_lines: &mut Vec<String>,
+    hunk: &ApplyPatchHunk,
+    cursor: &mut usize,
+) -> Result<()> {
+    let old_lines = apply_patch_old_lines(&hunk.lines);
+    let new_lines = apply_patch_new_lines(&hunk.lines);
+    let position = locate_hunk_position(file_lines, &old_lines, *cursor, hunk.eof, hunk.header.as_deref())
+        .ok_or_else(|| anyhow!("unable to locate hunk context"))?;
+    let end = position + old_lines.len();
+    file_lines.splice(position..end, new_lines);
+    *cursor = position + apply_patch_new_line_count(&hunk.lines);
+    Ok(())
 }
 
-fn parse_unified_range(range: &str) -> Option<(usize, usize)> {
-    match range.split_once(',') {
-        Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
-        None => Some((range.parse().ok()?, 1)),
-    }
-}
-
-fn format_unified_range(start: usize, count: usize) -> String {
-    if count == 1 {
-        start.to_string()
-    } else {
-        format!("{start},{count}")
-    }
-}
-
-fn hunk_old_lines(hunk_lines: &[String]) -> Vec<String> {
+fn apply_patch_old_lines(hunk_lines: &[String]) -> Vec<String> {
     hunk_lines
         .iter()
-        .filter_map(|line| {
-            if line.starts_with(' ') || (line.starts_with('-') && !line.starts_with("---")) {
-                Some(line[1..].to_string())
-            } else {
-                None
-            }
+        .filter_map(|line| match line.chars().next() {
+            Some(' ') | Some('-') => Some(line[1..].to_string()),
+            _ => None,
         })
         .collect()
 }
 
-fn hunk_old_count(hunk_lines: &[String]) -> usize {
+fn apply_patch_new_lines(hunk_lines: &[String]) -> Vec<String> {
     hunk_lines
         .iter()
-        .filter(|line| line.starts_with(' ') || (line.starts_with('-') && !line.starts_with("---")))
+        .filter_map(|line| match line.chars().next() {
+            Some(' ') | Some('+') => Some(line[1..].to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn apply_patch_new_line_count(hunk_lines: &[String]) -> usize {
+    hunk_lines
+        .iter()
+        .filter(|line| matches!(line.chars().next(), Some(' ') | Some('+')))
         .count()
 }
 
-fn hunk_new_count(hunk_lines: &[String]) -> usize {
-    hunk_lines
-        .iter()
-        .filter(|line| line.starts_with(' ') || (line.starts_with('+') && !line.starts_with("+++")))
-        .count()
+fn locate_hunk_position(
+    file_lines: &[String],
+    old_lines: &[String],
+    start: usize,
+    eof: bool,
+    _header: Option<&str>,
+) -> Option<usize> {
+    if old_lines.is_empty() {
+        return Some(if eof { file_lines.len() } else { start.min(file_lines.len()) });
+    }
+    seek_sequence(file_lines, old_lines, start, eof)
 }
 
-fn find_exact_line_sequence(haystack: &[String], needle: &[String]) -> Vec<usize> {
+fn seek_sequence(
+    haystack: &[String],
+    needle: &[String],
+    start: usize,
+    eof: bool,
+) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(start.min(haystack.len()));
+    }
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    let exact = matching_sequence_positions(haystack, needle, |left, right| left == right);
+    if let Some(position) = choose_sequence_position(&exact, needle.len(), start, eof, haystack.len()) {
+        return Some(position);
+    }
+    let trimmed_end =
+        matching_sequence_positions(haystack, needle, |left, right| left.trim_end() == right.trim_end());
+    if let Some(position) =
+        choose_sequence_position(&trimmed_end, needle.len(), start, eof, haystack.len())
+    {
+        return Some(position);
+    }
+    let trimmed = matching_sequence_positions(haystack, needle, |left, right| left.trim() == right.trim());
+    choose_sequence_position(&trimmed, needle.len(), start, eof, haystack.len())
+}
+
+fn matching_sequence_positions<F>(haystack: &[String], needle: &[String], matcher: F) -> Vec<usize>
+where
+    F: Fn(&str, &str) -> bool,
+{
     if needle.is_empty() || needle.len() > haystack.len() {
         return Vec::new();
     }
-    let mut matches = Vec::new();
+    let mut positions = Vec::new();
     for start in 0..=haystack.len() - needle.len() {
-        if haystack[start..start + needle.len()] == *needle {
-            matches.push(start);
+        if needle
+            .iter()
+            .enumerate()
+            .all(|(offset, line)| matcher(&haystack[start + offset], line))
+        {
+            positions.push(start);
         }
     }
-    matches
+    positions
+}
+
+fn choose_sequence_position(
+    positions: &[usize],
+    needle_len: usize,
+    start: usize,
+    eof: bool,
+    haystack_len: usize,
+) -> Option<usize> {
+    if positions.is_empty() {
+        return None;
+    }
+    if eof {
+        if let Some(position) = positions
+            .iter()
+            .copied()
+            .find(|position| position + needle_len == haystack_len)
+        {
+            return Some(position);
+        }
+    }
+    if let Some(position) = positions.iter().copied().find(|position| *position >= start) {
+        return Some(position);
+    }
+    if positions.len() == 1 {
+        return positions.first().copied();
+    }
+    None
 }
 
 fn collect_contract_checks(contract: &Contract) -> Vec<String> {
@@ -2414,7 +2435,7 @@ mod tests {
             approved_at: Some("now".into()),
         };
         let prompt = build_patch_apply_prompt(&contract, &ContextPack::default());
-        assert!(prompt.contains("single git-style unified diff patch"));
+        assert!(prompt.contains("single apply_patch-style patch"));
         assert!(prompt.contains("do not output JSON"));
         assert!(prompt.contains(blocked_execution_template()));
         assert!(!prompt.contains("match the provided schema exactly"));
@@ -2886,7 +2907,7 @@ mod tests {
     #[test]
     fn validate_patch_scope_rejects_out_of_scope_paths() {
         let err = validate_patch_scope(
-            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@\n-pub fn old() {}\n+pub fn new() {}\n",
+            "*** Begin Patch\n*** Update File: src/lib.rs\n@@ fn old\n-pub fn old() {}\n+pub fn new() {}\n*** End Patch\n",
             &[String::from("src/main.rs")],
         )
         .unwrap_err();
@@ -2895,12 +2916,12 @@ mod tests {
 
     #[test]
     fn load_patch_lane_response_extracts_fenced_patch() {
-        let stdout = "```diff\ndiff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn old() {}\n+pub fn new() {}\n```\n";
+        let stdout = "```text\n*** Begin Patch\n*** Update File: src/lib.rs\n@@ fn old\n-pub fn old() {}\n+pub fn new() {}\n*** End Patch\n```\n";
         let response = load_patch_lane_response(stdout, "").unwrap();
         assert_eq!(
             response,
             PatchLaneResponse::Patch(
-                "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn old() {}\n+pub fn new() {}\n".to_string()
+                "*** Begin Patch\n*** Update File: src/lib.rs\n@@ fn old\n-pub fn old() {}\n+pub fn new() {}\n*** End Patch\n".to_string()
             )
         );
     }
@@ -2921,7 +2942,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_patch_in_repo_applies_unified_diff() {
+    fn apply_patch_in_repo_applies_update_patch() {
         let root = std::env::temp_dir().join(format!(
             "punk-adapters-apply-patch-{}-{}",
             std::process::id(),
@@ -2937,12 +2958,62 @@ mod tests {
         assert!(init.status().unwrap().success());
         fs::write(root.join("src/lib.rs"), "pub fn old() {}\n").unwrap();
 
-        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn old() {}\n+pub fn new() {}\n";
-        apply_patch_in_repo(&root, patch).unwrap();
+        let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@ fn old\n-pub fn old() {}\n+pub fn new() {}\n*** End Patch\n";
+        let updates = validate_patch_scope(patch, &[String::from("src/lib.rs")]).unwrap();
+        apply_patch_in_repo(&root, &updates).unwrap();
         assert_eq!(
             fs::read_to_string(root.join("src/lib.rs")).unwrap(),
             "pub fn new() {}\n"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_patch_scope_rejects_add_file_sections() {
+        let err = validate_patch_scope(
+            "*** Begin Patch\n*** Add File: src/new.rs\n+pub fn new() {}\n*** End Patch\n",
+            &[String::from("src")],
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("only accepts existing-file updates"));
+    }
+
+    #[test]
+    fn run_patch_lane_command_with_timeout_detects_complete_patch_before_exit() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-patch-stream-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        let executor_pid = root.join("executor.json");
+
+        let mut command = Command::new("/bin/zsh");
+        command.arg("-lc").arg(
+            "printf '*** Begin Patch\n*** Update File: src/lib.rs\n@@ fn old\n-pub fn old() {}\n+pub fn new() {}\n*** End Patch\n'; sleep 5",
+        );
+
+        let output = run_patch_lane_command_with_timeout(
+            &mut command,
+            Duration::from_secs(1),
+            stdout_path,
+            stderr_path,
+            executor_pid,
+        )
+        .unwrap();
+
+        assert!(!output.timed_out);
+        assert!(!output.orphaned);
+        assert!(matches!(output.response, Some(PatchLaneResponse::Patch(_))));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -3011,24 +3082,21 @@ mod tests {
     }
 
     #[test]
-    fn rebase_hunk_header_adjusts_stale_start_line() {
-        let file_lines = vec![
-            "// filler 1".to_string(),
-            "// filler 2".to_string(),
-            "// filler 3".to_string(),
+    fn seek_sequence_prefers_exact_match_after_start_offset() {
+        let haystack = vec![
+            "fn alpha() {".to_string(),
+            "    one();".to_string(),
+            "}".to_string(),
             "fn gamma() {".to_string(),
             "    three();".to_string(),
             "}".to_string(),
         ];
-        let hunk_lines = vec![
-            " fn gamma() {".to_string(),
-            "     three();".to_string(),
-            "+    three_more();".to_string(),
-            " }".to_string(),
+        let needle = vec![
+            "fn gamma() {".to_string(),
+            "    three();".to_string(),
+            "}".to_string(),
         ];
-        let rewritten = rebase_hunk_header("src/lib.rs", &(2..=4), "", &hunk_lines, &file_lines)
-            .expect("expected rebased header");
-        assert_eq!(rewritten, "@@ -4,3 +4,4 @@");
+        assert_eq!(seek_sequence(&haystack, &needle, 3, false), Some(3));
     }
 
     #[test]
