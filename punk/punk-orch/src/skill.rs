@@ -11,39 +11,39 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub path: PathBuf,
+    pub state: SkillState,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillState {
+    Active,
+    Candidate,
 }
 
 fn skills_dir(bus: &Path) -> PathBuf {
     bus.parent().unwrap_or(bus).join("skills")
 }
 
-/// List all skills.
-pub fn list_skills(bus: &Path) -> Vec<Skill> {
-    let dir = skills_dir(bus);
+fn candidate_skills_dir(project_root: &Path) -> PathBuf {
+    project_root.join(".punk/skills/candidates")
+}
+
+/// List all active and candidate skills.
+pub fn list_skills(bus: &Path, project_root: Option<&Path>) -> Vec<Skill> {
     let mut skills = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "md") {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    let name = path
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    let description = extract_description(&content);
-                    skills.push(Skill {
-                        name,
-                        description,
-                        path,
-                    });
-                }
-            }
-        }
+    collect_skills_from_dir(&mut skills, &skills_dir(bus), SkillState::Active);
+    if let Some(root) = project_root {
+        collect_skills_from_dir(&mut skills, &candidate_skills_dir(root), SkillState::Candidate);
     }
 
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills.sort_by(|a, b| {
+        a.state
+            .sort_key()
+            .cmp(&b.state.sort_key())
+            .then_with(|| a.name.cmp(&b.name))
+    });
     skills
 }
 
@@ -76,6 +76,56 @@ pub fn create_skill(
     fs::write(&tmp_path, &skill_content).map_err(|e| e.to_string())?;
     fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
 
+    Ok(path)
+}
+
+pub fn create_candidate_skill(
+    cwd: &Path,
+    name: &str,
+    description: &str,
+    content: &str,
+    evidence_refs: &[String],
+) -> Result<PathBuf, String> {
+    if evidence_refs.is_empty() {
+        return Err("candidate skills require at least one --evidence reference".to_string());
+    }
+
+    if let Some(issue) = security_scan(content) {
+        return Err(format!("security scan failed (content): {issue}"));
+    }
+    if let Some(issue) = security_scan(description) {
+        return Err(format!("security scan failed (description): {issue}"));
+    }
+
+    sanitize::safe_id(name)?;
+    let root = detect_repo_root(cwd)?;
+    let dir = candidate_skills_dir(&root);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let mut deduped = Vec::new();
+    for evidence in evidence_refs {
+        let trimmed = evidence.trim();
+        if trimmed.is_empty() {
+            return Err("evidence refs must be non-empty".to_string());
+        }
+        if !deduped.iter().any(|existing: &String| existing == trimmed) {
+            deduped.push(trimmed.to_string());
+        }
+    }
+
+    let evidence_block = deduped
+        .iter()
+        .map(|evidence| format!("  - {evidence}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let skill_content = format!(
+        "---\nname: {name}\ndescription: {description}\nstate: candidate\nevidence:\n{evidence_block}\n---\n\n{content}"
+    );
+
+    let path = dir.join(format!("{name}.md"));
+    let tmp_path = dir.join(format!(".{name}.tmp"));
+    fs::write(&tmp_path, &skill_content).map_err(|e| e.to_string())?;
+    fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
     Ok(path)
 }
 
@@ -132,6 +182,115 @@ fn extract_description(content: &str) -> String {
         .collect()
 }
 
+fn extract_evidence_refs(content: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    if let Some(frontmatter) = frontmatter(content) {
+        let mut in_evidence = false;
+        for line in frontmatter.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("evidence:") {
+                in_evidence = true;
+                if !rest.trim().is_empty() {
+                    refs.push(rest.trim().to_string());
+                }
+                continue;
+            }
+            if in_evidence {
+                if let Some(item) = trimmed.strip_prefix("- ") {
+                    refs.push(item.trim().to_string());
+                    continue;
+                }
+                if trimmed.is_empty() {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    refs
+}
+
+fn extract_state(content: &str, default_state: SkillState) -> SkillState {
+    if let Some(frontmatter) = frontmatter(content) {
+        for line in frontmatter.lines() {
+            if let Some(state) = line.trim().strip_prefix("state:") {
+                return match state.trim() {
+                    "candidate" => SkillState::Candidate,
+                    _ => SkillState::Active,
+                };
+            }
+        }
+    }
+    default_state
+}
+
+fn frontmatter(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix("---")?;
+    let end = rest.find("---")?;
+    Some(&rest[..end])
+}
+
+fn collect_skills_from_dir(skills: &mut Vec<Skill>, dir: &Path, default_state: SkillState) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "md") {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    let name = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    skills.push(Skill {
+                        name,
+                        description: extract_description(&content),
+                        path,
+                        state: extract_state(&content, default_state.clone()),
+                        evidence_refs: extract_evidence_refs(&content),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn detect_repo_root(cwd: &Path) -> Result<PathBuf, String> {
+    for (bin, args) in [
+        ("jj", vec!["root"]),
+        ("git", vec!["rev-parse", "--show-toplevel"]),
+    ] {
+        let output = std::process::Command::new(bin)
+            .args(&args)
+            .current_dir(cwd)
+            .output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !root.is_empty() {
+                    return Ok(PathBuf::from(root));
+                }
+            }
+        }
+    }
+    Err("candidate skills require running inside a Git/jj repository".to_string())
+}
+
+impl SkillState {
+    fn sort_key(&self) -> u8 {
+        match self {
+            SkillState::Candidate => 0,
+            SkillState::Active => 1,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SkillState::Active => "active",
+            SkillState::Candidate => "candidate",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +312,41 @@ mod tests {
     fn extract_desc_from_frontmatter() {
         let content = "---\nname: test\ndescription: A useful skill\n---\n\nContent here.";
         assert_eq!(extract_description(content), "A useful skill");
+    }
+
+    #[test]
+    fn create_candidate_skill_requires_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let err =
+            create_candidate_skill(tmp.path(), "test", "desc", "content", &[]).unwrap_err();
+        assert!(err.contains("at least one --evidence"));
+    }
+
+    #[test]
+    fn list_skills_includes_repo_local_candidates() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        let root = tmp.path().join("repo");
+        fs::create_dir_all(bus.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.join(".punk/skills/candidates")).unwrap();
+        fs::create_dir_all(tmp.path().join("skills")).unwrap();
+
+        fs::write(
+            tmp.path().join("skills/base.md"),
+            "---\nname: base\ndescription: Base skill\n---\n\nContent",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".punk/skills/candidates/fix.md"),
+            "---\nname: fix\ndescription: Candidate\nstate: candidate\nevidence:\n  - run_1\n---\n\nContent",
+        )
+        .unwrap();
+
+        let listed = list_skills(&bus, Some(&root));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].state, SkillState::Candidate);
+        assert_eq!(listed[0].evidence_refs, vec!["run_1".to_string()]);
+        assert_eq!(listed[1].state, SkillState::Active);
     }
 
     // --- Security bypass attempts for security_scan() ---

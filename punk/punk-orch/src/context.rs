@@ -99,7 +99,7 @@ fn load_agent_guidance(config_dir: &Path, agent_id: &str) -> Option<String> {
 
 /// Find skills that match the current task's category + project.
 fn match_skills(bus: &Path, project: &str, category: &str) -> String {
-    let skills = skill::list_skills(bus);
+    let skills = skill::list_skills(bus, None);
     let mut matched = Vec::new();
 
     for s in &skills {

@@ -225,6 +225,18 @@ enum SkillAction {
         #[arg(long)]
         file: String,
     },
+    /// Register a repo-local candidate skill patch with evidence refs
+    Candidate {
+        name: String,
+        #[arg(long)]
+        description: String,
+        /// Path to skill content file
+        #[arg(long)]
+        file: String,
+        /// Evidence refs such as run ids, receipts, or incident ids
+        #[arg(long = "evidence", required = true)]
+        evidence: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -505,13 +517,25 @@ async fn main() -> anyhow::Result<()> {
         Command::Skill { action } => match action {
             SkillAction::List => {
                 let bus_path = bus::bus_dir();
-                let skills = skill::list_skills(&bus_path);
+                let cwd = std::env::current_dir().ok();
+                let skills = skill::list_skills(&bus_path, cwd.as_deref());
                 if skills.is_empty() {
                     println!("No skills.");
                 } else {
                     println!("Skills ({})\n", skills.len());
                     for s in &skills {
-                        println!("  {:<20} {}", s.name, s.description);
+                        let evidence = if s.evidence_refs.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{} evidence]", s.evidence_refs.len())
+                        };
+                        println!(
+                            "  {:<20} {:<10} {}{}",
+                            s.name,
+                            s.state.as_str(),
+                            s.description,
+                            evidence
+                        );
                     }
                 }
             }
@@ -527,6 +551,29 @@ async fn main() -> anyhow::Result<()> {
                 });
                 match skill::create_skill(&bus_path, &name, &description, &content) {
                     Ok(path) => println!("Created: {}", path.display()),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            SkillAction::Candidate {
+                name,
+                description,
+                file,
+                evidence,
+            } => {
+                let cwd = std::env::current_dir().unwrap_or_else(|e| {
+                    eprintln!("Error reading current directory: {e}");
+                    std::process::exit(1);
+                });
+                let content = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+                    eprintln!("Error reading {file}: {e}");
+                    std::process::exit(1);
+                });
+                match skill::create_candidate_skill(&cwd, &name, &description, &content, &evidence)
+                {
+                    Ok(path) => println!("Created candidate: {}", path.display()),
                     Err(e) => {
                         eprintln!("Error: {e}");
                         std::process::exit(1);
