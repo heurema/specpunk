@@ -345,6 +345,11 @@ enum ResearchAction {
         #[arg(long = "evidence-ref")]
         evidence_ref: Vec<String>,
     },
+    /// Show one research run with packet/artifacts/synthesis details
+    Show {
+        /// Research id
+        research_id: String,
+    },
     /// List frozen research runs for the current repo
     List,
 }
@@ -822,6 +827,7 @@ async fn main() -> anyhow::Result<()> {
                 file,
                 evidence_ref,
             } => cmd_research_artifact(&research_id, &kind, &title, &file, &evidence_ref),
+            ResearchAction::Show { research_id } => cmd_research_show(&research_id),
             ResearchAction::List => cmd_research_list(),
         },
         Command::Goal { action } => match action {
@@ -2242,7 +2248,7 @@ fn cmd_research_list() {
             std::process::exit(1);
         }
     };
-    let runs = research::list_research_runs(&cwd).unwrap_or_else(|e| {
+    let runs = research::summarize_research_runs(&cwd).unwrap_or_else(|e| {
         eprintln!("Error: {e}");
         std::process::exit(1);
     });
@@ -2254,10 +2260,12 @@ fn cmd_research_list() {
     println!("Research runs ({})\n", runs.len());
     for run in runs {
         println!(
-            "  {:<48} {:<10} {:<22} {}",
+            "  {:<48} {:<10} {:<22} artifacts={} synthesis={} {}",
             run.research_id,
-            "frozen",
+            format!("{:?}", run.status).to_ascii_lowercase(),
             run.project_id,
+            run.artifact_count,
+            if run.has_synthesis { "yes" } else { "no" },
             run.created_at.to_rfc3339()
         );
     }
@@ -2346,6 +2354,39 @@ fn cmd_research_artifact(
 
     println!("Research id: {}", write.artifact.research_id);
     println!("Artifact: {}", write.artifact_path.display());
+}
+
+fn cmd_research_show(research_id: &str) {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let inspect = research::inspect_research(&cwd, research_id).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
+    println!("Research id: {}", inspect.record.research_id);
+    println!("Status: {:?}", inspect.record.status);
+    println!("Kind: {:?}", inspect.record.kind);
+    println!("Project: {}", inspect.record.project_id);
+    println!("Root dir: {}", inspect.root_dir.display());
+    println!("Question: {}", inspect.packet.question.question);
+    println!("Goal: {}", inspect.packet.question.goal);
+    println!("Artifacts: {}", inspect.artifacts.len());
+    for artifact in &inspect.artifacts {
+        println!("  - {:?}: {}", artifact.kind, artifact.title);
+    }
+    match &inspect.synthesis {
+        Some(synthesis) => {
+            println!("Synthesis outcome: {:?}", synthesis.outcome);
+            println!("Synthesis title: {}", synthesis.title);
+        }
+        None => println!("Synthesis outcome: none"),
+    }
 }
 
 fn load_config_or_exit(dir: &Path) -> config::Config {
