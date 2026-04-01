@@ -582,7 +582,8 @@ async fn main() -> anyhow::Result<()> {
             match chart_type.as_str() {
                 "cost" => print!("{}", graph::cost_chart(&bus_path, since)),
                 "project" => print!("{}", graph::project_chart(&bus_path, since)),
-                _ => eprintln!("Unknown chart type: {chart_type}. Available: cost, project"),
+                "gantt" => print!("{}", graph::gantt_chart(&bus_path, since)),
+                _ => eprintln!("Unknown chart type: {chart_type}. Available: cost, project, gantt"),
             }
         }
         Command::Goal { action } => match action {
