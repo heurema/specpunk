@@ -1,6 +1,7 @@
 pub use chrono;
 
 pub mod adapter;
+pub mod benchmark;
 pub mod budget;
 pub mod bus;
 pub mod config;

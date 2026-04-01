@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use punk_core::vcs::{detect_mode as detect_vcs_mode, enable_jj as enable_jj_for_repo, VcsMode};
 use punk_orch::{
-    bus, config, context, daemon, diverge, doctor, eval, goal, graph, morning, ops, panel,
-    pipeline, ratchet, recall, research, resolver, skill,
+    benchmark, bus, config, context, daemon, diverge, doctor, eval, goal, graph, morning, ops,
+    panel, pipeline, ratchet, recall, research, resolver, skill,
 };
 
 #[derive(Parser)]
@@ -191,6 +191,11 @@ enum Command {
         #[command(subcommand)]
         action: EvalAction,
     },
+    /// Repo-local benchmark result storage
+    Benchmark {
+        #[command(subcommand)]
+        action: BenchmarkAction,
+    },
     /// Pin a project alias to a local path
     Use {
         /// Project slug
@@ -376,6 +381,41 @@ enum EvalAction {
         /// Limit to newest N eval records
         #[arg(long)]
         limit: Option<usize>,
+    },
+}
+
+#[derive(Subcommand)]
+enum BenchmarkAction {
+    /// Record one benchmark result
+    Record {
+        /// Benchmark suite name
+        #[arg(long)]
+        suite: String,
+        /// Project id
+        #[arg(long)]
+        project: String,
+        /// Outcome: pass, fail, flaky
+        #[arg(long)]
+        outcome: String,
+        /// Score in [0.0, 1.0]
+        #[arg(long)]
+        score: f64,
+        /// Optional subject reference
+        #[arg(long)]
+        subject_ref: Option<String>,
+        /// Metric in `name=value` form, can be repeated
+        #[arg(long = "metric")]
+        metric: Vec<String>,
+        /// Free-form note, can be repeated
+        #[arg(long = "note")]
+        note: Vec<String>,
+    },
+    /// List stored benchmark results
+    List,
+    /// Show one benchmark result
+    Show {
+        /// Benchmark id
+        benchmark_id: String,
     },
 }
 
@@ -859,6 +899,27 @@ async fn main() -> anyhow::Result<()> {
             EvalAction::Task { task_id } => cmd_eval_task(&task_id),
             EvalAction::List => cmd_eval_list(),
             EvalAction::Summary { project, limit } => cmd_eval_summary(project.as_deref(), limit),
+        },
+        Command::Benchmark { action } => match action {
+            BenchmarkAction::Record {
+                suite,
+                project,
+                outcome,
+                score,
+                subject_ref,
+                metric,
+                note,
+            } => cmd_benchmark_record(
+                &suite,
+                &project,
+                &outcome,
+                score,
+                subject_ref.as_deref(),
+                &metric,
+                &note,
+            ),
+            BenchmarkAction::List => cmd_benchmark_list(),
+            BenchmarkAction::Show { benchmark_id } => cmd_benchmark_show(&benchmark_id),
         },
         Command::Goal { action } => match action {
             GoalAction::Create {
@@ -2564,6 +2625,155 @@ fn cmd_eval_summary(project_filter: Option<&str>, limit: Option<usize>) {
             format!("{:?}", task.gate_outcome).to_ascii_lowercase(),
             task.created_at.to_rfc3339(),
         );
+    }
+}
+
+fn parse_benchmark_outcome(raw: &str) -> Result<benchmark::BenchmarkOutcome, String> {
+    match raw {
+        "pass" => Ok(benchmark::BenchmarkOutcome::Pass),
+        "fail" => Ok(benchmark::BenchmarkOutcome::Fail),
+        "flaky" => Ok(benchmark::BenchmarkOutcome::Flaky),
+        _ => Err(format!(
+            "unknown benchmark outcome: {raw} (expected pass, fail, or flaky)"
+        )),
+    }
+}
+
+fn parse_benchmark_metrics(raw: &[String]) -> Result<Vec<benchmark::BenchmarkMetric>, String> {
+    let mut metrics = Vec::new();
+    for item in raw {
+        let Some((name, value)) = item.split_once('=') else {
+            return Err(format!(
+                "invalid metric format: {item} (expected name=value)"
+            ));
+        };
+        let parsed = value
+            .parse::<f64>()
+            .map_err(|_| format!("invalid metric value in: {item}"))?;
+        metrics.push(benchmark::BenchmarkMetric {
+            name: name.to_string(),
+            value: parsed,
+        });
+    }
+    Ok(metrics)
+}
+
+fn cmd_benchmark_record(
+    suite: &str,
+    project: &str,
+    outcome: &str,
+    score: f64,
+    subject_ref: Option<&str>,
+    metrics: &[String],
+    notes: &[String],
+) {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let outcome = parse_benchmark_outcome(outcome).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+    let metrics = parse_benchmark_metrics(metrics).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
+    let result = benchmark::record_benchmark(
+        &cwd,
+        benchmark::RecordBenchmarkRequest {
+            suite: suite.to_string(),
+            project_id: project.to_string(),
+            subject_ref: subject_ref.map(|value| value.to_string()),
+            outcome,
+            score,
+            metrics,
+            notes: notes.to_vec(),
+        },
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
+    println!("Benchmark id: {}", result.benchmark_id);
+    println!("Suite: {}", result.suite);
+    println!("Project: {}", result.project_id);
+    println!("Outcome: {:?}", result.outcome);
+    println!("Score: {:.2}", result.score);
+}
+
+fn cmd_benchmark_list() {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let results = benchmark::list_benchmarks(&cwd).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+    if results.is_empty() {
+        println!("No benchmark results.");
+        return;
+    }
+
+    println!("Benchmark results ({})\n", results.len());
+    for result in results {
+        println!(
+            "  {:<36} {:<20} {:<18} score={:.2} {:?} {}",
+            result.benchmark_id,
+            result.suite,
+            result.project_id,
+            result.score,
+            result.outcome,
+            result.created_at.to_rfc3339(),
+        );
+    }
+}
+
+fn cmd_benchmark_show(benchmark_id: &str) {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let result = benchmark::load_benchmark(&cwd, benchmark_id).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
+    println!("Benchmark id: {}", result.benchmark_id);
+    println!("Suite: {}", result.suite);
+    println!("Project: {}", result.project_id);
+    println!("Outcome: {:?}", result.outcome);
+    println!("Score: {:.2}", result.score);
+    if let Some(subject_ref) = &result.subject_ref {
+        println!("Subject ref: {subject_ref}");
+    }
+    if result.metrics.is_empty() {
+        println!("Metrics: none");
+    } else {
+        println!("Metrics:");
+        for metric in &result.metrics {
+            println!("  - {}={:.3}", metric.name, metric.value);
+        }
+    }
+    if result.notes.is_empty() {
+        println!("Notes: none");
+    } else {
+        println!("Notes:");
+        for note in &result.notes {
+            println!("  - {note}");
+        }
     }
 }
 
