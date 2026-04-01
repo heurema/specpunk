@@ -840,7 +840,7 @@ fn cmd_config() {
     );
     let b = &cfg.policy.budget;
     println!(
-        "  budget: ${:.0}/mo ceiling, {}% soft, {}% hard",
+        "  budget: ${:.0}/mo ceiling, {}% soft, {}% hard, 95% stop",
         b.monthly_ceiling_usd, b.soft_alert_pct, b.hard_stop_pct
     );
     println!("  rules: {}", cfg.policy.rules.len());
@@ -1920,7 +1920,7 @@ fn initialize_config_files(
             [budget]\n\
             monthly_ceiling_usd = 50.0\n\
             soft_alert_pct = 80\n\
-            hard_stop_pct = 95\n";
+            hard_stop_pct = 90\n";
         std::fs::write(dir.join("policy.toml"), toml)?;
         summary.created.push("policy.toml".to_string());
     }
@@ -2080,6 +2080,9 @@ mod tests {
         assert!(tmp.join("projects.toml").is_file());
         assert!(tmp.join("policy.toml").is_file());
         assert!(!tmp.join("agents.toml").exists());
+        let policy = fs::read_to_string(tmp.join("policy.toml")).unwrap();
+        assert!(policy.contains("soft_alert_pct = 80"));
+        assert!(policy.contains("hard_stop_pct = 90"));
         assert!(summary
             .notices
             .iter()

@@ -324,7 +324,7 @@ fn default_soft() -> u32 {
     80
 }
 fn default_hard() -> u32 {
-    95
+    90
 }
 
 #[cfg(test)]
@@ -376,5 +376,13 @@ mod tests {
     fn detect_agents_returns_empty_when_no_supported_cli_is_installed() {
         let agents = detect_agents_with(|_| false);
         assert!(agents.agents.is_empty());
+    }
+
+    #[test]
+    fn load_or_default_uses_budget_backpressure_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = load_or_default(tmp.path()).unwrap();
+        assert_eq!(cfg.policy.budget.soft_alert_pct, 80);
+        assert_eq!(cfg.policy.budget.hard_stop_pct, 90);
     }
 }

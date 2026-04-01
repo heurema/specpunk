@@ -9,6 +9,7 @@ use tokio::time;
 
 use crate::adapter::{Adapter, SpawnedProcess, TaskSpec};
 use crate::budget;
+use crate::config::{self, BudgetPolicy};
 use crate::goal::{self, GoalStatus, StepStatus};
 use crate::queue::{self, HeartbeatTracker, ProjectLock, SlotManager};
 use crate::receipt::{CallStyle, Receipt, ReceiptStatus};
@@ -36,6 +37,13 @@ pub struct DaemonConfig {
     pub shadow: bool,
 }
 
+#[derive(Debug, Clone)]
+struct BudgetBackpressure {
+    pressure: budget::PressureLevel,
+    spent_usd: f64,
+    effective_max_slots: u32,
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -49,6 +57,51 @@ impl Default for DaemonConfig {
             shadow: false,
         }
     }
+}
+
+impl BudgetBackpressure {
+    fn from_policy(bus: &Path, policy: &BudgetPolicy, configured_max_slots: u32) -> Self {
+        let (pressure, spent_usd) = budget::check_pressure(
+            bus,
+            policy.monthly_ceiling_usd,
+            policy.soft_alert_pct,
+            policy.hard_stop_pct,
+        );
+        let effective_max_slots = budget::effective_max_slots(&pressure, configured_max_slots);
+        Self {
+            pressure,
+            spent_usd,
+            effective_max_slots,
+        }
+    }
+
+    fn normal(configured_max_slots: u32) -> Self {
+        Self {
+            pressure: budget::PressureLevel::Normal,
+            spent_usd: 0.0,
+            effective_max_slots: configured_max_slots,
+        }
+    }
+}
+
+fn load_budget_backpressure(bus: &Path, configured_max_slots: u32) -> BudgetBackpressure {
+    let config_dir = config::config_dir();
+    match config::load_or_default(&config_dir) {
+        Ok(cfg) => BudgetBackpressure::from_policy(bus, &cfg.policy.budget, configured_max_slots),
+        Err(err) => {
+            eprintln!("daemon: budget policy unavailable ({err}); using daemon defaults");
+            BudgetBackpressure::normal(configured_max_slots)
+        }
+    }
+}
+
+fn budget_allows_dispatch(
+    entry: &queue::QueuedEntry,
+    backpressure: &BudgetBackpressure,
+    occupied_slots: u32,
+) -> bool {
+    occupied_slots < backpressure.effective_max_slots
+        && budget::priority_allowed(&backpressure.pressure, &entry.priority)
 }
 
 /// Run the daemon main loop.
@@ -179,11 +232,14 @@ pub async fn run(dcfg: DaemonConfig) {
         evaluate_goals(bus);
 
         // 4. Budget backpressure check
-        let (pressure, spent) = budget::check_pressure(bus, 50.0, 80, 95);
-        if pressure != budget::PressureLevel::Normal {
+        let backpressure = load_budget_backpressure(bus, dcfg.max_slots);
+        if backpressure.pressure != budget::PressureLevel::Normal {
             eprintln!(
-                "daemon: budget pressure {:?} (${:.2} spent)",
-                pressure, spent
+                "daemon: budget pressure {:?} (${:.2} spent, slots {}/{})",
+                backpressure.pressure,
+                backpressure.spent_usd,
+                backpressure.effective_max_slots,
+                dcfg.max_slots
             );
         }
 
@@ -197,6 +253,7 @@ pub async fn run(dcfg: DaemonConfig) {
                 &mut active,
                 &mut circuits,
                 &dcfg,
+                &backpressure,
             )
             .await;
         } else {
@@ -223,10 +280,27 @@ async fn dispatch_queued(
     active: &mut HashMap<String, ActiveTask>,
     circuits: &mut HashMap<String, CircuitBreaker>,
     _dcfg: &DaemonConfig,
+    backpressure: &BudgetBackpressure,
 ) {
+    if slots.occupied() >= backpressure.effective_max_slots {
+        return;
+    }
+
     let entries = queue::scan_queue(bus);
 
     for entry in entries {
+        let occupied_slots = slots.occupied();
+        if !budget_allows_dispatch(&entry, backpressure, occupied_slots) {
+            if occupied_slots >= backpressure.effective_max_slots {
+                break;
+            }
+            eprintln!(
+                "daemon: skipping {} at {:?} pressure (priority={})",
+                entry.task_id, backpressure.pressure, entry.priority
+            );
+            continue;
+        }
+
         // Slot available?
         let slot_id = match slots.acquire() {
             Some(s) => s,
@@ -1147,6 +1221,7 @@ fn extract_cost(stdout_path: &Path) -> f64 {
 mod tests {
     use super::*;
     use crate::goal::{self, Goal, Plan, Step};
+    use crate::queue::QueuedEntry;
     use tempfile::TempDir;
 
     fn active_goal(steps: Vec<Step>) -> Goal {
@@ -1176,6 +1251,67 @@ mod tests {
             "category": "fix"
         });
         fs::write(path, serde_json::to_string_pretty(&task).unwrap()).unwrap();
+    }
+
+    fn queued_entry(priority: &str) -> QueuedEntry {
+        QueuedEntry {
+            task_id: format!("task-{priority}"),
+            path: PathBuf::from(format!("/tmp/{priority}.json")),
+            project: "test".into(),
+            model: "claude".into(),
+            worktree: false,
+            priority: priority.into(),
+            depends_on: vec![],
+        }
+    }
+
+    #[test]
+    fn budget_backpressure_uses_policy_thresholds_and_slot_cap() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(tmp.path().join("receipts")).unwrap();
+        fs::write(
+            tmp.path().join("receipts/index.jsonl"),
+            serde_json::json!({
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "cost_usd": 45.0
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let policy = BudgetPolicy {
+            monthly_ceiling_usd: 50.0,
+            soft_alert_pct: 80,
+            hard_stop_pct: 90,
+        };
+
+        let state = BudgetBackpressure::from_policy(&bus, &policy, 5);
+        assert_eq!(state.pressure, budget::PressureLevel::Hard);
+        assert_eq!(state.effective_max_slots, 2);
+    }
+
+    #[test]
+    fn budget_dispatch_blocks_low_priority_work_at_hard_and_stop_pressure() {
+        let hard = BudgetBackpressure {
+            pressure: budget::PressureLevel::Hard,
+            spent_usd: 45.0,
+            effective_max_slots: 2,
+        };
+        let stop = BudgetBackpressure {
+            pressure: budget::PressureLevel::Stop,
+            spent_usd: 48.0,
+            effective_max_slots: 1,
+        };
+
+        assert!(budget_allows_dispatch(&queued_entry("p0"), &hard, 0));
+        assert!(budget_allows_dispatch(&queued_entry("p1"), &hard, 0));
+        assert!(!budget_allows_dispatch(&queued_entry("p2"), &hard, 0));
+
+        assert!(budget_allows_dispatch(&queued_entry("p0"), &stop, 0));
+        assert!(!budget_allows_dispatch(&queued_entry("p1"), &stop, 0));
+        assert!(!budget_allows_dispatch(&queued_entry("p0"), &stop, 1));
     }
 
     #[test]
