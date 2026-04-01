@@ -166,6 +166,15 @@ impl Executor for CodexCliExecutor {
     }
 
     fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+        if let Some(summary) = manual_mode_block_summary(&input.contract) {
+            return Ok(ExecuteOutput {
+                success: false,
+                summary,
+                checks_run: Vec::new(),
+                cost_usd: None,
+                duration_ms: 0,
+            });
+        }
         let start = Instant::now();
         restore_stale_entry_point_masks(&input.repo_root)?;
         let created_entry_points = if is_fail_closed_scope_task(&input.contract) {
@@ -786,6 +795,68 @@ fn is_fail_closed_scope_task(contract: &Contract) -> bool {
             contract.risk_level.trim().to_ascii_lowercase().as_str(),
             "low" | "medium"
         )
+}
+
+fn manual_mode_block_summary(contract: &Contract) -> Option<String> {
+    if !is_self_referential_reliability_slice(contract) {
+        return None;
+    }
+    Some(
+        "PUNK_EXECUTION_BLOCKED: self-referential reliability slice requires manual bounded implementation"
+            .to_string(),
+    )
+}
+
+fn is_self_referential_reliability_slice(contract: &Contract) -> bool {
+    if !is_fail_closed_scope_task(contract) {
+        return false;
+    }
+    let scoped_paths: Vec<&str> = contract
+        .allowed_scope
+        .iter()
+        .chain(contract.entry_points.iter())
+        .map(String::as_str)
+        .collect();
+    if scoped_paths.is_empty() {
+        return false;
+    }
+    if !scoped_paths
+        .iter()
+        .all(|path| is_self_referential_control_plane_path(path))
+    {
+        return false;
+    }
+    let mut text = contract.prompt_source.to_ascii_lowercase();
+    for item in contract
+        .expected_interfaces
+        .iter()
+        .chain(contract.behavior_requirements.iter())
+    {
+        text.push('\n');
+        text.push_str(&item.to_ascii_lowercase());
+    }
+    [
+        "self-hosting",
+        "reliability",
+        "retry",
+        "no implementation progress",
+        "bounded context dispatch",
+        "post-check",
+        "stall",
+        "patch seed",
+        "hunk seed",
+        "bootstrap hunk",
+        "controller-owned",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn is_self_referential_control_plane_path(path: &str) -> bool {
+    path.starts_with("crates/punk-adapters/")
+        || path.starts_with("crates/punk-vcs/")
+        || path.starts_with("crates/punk-cli/")
+        || path.starts_with("crates/punk-orch/")
 }
 
 fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<TimedOutput> {
@@ -1699,6 +1770,132 @@ mod tests {
             approved_at: Some("now".into()),
         };
         assert_eq!(codex_executor_reasoning_effort(&contract), Some("low"));
+    }
+
+    #[test]
+    fn self_referential_reliability_slice_requires_manual_mode() {
+        let contract = Contract {
+            id: "ct_retry".into(),
+            feature_id: "feat_retry".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source:
+                "Strengthen patch-seed retry for no-progress existing-file self-hosting slices"
+                    .into(),
+            entry_points: vec![
+                "crates/punk-adapters/src/context_pack.rs".into(),
+                "crates/punk-adapters/src/lib.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["controller-owned retry path".into()],
+            behavior_requirements: vec![
+                "preserve no implementation progress after bounded context dispatch".into(),
+            ],
+            allowed_scope: vec![
+                "crates/punk-adapters/src/context_pack.rs".into(),
+                "crates/punk-adapters/src/lib.rs".into(),
+            ],
+            target_checks: vec!["cargo test -p punk-adapters".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert!(is_self_referential_reliability_slice(&contract));
+        assert_eq!(
+            manual_mode_block_summary(&contract).as_deref(),
+            Some(
+                "PUNK_EXECUTION_BLOCKED: self-referential reliability slice requires manual bounded implementation"
+            )
+        );
+    }
+
+    #[test]
+    fn helper_feature_without_reliability_signal_is_not_forced_into_manual_mode() {
+        let contract = Contract {
+            id: "ct_vcs".into(),
+            feature_id: "feat_vcs".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Add JSON output to punk vcs status".into(),
+            entry_points: vec![
+                "crates/punk-vcs/src/lib.rs".into(),
+                "crates/punk-cli/src/main.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["punk vcs status --json emits structured JSON".into()],
+            behavior_requirements: vec!["preserve human output".into()],
+            allowed_scope: vec![
+                "crates/punk-vcs/src/lib.rs".into(),
+                "crates/punk-cli/src/main.rs".into(),
+            ],
+            target_checks: vec!["cargo test -p punk-vcs".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert!(!is_self_referential_reliability_slice(&contract));
+        assert!(manual_mode_block_summary(&contract).is_none());
+    }
+
+    #[test]
+    fn execute_contract_short_circuits_manual_mode_slices() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-manual-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let contract = Contract {
+            id: "ct_post_check".into(),
+            feature_id: "feat_post_check".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source:
+                "Classify and fail fast on post-check zero-progress stall in bounded self-hosting runs"
+                    .into(),
+            entry_points: vec!["crates/punk-adapters/src/lib.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["preserve current no-progress detection".into()],
+            behavior_requirements: vec!["post-check stall reliability slice".into()],
+            allowed_scope: vec!["crates/punk-adapters/src/lib.rs".into()],
+            target_checks: vec!["cargo test -p punk-adapters".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let executor = CodexCliExecutor::default();
+        let output = executor
+            .execute_contract(ExecuteInput {
+                repo_root: root.clone(),
+                contract,
+                stdout_path: root.join("stdout.log"),
+                stderr_path: root.join("stderr.log"),
+                executor_pid_path: root.join("executor.json"),
+            })
+            .unwrap();
+
+        assert!(!output.success);
+        assert_eq!(
+            output.summary,
+            "PUNK_EXECUTION_BLOCKED: self-referential reliability slice requires manual bounded implementation"
+        );
+        assert_eq!(output.duration_ms, 0);
+        assert!(!root.join("stdout.log").exists());
+        assert!(!root.join("stderr.log").exists());
+        assert!(!root.join("executor.json").exists());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
