@@ -17,6 +17,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{collections::HashMap, ops::RangeInclusive};
 
 use anyhow::{anyhow, Context, Result};
 use context_pack::{
@@ -1901,25 +1902,55 @@ fn push_unique_string(items: &mut Vec<String>, value: String) {
 }
 
 fn apply_patch_in_repo(repo_root: &Path, patch: &str) -> Result<()> {
-    let patch_path = std::env::temp_dir().join(format!(
+    match apply_patch_in_repo_once(repo_root, patch) {
+        Ok(()) => Ok(()),
+        Err(initial_err) => {
+            let Some(rebased_patch) = rebase_patch_hunks_to_repo(repo_root, patch)? else {
+                return Err(initial_err);
+            };
+            if rebased_patch.trim() == patch.trim() {
+                return Err(initial_err);
+            }
+            apply_patch_in_repo_once(repo_root, &rebased_patch)
+                .with_context(|| format!("initial apply error: {initial_err}"))
+        }
+    }
+}
+
+fn apply_patch_in_repo_once(repo_root: &Path, patch: &str) -> Result<()> {
+    let patch_path = temp_patch_path()?;
+    fs::write(&patch_path, patch).with_context(|| format!("write {}", patch_path.display()))?;
+    let check_result = run_git_apply_check(repo_root, &patch_path);
+    if let Err(err) = check_result {
+        let _ = fs::remove_file(&patch_path);
+        return Err(err);
+    }
+    let apply_result = run_git_apply(repo_root, &patch_path);
+    let _ = fs::remove_file(&patch_path);
+    apply_result
+}
+
+fn temp_patch_path() -> Result<PathBuf> {
+    Ok(std::env::temp_dir().join(format!(
         "punk-apply-patch-{}-{}.diff",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
-    ));
-    fs::write(&patch_path, patch).with_context(|| format!("write {}", patch_path.display()))?;
+    )))
+}
+
+fn run_git_apply_check(repo_root: &Path, patch_path: &Path) -> Result<()> {
     let mut check = Command::new("git");
     check
         .arg("apply")
         .arg("--check")
         .arg("--recount")
-        .arg(&patch_path)
+        .arg(patch_path)
         .current_dir(repo_root);
     let check_output = run_command_with_timeout(&mut check, codex_executor_timeout())?;
     if check_output.timed_out {
-        let _ = fs::remove_file(&patch_path);
         return Err(anyhow!(
             "git apply --check timed out after {}s",
             codex_executor_timeout().as_secs()
@@ -1928,7 +1959,6 @@ fn apply_patch_in_repo(repo_root: &Path, patch: &str) -> Result<()> {
     if !check_output.output.status.success() {
         let stdout = String::from_utf8_lossy(&check_output.output.stdout);
         let stderr = String::from_utf8_lossy(&check_output.output.stderr);
-        let _ = fs::remove_file(&patch_path);
         return Err(anyhow!(
             "{}",
             last_non_empty_line(&stderr)
@@ -1936,15 +1966,17 @@ fn apply_patch_in_repo(repo_root: &Path, patch: &str) -> Result<()> {
                 .unwrap_or_else(|| "git apply --check failed".to_string())
         ));
     }
+    Ok(())
+}
 
+fn run_git_apply(repo_root: &Path, patch_path: &Path) -> Result<()> {
     let mut apply = Command::new("git");
     apply
         .arg("apply")
         .arg("--recount")
-        .arg(&patch_path)
+        .arg(patch_path)
         .current_dir(repo_root);
     let apply_output = run_command_with_timeout(&mut apply, codex_executor_timeout())?;
-    let _ = fs::remove_file(&patch_path);
     if apply_output.timed_out {
         return Err(anyhow!(
             "git apply timed out after {}s",
@@ -1962,6 +1994,180 @@ fn apply_patch_in_repo(repo_root: &Path, patch: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn rebase_patch_hunks_to_repo(repo_root: &Path, patch: &str) -> Result<Option<String>> {
+    let mut file_cache: HashMap<String, Vec<String>> = HashMap::new();
+    let lines: Vec<&str> = patch.lines().collect();
+    let mut rewritten = Vec::with_capacity(lines.len());
+    let mut current_path: Option<String> = None;
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            if let Some((_, after)) = rest.split_once(" b/") {
+                current_path = Some(after.trim().to_string());
+            }
+            rewritten.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        if let Some((old_range, _new_range, suffix)) = parse_unified_hunk_header(line) {
+            let path = current_path.clone();
+            i += 1;
+            let mut hunk_lines = Vec::new();
+            while i < lines.len() {
+                let candidate = lines[i];
+                if candidate.starts_with("diff --git ")
+                    || parse_unified_hunk_header(candidate).is_some()
+                {
+                    break;
+                }
+                hunk_lines.push(candidate.to_string());
+                i += 1;
+            }
+            let rewritten_header = match path.as_deref() {
+                Some(path) => {
+                    let file_lines = load_repo_file_lines(repo_root, path, &mut file_cache)?;
+                    rebase_hunk_header(path, &old_range, &suffix, &hunk_lines, file_lines)
+                        .unwrap_or_else(|| line.to_string())
+                }
+                None => line.to_string(),
+            };
+            if rewritten_header != line {
+                changed = true;
+            }
+            rewritten.push(rewritten_header);
+            rewritten.extend(hunk_lines);
+            continue;
+        }
+        rewritten.push(line.to_string());
+        i += 1;
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let mut patch_text = rewritten.join("\n");
+    patch_text.push('\n');
+    Ok(Some(patch_text))
+}
+
+fn load_repo_file_lines<'a>(
+    repo_root: &Path,
+    path: &str,
+    cache: &'a mut HashMap<String, Vec<String>>,
+) -> Result<&'a Vec<String>> {
+    if !cache.contains_key(path) {
+        let file_path = repo_root.join(path);
+        let content = fs::read_to_string(&file_path)
+            .with_context(|| format!("read patch target {}", file_path.display()))?;
+        cache.insert(
+            path.to_string(),
+            content.lines().map(|line| line.to_string()).collect(),
+        );
+    }
+    Ok(cache.get(path).expect("cache entry inserted"))
+}
+
+fn rebase_hunk_header(
+    _path: &str,
+    old_range: &RangeInclusive<usize>,
+    suffix: &str,
+    hunk_lines: &[String],
+    file_lines: &[String],
+) -> Option<String> {
+    let old_lines: Vec<String> = hunk_old_lines(hunk_lines);
+    if old_lines.is_empty() {
+        return None;
+    }
+    let matches = find_exact_line_sequence(file_lines, &old_lines);
+    if matches.len() != 1 {
+        return None;
+    }
+    let start_line = matches[0] + 1;
+    let old_count = hunk_old_count(hunk_lines);
+    let new_count = hunk_new_count(hunk_lines);
+    let original_start = *old_range.start();
+    if start_line == original_start {
+        return None;
+    }
+    Some(format!(
+        "@@ -{} +{} @@{}",
+        format_unified_range(start_line, old_count),
+        format_unified_range(start_line, new_count),
+        suffix
+    ))
+}
+
+fn parse_unified_hunk_header(
+    line: &str,
+) -> Option<(RangeInclusive<usize>, RangeInclusive<usize>, String)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (ranges, suffix) = rest.split_once(" @@")?;
+    let (old_range, new_range) = ranges.split_once(" +")?;
+    let (old_start, old_count) = parse_unified_range(old_range)?;
+    let (new_start, new_count) = parse_unified_range(new_range)?;
+    Some((
+        old_start..=old_start + old_count.saturating_sub(1),
+        new_start..=new_start + new_count.saturating_sub(1),
+        suffix.to_string(),
+    ))
+}
+
+fn parse_unified_range(range: &str) -> Option<(usize, usize)> {
+    match range.split_once(',') {
+        Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+        None => Some((range.parse().ok()?, 1)),
+    }
+}
+
+fn format_unified_range(start: usize, count: usize) -> String {
+    if count == 1 {
+        start.to_string()
+    } else {
+        format!("{start},{count}")
+    }
+}
+
+fn hunk_old_lines(hunk_lines: &[String]) -> Vec<String> {
+    hunk_lines
+        .iter()
+        .filter_map(|line| {
+            if line.starts_with(' ') || (line.starts_with('-') && !line.starts_with("---")) {
+                Some(line[1..].to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn hunk_old_count(hunk_lines: &[String]) -> usize {
+    hunk_lines
+        .iter()
+        .filter(|line| line.starts_with(' ') || (line.starts_with('-') && !line.starts_with("---")))
+        .count()
+}
+
+fn hunk_new_count(hunk_lines: &[String]) -> usize {
+    hunk_lines
+        .iter()
+        .filter(|line| line.starts_with(' ') || (line.starts_with('+') && !line.starts_with("+++")))
+        .count()
+}
+
+fn find_exact_line_sequence(haystack: &[String], needle: &[String]) -> Vec<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    for start in 0..=haystack.len() - needle.len() {
+        if haystack[start..start + needle.len()] == *needle {
+            matches.push(start);
+        }
+    }
+    matches
 }
 
 fn collect_contract_checks(contract: &Contract) -> Vec<String> {
@@ -2675,6 +2881,27 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rebase_hunk_header_adjusts_stale_start_line() {
+        let file_lines = vec![
+            "// filler 1".to_string(),
+            "// filler 2".to_string(),
+            "// filler 3".to_string(),
+            "fn gamma() {".to_string(),
+            "    three();".to_string(),
+            "}".to_string(),
+        ];
+        let hunk_lines = vec![
+            " fn gamma() {".to_string(),
+            "     three();".to_string(),
+            "+    three_more();".to_string(),
+            " }".to_string(),
+        ];
+        let rewritten = rebase_hunk_header("src/lib.rs", &(2..=4), "", &hunk_lines, &file_lines)
+            .expect("expected rebased header");
+        assert_eq!(rewritten, "@@ -4,3 +4,4 @@");
     }
 
     #[test]

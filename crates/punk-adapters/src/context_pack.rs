@@ -1518,10 +1518,10 @@ mod tests {
         assert!(seed.files[0]
             .snippet
             .contains("Ordered file target: 1 of 1"));
+        assert!(seed.files[0].snippet.contains("Highest-confidence symbols"));
         assert!(seed.files[0]
             .snippet
-            .contains("Highest-confidence symbols"));
-        assert!(seed.files[0].snippet.contains("Anchor excerpts to edit in place"));
+            .contains("Anchor excerpts to edit in place"));
         assert!(seed.files[0].snippet.contains("line 2: pub fn existing()"));
 
         let _ = fs::remove_dir_all(&root);
