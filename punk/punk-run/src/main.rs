@@ -417,6 +417,18 @@ enum BenchmarkAction {
         /// Benchmark id
         benchmark_id: String,
     },
+    /// Aggregate stored benchmark results
+    Summary {
+        /// Optional project filter
+        #[arg(long)]
+        project: Option<String>,
+        /// Optional suite filter
+        #[arg(long)]
+        suite: Option<String>,
+        /// Limit to newest N benchmark results
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -920,6 +932,11 @@ async fn main() -> anyhow::Result<()> {
             ),
             BenchmarkAction::List => cmd_benchmark_list(),
             BenchmarkAction::Show { benchmark_id } => cmd_benchmark_show(&benchmark_id),
+            BenchmarkAction::Summary {
+                project,
+                suite,
+                limit,
+            } => cmd_benchmark_summary(project.as_deref(), suite.as_deref(), limit),
         },
         Command::Goal { action } => match action {
             GoalAction::Create {
@@ -2774,6 +2791,77 @@ fn cmd_benchmark_show(benchmark_id: &str) {
         for note in &result.notes {
             println!("  - {note}");
         }
+    }
+}
+
+fn cmd_benchmark_summary(
+    project_filter: Option<&str>,
+    suite_filter: Option<&str>,
+    limit: Option<usize>,
+) {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let summary = benchmark::summarize_benchmarks(&cwd, limit, project_filter, suite_filter)
+        .unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        });
+
+    println!("Benchmark summary");
+    if let Some(project) = project_filter {
+        println!("Project filter: {project}");
+    }
+    if let Some(suite) = suite_filter {
+        println!("Suite filter: {suite}");
+    }
+    if let Some(limit) = limit {
+        println!("Limit: newest {limit}");
+    }
+    println!(
+        "Totals: total={} pass={} fail={} flaky={}",
+        summary.total, summary.pass_count, summary.fail_count, summary.flaky_count
+    );
+    println!("Average score: {:.2}", summary.avg_score);
+    println!("Projects:");
+    for project in &summary.projects {
+        println!(
+            "  - {:<18} total={} pass={} fail={} flaky={} avg_score={:.2}",
+            project.project_id,
+            project.total,
+            project.pass_count,
+            project.fail_count,
+            project.flaky_count,
+            project.avg_score,
+        );
+    }
+    println!("Suites:");
+    for suite in &summary.suites {
+        println!(
+            "  - {:<20} total={} pass={} fail={} flaky={} avg_score={:.2}",
+            suite.suite,
+            suite.total,
+            suite.pass_count,
+            suite.fail_count,
+            suite.flaky_count,
+            suite.avg_score,
+        );
+    }
+    println!("Weakest benchmarks:");
+    for result in &summary.weakest {
+        println!(
+            "  - {:<36} {:<18} {:<18} score={:.2} {:?} {}",
+            result.benchmark_id,
+            result.project_id,
+            result.suite,
+            result.score,
+            result.outcome,
+            result.created_at.to_rfc3339(),
+        );
     }
 }
 

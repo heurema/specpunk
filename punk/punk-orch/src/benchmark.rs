@@ -32,6 +32,48 @@ pub struct BenchmarkResult {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ProjectBenchmarkSummary {
+    pub project_id: String,
+    pub total: usize,
+    pub pass_count: usize,
+    pub fail_count: usize,
+    pub flaky_count: usize,
+    pub avg_score: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SuiteBenchmarkSummary {
+    pub suite: String,
+    pub total: usize,
+    pub pass_count: usize,
+    pub fail_count: usize,
+    pub flaky_count: usize,
+    pub avg_score: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeakBenchmarkResult {
+    pub benchmark_id: String,
+    pub suite: String,
+    pub project_id: String,
+    pub outcome: BenchmarkOutcome,
+    pub score: f64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BenchmarkSummary {
+    pub total: usize,
+    pub pass_count: usize,
+    pub fail_count: usize,
+    pub flaky_count: usize,
+    pub avg_score: f64,
+    pub projects: Vec<ProjectBenchmarkSummary>,
+    pub suites: Vec<SuiteBenchmarkSummary>,
+    pub weakest: Vec<WeakBenchmarkResult>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecordBenchmarkRequest {
     pub suite: String,
     pub project_id: String,
@@ -177,6 +219,149 @@ pub fn load_benchmark(cwd: &Path, benchmark_id: &str) -> Result<BenchmarkResult,
     serde_json::from_str::<BenchmarkResult>(&content).map_err(|e| e.to_string())
 }
 
+fn outcome_counts(results: &[&BenchmarkResult]) -> (usize, usize, usize) {
+    let pass_count = results
+        .iter()
+        .filter(|result| result.outcome == BenchmarkOutcome::Pass)
+        .count();
+    let fail_count = results
+        .iter()
+        .filter(|result| result.outcome == BenchmarkOutcome::Fail)
+        .count();
+    let flaky_count = results.len() - pass_count - fail_count;
+    (pass_count, fail_count, flaky_count)
+}
+
+pub fn summarize_benchmarks(
+    cwd: &Path,
+    limit: Option<usize>,
+    project_filter: Option<&str>,
+    suite_filter: Option<&str>,
+) -> Result<BenchmarkSummary, String> {
+    let mut results = list_benchmarks(cwd)?;
+    if let Some(project) = project_filter {
+        results.retain(|result| result.project_id == project);
+    }
+    if let Some(suite) = suite_filter {
+        results.retain(|result| result.suite == suite);
+    }
+    if let Some(limit) = limit {
+        results.truncate(limit);
+    }
+    if results.is_empty() {
+        return Err("no benchmark results found for summary".to_string());
+    }
+
+    let total = results.len();
+    let pass_count = results
+        .iter()
+        .filter(|result| result.outcome == BenchmarkOutcome::Pass)
+        .count();
+    let fail_count = results
+        .iter()
+        .filter(|result| result.outcome == BenchmarkOutcome::Fail)
+        .count();
+    let flaky_count = total - pass_count - fail_count;
+    let avg_score = results.iter().map(|result| result.score).sum::<f64>() / total as f64;
+
+    let mut project_ids = results
+        .iter()
+        .map(|result| result.project_id.clone())
+        .collect::<Vec<_>>();
+    project_ids.sort();
+    project_ids.dedup();
+
+    let mut projects = Vec::new();
+    for project_id in project_ids {
+        let project_results = results
+            .iter()
+            .filter(|result| result.project_id == project_id)
+            .collect::<Vec<_>>();
+        let (pass_count, fail_count, flaky_count) = outcome_counts(&project_results);
+        let avg_score = project_results
+            .iter()
+            .map(|result| result.score)
+            .sum::<f64>()
+            / project_results.len() as f64;
+        projects.push(ProjectBenchmarkSummary {
+            project_id,
+            total: project_results.len(),
+            pass_count,
+            fail_count,
+            flaky_count,
+            avg_score,
+        });
+    }
+    projects.sort_by(|a, b| {
+        a.avg_score
+            .partial_cmp(&b.avg_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.project_id.cmp(&b.project_id))
+    });
+
+    let mut suite_ids = results
+        .iter()
+        .map(|result| result.suite.clone())
+        .collect::<Vec<_>>();
+    suite_ids.sort();
+    suite_ids.dedup();
+
+    let mut suites = Vec::new();
+    for suite in suite_ids {
+        let suite_results = results
+            .iter()
+            .filter(|result| result.suite == suite)
+            .collect::<Vec<_>>();
+        let (pass_count, fail_count, flaky_count) = outcome_counts(&suite_results);
+        let avg_score = suite_results.iter().map(|result| result.score).sum::<f64>()
+            / suite_results.len() as f64;
+        suites.push(SuiteBenchmarkSummary {
+            suite,
+            total: suite_results.len(),
+            pass_count,
+            fail_count,
+            flaky_count,
+            avg_score,
+        });
+    }
+    suites.sort_by(|a, b| {
+        a.avg_score
+            .partial_cmp(&b.avg_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.suite.cmp(&b.suite))
+    });
+
+    let mut weakest = results
+        .iter()
+        .map(|result| WeakBenchmarkResult {
+            benchmark_id: result.benchmark_id.clone(),
+            suite: result.suite.clone(),
+            project_id: result.project_id.clone(),
+            outcome: result.outcome.clone(),
+            score: result.score,
+            created_at: result.created_at,
+        })
+        .collect::<Vec<_>>();
+    weakest.sort_by(|a, b| {
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+    weakest.truncate(5);
+
+    Ok(BenchmarkSummary {
+        total,
+        pass_count,
+        fail_count,
+        flaky_count,
+        avg_score,
+        projects,
+        suites,
+        weakest,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +442,65 @@ mod tests {
         request.score = 1.5;
         let err = record_benchmark(&repo, request).unwrap_err();
         assert!(err.contains("score must be between 0.0 and 1.0"));
+    }
+
+    #[test]
+    fn summarize_benchmarks_aggregates_results() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let mut first = sample_request();
+        first.suite = "alpha".into();
+        first.score = 0.95;
+        first.outcome = BenchmarkOutcome::Pass;
+        let _ = record_benchmark(&repo, first).unwrap();
+
+        let mut second = sample_request();
+        second.suite = "beta".into();
+        second.score = 0.4;
+        second.outcome = BenchmarkOutcome::Fail;
+        let _ = record_benchmark(&repo, second).unwrap();
+
+        let summary = summarize_benchmarks(&repo, None, None, None).unwrap();
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.pass_count, 1);
+        assert_eq!(summary.fail_count, 1);
+        assert_eq!(summary.flaky_count, 0);
+        assert_eq!(summary.projects.len(), 1);
+        assert_eq!(summary.suites.len(), 2);
+        assert_eq!(summary.weakest[0].suite, "beta");
+    }
+
+    #[test]
+    fn summarize_benchmarks_applies_filters_and_limit() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let mut first = sample_request();
+        first.project_id = "alpha".into();
+        first.suite = "smoke".into();
+        let _ = record_benchmark(&repo, first).unwrap();
+
+        let mut second = sample_request();
+        second.project_id = "beta".into();
+        second.suite = "stress".into();
+        second.score = 0.5;
+        let _ = record_benchmark(&repo, second).unwrap();
+
+        let mut third = sample_request();
+        third.project_id = "alpha".into();
+        third.suite = "stress".into();
+        let _ = record_benchmark(&repo, third).unwrap();
+
+        let summary = summarize_benchmarks(&repo, Some(1), Some("alpha"), Some("stress")).unwrap();
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.projects.len(), 1);
+        assert_eq!(summary.projects[0].project_id, "alpha");
+        assert_eq!(summary.suites.len(), 1);
+        assert_eq!(summary.suites[0].suite, "stress");
     }
 }
