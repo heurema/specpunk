@@ -452,6 +452,18 @@ enum EvalAction {
     List,
     /// List stored skill eval results
     SkillList,
+    /// Aggregate stored skill eval results
+    SkillSummary {
+        /// Optional project filter
+        #[arg(long)]
+        project: Option<String>,
+        /// Optional skill filter
+        #[arg(long)]
+        skill: Option<String>,
+        /// Limit to newest N skill eval records
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Aggregate stored task eval results
     Summary {
         /// Optional project filter
@@ -1043,6 +1055,11 @@ async fn main() -> anyhow::Result<()> {
                 &note,
             ),
             EvalAction::SkillList => cmd_eval_skill_list(),
+            EvalAction::SkillSummary {
+                project,
+                skill,
+                limit,
+            } => cmd_eval_skill_summary(project.as_deref(), skill.as_deref(), limit),
             EvalAction::Summary { project, limit } => cmd_eval_summary(project.as_deref(), limit),
         },
         Command::Benchmark { action } => match action {
@@ -2901,6 +2918,81 @@ fn cmd_eval_skill_list() {
             record.suite_id,
             format!("{:?}", record.decision).to_ascii_lowercase(),
             record.baseline_primary_score,
+            record.candidate_primary_score,
+            record.created_at.to_rfc3339(),
+        );
+    }
+}
+
+fn cmd_eval_skill_summary(
+    project_filter: Option<&str>,
+    skill_filter: Option<&str>,
+    limit: Option<usize>,
+) {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let summary = eval::summarize_skill_evals(&cwd, limit, project_filter, skill_filter)
+        .unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        });
+
+    println!("Skill eval summary");
+    if let Some(project) = project_filter {
+        println!("Project filter: {project}");
+    }
+    if let Some(skill) = skill_filter {
+        println!("Skill filter: {skill}");
+    }
+    if let Some(limit) = limit {
+        println!("Limit: newest {limit}");
+    }
+    println!(
+        "Totals: total={} promote={} reject={} rollback={}",
+        summary.total, summary.promote_count, summary.reject_count, summary.rollback_count
+    );
+    println!(
+        "Average primary score: baseline={:.2} candidate={:.2} delta={:.2}",
+        summary.avg_baseline_primary_score,
+        summary.avg_candidate_primary_score,
+        summary.avg_score_delta,
+    );
+    println!("Projects:");
+    for project in &summary.projects {
+        println!(
+            "  - {:<18} total={} promote={} reject={} rollback={} avg_candidate_score={:.2}",
+            project.project_id,
+            project.total,
+            project.promote_count,
+            project.reject_count,
+            project.rollback_count,
+            project.avg_candidate_primary_score,
+        );
+    }
+    println!("Skills:");
+    for skill in &summary.skills {
+        println!(
+            "  - {:<24} total={} promote={} reject={} rollback={} avg_delta={:.2}",
+            skill.skill_name,
+            skill.total,
+            skill.promote_count,
+            skill.reject_count,
+            skill.rollback_count,
+            skill.avg_score_delta,
+        );
+    }
+    println!("Weakest skill evals:");
+    for record in &summary.weakest {
+        println!(
+            "  - {:<24} {:<18} decision={} candidate_score={:.2} {}",
+            record.skill_name,
+            record.project_id,
+            format!("{:?}", record.decision).to_ascii_lowercase(),
             record.candidate_primary_score,
             record.created_at.to_rfc3339(),
         );

@@ -74,6 +74,50 @@ pub struct EvalSummary {
     pub weakest_tasks: Vec<WeakTaskEval>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillProjectEvalSummary {
+    pub project_id: String,
+    pub total: usize,
+    pub promote_count: usize,
+    pub reject_count: usize,
+    pub rollback_count: usize,
+    pub avg_candidate_primary_score: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillNameEvalSummary {
+    pub skill_name: String,
+    pub total: usize,
+    pub promote_count: usize,
+    pub reject_count: usize,
+    pub rollback_count: usize,
+    pub avg_score_delta: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeakSkillEval {
+    pub eval_id: String,
+    pub skill_name: String,
+    pub project_id: String,
+    pub decision: PromotionDecision,
+    pub candidate_primary_score: f64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillEvalSummary {
+    pub total: usize,
+    pub promote_count: usize,
+    pub reject_count: usize,
+    pub rollback_count: usize,
+    pub avg_baseline_primary_score: f64,
+    pub avg_candidate_primary_score: f64,
+    pub avg_score_delta: f64,
+    pub projects: Vec<SkillProjectEvalSummary>,
+    pub skills: Vec<SkillNameEvalSummary>,
+    pub weakest: Vec<WeakSkillEval>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromotionDecision {
@@ -853,6 +897,173 @@ pub fn list_skill_evals(cwd: &Path) -> Result<Vec<SkillEvalRecord>, String> {
     Ok(records)
 }
 
+pub fn summarize_skill_evals(
+    cwd: &Path,
+    limit: Option<usize>,
+    project_filter: Option<&str>,
+    skill_filter: Option<&str>,
+) -> Result<SkillEvalSummary, String> {
+    let mut records = list_skill_evals(cwd)?;
+    if let Some(project) = project_filter {
+        records.retain(|record| record.project_id == project);
+    }
+    if let Some(skill_name) = skill_filter {
+        records.retain(|record| record.skill_name == skill_name);
+    }
+    if let Some(limit) = limit {
+        records.truncate(limit);
+    }
+    if records.is_empty() {
+        return Err("no skill evals found for summary".to_string());
+    }
+
+    let total = records.len();
+    let promote_count = records
+        .iter()
+        .filter(|record| record.decision == PromotionDecision::Promote)
+        .count();
+    let reject_count = records
+        .iter()
+        .filter(|record| record.decision == PromotionDecision::Reject)
+        .count();
+    let rollback_count = total - promote_count - reject_count;
+    let avg_baseline_primary_score = records
+        .iter()
+        .map(|record| record.baseline_primary_score)
+        .sum::<f64>()
+        / total as f64;
+    let avg_candidate_primary_score = records
+        .iter()
+        .map(|record| record.candidate_primary_score)
+        .sum::<f64>()
+        / total as f64;
+    let avg_score_delta = records
+        .iter()
+        .map(|record| record.candidate_primary_score - record.baseline_primary_score)
+        .sum::<f64>()
+        / total as f64;
+
+    let mut project_ids = records
+        .iter()
+        .map(|record| record.project_id.clone())
+        .collect::<Vec<_>>();
+    project_ids.sort();
+    project_ids.dedup();
+
+    let mut projects = Vec::new();
+    for project_id in project_ids {
+        let project_records = records
+            .iter()
+            .filter(|record| record.project_id == project_id)
+            .collect::<Vec<_>>();
+        let project_total = project_records.len();
+        let project_promote_count = project_records
+            .iter()
+            .filter(|record| record.decision == PromotionDecision::Promote)
+            .count();
+        let project_reject_count = project_records
+            .iter()
+            .filter(|record| record.decision == PromotionDecision::Reject)
+            .count();
+        let project_rollback_count = project_total - project_promote_count - project_reject_count;
+        let avg_candidate_primary_score = project_records
+            .iter()
+            .map(|record| record.candidate_primary_score)
+            .sum::<f64>()
+            / project_total as f64;
+        projects.push(SkillProjectEvalSummary {
+            project_id,
+            total: project_total,
+            promote_count: project_promote_count,
+            reject_count: project_reject_count,
+            rollback_count: project_rollback_count,
+            avg_candidate_primary_score,
+        });
+    }
+    projects.sort_by(|a, b| {
+        b.avg_candidate_primary_score
+            .partial_cmp(&a.avg_candidate_primary_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.project_id.cmp(&b.project_id))
+    });
+
+    let mut skill_names = records
+        .iter()
+        .map(|record| record.skill_name.clone())
+        .collect::<Vec<_>>();
+    skill_names.sort();
+    skill_names.dedup();
+
+    let mut skills = Vec::new();
+    for skill_name in skill_names {
+        let skill_records = records
+            .iter()
+            .filter(|record| record.skill_name == skill_name)
+            .collect::<Vec<_>>();
+        let skill_total = skill_records.len();
+        let skill_promote_count = skill_records
+            .iter()
+            .filter(|record| record.decision == PromotionDecision::Promote)
+            .count();
+        let skill_reject_count = skill_records
+            .iter()
+            .filter(|record| record.decision == PromotionDecision::Reject)
+            .count();
+        let skill_rollback_count = skill_total - skill_promote_count - skill_reject_count;
+        let avg_score_delta = skill_records
+            .iter()
+            .map(|record| record.candidate_primary_score - record.baseline_primary_score)
+            .sum::<f64>()
+            / skill_total as f64;
+        skills.push(SkillNameEvalSummary {
+            skill_name,
+            total: skill_total,
+            promote_count: skill_promote_count,
+            reject_count: skill_reject_count,
+            rollback_count: skill_rollback_count,
+            avg_score_delta,
+        });
+    }
+    skills.sort_by(|a, b| {
+        b.avg_score_delta
+            .partial_cmp(&a.avg_score_delta)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.skill_name.cmp(&b.skill_name))
+    });
+
+    let mut weakest = records
+        .iter()
+        .map(|record| WeakSkillEval {
+            eval_id: record.eval_id.clone(),
+            skill_name: record.skill_name.clone(),
+            project_id: record.project_id.clone(),
+            decision: record.decision.clone(),
+            candidate_primary_score: record.candidate_primary_score,
+            created_at: record.created_at,
+        })
+        .collect::<Vec<_>>();
+    weakest.sort_by(|a, b| {
+        a.candidate_primary_score
+            .partial_cmp(&b.candidate_primary_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+    weakest.truncate(3);
+
+    Ok(SkillEvalSummary {
+        total,
+        promote_count,
+        reject_count,
+        rollback_count,
+        avg_baseline_primary_score,
+        avg_candidate_primary_score,
+        avg_score_delta,
+        projects,
+        skills,
+        weakest,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1222,5 +1433,161 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].skill_name, "second-skill");
         assert_eq!(listed[1].skill_name, "first-skill");
+    }
+
+    #[test]
+    fn summarize_skill_evals_aggregates_projects_and_skills() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        skill::create_candidate_skill(
+            &repo,
+            "cleanup-overlay",
+            "cleanup",
+            "Cleanup candidate.",
+            &[String::from("receipt:one")],
+        )
+        .unwrap();
+        skill::create_candidate_skill(
+            &repo,
+            "docs-overlay",
+            "docs",
+            "Docs candidate.",
+            &[String::from("receipt:two")],
+        )
+        .unwrap();
+
+        let baseline = sample_skill_metrics();
+        let mut improved = baseline.clone();
+        improved.primary.contract_satisfaction = 0.82;
+        improved.primary.target_pass_rate = 0.81;
+
+        let mut regressed = baseline.clone();
+        regressed.safety.docs_parity = 0.60;
+
+        let _ = evaluate_skill(
+            &repo,
+            &bus,
+            EvaluateSkillRequest {
+                skill_name: "cleanup-overlay".into(),
+                project_id: "alpha".into(),
+                suite_id: "suite-a".into(),
+                role: None,
+                baseline: baseline.clone(),
+                candidate: improved,
+                suite_size: 5,
+                evidence_refs: vec!["receipt:one".into()],
+                notes: Vec::new(),
+            },
+        )
+        .unwrap();
+        let _ = evaluate_skill(
+            &repo,
+            &bus,
+            EvaluateSkillRequest {
+                skill_name: "docs-overlay".into(),
+                project_id: "beta".into(),
+                suite_id: "suite-b".into(),
+                role: None,
+                baseline,
+                candidate: regressed,
+                suite_size: 6,
+                evidence_refs: vec!["receipt:two".into()],
+                notes: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let summary = summarize_skill_evals(&repo, None, None, None).unwrap();
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.promote_count, 1);
+        assert_eq!(summary.reject_count, 1);
+        assert_eq!(summary.projects.len(), 2);
+        assert_eq!(summary.skills.len(), 2);
+        assert!(summary
+            .weakest
+            .iter()
+            .any(|record| record.skill_name == "docs-overlay"));
+    }
+
+    #[test]
+    fn summarize_skill_evals_applies_filters_and_limit() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        skill::create_candidate_skill(
+            &repo,
+            "cleanup-overlay",
+            "cleanup",
+            "Cleanup candidate.",
+            &[String::from("receipt:one")],
+        )
+        .unwrap();
+        skill::create_candidate_skill(
+            &repo,
+            "docs-overlay",
+            "docs",
+            "Docs candidate.",
+            &[String::from("receipt:two")],
+        )
+        .unwrap();
+
+        let baseline = sample_skill_metrics();
+        let mut improved = baseline.clone();
+        improved.primary.contract_satisfaction = 0.82;
+        improved.primary.target_pass_rate = 0.81;
+        let mut improved_two = improved.clone();
+        improved_two.primary.contract_satisfaction = 0.84;
+
+        let _ = evaluate_skill(
+            &repo,
+            &bus,
+            EvaluateSkillRequest {
+                skill_name: "cleanup-overlay".into(),
+                project_id: "alpha".into(),
+                suite_id: "suite-a".into(),
+                role: None,
+                baseline: baseline.clone(),
+                candidate: improved,
+                suite_size: 5,
+                evidence_refs: vec!["receipt:one".into()],
+                notes: Vec::new(),
+            },
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        let _ = evaluate_skill(
+            &repo,
+            &bus,
+            EvaluateSkillRequest {
+                skill_name: "cleanup-overlay".into(),
+                project_id: "alpha".into(),
+                suite_id: "suite-b".into(),
+                role: None,
+                baseline,
+                candidate: improved_two,
+                suite_size: 5,
+                evidence_refs: vec!["receipt:two".into()],
+                notes: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let summary =
+            summarize_skill_evals(&repo, Some(1), Some("alpha"), Some("cleanup-overlay")).unwrap();
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.promote_count, 1);
+        assert_eq!(summary.reject_count, 0);
+        assert_eq!(summary.projects.len(), 1);
+        assert_eq!(summary.skills.len(), 1);
+        assert_eq!(summary.skills[0].skill_name, "cleanup-overlay");
     }
 }
