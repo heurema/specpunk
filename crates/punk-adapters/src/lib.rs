@@ -451,18 +451,12 @@ impl CodexCliExecutor {
         }
         command.arg(prompt);
 
-        let timed_output = match run_command_with_timeout_and_tee(
+        let timed_output = match run_patch_lane_command_with_timeout(
             &mut command,
             codex_executor_timeout(),
-            codex_executor_stall_timeout(),
-            codex_executor_no_progress_timeout(),
-            codex_executor_scaffold_progress_timeout(),
-            codex_executor_orphan_grace_timeout(),
             input.stdout_path.clone(),
             input.stderr_path.clone(),
             input.executor_pid_path.clone(),
-            None,
-            None,
         ) {
             Ok(output) => {
                 if let Some(guard) = excerpt_guard.as_mut() {
@@ -1258,6 +1252,51 @@ fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let output = child.wait_with_output()?;
+            return Ok(TimedOutput {
+                output,
+                timed_out: true,
+                stalled: false,
+                orphaned: false,
+                no_progress_paths: Vec::new(),
+                scaffold_only_paths: Vec::new(),
+                post_check_zero_progress_paths: Vec::new(),
+            });
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn run_patch_lane_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    executor_pid_path: PathBuf,
+) -> Result<TimedOutput> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    write_executor_pid(&executor_pid_path, child.id())?;
+    let start = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            let output = child.wait_with_output()?;
+            fs::write(&stdout_path, &output.stdout)?;
+            fs::write(&stderr_path, &output.stderr)?;
+            return Ok(TimedOutput {
+                output,
+                timed_out: false,
+                stalled: false,
+                orphaned: false,
+                no_progress_paths: Vec::new(),
+                scaffold_only_paths: Vec::new(),
+                post_check_zero_progress_paths: Vec::new(),
+            });
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            fs::write(&stdout_path, &output.stdout)?;
+            fs::write(&stderr_path, &output.stderr)?;
             return Ok(TimedOutput {
                 output,
                 timed_out: true,
