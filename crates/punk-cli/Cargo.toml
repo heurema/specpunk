@@ -15,5 +15,7 @@ serde.workspace = true
 serde_json.workspace = true
 punk-adapters = { path = "../punk-adapters" }
 punk-gate = { path = "../punk-gate" }
+punk-domain = { path = "../punk-domain" }
 punk-orch = { path = "../punk-orch" }
 punk-proof = { path = "../punk-proof" }
+punk-vcs = { path = "../punk-vcs" }

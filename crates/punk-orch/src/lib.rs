@@ -18,10 +18,10 @@ pub use punk_core::{find_object_path, read_json, relative_ref, write_json};
 use punk_domain::{
     now_rfc3339, Contract, ContractStatus, DraftInput, DraftProposal, EventEnvelope, Feature,
     FeatureStatus, ModeId, Project, Receipt, ReceiptArtifacts, RefineInput, Run, RunStatus, Task,
-    TaskKind, TaskStatus,
+    TaskKind, TaskStatus, VcsKind,
 };
 use punk_events::EventStore;
-use punk_vcs::detect_backend;
+use punk_vcs::{current_snapshot_ref, detect_backend};
 use serde::Serialize;
 
 #[derive(Debug, Clone)]
@@ -44,6 +44,10 @@ pub struct StatusSnapshot {
     pub last_contract_id: Option<String>,
     pub last_run_id: Option<String>,
     pub last_decision_id: Option<String>,
+    pub vcs_backend: Option<VcsKind>,
+    pub vcs_ref: Option<String>,
+    pub vcs_dirty: bool,
+    pub workspace_root: Option<String>,
 }
 
 pub struct OrchService {
@@ -628,6 +632,11 @@ impl OrchService {
     pub fn status(&self, id: Option<&str>) -> Result<StatusSnapshot> {
         let project = self.bootstrap_project()?;
         let events = self.events.load_all()?;
+        let vcs_snapshot = current_snapshot_ref(&self.paths.repo_root).ok();
+        let workspace_root = detect_backend(&self.paths.repo_root)
+            .ok()
+            .and_then(|backend| backend.workspace_root().ok())
+            .map(|path| path.display().to_string());
         if let Some(id) = id {
             let value = self.inspect(id)?;
             let last_run_id = value
@@ -669,6 +678,12 @@ impl OrchService {
                 last_contract_id,
                 last_run_id,
                 last_decision_id,
+                vcs_backend: vcs_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.vcs.clone()),
+                vcs_ref: vcs_snapshot.as_ref().and_then(|snapshot| snapshot.head_ref.clone()),
+                vcs_dirty: vcs_snapshot.as_ref().map(|snapshot| snapshot.dirty).unwrap_or(false),
+                workspace_root,
             });
         }
         let mut last_contract_id = None;
@@ -721,10 +736,23 @@ impl OrchService {
             last_contract_id,
             last_run_id,
             last_decision_id,
+            vcs_backend: vcs_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.vcs.clone()),
+            vcs_ref: vcs_snapshot.as_ref().and_then(|snapshot| snapshot.head_ref.clone()),
+            vcs_dirty: vcs_snapshot.as_ref().map(|snapshot| snapshot.dirty).unwrap_or(false),
+            workspace_root,
         })
     }
 
     pub fn inspect(&self, id: &str) -> Result<serde_json::Value> {
+        let project = self.bootstrap_project()?;
+        if id == project.id {
+            let mut value = serde_json::to_value(project)?;
+            attach_live_vcs(&mut value, self.live_vcs_value());
+            return Ok(value);
+        }
+
         for dir in [
             &self.paths.features_dir,
             &self.paths.contracts_dir,
@@ -734,10 +762,28 @@ impl OrchService {
             &self.paths.proofs_dir,
         ] {
             if let Ok(path) = self.find_object_path(dir, id) {
-                return read_json(&path);
+                let mut value = read_json(&path)?;
+                if dir == &self.paths.runs_dir {
+                    attach_live_vcs(&mut value, self.live_vcs_value());
+                }
+                return Ok(value);
             }
         }
         Err(anyhow!("unknown id: {id}"))
+    }
+
+    fn live_vcs_value(&self) -> serde_json::Value {
+        let snapshot = current_snapshot_ref(&self.paths.repo_root).ok();
+        let workspace_root = detect_backend(&self.paths.repo_root)
+            .ok()
+            .and_then(|backend| backend.workspace_root().ok())
+            .map(|path| path.display().to_string());
+        serde_json::json!({
+            "backend": snapshot.as_ref().and_then(|s| s.vcs.clone()),
+            "ref": snapshot.as_ref().and_then(|s| s.head_ref.clone()),
+            "dirty": snapshot.as_ref().map(|s| s.dirty).unwrap_or(false),
+            "workspace_root": workspace_root,
+        })
     }
 
     fn append_event(
@@ -774,6 +820,12 @@ impl OrchService {
 
     pub fn find_object_path(&self, dir: &Path, id: &str) -> Result<PathBuf> {
         find_object_path(dir, id)
+    }
+}
+
+fn attach_live_vcs(value: &mut serde_json::Value, live_vcs: serde_json::Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("live_vcs".to_string(), live_vcs);
     }
 }
 
@@ -1279,7 +1331,15 @@ mod tests {
     #[test]
     fn draft_and_approve_contract() {
         let root = std::env::temp_dir().join(format!("punk-orch-{}", std::process::id()));
-        let global = root.join("global");
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-status-vcs-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&global);
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(
@@ -1294,7 +1354,7 @@ mod tests {
             .current_dir(&root)
             .output()
             .unwrap();
-        fs::write(root.join(".gitignore"), "target\n").unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
         std::process::Command::new("git")
             .args(["add", ".gitignore"])
             .current_dir(&root)
@@ -1714,5 +1774,161 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn status_reports_current_vcs_snapshot_details() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-status-vcs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), "target\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let status = service.status(None).unwrap();
+        assert_eq!(status.vcs_backend, Some(VcsKind::Git));
+        assert!(status.vcs_ref.is_some());
+        assert_eq!(
+            status
+                .workspace_root
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .map(|path| fs::canonicalize(path).unwrap()),
+            Some(fs::canonicalize(&root).unwrap())
+        );
+
+        fs::write(root.join("src/lib.rs"), "pub fn demo() { println!(\"x\"); }\n").unwrap();
+        let dirty = service.status(None).unwrap();
+        assert!(dirty.vcs_dirty);
+
+        if std::process::Command::new("jj")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            std::process::Command::new("jj")
+                .args(["git", "init", "--colocate", "."])
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            let jj_status = service.status(None).unwrap();
+            assert_eq!(jj_status.vcs_backend, Some(VcsKind::Jj));
+        }
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn inspect_project_and_run_include_live_vcs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-inspect-vcs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-inspect-vcs-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let project = service.bootstrap_project().unwrap();
+        let project_inspect = service.inspect(&project.id).unwrap();
+        assert_eq!(
+            project_inspect["live_vcs"]["backend"].as_str(),
+            Some("git")
+        );
+        assert!(project_inspect["live_vcs"]["workspace_root"]
+            .as_str()
+            .is_some());
+
+        let contract = service.draft_contract(&FakeDrafter, "add file").unwrap();
+        service.approve_contract(&contract.id).unwrap();
+        let (run, _) = service.cut_run(&FakeExecutor, &contract.id).unwrap();
+        let run_inspect = service.inspect(&run.id).unwrap();
+        assert_eq!(run_inspect["id"].as_str(), Some(run.id.as_str()));
+        assert_eq!(run_inspect["live_vcs"]["backend"].as_str(), Some("git"));
+        assert!(run_inspect["live_vcs"]["ref"].as_str().is_some());
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
     }
 }
