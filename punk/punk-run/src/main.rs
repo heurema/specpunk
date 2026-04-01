@@ -1616,6 +1616,10 @@ fn cmd_ratchet() {
     if let Some(summary) = &eval_summary {
         directives.extend(ratchet::eval_directives(summary));
     }
+    let benchmark_summary = benchmark::summarize_benchmarks(&cwd, Some(20), None, None).ok();
+    if let Some(summary) = &benchmark_summary {
+        directives.extend(ratchet::benchmark_directives(summary));
+    }
     let verdict = ratchet::verdict(&directives);
     println!("  Verdict:   {:?}\n", verdict);
 
@@ -1632,6 +1636,16 @@ fn cmd_ratchet() {
         println!(
             "  Eval window: last {} stored evals, avg score {:.2}, drift {:.2}",
             summary.total, summary.avg_score, summary.avg_drift_penalty
+        );
+    }
+    if let Some(summary) = benchmark_summary {
+        println!(
+            "  Benchmark window: last {} results, avg score {:.2}, pass/fail/flaky = {}/{}/{}",
+            summary.total,
+            summary.avg_score,
+            summary.pass_count,
+            summary.fail_count,
+            summary.flaky_count
         );
     }
 }

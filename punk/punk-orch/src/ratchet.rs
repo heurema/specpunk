@@ -4,6 +4,7 @@ use std::path::Path;
 use chrono::{Duration, Utc};
 use serde_json::Value;
 
+use crate::benchmark::BenchmarkSummary;
 use crate::eval::EvalSummary;
 
 /// Weekly performance metrics computed from receipts.
@@ -301,6 +302,50 @@ pub fn eval_directives(summary: &EvalSummary) -> Vec<RatchetDirective> {
     directives
 }
 
+pub fn benchmark_directives(summary: &BenchmarkSummary) -> Vec<RatchetDirective> {
+    let mut directives = Vec::new();
+
+    if summary.avg_score < 0.7 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Warn,
+            metric: "benchmark_score",
+            message: format!("avg benchmark score is low at {:.2}", summary.avg_score),
+        });
+    } else if summary.avg_score >= 0.9 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Ok,
+            metric: "benchmark_score",
+            message: format!("avg benchmark score is strong at {:.2}", summary.avg_score),
+        });
+    }
+
+    if summary.fail_count > 0 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Warn,
+            metric: "benchmark_failures",
+            message: format!("{} benchmark results failed", summary.fail_count),
+        });
+    }
+
+    if summary.flaky_count > 0 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Warn,
+            metric: "benchmark_flaky",
+            message: format!("{} benchmark results are flaky", summary.flaky_count),
+        });
+    }
+
+    if summary.pass_count == summary.total && summary.total > 0 && summary.avg_score >= 0.9 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Ok,
+            metric: "benchmark_pass_rate",
+            message: format!("all {} benchmark results passed cleanly", summary.total),
+        });
+    }
+
+    directives
+}
+
 pub fn format_directive(directive: &RatchetDirective) -> String {
     let prefix = match directive.level {
         DirectiveLevel::Ok => "OK",
@@ -420,6 +465,50 @@ mod tests {
         assert!(directives
             .iter()
             .any(|d| d.metric == "drift" && d.level == DirectiveLevel::Ok));
+        assert_eq!(verdict(&directives), RatchetVerdict::Improving);
+    }
+
+    fn sample_benchmark_summary(
+        total: usize,
+        pass_count: usize,
+        fail_count: usize,
+        flaky_count: usize,
+        avg_score: f64,
+    ) -> BenchmarkSummary {
+        BenchmarkSummary {
+            total,
+            pass_count,
+            fail_count,
+            flaky_count,
+            avg_score,
+            projects: vec![],
+            suites: vec![],
+            weakest: vec![],
+        }
+    }
+
+    #[test]
+    fn benchmark_directives_warn_on_failures_and_flakes() {
+        let summary = sample_benchmark_summary(4, 1, 2, 1, 0.55);
+
+        let directives = benchmark_directives(&summary);
+        assert!(directives.iter().any(|d| d.metric == "benchmark_score"));
+        assert!(directives.iter().any(|d| d.metric == "benchmark_failures"));
+        assert!(directives.iter().any(|d| d.metric == "benchmark_flaky"));
+        assert_eq!(verdict(&directives), RatchetVerdict::Degrading);
+    }
+
+    #[test]
+    fn benchmark_directives_emit_ok_for_clean_high_scores() {
+        let summary = sample_benchmark_summary(3, 3, 0, 0, 0.94);
+
+        let directives = benchmark_directives(&summary);
+        assert!(directives
+            .iter()
+            .any(|d| d.metric == "benchmark_score" && d.level == DirectiveLevel::Ok));
+        assert!(directives
+            .iter()
+            .any(|d| d.metric == "benchmark_pass_rate" && d.level == DirectiveLevel::Ok));
         assert_eq!(verdict(&directives), RatchetVerdict::Improving);
     }
 }
