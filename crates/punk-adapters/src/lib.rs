@@ -1,13 +1,13 @@
 mod context_pack;
 pub mod council;
 
-use std::fs;
 use std::ffi::OsString;
+use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -53,6 +53,7 @@ struct TimedOutput {
     orphaned: bool,
     no_progress_paths: Vec<String>,
     scaffold_only_paths: Vec<String>,
+    post_check_zero_progress_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +216,12 @@ impl Executor for CodexCliExecutor {
             )
         } else if !timed_output.scaffold_only_paths.is_empty() {
             classify_scaffold_only_result(&timed_output.scaffold_only_paths, &stdout, &stderr)
+        } else if !timed_output.post_check_zero_progress_paths.is_empty() {
+            classify_post_check_zero_progress_result(
+                &timed_output.post_check_zero_progress_paths,
+                &stdout,
+                &stderr,
+            )
         } else if timed_output.timed_out {
             classify_timeout_result(&stdout, &stderr, codex_executor_timeout())
         } else if timed_output.orphaned {
@@ -796,6 +803,7 @@ fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<
                     orphaned: false,
                     no_progress_paths: Vec::new(),
                     scaffold_only_paths: Vec::new(),
+                    post_check_zero_progress_paths: Vec::new(),
                 })
                 .map_err(Into::into);
         }
@@ -809,6 +817,7 @@ fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<
                 orphaned: false,
                 no_progress_paths: Vec::new(),
                 scaffold_only_paths: Vec::new(),
+                post_check_zero_progress_paths: Vec::new(),
             });
         }
         thread::sleep(Duration::from_millis(200));
@@ -846,17 +855,24 @@ fn run_command_with_timeout_and_tee(
     let stdout_handle = spawn_stream_tee(stdout, stdout_path.clone(), progress.clone(), true);
     let stderr_handle = spawn_stream_tee(stderr, stderr_path.clone(), progress.clone(), false);
     let start = Instant::now();
-    let (timed_out, stalled, orphaned, no_progress_paths, scaffold_only_paths) = loop {
+    let (
+        timed_out,
+        stalled,
+        orphaned,
+        no_progress_paths,
+        scaffold_only_paths,
+        post_check_zero_progress_paths,
+    ) = loop {
         if child.try_wait()?.is_some() {
             if !wait_for_stream_completion(&stdout_handle, &stderr_handle, orphan_grace_timeout) {
                 terminate_process_tree(&mut child, child_pid);
-                break (false, false, true, Vec::new(), Vec::new());
+                break (false, false, true, Vec::new(), Vec::new(), Vec::new());
             }
-            break (false, false, false, Vec::new(), Vec::new());
+            break (false, false, false, Vec::new(), Vec::new(), Vec::new());
         }
         if start.elapsed() >= timeout {
             terminate_process_tree(&mut child, child_pid);
-            break (true, false, false, Vec::new(), Vec::new());
+            break (true, false, false, Vec::new(), Vec::new(), Vec::new());
         }
         if let Some((repo_root, snapshots)) = no_progress_probe {
             if progress.stalled_for(no_progress_timeout)
@@ -866,7 +882,7 @@ fn run_command_with_timeout_and_tee(
                 let unchanged_paths = unchanged_entry_point_paths(repo_root, snapshots)?;
                 if !unchanged_paths.is_empty() && unchanged_paths.len() == snapshots.len() {
                     terminate_process_tree(&mut child, child_pid);
-                    break (false, false, false, unchanged_paths, Vec::new());
+                    break (false, false, false, unchanged_paths, Vec::new(), Vec::new());
                 }
             }
         }
@@ -877,13 +893,31 @@ fn run_command_with_timeout_and_tee(
                 let scaffold_only_paths = scaffold_only_entry_points(repo_root, contract)?;
                 if !scaffold_only_paths.is_empty() {
                     terminate_process_tree(&mut child, child_pid);
-                    break (false, false, false, Vec::new(), scaffold_only_paths);
+                    break (
+                        false,
+                        false,
+                        false,
+                        Vec::new(),
+                        scaffold_only_paths,
+                        Vec::new(),
+                    );
+                }
+            }
+        }
+        if let Some((repo_root, snapshots)) = no_progress_probe {
+            if progress.stalled_for(scaffold_progress_timeout)
+                && logs_indicate_post_check_zero_progress_tail(&stdout_path, &stderr_path)
+            {
+                let unchanged_paths = unchanged_entry_point_paths(repo_root, snapshots)?;
+                if !unchanged_paths.is_empty() && unchanged_paths.len() == snapshots.len() {
+                    terminate_process_tree(&mut child, child_pid);
+                    break (false, false, false, Vec::new(), Vec::new(), unchanged_paths);
                 }
             }
         }
         if progress.stalled_for(stall_timeout) {
             terminate_process_tree(&mut child, child_pid);
-            break (false, true, false, Vec::new(), Vec::new());
+            break (false, true, false, Vec::new(), Vec::new(), Vec::new());
         }
         thread::sleep(Duration::from_millis(200));
     };
@@ -901,6 +935,7 @@ fn run_command_with_timeout_and_tee(
         orphaned,
         no_progress_paths,
         scaffold_only_paths,
+        post_check_zero_progress_paths,
     })
 }
 
@@ -1010,6 +1045,18 @@ fn logs_indicate_compile_or_check_reason(
         || combined.contains(SUCCESSFUL_EXECUTION_SENTINEL)
 }
 
+fn logs_indicate_post_check_zero_progress_tail(
+    stdout_path: &std::path::Path,
+    stderr_path: &std::path::Path,
+) -> bool {
+    let stdout = read_tail_text(stdout_path, 1024).unwrap_or_default();
+    let stderr = read_tail_text(stderr_path, 1024).unwrap_or_default();
+    let combined = format!("{stdout}\n{stderr}");
+    combined.contains("0 tests, 0 benchmarks")
+        || combined.contains("0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out")
+        || combined.contains("0 passed; 0 failed;")
+}
+
 fn read_tail_text(path: &std::path::Path, max_bytes: usize) -> Result<String> {
     if !path.exists() {
         return Ok(String::new());
@@ -1041,6 +1088,17 @@ fn no_progress_after_dispatch_summary(paths: &[String], stdout: &str, stderr: &s
     )
 }
 
+fn post_check_zero_progress_summary(paths: &[String], stdout: &str, stderr: &str) -> String {
+    format!(
+        "no implementation progress after post-check stall in {}{}",
+        paths.join(", "),
+        last_non_empty_line(stderr)
+            .or_else(|| last_non_empty_line(stdout))
+            .map(|line| format!(": {line}"))
+            .unwrap_or_default()
+    )
+}
+
 fn classify_scaffold_only_result(paths: &[String], stdout: &str, stderr: &str) -> (bool, String) {
     if let Some(blocked) = blocked_execution_line(stdout, stderr) {
         return (false, blocked);
@@ -1059,6 +1117,20 @@ fn classify_no_progress_after_dispatch_result(
     (
         false,
         no_progress_after_dispatch_summary(paths, stdout, stderr),
+    )
+}
+
+fn classify_post_check_zero_progress_result(
+    paths: &[String],
+    stdout: &str,
+    stderr: &str,
+) -> (bool, String) {
+    if let Some(blocked) = blocked_execution_line(stdout, stderr) {
+        return (false, blocked);
+    }
+    (
+        false,
+        post_check_zero_progress_summary(paths, stdout, stderr),
     )
 }
 
@@ -1461,7 +1533,8 @@ mod tests {
         assert!(prompt.contains("The approved cut contract already defines the execution workflow"));
         assert!(prompt.contains("Do not read any file outside allowed scope or entry points."));
         assert!(prompt.contains("Avoid reading `#[cfg(test)]` modules or long test sections"));
-        assert!(prompt.contains("Do not use git checkout, git restore, git reset, git clean, git switch"));
+        assert!(prompt
+            .contains("Do not use git checkout, git restore, git reset, git clean, git switch"));
     }
 
     #[test]
@@ -1572,7 +1645,8 @@ mod tests {
         assert!(prompt.contains(
             "If the context pack includes a controller-owned recipe seed, follow it directly"
         ));
-        assert!(prompt.contains("Do not use git checkout, git restore, git reset, git clean, git switch"));
+        assert!(prompt
+            .contains("Do not use git checkout, git restore, git reset, git clean, git switch"));
         assert!(prompt.contains("Controller-owned patch seed:"));
         assert!(prompt.contains("pub fn persist_synthesis() {}"));
         assert!(prompt.contains("Controller-owned recipe seed:"));
@@ -1581,7 +1655,9 @@ mod tests {
 
     #[test]
     fn git_guard_wrapper_blocks_destructive_restore_commands() {
-        let guard = GitGuardEnv::install().unwrap().expect("git guard should install");
+        let guard = GitGuardEnv::install()
+            .unwrap()
+            .expect("git guard should install");
         let mut command = Command::new("python3");
         command.arg("-c").arg(
             "import subprocess, sys; cp = subprocess.run(['/bin/zsh', '-lc', 'git checkout -- src/lib.rs'], capture_output=True, text=True); sys.stdout.write(cp.stdout); sys.stderr.write(cp.stderr); sys.exit(cp.returncode)",
@@ -1597,7 +1673,10 @@ mod tests {
             combined.contains("PUNK_EXECUTION_BLOCKED: forbidden vcs restore/reset command"),
             "combined output: {combined:?}"
         );
-        assert!(combined.contains("git checkout -- src/lib.rs"), "combined output: {combined:?}");
+        assert!(
+            combined.contains("git checkout -- src/lib.rs"),
+            "combined output: {combined:?}"
+        );
     }
 
     #[test]
@@ -1882,6 +1961,7 @@ mod tests {
         assert!(!output.orphaned);
         assert!(output.no_progress_paths.is_empty());
         assert!(output.scaffold_only_paths.is_empty());
+        assert!(output.post_check_zero_progress_paths.is_empty());
         assert_eq!(String::from_utf8_lossy(&output.output.stdout), "out");
         assert_eq!(String::from_utf8_lossy(&output.output.stderr), "err");
         assert_eq!(fs::read_to_string(stdout_path).unwrap(), "out");
@@ -1931,6 +2011,7 @@ mod tests {
         assert!(!output.orphaned);
         assert!(output.no_progress_paths.is_empty());
         assert!(output.scaffold_only_paths.is_empty());
+        assert!(output.post_check_zero_progress_paths.is_empty());
         assert_eq!(
             String::from_utf8_lossy(&output.output.stdout),
             "before-timeout"
@@ -1986,6 +2067,7 @@ mod tests {
         assert!(!output.orphaned);
         assert!(output.no_progress_paths.is_empty());
         assert!(output.scaffold_only_paths.is_empty());
+        assert!(output.post_check_zero_progress_paths.is_empty());
         assert_eq!(String::from_utf8_lossy(&output.output.stdout), "start");
         assert_eq!(fs::read_to_string(stdout_path).unwrap(), "start");
         assert!(stall_summary(
@@ -2040,6 +2122,7 @@ mod tests {
         assert!(output.orphaned);
         assert!(output.no_progress_paths.is_empty());
         assert!(output.scaffold_only_paths.is_empty());
+        assert!(output.post_check_zero_progress_paths.is_empty());
         assert_eq!(
             String::from_utf8_lossy(&output.output.stdout),
             "parent-done"
@@ -2106,6 +2189,7 @@ mod tests {
         assert!(!output.stalled);
         assert!(!output.orphaned);
         assert!(output.no_progress_paths.is_empty());
+        assert!(output.post_check_zero_progress_paths.is_empty());
         assert_eq!(
             output.scaffold_only_paths,
             vec!["crates/punk-council/src/synthesis.rs".to_string()]
@@ -2160,7 +2244,63 @@ mod tests {
         assert!(!output.stalled);
         assert!(!output.orphaned);
         assert!(output.scaffold_only_paths.is_empty());
+        assert!(output.post_check_zero_progress_paths.is_empty());
         assert_eq!(output.no_progress_paths, vec!["src/lib.rs".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_command_with_timeout_and_tee_detects_post_check_zero_progress_stall() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-tee-post-check-stall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        let file_path = root.join("src/lib.rs");
+        fs::write(&file_path, "pub fn unchanged() {}\n").unwrap();
+        let snapshots = vec![EntryPointSnapshot {
+            path: "src/lib.rs".into(),
+            content: "pub fn unchanged() {}\n".into(),
+        }];
+
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-lc")
+            .arg("printf 'Running unittests\\n0 tests, 0 benchmarks\\n'; sleep 2");
+
+        let output = run_command_with_timeout_and_tee(
+            &mut command,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            Duration::from_millis(400),
+            Duration::from_secs(1),
+            stdout_path,
+            stderr_path,
+            root.join("executor.json"),
+            None,
+            Some((&root, snapshots.as_slice())),
+        )
+        .unwrap();
+
+        assert!(!output.timed_out);
+        assert!(!output.stalled);
+        assert!(!output.orphaned);
+        assert!(output.no_progress_paths.is_empty());
+        assert!(output.scaffold_only_paths.is_empty());
+        assert_eq!(
+            output.post_check_zero_progress_paths,
+            vec!["src/lib.rs".to_string()]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2293,6 +2433,18 @@ mod tests {
         assert!(!success);
         assert!(summary.contains("no implementation progress after bounded context dispatch"));
         assert!(summary.contains("crates/punk-council/src/synthesis.rs"));
+    }
+
+    #[test]
+    fn post_check_zero_progress_classification_reports_precise_failure() {
+        let (success, summary) = classify_post_check_zero_progress_result(
+            &[String::from("crates/punk-vcs/src/lib.rs")],
+            "",
+            "0 tests, 0 benchmarks\n",
+        );
+        assert!(!success);
+        assert!(summary.contains("no implementation progress after post-check stall"));
+        assert!(summary.contains("crates/punk-vcs/src/lib.rs"));
     }
 
     #[test]
