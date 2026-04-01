@@ -336,9 +336,11 @@ dependencies = [
  "anyhow",
  "clap",
  "punk-adapters",
+ "punk-domain",
  "punk-gate",
  "punk-orch",
  "punk-proof",
+ "punk-vcs",
  "serde",
  "serde_json",
 ]
