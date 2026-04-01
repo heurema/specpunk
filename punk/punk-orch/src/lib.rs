@@ -8,6 +8,7 @@ pub mod context;
 pub mod daemon;
 pub mod diverge;
 pub mod doctor;
+pub mod eval;
 pub mod followup;
 pub mod goal;
 pub mod graph;

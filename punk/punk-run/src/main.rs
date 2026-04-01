@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use punk_core::vcs::{detect_mode as detect_vcs_mode, enable_jj as enable_jj_for_repo, VcsMode};
 use punk_orch::{
-    bus, config, context, daemon, diverge, doctor, goal, graph, morning, ops, panel, pipeline,
-    ratchet, recall, research, resolver, skill,
+    bus, config, context, daemon, diverge, doctor, eval, goal, graph, morning, ops, panel,
+    pipeline, ratchet, recall, research, resolver, skill,
 };
 
 #[derive(Parser)]
@@ -186,6 +186,11 @@ enum Command {
         #[command(subcommand)]
         action: ResearchAction,
     },
+    /// Offline task eval records
+    Eval {
+        #[command(subcommand)]
+        action: EvalAction,
+    },
     /// Pin a project alias to a local path
     Use {
         /// Project slug
@@ -351,6 +356,17 @@ enum ResearchAction {
         research_id: String,
     },
     /// List frozen research runs for the current repo
+    List,
+}
+
+#[derive(Subcommand)]
+enum EvalAction {
+    /// Evaluate one task from its latest receipt
+    Task {
+        /// Task id
+        task_id: String,
+    },
+    /// List stored task eval results
     List,
 }
 
@@ -829,6 +845,10 @@ async fn main() -> anyhow::Result<()> {
             } => cmd_research_artifact(&research_id, &kind, &title, &file, &evidence_ref),
             ResearchAction::Show { research_id } => cmd_research_show(&research_id),
             ResearchAction::List => cmd_research_list(),
+        },
+        Command::Eval { action } => match action {
+            EvalAction::Task { task_id } => cmd_eval_task(&task_id),
+            EvalAction::List => cmd_eval_list(),
         },
         Command::Goal { action } => match action {
             GoalAction::Create {
@@ -2386,6 +2406,82 @@ fn cmd_research_show(research_id: &str) {
             println!("Synthesis title: {}", synthesis.title);
         }
         None => println!("Synthesis outcome: none"),
+    }
+}
+
+fn cmd_eval_task(task_id: &str) {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let bus_path = bus::bus_dir();
+    let record = eval::evaluate_task(&cwd, &bus_path, task_id).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+
+    println!("Task: {}", record.task_id);
+    println!("Project: {}", record.project_id);
+    println!(
+        "Receipt status: {}",
+        format!("{:?}", record.receipt_status).to_ascii_lowercase()
+    );
+    println!(
+        "Gate outcome: {}",
+        format!("{:?}", record.gate_outcome).to_ascii_lowercase()
+    );
+    println!("Overall score: {:.2}", record.overall_score);
+    println!(
+        "Metrics: contract={:.2} scope={:.2} target={:.2} integrity={:.2} cleanup={:.2} docs={:.2} drift_penalty={:.2}",
+        record.metrics.contract_satisfaction,
+        record.metrics.scope_discipline,
+        record.metrics.target_pass_rate,
+        record.metrics.integrity_pass_rate,
+        record.metrics.cleanup_completion,
+        record.metrics.docs_parity,
+        record.metrics.drift_penalty,
+    );
+    if record.notes.is_empty() {
+        println!("Notes: none");
+    } else {
+        println!("Notes:");
+        for note in &record.notes {
+            println!("  - {note}");
+        }
+    }
+}
+
+fn cmd_eval_list() {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    let records = eval::list_task_evals(&cwd).unwrap_or_else(|e| {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    });
+    if records.is_empty() {
+        println!("No task evals.");
+        return;
+    }
+
+    println!("Task evals ({})\n", records.len());
+    for record in records {
+        println!(
+            "  {:<24} {:<18} score={:.2} gate={} status={} {}",
+            record.task_id,
+            record.project_id,
+            record.overall_score,
+            format!("{:?}", record.gate_outcome).to_ascii_lowercase(),
+            format!("{:?}", record.receipt_status).to_ascii_lowercase(),
+            record.created_at.to_rfc3339(),
+        );
     }
 }
 

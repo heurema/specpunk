@@ -194,26 +194,6 @@ pub struct ResearchInspect {
     pub synthesis: Option<ResearchSynthesis>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ResearchSummary {
-    pub research_id: String,
-    pub project_id: String,
-    pub status: ResearchStatus,
-    pub kind: ResearchKind,
-    pub created_at: DateTime<Utc>,
-    pub artifact_count: usize,
-    pub has_synthesis: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct ResearchInspect {
-    pub root_dir: PathBuf,
-    pub record: ResearchRecord,
-    pub packet: ResearchPacket,
-    pub artifacts: Vec<ResearchArtifact>,
-    pub synthesis: Option<ResearchSynthesis>,
-}
-
 fn detect_repo_root(cwd: &Path) -> Result<PathBuf, String> {
     for (bin, args) in [
         ("jj", vec!["root"]),
@@ -360,39 +340,6 @@ fn load_synthesis(root_dir: &Path) -> Result<Option<ResearchSynthesis>, String> 
     }
 
     let content = fs::read_to_string(&synthesis_path).map_err(|e| e.to_string())?;
-    let synthesis = serde_json::from_str::<ResearchSynthesis>(&content).map_err(|e| e.to_string())?;
-    Ok(Some(synthesis))
-}
-
-fn load_artifacts(root_dir: &Path) -> Result<Vec<ResearchArtifact>, String> {
-    let artifacts_dir = root_dir.join("artifacts");
-    if !artifacts_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut artifacts = Vec::new();
-    for entry in fs::read_dir(&artifacts_dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "json") {
-            continue;
-        }
-        let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        let artifact =
-            serde_json::from_str::<ResearchArtifact>(&content).map_err(|e| e.to_string())?;
-        artifacts.push(artifact);
-    }
-    artifacts.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-    Ok(artifacts)
-}
-
-fn load_synthesis(root_dir: &Path) -> Result<Option<ResearchSynthesis>, String> {
-    let synthesis_path = root_dir.join("synthesis.json");
-    if !synthesis_path.exists() {
-        return Ok(None);
-    }
-
-    let content = fs::read_to_string(&synthesis_path).map_err(|e| e.to_string())?;
     let synthesis =
         serde_json::from_str::<ResearchSynthesis>(&content).map_err(|e| e.to_string())?;
     Ok(Some(synthesis))
@@ -490,46 +437,6 @@ pub fn list_research_runs(cwd: &Path) -> Result<Vec<ResearchRecord>, String> {
     }
     records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(records)
-}
-
-pub fn summarize_research_runs(cwd: &Path) -> Result<Vec<ResearchSummary>, String> {
-    let repo_root = detect_repo_root(cwd)?;
-    let records = list_research_runs(cwd)?;
-    let mut summaries = Vec::new();
-    for record in records {
-        let root_dir = research_root(&repo_root).join(&record.research_id);
-        let artifacts = load_artifacts(&root_dir)?;
-        summaries.push(ResearchSummary {
-            research_id: record.research_id.clone(),
-            project_id: record.project_id.clone(),
-            status: record.status.clone(),
-            kind: record.kind.clone(),
-            created_at: record.created_at,
-            artifact_count: artifacts.len(),
-            has_synthesis: record.synthesis_path.is_some(),
-        });
-    }
-    Ok(summaries)
-}
-
-pub fn inspect_research(cwd: &Path, research_id: &str) -> Result<ResearchInspect, String> {
-    let root_dir = research_dir(cwd, research_id)?;
-    if !root_dir.join("record.json").exists() {
-        return Err(format!("research run not found: {research_id}"));
-    }
-
-    let record = load_record(&root_dir)?;
-    let packet = load_packet(&root_dir)?;
-    let artifacts = load_artifacts(&root_dir)?;
-    let synthesis = load_synthesis(&root_dir)?;
-
-    Ok(ResearchInspect {
-        root_dir,
-        record,
-        packet,
-        artifacts,
-        synthesis,
-    })
 }
 
 pub fn summarize_research_runs(cwd: &Path) -> Result<Vec<ResearchSummary>, String> {
@@ -1105,117 +1012,5 @@ mod tests {
         .unwrap();
 
         assert_eq!(write.record.status, ResearchStatus::Escalated);
-    }
-
-    #[test]
-    fn summarize_research_runs_includes_artifact_and_synthesis_counts() {
-        let tmp = TempDir::new().unwrap();
-        let repo = tmp.path().join("repo");
-        fs::create_dir_all(&repo).unwrap();
-        init_repo(&repo);
-
-        let started = start_research(
-            &repo,
-            StartResearchRequest {
-                kind: ResearchKind::SkillImprovement,
-                project_id: "specpunk".into(),
-                subject_ref: None,
-                question: "Question".into(),
-                goal: "Goal".into(),
-                constraints: vec![],
-                success_criteria: vec!["done".into()],
-                budget: ResearchBudget::default(),
-                context_refs: vec![],
-                output_schema_ref: None,
-            },
-        )
-        .unwrap();
-        write_research_artifact(
-            &repo,
-            &started.record.research_id,
-            WriteResearchArtifactRequest {
-                kind: ResearchArtifactKind::Comparison,
-                title: "Compare two paths".into(),
-                content: "Path A vs path B".into(),
-                evidence_refs: vec![],
-            },
-        )
-        .unwrap();
-        synthesize_research(
-            &repo,
-            &started.record.research_id,
-            SynthesizeResearchRequest {
-                outcome: ResearchOutcome::CandidatePatch,
-                title: "Use candidate patch".into(),
-                findings: vec!["A repeatable failure exists".into()],
-                recommendations: vec!["Draft skill candidate".into()],
-                evidence_refs: vec![],
-                unresolved_questions: vec![],
-            },
-        )
-        .unwrap();
-
-        let summaries = summarize_research_runs(&repo).unwrap();
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].artifact_count, 1);
-        assert!(summaries[0].has_synthesis);
-    }
-
-    #[test]
-    fn inspect_research_returns_packet_artifacts_and_synthesis() {
-        let tmp = TempDir::new().unwrap();
-        let repo = tmp.path().join("repo");
-        fs::create_dir_all(&repo).unwrap();
-        init_repo(&repo);
-
-        let started = start_research(
-            &repo,
-            StartResearchRequest {
-                kind: ResearchKind::Architecture,
-                project_id: "specpunk".into(),
-                subject_ref: Some("contract:abc".into()),
-                question: "Question".into(),
-                goal: "Goal".into(),
-                constraints: vec!["bounded".into()],
-                success_criteria: vec!["adr".into()],
-                budget: ResearchBudget::default(),
-                context_refs: vec!["receipt:1".into()],
-                output_schema_ref: None,
-            },
-        )
-        .unwrap();
-        write_research_artifact(
-            &repo,
-            &started.record.research_id,
-            WriteResearchArtifactRequest {
-                kind: ResearchArtifactKind::Note,
-                title: "Architecture note".into(),
-                content: "We already have council primitives.".into(),
-                evidence_refs: vec!["receipt:1".into()],
-            },
-        )
-        .unwrap();
-        synthesize_research(
-            &repo,
-            &started.record.research_id,
-            SynthesizeResearchRequest {
-                outcome: ResearchOutcome::AdrDraft,
-                title: "Council-first architecture".into(),
-                findings: vec!["Council pattern already exists".into()],
-                recommendations: vec!["Write ADR".into()],
-                evidence_refs: vec!["receipt:1".into()],
-                unresolved_questions: vec!["Migration plan".into()],
-            },
-        )
-        .unwrap();
-
-        let inspect = inspect_research(&repo, &started.record.research_id).unwrap();
-        assert_eq!(inspect.packet.question.project_id, "specpunk");
-        assert_eq!(inspect.artifacts.len(), 1);
-        assert_eq!(inspect.artifacts[0].title, "Architecture note");
-        assert_eq!(
-            inspect.synthesis.as_ref().unwrap().title,
-            "Council-first architecture"
-        );
     }
 }
