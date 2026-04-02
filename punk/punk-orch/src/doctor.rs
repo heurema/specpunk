@@ -22,6 +22,7 @@ pub fn check_all(bus_path: &Path, config_dir: &Path, repo_path: &Path) -> Health
         check_provider("codex", &["--version"]),
         check_provider("gemini", &["--version"]),
     ];
+    let cfg = crate::config::load_or_default(config_dir).ok();
 
     let bus_ok = bus_path.join("new").is_dir() && bus_path.join("cur").is_dir();
     let status = crate::config::config_status(config_dir);
@@ -52,6 +53,8 @@ pub fn check_all(bus_path: &Path, config_dir: &Path, repo_path: &Path) -> Health
         config_ok,
         config_detail,
         config_path: config_dir.to_string_lossy().to_string(),
+        known_projects: crate::resolver::list_known(cfg.as_ref()).len(),
+        default_queue_agent: cfg.as_ref().and_then(preferred_queue_agent),
         occupied_slots,
         vcs_mode,
     }
@@ -65,6 +68,8 @@ pub struct HealthReport {
     pub config_ok: bool,
     pub config_detail: String,
     pub config_path: String,
+    pub known_projects: usize,
+    pub default_queue_agent: Option<String>,
     pub occupied_slots: u32,
     pub vcs_mode: VcsMode,
 }
@@ -104,6 +109,11 @@ impl HealthReport {
             "Config: {} ({}, {})\n",
             cfg_status, self.config_detail, self.config_path
         ));
+        out.push_str(&format!("Projects: {} known\n", self.known_projects));
+        match &self.default_queue_agent {
+            Some(agent) => out.push_str(&format!("Queue:  default agent = {agent}\n")),
+            None => out.push_str("Queue:  default agent = unavailable\n"),
+        }
         out.push_str(&format!("VCS:    {}\n", format_vcs_mode(self.vcs_mode)));
         out.push_str(&format!("Slots:  {}/5 occupied\n\n", self.occupied_slots));
 
@@ -155,6 +165,32 @@ fn vcs_mode_is_degraded(mode: VcsMode) -> bool {
     )
 }
 
+fn preferred_queue_agent(cfg: &crate::config::Config) -> Option<String> {
+    let agents = &cfg.agents.agents;
+
+    for preferred in ["claude", "codex", "gemini"] {
+        if agents.contains_key(preferred) {
+            return Some(preferred.to_string());
+        }
+    }
+
+    for preferred_provider in ["claude", "codex", "gemini"] {
+        let mut matching: Vec<_> = agents
+            .iter()
+            .filter(|(_, agent)| agent.provider == preferred_provider)
+            .map(|(id, _)| id.clone())
+            .collect();
+        matching.sort();
+        if let Some(id) = matching.into_iter().next() {
+            return Some(id);
+        }
+    }
+
+    let mut fallback_ids: Vec<_> = agents.keys().cloned().collect();
+    fallback_ids.sort();
+    fallback_ids.into_iter().next()
+}
+
 fn check_provider(name: &str, version_args: &[&str]) -> ProviderHealth {
     let which = Command::new("which").arg(name).output();
 
@@ -201,6 +237,10 @@ fn check_provider(name: &str, version_args: &[&str]) -> ProviderHealth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        Agent, AgentsFile, BudgetPolicy, Config, PolicyDefaults, PolicyFile, Project, ProjectsFile,
+    };
+    use std::collections::HashMap;
 
     fn sample_provider(name: &str) -> ProviderHealth {
         ProviderHealth {
@@ -210,6 +250,49 @@ mod tests {
             auth_ok: true,
             latency_ms: Some(1),
             error: None,
+        }
+    }
+
+    fn config_with_agents(agents: &[(&str, &str, &str)]) -> Config {
+        let mut map = HashMap::new();
+        for (id, provider, model) in agents {
+            map.insert(
+                (*id).to_string(),
+                Agent {
+                    provider: (*provider).to_string(),
+                    model: (*model).to_string(),
+                    role: "engineer".into(),
+                    invoke: "cli".into(),
+                    budget_usd: 1.0,
+                    system_prompt: None,
+                    skills: vec![],
+                },
+            );
+        }
+        Config {
+            projects: ProjectsFile {
+                projects: vec![Project {
+                    id: "demo".into(),
+                    path: "/tmp/demo".into(),
+                    stack: String::new(),
+                    active: true,
+                    budget_usd: 0.0,
+                    checkpoint: String::new(),
+                }],
+            },
+            agents: AgentsFile { agents: map },
+            policy: PolicyFile {
+                defaults: PolicyDefaults {
+                    model: "sonnet".into(),
+                    budget_usd: 1.0,
+                    timeout_s: 600,
+                    max_slots: 1,
+                },
+                budget: BudgetPolicy::default(),
+                rules: vec![],
+                features: HashMap::new(),
+            },
+            dir: "/tmp/config".into(),
         }
     }
 
@@ -226,6 +309,8 @@ mod tests {
             config_ok: true,
             config_detail: "complete".to_string(),
             config_path: "/tmp/config".to_string(),
+            known_projects: 1,
+            default_queue_agent: Some("claude".to_string()),
             occupied_slots: 0,
             vcs_mode: VcsMode::GitWithJjAvailableButDisabled,
         };
@@ -249,6 +334,8 @@ mod tests {
             config_ok: true,
             config_detail: "complete".to_string(),
             config_path: "/tmp/config".to_string(),
+            known_projects: 1,
+            default_queue_agent: Some("claude".to_string()),
             occupied_slots: 0,
             vcs_mode: VcsMode::Jj,
         };
@@ -256,5 +343,53 @@ mod tests {
         let rendered = report.display();
         assert!(rendered.contains("VCS:    jj"));
         assert!(rendered.contains("Overall: HEALTHY"));
+    }
+
+    #[test]
+    fn doctor_display_shows_default_queue_agent_and_project_count() {
+        let report = HealthReport {
+            providers: vec![sample_provider("codex")],
+            bus_ok: true,
+            bus_path: "/tmp/bus".to_string(),
+            config_ok: true,
+            config_detail: "defaults".to_string(),
+            config_path: "/tmp/config".to_string(),
+            known_projects: 3,
+            default_queue_agent: Some("codex".to_string()),
+            occupied_slots: 0,
+            vcs_mode: VcsMode::Jj,
+        };
+
+        let rendered = report.display();
+        assert!(rendered.contains("Projects: 3 known"));
+        assert!(rendered.contains("Queue:  default agent = codex"));
+    }
+
+    #[test]
+    fn doctor_display_shows_unavailable_default_queue_agent() {
+        let report = HealthReport {
+            providers: vec![],
+            bus_ok: true,
+            bus_path: "/tmp/bus".to_string(),
+            config_ok: true,
+            config_detail: "defaults".to_string(),
+            config_path: "/tmp/config".to_string(),
+            known_projects: 0,
+            default_queue_agent: None,
+            occupied_slots: 0,
+            vcs_mode: VcsMode::Jj,
+        };
+
+        let rendered = report.display();
+        assert!(rendered.contains("Queue:  default agent = unavailable"));
+    }
+
+    #[test]
+    fn preferred_queue_agent_prefers_supported_provider_order() {
+        let cfg = config_with_agents(&[
+            ("gemini", "gemini", "gemini-2.5-flash"),
+            ("codex", "codex", "o4-mini"),
+        ]);
+        assert_eq!(preferred_queue_agent(&cfg).as_deref(), Some("codex"));
     }
 }
