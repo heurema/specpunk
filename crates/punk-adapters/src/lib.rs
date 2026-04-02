@@ -21,10 +21,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use context_pack::{
     build_context_pack, derive_plan_seed, ensure_retry_patch_seed, format_context_pack,
-    format_patch_context_pack, format_plan_context_pack, materialize_missing_entry_points,
-    restore_missing_materialized_entry_points, restore_stale_entry_point_masks,
-    scaffold_only_entry_points, ContextPack, ContextPlanSeed, ContextPlanTarget,
-    EntryPointExcerptGuard,
+    format_patch_context_pack, format_plan_context_pack, hydrate_plan_seed_excerpts,
+    materialize_missing_entry_points, restore_missing_materialized_entry_points,
+    restore_stale_entry_point_masks, scaffold_only_entry_points, ContextPack, ContextPlanSeed,
+    ContextPlanTarget, EntryPointExcerptGuard,
 };
 use punk_domain::{Contract, DraftInput, DraftProposal, RefineInput};
 const BLOCKED_EXECUTION_SENTINEL: &str = "PUNK_EXECUTION_BLOCKED:";
@@ -521,6 +521,7 @@ impl CodexCliExecutor {
         let start = Instant::now();
         restore_stale_entry_point_masks(&input.repo_root)?;
         let mut context_pack = build_context_pack(&input.repo_root, &input.contract)?;
+        let controller_plan_seed = derive_plan_seed(&input.contract, &context_pack);
         let mut excerpt_guard = EntryPointExcerptGuard::apply(&input.repo_root, &context_pack)?;
         if needs_patch_plan_prepass(&input.contract, &context_pack) {
             match self.run_patch_plan_prepass(&input, &context_pack) {
@@ -571,20 +572,29 @@ impl CodexCliExecutor {
                                 .join(", ")
                         ),
                     )?;
-                    context_pack.plan_seed = Some(ContextPlanSeed {
-                        title: "Controller-owned plan prepass".to_string(),
-                        summary,
-                        targets: targets
-                            .into_iter()
-                            .map(|target| ContextPlanTarget {
-                                path: target.path,
-                                symbol: target.symbol,
-                                insertion_point: target.insertion_point,
-                                execution_sketch: target.execution_sketch,
-                                anchor_excerpt: String::new(),
-                            })
-                            .collect(),
-                    });
+                    let mut plan_seed = if controller_plan_seed.targets.is_empty() {
+                        ContextPlanSeed {
+                            title: "Controller-owned plan prepass".to_string(),
+                            summary,
+                            targets: targets
+                                .into_iter()
+                                .map(|target| ContextPlanTarget {
+                                    path: target.path,
+                                    symbol: target.symbol,
+                                    insertion_point: target.insertion_point,
+                                    execution_sketch: target.execution_sketch,
+                                    anchor_excerpt: String::new(),
+                                })
+                                .collect(),
+                        }
+                    } else {
+                        let mut seed = controller_plan_seed.clone();
+                        seed.title = "Controller-owned plan prepass".to_string();
+                        seed.summary = summary;
+                        seed
+                    };
+                    hydrate_plan_seed_excerpts(&context_pack, &mut plan_seed);
+                    context_pack.plan_seed = Some(plan_seed);
                 }
             }
         }
@@ -1045,6 +1055,7 @@ Requirements:\n\
 - use only `*** Update File:` sections in this lane\n\
 - do not add, delete, move, or rename files in this lane\n\
 - do not run `rg`, `grep`, `sed`, `cat`, `find`, `ls`, or any other shell command for orientation in this lane\n\
+- the controller-owned plan excerpts already include the exact local edit windows; do not use python or any shell/interpreter command to rediscover them\n\
 - prefer the smallest bounded patch that follows any controller-owned plan targets exactly before doing broader exploration\n\
 - each update hunk must include enough unchanged or removed context lines for deterministic controller-side application\n\
 - prefer the smallest bounded patch that gets the implementation started and covers the approved behavior\n\
@@ -2622,12 +2633,31 @@ fn apply_hunk_to_lines(
         *cursor,
         hunk.eof,
         hunk.header.as_deref(),
-    )
-    .ok_or_else(|| anyhow!("unable to locate hunk context"))?;
-    let end = position + old_lines.len();
-    file_lines.splice(position..end, new_lines);
-    *cursor = position + apply_patch_new_line_count(&hunk.lines);
-    Ok(())
+    );
+    if let Some(position) = position {
+        let end = position + old_lines.len();
+        file_lines.splice(position..end, new_lines);
+        *cursor = position + apply_patch_new_line_count(&hunk.lines);
+        return Ok(());
+    }
+
+    if is_addition_only_hunk(&hunk.lines) {
+        if let Some(positions) =
+            locate_ordered_subsequence_positions(file_lines, &old_lines, *cursor)
+        {
+            let insert_at = positions
+                .last()
+                .copied()
+                .unwrap_or(*cursor)
+                .saturating_add(1);
+            let added_lines = apply_patch_added_lines(&hunk.lines);
+            file_lines.splice(insert_at..insert_at, added_lines.clone());
+            *cursor = insert_at + added_lines.len();
+            return Ok(());
+        }
+    }
+
+    Err(anyhow!("unable to locate hunk context"))
 }
 
 fn apply_patch_old_lines(hunk_lines: &[String]) -> Vec<String> {
@@ -2655,6 +2685,26 @@ fn apply_patch_new_line_count(hunk_lines: &[String]) -> usize {
         .iter()
         .filter(|line| matches!(line.chars().next(), Some(' ') | Some('+')))
         .count()
+}
+
+fn apply_patch_added_lines(hunk_lines: &[String]) -> Vec<String> {
+    hunk_lines
+        .iter()
+        .filter_map(|line| match line.chars().next() {
+            Some('+') => Some(line[1..].to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_addition_only_hunk(hunk_lines: &[String]) -> bool {
+    let has_add = hunk_lines
+        .iter()
+        .any(|line| matches!(line.chars().next(), Some('+')));
+    let has_remove = hunk_lines
+        .iter()
+        .any(|line| matches!(line.chars().next(), Some('-')));
+    has_add && !has_remove
 }
 
 fn locate_hunk_position(
@@ -2748,6 +2798,58 @@ fn choose_sequence_position(
     }
     if positions.len() == 1 {
         return positions.first().copied();
+    }
+    None
+}
+
+fn locate_ordered_subsequence_positions(
+    haystack: &[String],
+    needle: &[String],
+    start: usize,
+) -> Option<Vec<usize>> {
+    if needle.is_empty() {
+        return Some(Vec::new());
+    }
+    let first = needle.first()?.trim();
+    let mut starts = haystack
+        .iter()
+        .enumerate()
+        .skip(start)
+        .filter_map(|(idx, line)| (line.trim() == first).then_some(idx))
+        .collect::<Vec<_>>();
+    if starts.is_empty() && start > 0 {
+        starts = haystack
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| (line.trim() == first).then_some(idx))
+            .collect();
+    }
+    for candidate_start in starts {
+        let mut positions = vec![candidate_start];
+        let mut cursor = candidate_start + 1;
+        let mut matched = true;
+        for expected in needle.iter().skip(1) {
+            let expected = expected.trim();
+            if let Some((idx, _)) = haystack
+                .iter()
+                .enumerate()
+                .skip(cursor)
+                .find(|(_, line)| line.trim() == expected)
+            {
+                positions.push(idx);
+                cursor = idx + 1;
+            } else {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            if let (Some(first_idx), Some(last_idx)) = (positions.first(), positions.last()) {
+                if last_idx.saturating_sub(*first_idx) <= needle.len() + 8 {
+                    return Some(positions);
+                }
+            }
+        }
     }
     None
 }
@@ -2998,6 +3100,8 @@ mod tests {
         assert!(prompt.contains("single apply_patch-style patch"));
         assert!(prompt.contains("do not output JSON"));
         assert!(prompt.contains("do not run `rg`, `grep`, `sed`, `cat`, `find`, `ls`, or any other shell command for orientation"));
+        assert!(prompt
+            .contains("do not use python or any shell/interpreter command to rediscover them"));
         assert!(prompt.contains(blocked_execution_template()));
         assert!(!prompt.contains("match the provided schema exactly"));
     }
@@ -3577,6 +3681,36 @@ mod tests {
             fs::read_to_string(root.join("src/lib.rs")).unwrap(),
             "pub fn new() {}\n"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_patch_in_repo_accepts_addition_hunk_with_gapped_context() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-apply-patch-gap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        let mut init = Command::new("git");
+        init.arg("init").current_dir(&root);
+        assert!(init.status().unwrap().success());
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn summarize() {\n    let skills = 1;\n    let weakest = 2;\n    println!(\"done\");\n}\n",
+        )
+        .unwrap();
+
+        let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n     let skills = 1;\n     println!(\"done\");\n }\n+\n+pub fn format_summary() -> &'static str {\n+    \"ok\"\n+}\n*** End Patch\n";
+        let updates = validate_patch_scope(patch, &[String::from("src/lib.rs")]).unwrap();
+        apply_patch_in_repo(&root, &updates).unwrap();
+        let updated = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(updated.contains("pub fn format_summary()"));
 
         let _ = fs::remove_dir_all(&root);
     }
