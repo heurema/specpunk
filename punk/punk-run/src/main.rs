@@ -1274,6 +1274,11 @@ fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {
         fail_count,
         total_cost
     );
+    if let Ok(skill_eval_summary) =
+        eval::summarize_skill_evals(Path::new("."), Some(recent_limit), project_filter, None)
+    {
+        println!("{}", eval::format_skill_eval_summary_line(&skill_eval_summary));
+    }
 }
 
 fn cmd_config() {

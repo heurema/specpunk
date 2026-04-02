@@ -1064,6 +1064,18 @@ pub fn summarize_skill_evals(
     })
 }
 
+pub fn format_skill_eval_summary_line(summary: &SkillEvalSummary) -> String {
+    format!(
+        "Skill evals: {} total ({} promote, {} reject, {} rollback), avg candidate {:.2}, avg delta {:+.2}",
+        summary.total,
+        summary.promote_count,
+        summary.reject_count,
+        summary.rollback_count,
+        summary.avg_candidate_primary_score,
+        summary.avg_score_delta
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
