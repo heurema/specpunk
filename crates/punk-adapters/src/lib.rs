@@ -123,6 +123,12 @@ struct GitGuardEnv {
     zdotdir: PathBuf,
 }
 
+struct OrientationGuardEnv {
+    dir: PathBuf,
+    path: OsString,
+    zdotdir: PathBuf,
+}
+
 pub trait Executor {
     fn name(&self) -> &'static str;
     fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput>;
@@ -199,6 +205,70 @@ impl GitGuardEnv {
 }
 
 impl Drop for GitGuardEnv {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+const ORIENTATION_BLOCKED_COMMANDS: &[&str] = &[
+    "rg", "grep", "sed", "cat", "awk", "find", "fd", "ls", "head", "tail", "tree", "bat",
+    "less", "more", "perl", "python", "python3", "ruby", "git", "bash", "sh", "zsh",
+];
+
+impl OrientationGuardEnv {
+    fn install() -> Result<Self> {
+        let dir = std::env::temp_dir().join(format!(
+            "punk-orientation-guard-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir)?;
+        for command_name in ORIENTATION_BLOCKED_COMMANDS {
+            let wrapper_path = dir.join(command_name);
+            let wrapper = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"{blocked} shell orientation forbidden in patch/apply lane: {command_name} $*\" >&2\nexit 97\n",
+                blocked = BLOCKED_EXECUTION_SENTINEL,
+                command_name = command_name,
+            );
+            fs::write(&wrapper_path, wrapper)?;
+            #[cfg(unix)]
+            {
+                let mut perms = fs::metadata(&wrapper_path)?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&wrapper_path, perms)?;
+            }
+        }
+
+        let mut paths = vec![dir.clone()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let path = std::env::join_paths(paths)?;
+        let zdotdir = dir.join("zdotdir");
+        fs::create_dir_all(&zdotdir)?;
+        let mut zshenv = String::new();
+        zshenv.push_str(&format!("export PATH={}:$PATH\n", sh_single_quote(&dir.to_string_lossy())));
+        for command_name in ORIENTATION_BLOCKED_COMMANDS {
+            zshenv.push_str(&format!(
+                "{name}() {{\n  print -r -- \"{blocked} shell orientation forbidden in patch/apply lane: {name} $*\" >&2\n  return 97\n}}\n",
+                name = command_name,
+                blocked = BLOCKED_EXECUTION_SENTINEL,
+            ));
+        }
+        fs::write(zdotdir.join(".zshenv"), zshenv)?;
+        Ok(Self { dir, path, zdotdir })
+    }
+
+    fn apply(&self, command: &mut Command) {
+        command.env("PATH", &self.path);
+        command.env("ZDOTDIR", &self.zdotdir);
+    }
+}
+
+impl Drop for OrientationGuardEnv {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
@@ -534,6 +604,8 @@ impl CodexCliExecutor {
                 .arg("-c")
                 .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""));
         }
+        let orientation_guard = OrientationGuardEnv::install()?;
+        orientation_guard.apply(&mut command);
         command.arg(prompt);
 
         let timed_output = match run_patch_lane_command_with_timeout(
@@ -724,6 +796,8 @@ impl CodexCliExecutor {
                 .arg("-c")
                 .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""));
         }
+        let orientation_guard = OrientationGuardEnv::install()?;
+        orientation_guard.apply(&mut command);
         command.arg(prompt);
 
         let timed_output = run_plan_lane_command_with_timeout(
@@ -967,6 +1041,7 @@ Requirements:\n\
 - touch only files inside allowed scope\n\
 - use only `*** Update File:` sections in this lane\n\
 - do not add, delete, move, or rename files in this lane\n\
+- do not run `rg`, `grep`, `sed`, `cat`, `find`, `ls`, or any other shell command for orientation in this lane\n\
 - prefer the smallest bounded patch that follows any controller-owned plan targets exactly before doing broader exploration\n\
 - each update hunk must include enough unchanged or removed context lines for deterministic controller-side application\n\
 - prefer the smallest bounded patch that gets the implementation started and covers the approved behavior\n\
@@ -2906,6 +2981,7 @@ mod tests {
         let prompt = build_patch_apply_prompt(&contract, &ContextPack::default());
         assert!(prompt.contains("single apply_patch-style patch"));
         assert!(prompt.contains("do not output JSON"));
+        assert!(prompt.contains("do not run `rg`, `grep`, `sed`, `cat`, `find`, `ls`, or any other shell command for orientation"));
         assert!(prompt.contains(blocked_execution_template()));
         assert!(!prompt.contains("match the provided schema exactly"));
     }
@@ -3168,6 +3244,29 @@ mod tests {
         );
         assert!(
             combined.contains("git checkout -- src/lib.rs"),
+            "combined output: {combined:?}"
+        );
+    }
+
+    #[test]
+    fn orientation_guard_blocks_shell_orientation_commands() {
+        let guard = OrientationGuardEnv::install().expect("orientation guard should install");
+        let python = find_binary_in_path("python3").expect("python3 should exist");
+        let mut command = Command::new(python);
+        command.arg("-c").arg(
+            "import subprocess, sys; cp = subprocess.run(['/bin/zsh', '-lc', 'rg -n \"foo\" src'], capture_output=True, text=True); sys.stdout.write(cp.stdout); sys.stderr.write(cp.stderr); sys.exit(cp.returncode)",
+        );
+        guard.apply(&mut command);
+
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        assert!(!output.status.success());
+        assert!(
+            combined.contains(
+                "PUNK_EXECUTION_BLOCKED: shell orientation forbidden in patch/apply lane: rg"
+            ),
             "combined output: {combined:?}"
         );
     }
