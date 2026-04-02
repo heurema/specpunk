@@ -44,32 +44,67 @@ Prompt examples:
 
 ---
 
-## 3. First command set
+## 3. Primary entrypoints
 
-### Plot
+These are the preferred user-facing commands in the current v0/v0.1 surface.
+
+### Project bootstrap
+
+```bash
+punk init --enable-jj --verify
+punk init --project <id> --enable-jj --verify
+```
+
+Use `--project <id>` only when the repo basename is not a suitable project id.
+
+Bootstrap should:
+
+- pin the current repo as a known project
+- create repo-local agent guidance
+- verify status scope and VCS mode
+
+Generated guidance:
+
+- `AGENTS.md`
+- `.punk/AGENT_START.md`
+
+### Default autonomous intake
+
+```bash
+punk go --fallback-staged "<goal>"
+```
+
+Behavior:
+
+- accepts a plain goal, not a user-written task decomposition
+- drafts and approves a contract internally
+- runs `cut`
+- runs `gate`
+- writes proof artifacts
+- exits non-zero when verification blocks or escalates
+- prepares a staged recovery contract when `--fallback-staged` is enabled
+
+### Staged/manual intake
+
+```bash
+punk start "<goal>"
+```
+
+Behavior:
+
+- accepts a plain goal
+- drafts a contract
+- prints the next explicit operator step
+
+### Mode-level commands
 
 ```bash
 punk plot contract "<prompt>"
 punk plot refine <contract-id> "<guidance>"
 punk plot approve <contract-id>
-```
-
-### Cut
-
-```bash
 punk cut run <contract-id>
-```
-
-### Gate
-
-```bash
 punk gate run <run-id>
 punk gate proof <run-id|decision-id>
-```
-
-### Read-only inspection
-
-```bash
 punk status [id]
 punk inspect <id> --json
 ```
@@ -105,6 +140,59 @@ Plain text behavior:
 ---
 
 ## 5. Minimal command semantics
+
+### `punk init [--project <id>] --enable-jj --verify`
+
+Bootstraps the current repo for `punk`.
+
+Creates or refreshes:
+
+- project pin / resolver entry
+- bootstrap guidance
+- repo-local agent instructions
+
+Verifies:
+
+- resolved project id
+- status scope
+- VCS mode
+
+### `punk go [--fallback-staged] "<goal>"`
+
+Runs the autonomous path from a plain goal.
+
+Internally this executes:
+
+- `plot contract`
+- internal approval
+- `cut run`
+- `gate run`
+- `gate proof`
+
+Returns:
+
+- concise human summary with outcome / basis / proof
+- structured JSON when `--json` is requested
+- non-zero exit for `block` or `escalate`
+
+When `--fallback-staged` is set and autonomy blocks:
+
+- a staged recovery contract is drafted automatically
+- recovery metadata and next command are returned
+
+### `punk start "<goal>"`
+
+Creates:
+
+- `Feature`
+- draft `Contract`
+
+Writes:
+
+- `.punk/features/<feature-id>.json`
+- `.punk/contracts/<feature-id>/v1.json`
+- `feature.created`
+- `contract.drafted`
 
 ### `punk plot contract "<prompt>"`
 
@@ -198,6 +286,8 @@ Writes:
 2. `gate` is the only path that writes final decision artifacts.
 3. `status` must reconstruct state from the event log, not from ad-hoc file scanning.
 4. All inspectable commands should support structured output.
+5. Plain user goals should route through `punk go --fallback-staged "<goal>"` by default.
+6. `punk start "<goal>"` remains the staged/manual escape hatch.
 
 ---
 
