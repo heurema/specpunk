@@ -23,6 +23,7 @@ pub fn check_all(bus_path: &Path, config_dir: &Path, repo_path: &Path) -> Health
         check_provider("gemini", &["--version"]),
     ];
     let cfg = crate::config::load_or_default(config_dir).ok();
+    let queue_state = crate::bus::read_state(bus_path, 10);
 
     let bus_ok = bus_path.join("new").is_dir() && bus_path.join("cur").is_dir();
     let status = crate::config::config_status(config_dir);
@@ -55,6 +56,10 @@ pub fn check_all(bus_path: &Path, config_dir: &Path, repo_path: &Path) -> Health
         config_path: config_dir.to_string_lossy().to_string(),
         known_projects: crate::resolver::list_known(cfg.as_ref()).len(),
         default_queue_agent: cfg.as_ref().and_then(preferred_queue_agent),
+        queued_count: queue_state.queued.len(),
+        running_count: queue_state.running.len(),
+        done_count: queue_state.done.len(),
+        failed_count: queue_state.failed.len(),
         occupied_slots,
         vcs_mode,
     }
@@ -70,6 +75,10 @@ pub struct HealthReport {
     pub config_path: String,
     pub known_projects: usize,
     pub default_queue_agent: Option<String>,
+    pub queued_count: usize,
+    pub running_count: usize,
+    pub done_count: usize,
+    pub failed_count: usize,
     pub occupied_slots: u32,
     pub vcs_mode: VcsMode,
 }
@@ -114,6 +123,10 @@ impl HealthReport {
             Some(agent) => out.push_str(&format!("Queue:  default agent = {agent}\n")),
             None => out.push_str("Queue:  default agent = unavailable\n"),
         }
+        out.push_str(&format!(
+            "Tasks:  queued={} running={} done={} failed={}\n",
+            self.queued_count, self.running_count, self.done_count, self.failed_count
+        ));
         out.push_str(&format!("VCS:    {}\n", format_vcs_mode(self.vcs_mode)));
         out.push_str(&format!("Slots:  {}/5 occupied\n\n", self.occupied_slots));
 
@@ -311,6 +324,10 @@ mod tests {
             config_path: "/tmp/config".to_string(),
             known_projects: 1,
             default_queue_agent: Some("claude".to_string()),
+            queued_count: 0,
+            running_count: 0,
+            done_count: 0,
+            failed_count: 0,
             occupied_slots: 0,
             vcs_mode: VcsMode::GitWithJjAvailableButDisabled,
         };
@@ -336,6 +353,10 @@ mod tests {
             config_path: "/tmp/config".to_string(),
             known_projects: 1,
             default_queue_agent: Some("claude".to_string()),
+            queued_count: 0,
+            running_count: 0,
+            done_count: 0,
+            failed_count: 0,
             occupied_slots: 0,
             vcs_mode: VcsMode::Jj,
         };
@@ -356,6 +377,10 @@ mod tests {
             config_path: "/tmp/config".to_string(),
             known_projects: 3,
             default_queue_agent: Some("codex".to_string()),
+            queued_count: 2,
+            running_count: 1,
+            done_count: 4,
+            failed_count: 1,
             occupied_slots: 0,
             vcs_mode: VcsMode::Jj,
         };
@@ -363,6 +388,7 @@ mod tests {
         let rendered = report.display();
         assert!(rendered.contains("Projects: 3 known"));
         assert!(rendered.contains("Queue:  default agent = codex"));
+        assert!(rendered.contains("Tasks:  queued=2 running=1 done=4 failed=1"));
     }
 
     #[test]
@@ -376,6 +402,10 @@ mod tests {
             config_path: "/tmp/config".to_string(),
             known_projects: 0,
             default_queue_agent: None,
+            queued_count: 0,
+            running_count: 0,
+            done_count: 0,
+            failed_count: 0,
             occupied_slots: 0,
             vcs_mode: VcsMode::Jj,
         };
