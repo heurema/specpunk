@@ -1554,56 +1554,166 @@ fn cmd_goal(project: &str, objective: &str, budget: f64, deadline: Option<&str>)
         }
     };
 
-    // Generate plan via CLI
     println!("Generating plan...");
     let prompt = goal::build_planner_prompt(&g, std::path::Path::new(&project_path));
+    let report = run_goal_planner_with_fallback(&prompt);
 
-    let output = std::process::Command::new("claude")
-        .args([
-            "-p",
-            &prompt,
-            "--output-format",
-            "text",
-            "--model",
-            "sonnet",
-        ])
-        .env_remove("CLAUDECODE")
-        .env_remove("ANTHROPIC_API_KEY")
-        .output();
+    match (
+        report.selected_provider.as_deref(),
+        report.plan_text.as_deref(),
+    ) {
+        (Some(provider), Some(text)) => match goal::parse_plan(text, provider) {
+            Some(plan) => {
+                let step_count = plan.steps.len();
+                let est_cost: f64 = plan.steps.iter().map(|s| s.est_cost_usd).sum();
+                g.plan = Some(plan);
+                g.status = goal::GoalStatus::AwaitingApproval;
+                goal::save_goal(&bus_path, &g).ok();
 
-    match output {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            match goal::parse_plan(&text, "claude-sonnet") {
-                Some(plan) => {
-                    let step_count = plan.steps.len();
-                    let est_cost: f64 = plan.steps.iter().map(|s| s.est_cost_usd).sum();
-                    g.plan = Some(plan);
-                    g.status = goal::GoalStatus::AwaitingApproval;
-                    goal::save_goal(&bus_path, &g).ok();
-
-                    println!(
-                        "Plan generated: {} steps, ${:.2} estimated\n",
-                        step_count, est_cost
-                    );
-                    println!("Review and approve:");
-                    println!("  punk-run approve {}", g.id);
-                }
-                None => {
-                    eprintln!("Failed to parse planner output. Raw output saved to goal file.");
-                    eprintln!("Try: punk-run approve {} (after manual plan edit)", g.id);
-                }
+                println!(
+                    "Plan generated via {provider}: {} steps, ${:.2} estimated\n",
+                    step_count, est_cost
+                );
+                println!("Review and approve:");
+                println!("  punk-run goal approve {}", g.id);
             }
-        }
-        Ok(out) => {
-            eprintln!("Planner failed (exit {})", out.status.code().unwrap_or(-1));
-            eprintln!("{}", String::from_utf8_lossy(&out.stderr));
-        }
-        Err(e) => {
-            eprintln!("Failed to invoke planner: {e}");
-            eprintln!("Install claude CLI or add plan manually");
+            None => {
+                eprintln!("Failed to parse planner output from {provider}.");
+                eprintln!(
+                    "Try: punk-run goal approve {} (after manual plan edit)",
+                    g.id
+                );
+            }
+        },
+        _ => {
+            eprintln!("{}", format_goal_planner_failure(&report));
+            eprintln!("Try: install claude, codex, or gemini, or add the plan manually.");
         }
     }
+}
+
+struct GoalPlannerAttempt {
+    provider: String,
+    error: Option<String>,
+}
+
+struct GoalPlannerReport {
+    available_providers: Vec<String>,
+    selected_provider: Option<String>,
+    plan_text: Option<String>,
+    attempts: Vec<GoalPlannerAttempt>,
+}
+
+fn run_goal_planner_with_fallback(prompt: &str) -> GoalPlannerReport {
+    let providers = panel::detect_available_providers();
+    let mut attempts = Vec::new();
+
+    for provider in &providers {
+        match run_goal_planner_provider(provider, prompt) {
+            Ok(plan_text) => {
+                attempts.push(GoalPlannerAttempt {
+                    provider: provider.clone(),
+                    error: None,
+                });
+                return GoalPlannerReport {
+                    available_providers: providers.clone(),
+                    selected_provider: Some(provider.clone()),
+                    plan_text: Some(plan_text),
+                    attempts,
+                };
+            }
+            Err(error) => attempts.push(GoalPlannerAttempt {
+                provider: provider.clone(),
+                error: Some(error),
+            }),
+        }
+    }
+
+    GoalPlannerReport {
+        available_providers: providers,
+        selected_provider: None,
+        plan_text: None,
+        attempts,
+    }
+}
+
+fn run_goal_planner_provider(provider: &str, prompt: &str) -> Result<String, String> {
+    match provider {
+        "claude" => {
+            let out = std::process::Command::new("claude")
+                .args(["-p", prompt, "--output-format", "text", "--model", "sonnet"])
+                .env_remove("CLAUDECODE")
+                .env_remove("ANTHROPIC_API_KEY")
+                .output()
+                .map_err(|e| e.to_string())?;
+            if out.status.success() {
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            } else {
+                Err(format!(
+                    "exit {}: {}",
+                    out.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ))
+            }
+        }
+        "codex" => {
+            let out_file = std::env::temp_dir()
+                .join(format!("punk-goal-plan-codex-{}.txt", std::process::id()));
+            let out = std::process::Command::new("codex")
+                .args(["exec", "--ephemeral", "-p", "fast", "--output-last-message"])
+                .arg(&out_file)
+                .arg(prompt)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let _ = std::fs::remove_file(&out_file);
+                return Err(format!(
+                    "exit {}: {stderr}",
+                    out.status.code().unwrap_or(-1)
+                ));
+            }
+            let text = std::fs::read_to_string(&out_file).map_err(|e| e.to_string())?;
+            let _ = std::fs::remove_file(&out_file);
+            Ok(text)
+        }
+        "gemini" => {
+            let out = std::process::Command::new("gemini")
+                .args(["-p", prompt, "-o", "text"])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if out.status.success() {
+                Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+            } else {
+                Err(format!(
+                    "exit {}: {}",
+                    out.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ))
+            }
+        }
+        _ => Err(format!("unsupported planner provider: {provider}")),
+    }
+}
+
+fn format_goal_planner_failure(report: &GoalPlannerReport) -> String {
+    let mut out = String::from("Planner unavailable.\n");
+    if report.available_providers.is_empty() {
+        out.push_str("Reason: no supported providers detected.\n");
+        return out;
+    }
+    out.push_str(&format!(
+        "Providers tried: {}\n",
+        report.available_providers.join(", ")
+    ));
+    if !report.attempts.is_empty() {
+        out.push_str("Attempts:\n");
+        for attempt in &report.attempts {
+            let status = attempt.error.as_deref().unwrap_or("ok");
+            out.push_str(&format!("  - {}: {}\n", attempt.provider, status));
+        }
+    }
+    out
 }
 
 fn cmd_goals() {
@@ -4603,5 +4713,40 @@ mod cli_goal_tests {
         assert!(replan.contains("Replan ready: goal-1 (project=specpunk)"));
         assert!(replan.contains("status: planning"));
         assert!(replan.contains("punk-run goal create specpunk \"ship checkpoint\""));
+    }
+
+    #[test]
+    fn goal_planner_failure_mentions_attempts_and_providers() {
+        let rendered = format_goal_planner_failure(&GoalPlannerReport {
+            available_providers: vec!["claude".into(), "codex".into()],
+            selected_provider: None,
+            plan_text: None,
+            attempts: vec![
+                GoalPlannerAttempt {
+                    provider: "claude".into(),
+                    error: Some("exit 1: boom".into()),
+                },
+                GoalPlannerAttempt {
+                    provider: "codex".into(),
+                    error: Some("exit 1: nope".into()),
+                },
+            ],
+        });
+        assert!(rendered.contains("Planner unavailable."));
+        assert!(rendered.contains("Providers tried: claude, codex"));
+        assert!(rendered.contains("- claude: exit 1: boom"));
+        assert!(rendered.contains("- codex: exit 1: nope"));
+    }
+
+    #[test]
+    fn goal_planner_failure_handles_no_detected_providers() {
+        let rendered = format_goal_planner_failure(&GoalPlannerReport {
+            available_providers: vec![],
+            selected_provider: None,
+            plan_text: None,
+            attempts: vec![],
+        });
+        assert!(rendered.contains("Planner unavailable."));
+        assert!(rendered.contains("no supported providers detected"));
     }
 }
