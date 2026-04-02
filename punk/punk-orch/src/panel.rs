@@ -31,6 +31,14 @@ pub struct PanelSummary {
     pub timed_out: usize,
 }
 
+#[derive(Debug)]
+pub struct FallbackAskReport {
+    pub available_providers: Vec<String>,
+    pub attempts: Vec<ProviderResponse>,
+    pub selected_provider: Option<String>,
+    pub answer: Option<String>,
+}
+
 pub fn detect_available_providers() -> Vec<String> {
     detect_available_providers_with(|name| config::detect_agents().agents.contains_key(name))
 }
@@ -91,6 +99,41 @@ pub async fn ask_all(question: &str, timeout_s: u64) -> PanelReport {
     PanelReport {
         available_providers: providers,
         responses,
+    }
+}
+
+pub async fn ask_with_fallback(question: &str, timeout_s: u64) -> FallbackAskReport {
+    let providers = detect_available_providers();
+    let mut attempts = Vec::new();
+
+    for provider in &providers {
+        let response = ask_provider(provider, question, timeout_s).await;
+        let success = is_success_response(&response);
+        attempts.push(response);
+        if success {
+            break;
+        }
+    }
+
+    build_fallback_report(providers, attempts)
+}
+
+fn is_success_response(response: &ProviderResponse) -> bool {
+    response.exit_code == 0 && !response.answer.trim().is_empty()
+}
+
+fn build_fallback_report(
+    available_providers: Vec<String>,
+    attempts: Vec<ProviderResponse>,
+) -> FallbackAskReport {
+    let selected = attempts
+        .iter()
+        .find(|response| is_success_response(response));
+    FallbackAskReport {
+        available_providers,
+        selected_provider: selected.map(|response| response.provider.clone()),
+        answer: selected.map(|response| response.answer.clone()),
+        attempts,
     }
 }
 
@@ -242,5 +285,36 @@ mod tests {
                 timed_out: 1,
             }
         );
+    }
+
+    #[test]
+    fn build_fallback_report_selects_first_success_answer() {
+        let report = build_fallback_report(
+            vec!["claude".into(), "codex".into(), "gemini".into()],
+            vec![
+                ProviderResponse {
+                    provider: "claude".into(),
+                    answer: String::new(),
+                    exit_code: 1,
+                    error: Some("exit 1".into()),
+                    duration_ms: 1,
+                    timed_out: false,
+                },
+                ProviderResponse {
+                    provider: "codex".into(),
+                    answer: "ok".into(),
+                    exit_code: 0,
+                    error: None,
+                    duration_ms: 2,
+                    timed_out: false,
+                },
+            ],
+        );
+
+        assert_eq!(report.selected_provider.as_deref(), Some("codex"));
+        assert_eq!(report.answer.as_deref(), Some("ok"));
+        assert_eq!(report.attempts.len(), 2);
+        assert_eq!(report.attempts[0].provider, "claude");
+        assert_eq!(report.attempts[1].provider, "codex");
     }
 }

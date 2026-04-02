@@ -702,7 +702,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Receipts { project, since } => {
             cmd_receipts(project.as_deref(), since);
         }
-        Command::Ask { question } => cmd_ask(&question),
+        Command::Ask { question } => cmd_ask(&question).await,
         Command::Pipeline { action } => match action {
             PipelineAction::List => cmd_pipeline_list(),
             PipelineAction::Add {
@@ -2015,7 +2015,10 @@ fn cmd_queue(
     }
 }
 
-fn resolve_queue_agent(cfg: &config::Config, explicit_agent: Option<&str>) -> Result<String, String> {
+fn resolve_queue_agent(
+    cfg: &config::Config,
+    explicit_agent: Option<&str>,
+) -> Result<String, String> {
     if let Some(agent) = explicit_agent {
         return Ok(agent.to_string());
     }
@@ -2126,70 +2129,167 @@ fn cmd_receipts(project_filter: Option<&str>, since_days: i64) {
     println!("\n{count} receipts (last {since_days}d)");
 }
 
-fn cmd_ask(question: &str) {
+#[derive(Debug)]
+struct AskSnapshot {
+    captured_at: String,
+    recent_total: usize,
+    recent_success: usize,
+    running: Vec<String>,
+    queued: Vec<String>,
+    failed: Vec<String>,
+    goals: Vec<String>,
+}
+
+async fn cmd_ask(question: &str) {
     let bus_path = bus::bus_dir();
     let state = bus::read_state(&bus_path, 20);
+    let goals = goal::list_goals(&bus_path);
+    let snapshot = AskSnapshot {
+        captured_at: punk_orch::chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string(),
+        recent_total: state.done.len(),
+        recent_success: state.done.iter().filter(|t| t.status == "success").count(),
+        running: state
+            .running
+            .iter()
+            .map(|task| format!("{} ({}, {})", task.id, task.project, task.model))
+            .collect(),
+        queued: state
+            .queued
+            .iter()
+            .map(|task| format!("{} ({}, {})", task.id, task.project, task.model))
+            .collect(),
+        failed: state
+            .failed
+            .iter()
+            .map(|task| format!("{} ({}, {})", task.id, task.project, task.model))
+            .collect(),
+        goals: goals
+            .iter()
+            .map(|goal| {
+                format!(
+                    "{} ({:?}, ${:.2}/${:.2})",
+                    goal.id, goal.status, goal.spent_usd, goal.budget_usd
+                )
+            })
+            .collect(),
+    };
+    let prompt = format_ask_prompt(question, &snapshot);
+    let report = panel::ask_with_fallback(&prompt, 30).await;
 
-    // Build deterministic data snapshot
-    let mut context = format!(
-        "Data snapshot ({}):\n",
-        punk_orch::chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S")
+    if let (Some(provider), Some(answer)) = (
+        report.selected_provider.as_deref(),
+        report.answer.as_deref(),
+    ) {
+        println!("Provider: {provider}\n");
+        println!("{}", answer.trim());
+        println!("\n{}", format_ask_provenance(&snapshot));
+        return;
+    }
+
+    println!(
+        "{}",
+        format_deterministic_ask_fallback(question, &snapshot, &report)
     );
+}
+
+fn format_ask_prompt(question: &str, snapshot: &AskSnapshot) -> String {
+    let mut context = format!("Data snapshot ({}):\n", snapshot.captured_at);
     context.push_str(&format!(
         "- Recent: {} tasks ({} ok)\n",
-        state.done.len(),
-        state.done.iter().filter(|t| t.status == "success").count()
+        snapshot.recent_total, snapshot.recent_success
     ));
-    if !state.running.is_empty() {
-        context.push_str(&format!("- Running: {} tasks\n", state.running.len()));
+    if !snapshot.running.is_empty() {
+        context.push_str(&format!("- Running: {}\n", snapshot.running.len()));
+        for item in &snapshot.running {
+            context.push_str(&format!("  - {item}\n"));
+        }
     }
-    if !state.queued.is_empty() {
-        context.push_str(&format!("- Queued: {} tasks\n", state.queued.len()));
+    if !snapshot.queued.is_empty() {
+        context.push_str(&format!("- Queued: {}\n", snapshot.queued.len()));
+        for item in &snapshot.queued {
+            context.push_str(&format!("  - {item}\n"));
+        }
     }
-    if !state.failed.is_empty() {
+    if !snapshot.failed.is_empty() {
         context.push_str(&format!(
             "- Failed: {} tasks pending triage\n",
-            state.failed.len()
+            snapshot.failed.len()
         ));
-        for t in &state.failed {
-            context.push_str(&format!("  - {} ({}, {})\n", t.id, t.project, t.model));
+        for item in &snapshot.failed {
+            context.push_str(&format!("  - {item}\n"));
         }
     }
-    let goals = goal::list_goals(&bus_path);
-    if !goals.is_empty() {
-        context.push_str(&format!("- Goals: {}\n", goals.len()));
-        for g in &goals {
-            context.push_str(&format!(
-                "  - {} ({:?}, ${:.2}/${:.2})\n",
-                g.id, g.status, g.spent_usd, g.budget_usd
-            ));
+    if !snapshot.goals.is_empty() {
+        context.push_str(&format!("- Goals: {}\n", snapshot.goals.len()));
+        for item in &snapshot.goals {
+            context.push_str(&format!("  - {item}\n"));
         }
     }
+    format!(
+        "{context}\n\nBased ONLY on the data above, answer: {question}\nRules: cite task/goal IDs, do not invent data outside the snapshot, and say 'unknown' if the snapshot is insufficient."
+    )
+}
 
-    let prompt = format!(
-        "{context}\n\nBased ONLY on the data above, answer: {question}\nRules: cite task/goal IDs, don't invent data not in the snapshot, say 'unknown' if data insufficient."
-    );
+fn format_ask_provenance(snapshot: &AskSnapshot) -> String {
+    let mut out = String::from("Provenance:\n");
+    out.push_str(&format!(
+        "- Snapshot: {} recent / {} ok\n",
+        snapshot.recent_total, snapshot.recent_success
+    ));
+    if !snapshot.running.is_empty() {
+        out.push_str(&format!("- Running IDs: {}\n", snapshot.running.join(", ")));
+    }
+    if !snapshot.queued.is_empty() {
+        out.push_str(&format!("- Queued IDs: {}\n", snapshot.queued.join(", ")));
+    }
+    if !snapshot.failed.is_empty() {
+        out.push_str(&format!("- Failed IDs: {}\n", snapshot.failed.join(", ")));
+    }
+    if !snapshot.goals.is_empty() {
+        out.push_str(&format!("- Goal IDs: {}\n", snapshot.goals.join(", ")));
+    }
+    out
+}
 
-    // Call Claude haiku for fast answer
-    let output = std::process::Command::new("claude")
-        .args(["-p", &prompt, "--output-format", "text", "--model", "haiku"])
-        .env_remove("CLAUDECODE")
-        .env_remove("ANTHROPIC_API_KEY")
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            println!("{}", String::from_utf8_lossy(&out.stdout));
-        }
-        Ok(out) => {
-            eprintln!("claude failed (exit {})", out.status.code().unwrap_or(-1));
-            std::process::exit(1);
-        }
-        Err(_) => {
-            eprintln!("claude not found. Install: https://claude.ai/download");
-            std::process::exit(1);
+fn format_deterministic_ask_fallback(
+    question: &str,
+    snapshot: &AskSnapshot,
+    report: &panel::FallbackAskReport,
+) -> String {
+    let mut out = String::from("AI answer unavailable.\n");
+    out.push_str(&format!("Question: {question}\n"));
+    out.push_str("Answer: unknown\n");
+    if report.available_providers.is_empty() {
+        out.push_str("Reason: no supported providers detected.\n");
+    } else {
+        out.push_str(&format!(
+            "Providers tried: {}\n",
+            report.available_providers.join(", ")
+        ));
+        if !report.attempts.is_empty() {
+            out.push_str("Attempt results:\n");
+            for attempt in &report.attempts {
+                let status = if attempt.timed_out {
+                    "timeout".to_string()
+                } else if attempt.exit_code == 0 && attempt.answer.trim().is_empty() {
+                    "empty answer".to_string()
+                } else if attempt.exit_code == 0 {
+                    "ok".to_string()
+                } else {
+                    attempt
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| format!("exit {}", attempt.exit_code))
+                };
+                out.push_str(&format!("  - {}: {}\n", attempt.provider, status));
+            }
         }
     }
+    out.push('\n');
+    out.push_str(&format_ask_provenance(snapshot));
+    out
 }
 
 fn cmd_pipeline_list() {
@@ -3757,6 +3857,64 @@ mod tests {
     #[test]
     fn format_triage_report_handles_empty_entries() {
         assert_eq!(format_triage_report(&[]), "No tasks pending triage.\n");
+    }
+
+    fn sample_ask_snapshot() -> AskSnapshot {
+        AskSnapshot {
+            captured_at: "2026-04-02T11:22:33".to_string(),
+            recent_total: 3,
+            recent_success: 2,
+            running: vec!["run-1 (specpunk, codex)".to_string()],
+            queued: vec!["queue-1 (signum, claude)".to_string()],
+            failed: vec!["fail-1 (specpunk, codex)".to_string()],
+            goals: vec!["goal-1 (Active, $1.00/$3.00)".to_string()],
+        }
+    }
+
+    #[test]
+    fn format_ask_provenance_lists_snapshot_ids() {
+        let rendered = format_ask_provenance(&sample_ask_snapshot());
+        assert!(rendered.contains("Snapshot: 3 recent / 2 ok"));
+        assert!(rendered.contains("run-1 (specpunk, codex)"));
+        assert!(rendered.contains("queue-1 (signum, claude)"));
+        assert!(rendered.contains("fail-1 (specpunk, codex)"));
+        assert!(rendered.contains("goal-1 (Active, $1.00/$3.00)"));
+    }
+
+    #[test]
+    fn deterministic_ask_fallback_mentions_unknown_and_attempts() {
+        let snapshot = sample_ask_snapshot();
+        let report = panel::FallbackAskReport {
+            available_providers: vec!["claude".into(), "codex".into()],
+            attempts: vec![
+                panel::ProviderResponse {
+                    provider: "claude".into(),
+                    answer: String::new(),
+                    exit_code: 1,
+                    error: Some("exit 1".into()),
+                    duration_ms: 10,
+                    timed_out: false,
+                },
+                panel::ProviderResponse {
+                    provider: "codex".into(),
+                    answer: String::new(),
+                    exit_code: 1,
+                    error: Some("timeout".into()),
+                    duration_ms: 20,
+                    timed_out: true,
+                },
+            ],
+            selected_provider: None,
+            answer: None,
+        };
+
+        let rendered = format_deterministic_ask_fallback("what is blocked?", &snapshot, &report);
+        assert!(rendered.contains("AI answer unavailable."));
+        assert!(rendered.contains("Answer: unknown"));
+        assert!(rendered.contains("Providers tried: claude, codex"));
+        assert!(rendered.contains("claude: exit 1"));
+        assert!(rendered.contains("codex: timeout"));
+        assert!(rendered.contains("Provenance:"));
     }
 
     #[test]
