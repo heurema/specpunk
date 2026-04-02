@@ -14,6 +14,11 @@ struct ScopeCandidates {
     directories: Vec<String>,
 }
 
+fn is_swiftpm_build_path(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::Normal(name) if name == ".build"))
+}
+
 pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
     let mut manifests = Vec::new();
     let mut package_manager = None;
@@ -342,7 +347,10 @@ fn collect_scope_candidates(repo_root: &Path, prompt: &str) -> Result<ScopeCandi
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if ignored_name(&name) || ignored_relative_path(Path::new(&name)) {
+        if ignored_name(&name)
+            || ignored_relative_path(Path::new(&name))
+            || is_swiftpm_build_path(Path::new(&name))
+        {
             continue;
         }
         if path.is_dir() {
@@ -373,10 +381,13 @@ fn collect_scope_candidates(repo_root: &Path, prompt: &str) -> Result<ScopeCandi
         }
     }
 
-    Ok(ScopeCandidates {
-        files: sort_scored_candidates(file_candidates),
-        directories: sort_scored_candidates(directory_candidates),
-    })
+    let mut files = sort_scored_candidates(file_candidates);
+    files.retain(|candidate| !is_swiftpm_build_path(Path::new(candidate)));
+
+    let mut directories = sort_scored_candidates(directory_candidates);
+    directories.retain(|candidate| !is_swiftpm_build_path(Path::new(candidate)));
+
+    Ok(ScopeCandidates { files, directories })
 }
 
 fn walk_repo(
@@ -444,6 +455,7 @@ fn combined_scope_candidates(candidates: &ScopeCandidates) -> Vec<String> {
         .files
         .iter()
         .chain(candidates.directories.iter())
+        .filter(|candidate| !is_swiftpm_build_path(Path::new(candidate)))
         .cloned()
         .take(20)
         .collect()
@@ -454,6 +466,9 @@ fn ignored_name(name: &str) -> bool {
 }
 
 fn ignored_relative_path(relative: &Path) -> bool {
+    if is_swiftpm_build_path(relative) {
+        return true;
+    }
     let components = relative
         .components()
         .take(3)
@@ -1348,6 +1363,7 @@ fn is_artifact_storage_pattern(path: &str) -> bool {
         || lowered.contains('>')
         || lowered.starts_with(".punk/")
         || lowered.contains("/.punk/")
+        || is_swiftpm_build_path(Path::new(path.trim()))
 }
 
 fn scope_covers_path(allowed_scope: &[String], entry_point: &str) -> bool {
@@ -1371,6 +1387,9 @@ fn validate_scope_path(repo_root: &Path, value: &str) -> std::result::Result<(),
         return Err("must be bounded to a repo-relative path".to_string());
     }
     let relative = normalize_relative_path(trimmed)?;
+    if is_swiftpm_build_path(&relative) {
+        return Err("must not point to generated build artifacts".to_string());
+    }
     let joined = repo_root.join(&relative);
     if joined.exists() {
         return Ok(());
@@ -1927,6 +1946,85 @@ mod tests {
             .candidate_entry_points
             .iter()
             .all(|path| !path.starts_with("docs/research/_delve_runs")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scope_candidates_ignore_swiftpm_build_artifacts() {
+        let root =
+            std::env::temp_dir().join(format!("punk-core-swiftpm-build-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Packages/InterviewCoachKit/Sources/InterviewCoachDevUI"))
+            .unwrap();
+        fs::create_dir_all(root.join("Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests"))
+            .unwrap();
+        fs::create_dir_all(root.join("Packages/InterviewCoachKit/.build/debug")).unwrap();
+        fs::write(
+            root.join("Packages/InterviewCoachKit/Package.swift"),
+            "// swift package manifest\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(
+                "Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/MainWindowView.swift",
+            ),
+            "struct MainWindowView {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests/DevAppViewModelTests.swift"),
+            "func testDevUI() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Packages/InterviewCoachKit/.build/debug/Generated.swift"),
+            "struct GeneratedArtifact {}\n",
+        )
+        .unwrap();
+
+        let summary = scan_repo(
+            &root,
+            "Add trace panel to InterviewCoachDevUI MainWindowView",
+        )
+        .unwrap();
+        assert!(summary
+            .candidate_scope_paths
+            .iter()
+            .all(|path| !path.contains(".build/")));
+        assert!(summary
+            .candidate_file_scope_paths
+            .iter()
+            .all(|path| !path.contains(".build/")));
+        assert!(summary
+            .candidate_directory_scope_paths
+            .iter()
+            .all(|path| !path.contains(".build/")));
+        assert!(summary
+            .candidate_file_scope_paths
+            .iter()
+            .any(|path| path.ends_with("MainWindowView.swift")));
+
+        let proposal = DraftProposal {
+            title: "Add trace panel".into(),
+            summary: "Keep scope in real sources only".into(),
+            entry_points: vec![
+                "Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/MainWindowView.swift"
+                    .into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["Trace panel remains mock-only".into()],
+            behavior_requirements: vec!["Show latest trace events".into()],
+            allowed_scope: vec!["Packages/InterviewCoachKit/.build/debug/Generated.swift".into()],
+            target_checks: vec!["swift test".into()],
+            integrity_checks: vec!["swift test".into()],
+            risk_level: "low".into(),
+        };
+        let errors = validate_draft_proposal(&root, &proposal);
+        assert!(errors.iter().any(|error| {
+            error.field.starts_with("allowed_scope")
+                && error.message.contains("generated build artifacts")
+        }));
+
         let _ = fs::remove_dir_all(&root);
     }
 
