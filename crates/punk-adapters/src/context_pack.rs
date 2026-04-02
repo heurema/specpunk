@@ -663,6 +663,15 @@ fn infer_plan_sketch(contract: &Contract, path: &str, symbol: &str) -> String {
     if symbol_lc.contains("cmd_status") {
         return "Reuse the existing status rendering block and add the new summary line immediately near the current eval or benchmark window lines.".to_string();
     }
+    if symbol_lc.contains("cmd_resolve") {
+        return "Thread ambiguity handling through the existing resolve CLI path and print the new conflict details plus a disambiguation hint in place instead of creating a parallel surface.".to_string();
+    }
+    if symbol_lc.contains("cmd_queue") {
+        return "Reuse the existing queue resolver call and surface the same ambiguity/disambiguation messaging there without changing unrelated queue wiring.".to_string();
+    }
+    if path.ends_with("resolver.rs") && symbol_lc.contains("pub fn resolve") {
+        return "Keep the existing resolution order for unique matches, but detect conflicting candidates here and return a precise ambiguity error with the competing paths and sources.".to_string();
+    }
     if symbol_lc.contains("cmd_eval_skill_summary") {
         return "Reuse the existing skill eval summary helper or output formatting from this function instead of inventing a parallel formatter.".to_string();
     }
@@ -1254,6 +1263,31 @@ fn anchor_score(
     {
         score += 20;
     }
+    if path_lc.ends_with("resolver.rs")
+        && signature_lc.contains("pub fn resolve")
+        && (contract_surface_lc.contains("ambiguity")
+            || contract_surface_lc.contains("disambigu")
+            || contract_surface_lc.contains("zero-config project resolution"))
+    {
+        score += 20;
+    }
+    if path_lc.ends_with("main.rs")
+        && signature_lc.contains("cmd_resolve")
+        && (contract_surface_lc.contains("ambiguity")
+            || contract_surface_lc.contains("disambigu")
+            || contract_surface_lc.contains("queue-style")
+            || contract_surface_lc.contains("zero-config project resolution"))
+    {
+        score += 18;
+    }
+    if path_lc.ends_with("main.rs")
+        && signature_lc.contains("cmd_queue")
+        && (contract_surface_lc.contains("ambiguity")
+            || contract_surface_lc.contains("disambigu")
+            || contract_surface_lc.contains("queue-style"))
+    {
+        score += 16;
+    }
     if path_lc.ends_with("main.rs")
         && signature_lc.contains("cmd_eval_skill_summary")
         && contract_surface_lc.contains("status output")
@@ -1285,6 +1319,17 @@ fn anchor_score(
         && contract_surface_lc.contains("helper")
     {
         score = score.saturating_sub(4);
+    }
+    if path_lc.ends_with("resolver.rs")
+        && (signature_lc.starts_with("pub struct ")
+            || signature_lc.starts_with("struct ")
+            || signature_lc.starts_with("pub enum ")
+            || signature_lc.starts_with("enum "))
+        && (contract_surface_lc.contains("ambiguity")
+            || contract_surface_lc.contains("queue-style")
+            || contract_surface_lc.contains("cli surfaces"))
+    {
+        score = score.saturating_sub(6);
     }
     score
 }
@@ -2062,6 +2107,80 @@ mod tests {
                     other.path == "punk/punk-run/src/main.rs"
                         && other.symbol.contains("fn cmd_status")
                 })
+        }));
+    }
+
+    #[test]
+    fn derive_plan_seed_prefers_resolver_and_cli_ambiguity_surfaces() {
+        let contract = Contract {
+            id: "ct_resolver_ambiguity".into(),
+            feature_id: "feat_resolver_ambiguity".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Add project resolver ambiguity handling for zero-config project resolution. Keep the change bounded to punk/punk-orch/src/resolver.rs and punk/punk-run/src/main.rs. When multiple candidate projects share the same logical id or match the requested name across cache, lazy scan roots, or TOML-backed known projects, do not silently pick one. Return a precise ambiguity error that includes the conflicting paths and their sources, and make punk-run resolve and queue-style resolution surfaces print an actionable hint to disambiguate by path or punk-run use.".into(),
+            entry_points: vec![
+                "punk/punk-orch/src/resolver.rs".into(),
+                "punk/punk-run/src/main.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "Resolver APIs continue returning the same success shape for unique matches, but produce an ambiguity error for conflicting matches.".into(),
+                "CLI/output handling in punk-run surfaces resolver ambiguity with conflicting paths, candidate sources, and a concrete disambiguation hint.".into(),
+            ],
+            behavior_requirements: vec![
+                "Detect ambiguity during zero-config project resolution when multiple candidates share the same logical id or match the requested name across cache, lazy scan roots, or TOML-backed known projects.".into(),
+                "Update queue-style and main resolution surfaces to print an actionable disambiguation hint by explicit path or punk-run use.".into(),
+            ],
+            allowed_scope: vec![
+                "punk/punk-orch/src/resolver.rs".into(),
+                "punk/punk-run/src/main.rs".into(),
+            ],
+            target_checks: vec!["cargo test -p punk-run".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let pack = ContextPack {
+            files: vec![
+                ContextFileExcerpt {
+                    path: "punk/punk-orch/src/resolver.rs".into(),
+                    start_line: 1,
+                    end_line: 48,
+                    truncated_at_test_boundary: false,
+                    content: "pub struct ResolvedProject {\n    pub id: String,\n}\n\npub enum ResolveError {\n    NotFound { name: String },\n}\n\npub fn resolve(\n    name: &str,\n    cli_path: Option<&Path>,\n    config: Option<&Config>,\n) -> Result<ResolvedProject, ResolveError> {\n    todo!()\n}\n".into(),
+                },
+                ContextFileExcerpt {
+                    path: "punk/punk-run/src/main.rs".into(),
+                    start_line: 2274,
+                    end_line: 2350,
+                    truncated_at_test_boundary: false,
+                    content: "fn cmd_use(name: &str, path: &str) {\n}\n\nfn cmd_resolve(name: &str, cli_path: Option<&str>) {\n}\n\nfn cmd_queue(\n    project: &str,\n    prompt: &str,\n    agent: &str,\n    category: &str,\n    priority: &str,\n    timeout: u64,\n    budget: Option<f64>,\n    worktree: bool,\n    after: Option<&str>,\n) {\n}\n".into(),
+                },
+            ],
+            missing_paths: vec![],
+            recipe_seed: None,
+            patch_seed: None,
+            plan_seed: None,
+        };
+
+        let seed = derive_plan_seed(&contract, &pack);
+
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "punk/punk-orch/src/resolver.rs"
+                && target.symbol.contains("pub fn resolve")
+        }));
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "punk/punk-run/src/main.rs"
+                && target.symbol.contains("fn cmd_resolve")
+        }));
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "punk/punk-run/src/main.rs"
+                && target.symbol.contains("fn cmd_queue")
+        }));
+        assert!(!seed.targets.iter().any(|target| {
+            target.path == "punk/punk-orch/src/resolver.rs"
+                && target.symbol.contains("ResolvedProject")
         }));
     }
 
