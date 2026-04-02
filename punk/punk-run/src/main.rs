@@ -1127,9 +1127,19 @@ async fn main() -> anyhow::Result<()> {
                     );
                     std::process::exit(1);
                 }
+                let old_budget_usd = g.budget_usd;
                 g.budget_usd = usd;
                 goal::save_goal(&bus_path, &g).ok();
-                println!("{goal_id}: budget -> ${usd:.2}");
+                print!(
+                    "{}",
+                    format_goal_budget_outcome(GoalBudgetOutcome {
+                        goal_id: &goal_id,
+                        project: &g.project,
+                        old_budget_usd,
+                        new_budget_usd: usd,
+                        spent_usd: g.spent_usd,
+                    })
+                );
             }
             GoalAction::Replan { goal_id } => {
                 let bus_path = bus::bus_dir();
@@ -1148,10 +1158,13 @@ async fn main() -> anyhow::Result<()> {
                 g.status = goal::GoalStatus::Planning;
                 g.completed_at = None;
                 goal::save_goal(&bus_path, &g).ok();
-                println!("{goal_id}: plan cleared, status -> planning");
-                println!(
-                    "Re-run: punk-run goal create {} \"{}\"",
-                    g.project, g.objective
+                print!(
+                    "{}",
+                    format_goal_replan_outcome(GoalReplanOutcome {
+                        goal_id: &goal_id,
+                        project: &g.project,
+                        objective: &g.objective,
+                    })
                 );
             }
         },
@@ -1682,11 +1695,7 @@ fn cmd_approve(goal_id: &str) {
         std::process::exit(1);
     }
 
-    println!(
-        "\nApproved. {} step(s) queued: {}",
-        queued.len(),
-        queued.join(", ")
-    );
+    print!("{}", format_goal_approval_report(&g, &queued));
 }
 
 fn format_still_alive_guard(
@@ -2392,6 +2401,33 @@ struct StepStatusSummary {
     skipped: usize,
 }
 
+struct GoalApprovalSummary<'a> {
+    goal: &'a goal::Goal,
+    queued: &'a [String],
+}
+
+struct GoalBudgetOutcome<'a> {
+    goal_id: &'a str,
+    project: &'a str,
+    old_budget_usd: f64,
+    new_budget_usd: f64,
+    spent_usd: f64,
+}
+
+struct GoalReplanOutcome<'a> {
+    goal_id: &'a str,
+    project: &'a str,
+    objective: &'a str,
+}
+
+struct GoalTransitionOutcome<'a> {
+    goal_id: &'a str,
+    project: &'a str,
+    old_status: goal::GoalStatus,
+    new_status: goal::GoalStatus,
+    inflight_task_count: usize,
+}
+
 fn format_goals_report(goals: &[goal::Goal]) -> String {
     if goals.is_empty() {
         return "No goals.\n".to_string();
@@ -2525,6 +2561,97 @@ fn format_goal_status_report(goal: &goal::Goal) -> String {
     out
 }
 
+fn format_goal_approval_report(goal: &goal::Goal, queued: &[String]) -> String {
+    let summary = GoalApprovalSummary { goal, queued };
+    let mut out = String::new();
+    out.push_str(&format!("Approved: {}\n", summary.goal.id));
+    out.push_str(&format!("  project: {}\n", summary.goal.project));
+    out.push_str(&format!(
+        "  status:  {}\n",
+        goal_status_label(&summary.goal.status)
+    ));
+    out.push_str(&format!("  queued:  {} step(s)\n", summary.queued.len()));
+    if !summary.queued.is_empty() {
+        out.push_str(&format!("  tasks:   {}\n", summary.queued.join(", ")));
+    }
+    out.push_str(&format!(
+        "  budget:  ${:.2} spent ${:.2}\n",
+        summary.goal.budget_usd, summary.goal.spent_usd
+    ));
+    out.push_str("\nActions:\n");
+    out.push_str(&format!("  punk-run goal status {}\n", summary.goal.id));
+    out.push_str(&format!(
+        "  punk-run status --project {}\n",
+        summary.goal.project
+    ));
+    out
+}
+
+fn format_goal_budget_outcome(outcome: GoalBudgetOutcome<'_>) -> String {
+    format!(
+        "Budget updated: {} (project={}) ${:.2} -> ${:.2}, spent ${:.2}\n",
+        outcome.goal_id,
+        outcome.project,
+        outcome.old_budget_usd,
+        outcome.new_budget_usd,
+        outcome.spent_usd
+    )
+}
+
+fn format_goal_replan_outcome(outcome: GoalReplanOutcome<'_>) -> String {
+    format!(
+        "Replan ready: {} (project={})\n  status: planning\n  plan:   cleared\n  next:   punk-run goal create {} \"{}\"\n",
+        outcome.goal_id, outcome.project, outcome.project, outcome.objective
+    )
+}
+
+fn format_goal_transition_outcome(outcome: GoalTransitionOutcome<'_>) -> String {
+    let mut out = format!(
+        "Goal updated: {} (project={}) {} -> {}\n",
+        outcome.goal_id,
+        outcome.project,
+        goal_status_label(&outcome.old_status),
+        goal_status_label(&outcome.new_status)
+    );
+    if outcome.new_status == goal::GoalStatus::Failed {
+        out.push_str(&format!(
+            "  inflight tasks signaled: {}\n",
+            outcome.inflight_task_count
+        ));
+    }
+    out.push_str("Actions:\n");
+    match outcome.new_status {
+        goal::GoalStatus::Paused => {
+            out.push_str(&format!("  punk-run goal resume {}\n", outcome.goal_id));
+            out.push_str(&format!("  punk-run goal status {}\n", outcome.goal_id));
+        }
+        goal::GoalStatus::Active => {
+            out.push_str(&format!("  punk-run goal status {}\n", outcome.goal_id));
+            out.push_str(&format!(
+                "  punk-run status --project {}\n",
+                outcome.project
+            ));
+        }
+        goal::GoalStatus::Failed => {
+            out.push_str(&format!("  punk-run goal status {}\n", outcome.goal_id));
+            out.push_str(&format!("  punk-run goal replan {}\n", outcome.goal_id));
+        }
+        _ => {}
+    }
+    out
+}
+
+fn goal_status_label(status: &goal::GoalStatus) -> &'static str {
+    match status {
+        goal::GoalStatus::Planning => "planning",
+        goal::GoalStatus::AwaitingApproval => "awaiting_approval",
+        goal::GoalStatus::Active => "active",
+        goal::GoalStatus::Paused => "paused",
+        goal::GoalStatus::Done => "done",
+        goal::GoalStatus::Failed => "failed",
+    }
+}
+
 fn summarize_goal_statuses(goals: &[goal::Goal]) -> GoalStatusSummary {
     let mut summary = GoalStatusSummary::default();
     for goal in goals {
@@ -2571,8 +2698,11 @@ fn cmd_goal_set_status(goal_id: &str, new_status: goal::GoalStatus) {
         std::process::exit(1);
     }
 
+    let old_status = g.status.clone();
+    let inflight_task_ids = goal_inflight_task_ids(&g);
+
     if new_status == goal::GoalStatus::Failed {
-        for task_id in goal_inflight_task_ids(&g) {
+        for task_id in &inflight_task_ids {
             if let Err(err) = ops::cancel_task(&bus_path, &task_id) {
                 eprintln!("Failed to cancel goal task {task_id}: {err}");
                 std::process::exit(1);
@@ -2586,16 +2716,23 @@ fn cmd_goal_set_status(goal_id: &str, new_status: goal::GoalStatus) {
         g.completed_at = None;
     }
 
-    let old = format!("{:?}", g.status);
     g.status = new_status;
-    let new = format!("{:?}", g.status);
 
     if let Err(e) = goal::save_goal(&bus_path, &g) {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 
-    println!("{goal_id}: {old} -> {new}");
+    print!(
+        "{}",
+        format_goal_transition_outcome(GoalTransitionOutcome {
+            goal_id,
+            project: &g.project,
+            old_status,
+            new_status: g.status,
+            inflight_task_count: inflight_task_ids.len(),
+        })
+    );
 }
 
 fn goal_has_inflight_steps(goal: &goal::Goal) -> bool {
@@ -4420,5 +4557,51 @@ mod cli_goal_tests {
             "Step summary: pending=0 queued=1 running=0 done=1 blocked=1 failed=0 skipped=0"
         ));
         assert!(rendered.contains("punk-run goal approve goal-1"));
+    }
+
+    #[test]
+    fn format_goal_approval_report_lists_queued_tasks_and_actions() {
+        let goal = sample_goal(goal::GoalStatus::Active, &[goal::StepStatus::Queued]);
+        let rendered = format_goal_approval_report(&goal, &["task-1".into(), "task-2".into()]);
+        assert!(rendered.contains("Approved: goal-1"));
+        assert!(rendered.contains("queued:  2 step(s)"));
+        assert!(rendered.contains("tasks:   task-1, task-2"));
+        assert!(rendered.contains("punk-run goal status goal-1"));
+        assert!(rendered.contains("punk-run status --project specpunk"));
+    }
+
+    #[test]
+    fn format_goal_transition_outcome_for_cancel_mentions_replan() {
+        let rendered = format_goal_transition_outcome(GoalTransitionOutcome {
+            goal_id: "goal-1",
+            project: "specpunk",
+            old_status: goal::GoalStatus::Active,
+            new_status: goal::GoalStatus::Failed,
+            inflight_task_count: 2,
+        });
+        assert!(rendered.contains("Goal updated: goal-1 (project=specpunk) active -> failed"));
+        assert!(rendered.contains("inflight tasks signaled: 2"));
+        assert!(rendered.contains("punk-run goal replan goal-1"));
+    }
+
+    #[test]
+    fn format_goal_budget_and_replan_outcomes_are_actionable() {
+        let budget = format_goal_budget_outcome(GoalBudgetOutcome {
+            goal_id: "goal-1",
+            project: "specpunk",
+            old_budget_usd: 5.0,
+            new_budget_usd: 7.5,
+            spent_usd: 1.0,
+        });
+        assert!(budget.contains("Budget updated: goal-1 (project=specpunk) $5.00 -> $7.50"));
+
+        let replan = format_goal_replan_outcome(GoalReplanOutcome {
+            goal_id: "goal-1",
+            project: "specpunk",
+            objective: "ship checkpoint",
+        });
+        assert!(replan.contains("Replan ready: goal-1 (project=specpunk)"));
+        assert!(replan.contains("status: planning"));
+        assert!(replan.contains("punk-run goal create specpunk \"ship checkpoint\""));
     }
 }
