@@ -47,12 +47,28 @@ pub(crate) struct ContextPatchSeed {
     pub files: Vec<ContextPatchSeedFile>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContextPlanTarget {
+    pub path: String,
+    pub symbol: String,
+    pub insertion_point: String,
+    pub execution_sketch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContextPlanSeed {
+    pub title: String,
+    pub summary: String,
+    pub targets: Vec<ContextPlanTarget>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ContextPack {
     pub files: Vec<ContextFileExcerpt>,
     pub missing_paths: Vec<String>,
     pub recipe_seed: Option<ContextRecipeSeed>,
     pub patch_seed: Option<ContextPatchSeed>,
+    pub plan_seed: Option<ContextPlanSeed>,
 }
 
 pub(crate) fn build_context_pack(repo_root: &Path, contract: &Contract) -> Result<ContextPack> {
@@ -385,6 +401,75 @@ pub(crate) fn format_patch_context_pack(pack: &ContextPack) -> String {
             sections.push("```rust".to_string());
             sections.push(compact_patch_excerpt(&file.snippet, 60, 2500));
             sections.push("```".to_string());
+        }
+    }
+
+    if let Some(seed) = &pack.plan_seed {
+        sections.push("Controller-owned plan prepass:".to_string());
+        sections.push(format!("- title: {}", seed.title));
+        sections.push(format!("- summary: {}", seed.summary));
+        for target in &seed.targets {
+            sections.push(format!(
+                "- target: {} | symbol: {} | insert: {}",
+                target.path, target.symbol, target.insertion_point
+            ));
+            sections.push(format!("  sketch: {}", target.execution_sketch));
+        }
+    } else if pack.patch_seed.is_none() {
+        if let Some(seed) = &pack.recipe_seed {
+            sections.push("Controller-owned recipe seed:".to_string());
+            sections.push(format!("- title: {}", seed.title));
+            sections.push(format!("- summary: {}", seed.summary));
+            for file in &seed.files {
+                sections.push(format!(
+                    "- file: {} ({}) targets: {}",
+                    file.path,
+                    file.role,
+                    file.edit_targets.join("; ")
+                ));
+            }
+        }
+    }
+
+    sections.join("\n")
+}
+
+pub(crate) fn format_plan_context_pack(pack: &ContextPack) -> String {
+    let mut sections = Vec::new();
+
+    if !pack.files.is_empty() {
+        sections.push("Plan prepass bounded context:".to_string());
+        for file in &pack.files {
+            sections.push(format!(
+                "- {} (lines {}-{}, truncated_at_test_boundary: {})",
+                file.path,
+                file.start_line,
+                file.end_line,
+                if file.truncated_at_test_boundary {
+                    "true"
+                } else {
+                    "false"
+                }
+            ));
+            sections.push("```rust".to_string());
+            sections.push(compact_patch_excerpt(&file.content, 50, 2200));
+            sections.push("```".to_string());
+        }
+    }
+
+    if !pack.missing_paths.is_empty() {
+        sections.push(format!(
+            "Missing entry-point files at baseline: {}",
+            pack.missing_paths.join(", ")
+        ));
+    }
+
+    if let Some(seed) = &pack.patch_seed {
+        sections.push("Existing patch seed hints:".to_string());
+        sections.push(format!("- title: {}", seed.title));
+        sections.push(format!("- summary: {}", seed.summary));
+        for file in &seed.files {
+            sections.push(format!("- file: {} ({})", file.path, file.purpose));
         }
     } else if let Some(seed) = &pack.recipe_seed {
         sections.push("Controller-owned recipe seed:".to_string());
@@ -1233,6 +1318,7 @@ mod tests {
             missing_paths: vec!["src/new_file.rs".into()],
             recipe_seed: None,
             patch_seed: None,
+            plan_seed: None,
         };
         let rendered = format_context_pack(&pack);
         assert!(rendered.contains("Missing entry-point files at baseline: src/new_file.rs"));
@@ -1255,11 +1341,36 @@ mod tests {
             missing_paths: vec![],
             recipe_seed: None,
             patch_seed: None,
+            plan_seed: None,
         };
         let rendered = format_patch_context_pack(&pack);
         assert!(rendered.contains("Patch lane bounded context:"));
         assert!(rendered.contains("src/lib.rs"));
         assert!(rendered.contains("excerpt truncated for patch lane"));
+    }
+
+    #[test]
+    fn patch_formatter_includes_plan_seed_targets() {
+        let pack = ContextPack {
+            files: vec![],
+            missing_paths: vec![],
+            recipe_seed: None,
+            patch_seed: None,
+            plan_seed: Some(ContextPlanSeed {
+                title: "plan".into(),
+                summary: "tighten patch generation".into(),
+                targets: vec![ContextPlanTarget {
+                    path: "src/lib.rs".into(),
+                    symbol: "fn status".into(),
+                    insertion_point: "after benchmark output".into(),
+                    execution_sketch: "add one skill eval summary line".into(),
+                }],
+            }),
+        };
+        let rendered = format_patch_context_pack(&pack);
+        assert!(rendered.contains("Controller-owned plan prepass:"));
+        assert!(rendered.contains("src/lib.rs"));
+        assert!(rendered.contains("fn status"));
     }
 
     #[test]
@@ -1328,6 +1439,7 @@ mod tests {
             missing_paths: pack.missing_paths,
             recipe_seed: Some(seed),
             patch_seed: None,
+            plan_seed: None,
         });
         assert!(rendered.contains("Controller-owned recipe seed:"));
         assert!(rendered.contains("crates/punk-council/src/lib.rs (wiring)"));
@@ -1395,6 +1507,7 @@ mod tests {
             missing_paths: pack.missing_paths,
             recipe_seed: pack.recipe_seed,
             patch_seed: Some(seed),
+            plan_seed: None,
         });
         assert!(rendered.contains("Controller-owned patch seed:"));
         assert!(rendered.contains("Apply these snippets in place"));

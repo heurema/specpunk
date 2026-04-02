@@ -21,8 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use context_pack::{
     build_context_pack, ensure_retry_patch_seed, format_context_pack, format_patch_context_pack,
-    materialize_missing_entry_points, restore_missing_materialized_entry_points,
-    restore_stale_entry_point_masks, scaffold_only_entry_points, ContextPack,
+    format_plan_context_pack, materialize_missing_entry_points,
+    restore_missing_materialized_entry_points, restore_stale_entry_point_masks,
+    scaffold_only_entry_points, ContextPack, ContextPlanSeed, ContextPlanTarget,
     EntryPointExcerptGuard,
 };
 use punk_domain::{Contract, DraftInput, DraftProposal, RefineInput};
@@ -62,6 +63,13 @@ struct PatchLaneTimedOutput {
     response: Option<PatchLaneResponse>,
 }
 
+struct PlanLaneTimedOutput {
+    output: std::process::Output,
+    timed_out: bool,
+    orphaned: bool,
+    response: Option<PlanPrepassResponse>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EntryPointSnapshot {
     path: String,
@@ -83,6 +91,23 @@ enum ExecutionLane {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PatchLaneResponse {
     Patch(String),
+    Blocked(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanPrepassTarget {
+    path: String,
+    symbol: String,
+    insertion_point: String,
+    execution_sketch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlanPrepassResponse {
+    Plan {
+        summary: String,
+        targets: Vec<PlanPrepassTarget>,
+    },
     Blocked(String),
 }
 
@@ -422,8 +447,73 @@ impl CodexCliExecutor {
     fn execute_patch_apply_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
         let start = Instant::now();
         restore_stale_entry_point_masks(&input.repo_root)?;
-        let context_pack = build_context_pack(&input.repo_root, &input.contract)?;
+        let mut context_pack = build_context_pack(&input.repo_root, &input.contract)?;
         let mut excerpt_guard = EntryPointExcerptGuard::apply(&input.repo_root, &context_pack)?;
+        if needs_patch_plan_prepass(&input.contract, &context_pack) {
+            match self.run_patch_plan_prepass(&input, &context_pack) {
+                Err(err) => {
+                    if let Some(guard) = excerpt_guard.as_mut() {
+                        guard.restore()?;
+                    }
+                    append_log_text(
+                        &input.stderr_path,
+                        &format!("\n[punk patch/prepass] failed: {err}\n"),
+                    )?;
+                    return Ok(ExecuteOutput {
+                        success: false,
+                        summary: format!("patch prepass failed: {err}"),
+                        checks_run: Vec::new(),
+                        cost_usd: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
+                Ok(PlanPrepassResponse::Blocked(reason)) => {
+                    if let Some(guard) = excerpt_guard.as_mut() {
+                        guard.restore()?;
+                    }
+                    append_log_text(
+                        &input.stderr_path,
+                        &format!("\n[punk patch/prepass] blocked: {reason}\n"),
+                    )?;
+                    return Ok(ExecuteOutput {
+                        success: false,
+                        summary: reason,
+                        checks_run: Vec::new(),
+                        cost_usd: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
+                Ok(PlanPrepassResponse::Plan { summary, targets }) => {
+                    append_log_text(
+                        &input.stdout_path,
+                        &format!(
+                            "\n[punk patch/prepass] planned targets: {}\n",
+                            targets
+                                .iter()
+                                .map(|target| format!(
+                                    "{}:{}@{}",
+                                    target.path, target.symbol, target.insertion_point
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    )?;
+                    context_pack.plan_seed = Some(ContextPlanSeed {
+                        title: "Controller-owned plan prepass".to_string(),
+                        summary,
+                        targets: targets
+                            .into_iter()
+                            .map(|target| ContextPlanTarget {
+                                path: target.path,
+                                symbol: target.symbol,
+                                insertion_point: target.insertion_point,
+                                execution_sketch: target.execution_sketch,
+                            })
+                            .collect(),
+                    });
+                }
+            }
+        }
         let prompt = build_patch_apply_prompt(&input.contract, &context_pack);
 
         let mut command = Command::new("codex");
@@ -608,6 +698,68 @@ impl CodexCliExecutor {
         })
     }
 
+    fn run_patch_plan_prepass(
+        &self,
+        input: &ExecuteInput,
+        context_pack: &ContextPack,
+    ) -> Result<PlanPrepassResponse> {
+        let prompt = build_patch_plan_prompt(&input.contract, context_pack);
+        let mut command = Command::new("codex");
+        command
+            .arg("exec")
+            .arg("--full-auto")
+            .arg("--ephemeral")
+            .arg("-s")
+            .arg("read-only")
+            .arg("-C")
+            .arg(&input.repo_root);
+        if let Some(model) = &self.model {
+            command.arg("-m").arg(model);
+        }
+        if let Some(reasoning_effort) = codex_executor_reasoning_effort(&input.contract) {
+            command
+                .arg("-c")
+                .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""));
+        }
+        command.arg(prompt);
+
+        let timed_output = run_plan_lane_command_with_timeout(
+            &mut command,
+            codex_plan_prepass_timeout(),
+            input.stdout_path.clone(),
+            input.stderr_path.clone(),
+            input.executor_pid_path.clone(),
+        )?;
+        let stdout = String::from_utf8_lossy(&timed_output.output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&timed_output.output.stderr).to_string();
+        let response = timed_output
+            .response
+            .clone()
+            .or_else(|| load_plan_prepass_response(&stdout, &stderr).ok());
+        if timed_output.timed_out && response.is_none() {
+            return Err(anyhow!(
+                "patch prepass timed out: {}",
+                timeout_summary(codex_plan_prepass_timeout(), &stdout, &stderr)
+            ));
+        }
+        if timed_output.orphaned {
+            return Err(anyhow!(
+                "patch prepass orphaned: {}",
+                orphan_summary(&stdout, &stderr)
+            ));
+        }
+        if !timed_output.output.status.success() && response.is_none() {
+            return Err(anyhow!(
+                "patch prepass failed: {}",
+                classify_execution_result(false, &stdout, &stderr).1
+            ));
+        }
+        let response =
+            response.ok_or_else(|| anyhow!("patch prepass returned no complete plan artifact"))?;
+        validate_plan_prepass_scope(&response, &input.contract.allowed_scope)?;
+        Ok(response)
+    }
+
     fn run_execution_attempt(
         &self,
         input: &ExecuteInput,
@@ -787,6 +939,11 @@ fn build_exec_prompt_with_mode(
 
 fn build_patch_apply_prompt(contract: &Contract, context_pack: &ContextPack) -> String {
     let context_pack_section = format_patch_context_pack(context_pack);
+    let plan_rule = if context_pack.plan_seed.is_some() {
+        "- if the controller-owned plan prepass is present, treat its target files, symbols, and insertion points as authoritative and produce the patch directly against that plan\n"
+    } else {
+        ""
+    };
     format!(
         "Produce plain text only for a controller-owned patch/apply lane.\n\
 Return exactly one of:\n\
@@ -801,11 +958,13 @@ Expected interfaces: {}\n\
 Target checks to satisfy after apply: {}\n\
 Integrity checks to keep passing after apply: {}\n\
 {}\n\
+{}\n\
 Requirements:\n\
 - emit one complete `apply_patch` envelope when implementation is possible\n\
 - touch only files inside allowed scope\n\
 - use only `*** Update File:` sections in this lane\n\
 - do not add, delete, move, or rename files in this lane\n\
+- prefer the smallest bounded patch that follows any controller-owned plan targets exactly before doing broader exploration\n\
 - each update hunk must include enough unchanged or removed context lines for deterministic controller-side application\n\
 - prefer the smallest bounded patch that gets the implementation started and covers the approved behavior\n\
 - output patch text only; do not output JSON, commentary, bullets, or markdown fences\n\
@@ -817,6 +976,43 @@ Requirements:\n\
         contract.expected_interfaces.join("; "),
         contract.target_checks.join("; "),
         contract.integrity_checks.join("; "),
+        context_pack_section,
+        plan_rule,
+        blocked = blocked_execution_template(),
+    )
+}
+
+fn build_patch_plan_prompt(contract: &Contract, context_pack: &ContextPack) -> String {
+    let context_pack_section = format_plan_context_pack(context_pack);
+    format!(
+        "Produce plain text only for a controller-owned planning prepass.\n\
+Return exactly one of:\n\
+1. a single compact plan envelope starting with `PUNK_PLAN_BEGIN` and ending with `PUNK_PLAN_END`\n\
+2. a single line `{blocked}` followed by a concise reason\n\
+The repository is read-only for this step; do not modify files directly.\n\
+Contract id: {}\n\
+Behavior requirements: {}\n\
+Allowed scope: {}\n\
+Entry points: {}\n\
+Expected interfaces: {}\n\
+{}\n\
+Plan format requirements:\n\
+- first line inside the envelope must be `SUMMARY: <one-line summary>`\n\
+- each target must use exactly these three lines:\n\
+  `TARGET: <repo-path>`\n\
+  `SYMBOL: <function/type/section to edit>`\n\
+  `INSERT: <exact insertion point or nearby anchor>`\n\
+  `SKETCH: <one-line execution sketch>`\n\
+- include 1 to 3 targets only\n\
+- all targets must stay inside allowed scope\n\
+- prefer the smallest exact plan that directly unblocks patch generation\n\
+- do not output JSON, markdown fences, or commentary\n\
+- if implementation is blocked inside allowed scope, output exactly one `{blocked}` line and nothing else\n",
+        contract.id,
+        contract.behavior_requirements.join("; "),
+        contract.allowed_scope.join(", "),
+        contract.entry_points.join(", "),
+        contract.expected_interfaces.join("; "),
         context_pack_section,
         blocked = blocked_execution_template(),
     )
@@ -951,6 +1147,15 @@ fn codex_patch_lane_timeout() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(90);
+    Duration::from_secs(seconds)
+}
+
+fn codex_plan_prepass_timeout() -> Duration {
+    let seconds = std::env::var("PUNK_CODEX_PLAN_PREPASS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(45);
     Duration::from_secs(seconds)
 }
 
@@ -1118,6 +1323,46 @@ fn is_patch_apply_lane_candidate(repo_root: &Path, contract: &Contract) -> bool 
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+fn needs_patch_plan_prepass(contract: &Contract, context_pack: &ContextPack) -> bool {
+    if contract.allowed_scope.len() != 2 || contract.entry_points.len() != 2 {
+        return false;
+    }
+    if context_pack.plan_seed.is_some() {
+        return false;
+    }
+
+    let mut text = contract.prompt_source.to_ascii_lowercase();
+    for item in contract
+        .expected_interfaces
+        .iter()
+        .chain(contract.behavior_requirements.iter())
+    {
+        text.push('\n');
+        text.push_str(&item.to_ascii_lowercase());
+    }
+
+    let uncertainty_markers = [
+        "reuse existing",
+        "derived from",
+        "similar to existing",
+        "backward-compatible",
+        "backward compatible",
+        "concise human-readable",
+        "status snapshot",
+        "window data",
+    ];
+    let surface_markers = ["status", "summary", "output", "report", "window"];
+
+    uncertainty_markers
+        .iter()
+        .any(|needle| text.contains(needle))
+        || surface_markers
+            .iter()
+            .filter(|needle| text.contains(**needle))
+            .count()
+            >= 3
 }
 
 fn manual_mode_block_summary(contract: &Contract) -> Option<String> {
@@ -1295,6 +1540,83 @@ fn run_patch_lane_command_with_timeout(
     })
 }
 
+fn run_plan_lane_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    executor_pid_path: PathBuf,
+) -> Result<PlanLaneTimedOutput> {
+    #[cfg(unix)]
+    command.process_group(0);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let child_pid = child.id();
+    write_executor_pid(&executor_pid_path, child_pid)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("child stdout pipe unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("child stderr pipe unavailable"))?;
+    let progress = Arc::new(ProgressTracker::new());
+    let stdout_live = Arc::new(Mutex::new(Vec::new()));
+    let stderr_live = Arc::new(Mutex::new(Vec::new()));
+    let stdout_handle = spawn_stream_tee_with_live_capture(
+        stdout,
+        stdout_path,
+        progress.clone(),
+        true,
+        Some(stdout_live.clone()),
+    );
+    let stderr_handle = spawn_stream_tee_with_live_capture(
+        stderr,
+        stderr_path,
+        progress,
+        false,
+        Some(stderr_live.clone()),
+    );
+    let start = Instant::now();
+    let (timed_out, orphaned, response) = loop {
+        if let Some(response) = detect_plan_prepass_response(&stdout_live, &stderr_live) {
+            terminate_process_tree(&mut child, child_pid);
+            break (false, false, Some(response));
+        }
+        if child.try_wait()?.is_some() {
+            if !wait_for_stream_completion(
+                &stdout_handle,
+                &stderr_handle,
+                codex_executor_orphan_grace_timeout(),
+            ) {
+                terminate_process_tree(&mut child, child_pid);
+                break (false, true, None);
+            }
+            break (false, false, None);
+        }
+        if start.elapsed() >= timeout {
+            let response = detect_plan_prepass_response(&stdout_live, &stderr_live);
+            terminate_process_tree(&mut child, child_pid);
+            break (response.is_none(), false, response);
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    let status = child.wait()?;
+    let stdout = join_stream_tee(stdout_handle)?;
+    let stderr = join_stream_tee(stderr_handle)?;
+    Ok(PlanLaneTimedOutput {
+        output: std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+        timed_out,
+        orphaned,
+        response,
+    })
+}
+
 fn run_command_with_timeout_and_tee(
     command: &mut Command,
     timeout: Duration,
@@ -1417,6 +1739,15 @@ fn detect_patch_lane_response(
     let stdout = snapshot_live_output(stdout)?;
     let stderr = snapshot_live_output(stderr)?;
     load_patch_lane_response(&stdout, &stderr).ok()
+}
+
+fn detect_plan_prepass_response(
+    stdout: &Arc<Mutex<Vec<u8>>>,
+    stderr: &Arc<Mutex<Vec<u8>>>,
+) -> Option<PlanPrepassResponse> {
+    let stdout = snapshot_live_output(stdout)?;
+    let stderr = snapshot_live_output(stderr)?;
+    load_plan_prepass_response(&stdout, &stderr).ok()
 }
 
 fn snapshot_live_output(buffer: &Arc<Mutex<Vec<u8>>>) -> Option<String> {
@@ -1872,6 +2203,114 @@ fn load_patch_lane_response(stdout: &str, stderr: &str) -> Result<PatchLaneRespo
         .ok_or_else(|| anyhow!("patch lane returned no complete patch artifact or blocked sentinel"))
 }
 
+fn load_plan_prepass_response(stdout: &str, stderr: &str) -> Result<PlanPrepassResponse> {
+    if let Some(blocked) = blocked_execution_line(stdout, stderr) {
+        return Ok(PlanPrepassResponse::Blocked(blocked));
+    }
+
+    let payload = extract_plan_envelope(stdout)
+        .or_else(|| extract_plan_envelope(stderr))
+        .or_else(|| extract_plan_envelope(&format!("{stdout}\n{stderr}")))
+        .ok_or_else(|| anyhow!("patch prepass returned no complete plan artifact"))?;
+    parse_plan_prepass_response(&payload)
+}
+
+fn extract_plan_envelope(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut begin = None;
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if begin.is_none() {
+            if trimmed == "PUNK_PLAN_BEGIN" {
+                begin = Some(idx);
+            }
+            continue;
+        }
+        if trimmed == "PUNK_PLAN_END" {
+            let body = lines[begin? + 1..idx].join("\n");
+            let body = body.trim().to_string();
+            if body.is_empty() {
+                return None;
+            }
+            return Some(body);
+        }
+    }
+    None
+}
+
+fn parse_plan_prepass_response(payload: &str) -> Result<PlanPrepassResponse> {
+    let mut summary = None;
+    let mut targets = Vec::new();
+    let mut current_path = None;
+    let mut current_symbol = None;
+    let mut current_insert = None;
+    let mut current_sketch = None;
+
+    for raw_line in payload.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("SUMMARY: ") {
+            summary = Some(rest.trim().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("TARGET: ") {
+            if let (Some(path), Some(symbol), Some(insertion_point), Some(execution_sketch)) = (
+                current_path.take(),
+                current_symbol.take(),
+                current_insert.take(),
+                current_sketch.take(),
+            ) {
+                targets.push(PlanPrepassTarget {
+                    path,
+                    symbol,
+                    insertion_point,
+                    execution_sketch,
+                });
+            }
+            current_path = Some(rest.trim().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("SYMBOL: ") {
+            current_symbol = Some(rest.trim().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("INSERT: ") {
+            current_insert = Some(rest.trim().to_string());
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("SKETCH: ") {
+            current_sketch = Some(rest.trim().to_string());
+            continue;
+        }
+        return Err(anyhow!("unexpected plan prepass line `{line}`"));
+    }
+
+    if let (Some(path), Some(symbol), Some(insertion_point), Some(execution_sketch)) = (
+        current_path.take(),
+        current_symbol.take(),
+        current_insert.take(),
+        current_sketch.take(),
+    ) {
+        targets.push(PlanPrepassTarget {
+            path,
+            symbol,
+            insertion_point,
+            execution_sketch,
+        });
+    }
+
+    let summary = summary.ok_or_else(|| anyhow!("plan prepass missing SUMMARY line"))?;
+    if targets.is_empty() {
+        return Err(anyhow!("plan prepass declared no targets"));
+    }
+    if targets.len() > 3 {
+        return Err(anyhow!("plan prepass declared too many targets"));
+    }
+    Ok(PlanPrepassResponse::Plan { summary, targets })
+}
+
 fn extract_apply_patch_envelope(text: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     let (start, end) = find_apply_patch_boundaries(&lines)?;
@@ -1924,6 +2363,27 @@ fn validate_patch_scope(patch: &str, allowed_scope: &[String]) -> Result<Vec<App
         }
     }
     Ok(updates)
+}
+
+fn validate_plan_prepass_scope(
+    response: &PlanPrepassResponse,
+    allowed_scope: &[String],
+) -> Result<()> {
+    let PlanPrepassResponse::Plan { targets, .. } = response else {
+        return Ok(());
+    };
+    for target in targets {
+        if !path_is_in_allowed_scope(&target.path, allowed_scope) {
+            return Err(anyhow!(
+                "plan prepass touched out-of-scope path {}",
+                target.path
+            ));
+        }
+        if target.symbol.trim().is_empty() || target.insertion_point.trim().is_empty() {
+            return Err(anyhow!("plan prepass requires non-empty symbol and insertion point"));
+        }
+    }
+    Ok(())
 }
 
 fn parse_apply_patch_updates(patch: &str) -> Result<Vec<ApplyPatchUpdate>> {
@@ -2589,6 +3049,7 @@ mod tests {
             missing_paths: vec![],
             recipe_seed: None,
             patch_seed: None,
+            plan_seed: None,
         };
         let prompt = build_exec_prompt(
             &contract,
@@ -2659,6 +3120,7 @@ mod tests {
                     snippet: "pub fn persist_synthesis() {}".into(),
                 }],
             }),
+            plan_seed: None,
         };
         let prompt = build_exec_prompt(&contract, Some(&context_pack), &[]);
         assert!(prompt.contains(
@@ -2942,6 +3404,32 @@ mod tests {
     }
 
     #[test]
+    fn load_plan_prepass_response_extracts_compact_plan() {
+        let stdout = "PUNK_PLAN_BEGIN\nSUMMARY: wire skill eval summary into status output\nTARGET: punk/punk-orch/src/lib.rs\nSYMBOL: StatusSnapshot\nINSERT: near existing eval/benchmark fields\nSKETCH: add optional skill eval window fields and populate them from eval summary helpers\nTARGET: punk/punk-run/src/main.rs\nSYMBOL: cmd_status\nINSERT: after benchmark window printing\nSKETCH: print one concise skill eval window line using stored summary data\nPUNK_PLAN_END\n";
+        let response = load_plan_prepass_response(stdout, "").unwrap();
+        assert!(matches!(
+            response,
+            PlanPrepassResponse::Plan { targets, .. } if targets.len() == 2
+        ));
+    }
+
+    #[test]
+    fn validate_plan_prepass_scope_rejects_out_of_scope_paths() {
+        let response = PlanPrepassResponse::Plan {
+            summary: "x".into(),
+            targets: vec![PlanPrepassTarget {
+                path: "src/lib.rs".into(),
+                symbol: "fn old".into(),
+                insertion_point: "after old".into(),
+                execution_sketch: "edit old".into(),
+            }],
+        };
+        let err = validate_plan_prepass_scope(&response, &[String::from("src/main.rs")])
+            .unwrap_err();
+        assert!(err.to_string().contains("out-of-scope path src/lib.rs"));
+    }
+
+    #[test]
     fn apply_patch_in_repo_applies_update_patch() {
         let root = std::env::temp_dir().join(format!(
             "punk-adapters-apply-patch-{}-{}",
@@ -3016,6 +3504,37 @@ mod tests {
         assert!(matches!(output.response, Some(PatchLaneResponse::Patch(_))));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn needs_patch_plan_prepass_for_uncertain_status_summary_slice() {
+        let contract = Contract {
+            id: "ct_status".into(),
+            feature_id: "feat_status".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Add a skill eval summary line to nested punk status output and reuse existing eval summary helpers.".into(),
+            entry_points: vec![
+                "punk/punk-orch/src/lib.rs".into(),
+                "punk/punk-run/src/main.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["status snapshot remains backward-compatible".into()],
+            behavior_requirements: vec![
+                "derive window data from stored skill eval summaries".into(),
+                "print concise human-readable output similar to existing window reporting".into(),
+            ],
+            allowed_scope: vec![
+                "punk/punk-orch/src/lib.rs".into(),
+                "punk/punk-run/src/main.rs".into(),
+            ],
+            target_checks: vec!["cargo test -p punk-run".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        assert!(needs_patch_plan_prepass(&contract, &ContextPack::default()));
     }
 
     #[test]
