@@ -223,6 +223,12 @@ enum Command {
         /// Bootstrap the current repo as a project after normal init
         #[arg(long)]
         project: Option<String>,
+        /// Enable jj for the bootstrapped repo when possible
+        #[arg(long)]
+        enable_jj: bool,
+        /// Verify project resolution and status scope after bootstrap
+        #[arg(long)]
+        verify: bool,
     },
     /// Version-control integration helpers
     Vcs {
@@ -1206,7 +1212,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Resolve { name, path } => cmd_resolve(&name, path.as_deref()),
         Command::Forget { name } => cmd_forget(&name),
         Command::Projects => cmd_projects(),
-        Command::Init { project } => cmd_init(project.as_deref()),
+        Command::Init {
+            project,
+            enable_jj,
+            verify,
+        } => cmd_init(project.as_deref(), enable_jj, verify),
         Command::Vcs { action } => match action {
             VcsAction::Status => cmd_vcs_status(),
             VcsAction::EnableJj => cmd_vcs_enable_jj(),
@@ -3213,8 +3223,28 @@ struct ProjectBootstrapSummary {
     skill_created: bool,
 }
 
-fn cmd_init(project: Option<&str>) {
-    maybe_warn_jj_degraded_mode();
+struct ProjectInitVerification {
+    expected_project: String,
+    resolved_project: Option<String>,
+    status_scope_label: String,
+    vcs_status: String,
+}
+
+enum InitEnableJjOutcome {
+    Enabled,
+    AlreadyEnabled,
+    UnavailableNoJj,
+    UnavailableNoVcs,
+}
+
+fn cmd_init(project: Option<&str>, enable_jj: bool, verify: bool) {
+    if let Err(e) = validate_init_project_flags(project, enable_jj, verify) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+    if !enable_jj {
+        maybe_warn_jj_degraded_mode();
+    }
     let dir = config::config_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("Failed to initialize config dir {}: {e}", dir.display());
@@ -3259,6 +3289,25 @@ fn cmd_init(project: Option<&str>) {
             Ok(summary) => {
                 println!();
                 print!("{}", format_project_bootstrap_summary(&summary));
+                match maybe_enable_jj_for_bootstrapped_repo(&summary.repo_root, enable_jj) {
+                    Ok(Some(line)) => println!("{line}"),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("Project bootstrap failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                let current_vcs_mode = detect_vcs_mode(&summary.repo_root);
+                if !enable_jj && should_warn_about_disabled_jj(current_vcs_mode) {
+                    println!("{}", format_init_enable_jj_skipped_note(&summary.project));
+                }
+                if verify {
+                    let verification =
+                        collect_project_init_verification(&summary.project, &summary.repo_root);
+                    print!("{}", format_project_init_verification(&verification));
+                } else {
+                    println!("{}", format_init_verify_skipped_note(&summary.project));
+                }
             }
             Err(e) => {
                 eprintln!("Project bootstrap failed: {e}");
@@ -3384,6 +3433,118 @@ fn format_project_bootstrap_summary(summary: &ProjectBootstrapSummary) -> String
         repo_root = summary.repo_root.display(),
         bootstrap_file = summary.bootstrap_file.display(),
         skill_name = summary.skill_name,
+    )
+}
+
+fn validate_init_project_flags(
+    project: Option<&str>,
+    enable_jj: bool,
+    verify: bool,
+) -> Result<(), String> {
+    if project.is_none() && (enable_jj || verify) {
+        let mut flags = Vec::new();
+        if enable_jj {
+            flags.push("--enable-jj");
+        }
+        if verify {
+            flags.push("--verify");
+        }
+        return Err(format!(
+            "{} require --project <id> during init.",
+            flags.join(" and ")
+        ));
+    }
+    Ok(())
+}
+
+fn maybe_enable_jj_for_bootstrapped_repo(
+    repo_root: &Path,
+    requested: bool,
+) -> Result<Option<String>, String> {
+    if !requested {
+        return Ok(None);
+    }
+
+    let outcome = match detect_vcs_mode(repo_root) {
+        VcsMode::Jj => InitEnableJjOutcome::AlreadyEnabled,
+        VcsMode::GitWithJjAvailableButDisabled => {
+            enable_jj_for_repo(repo_root).map_err(|e| e.to_string())?;
+            InitEnableJjOutcome::Enabled
+        }
+        VcsMode::GitOnly => InitEnableJjOutcome::UnavailableNoJj,
+        VcsMode::NoVcs => InitEnableJjOutcome::UnavailableNoVcs,
+    };
+
+    Ok(Some(format_init_enable_jj_result(outcome, repo_root)))
+}
+
+fn format_init_enable_jj_result(outcome: InitEnableJjOutcome, repo_root: &Path) -> String {
+    match outcome {
+        InitEnableJjOutcome::Enabled => {
+            format!("VCS bootstrap: enabled jj for {}", repo_root.display())
+        }
+        InitEnableJjOutcome::AlreadyEnabled => {
+            format!(
+                "VCS bootstrap: jj already enabled for {}",
+                repo_root.display()
+            )
+        }
+        InitEnableJjOutcome::UnavailableNoJj => format!(
+            "VCS bootstrap: jj unavailable for {} (jj not installed); continuing in git-only mode",
+            repo_root.display()
+        ),
+        InitEnableJjOutcome::UnavailableNoVcs => format!(
+            "VCS bootstrap: jj unavailable for {} (no git repo detected)",
+            repo_root.display()
+        ),
+    }
+}
+
+fn format_init_enable_jj_skipped_note(project: &str) -> String {
+    format!(
+        "Agent note: jj bootstrap skipped for project `{project}`; rerun `punk-run init --project {project} --enable-jj` or use `punk-run vcs enable-jj`."
+    )
+}
+
+fn format_init_verify_skipped_note(project: &str) -> String {
+    format!(
+        "Agent note: verification skipped for project `{project}`; rerun `punk-run init --project {project} --verify`."
+    )
+}
+
+fn list_known_projects_for_scope() -> Vec<resolver::ResolvedProject> {
+    match config::load_or_default(&config::config_dir()) {
+        Ok(cfg) => resolver::list_known(Some(&cfg)),
+        Err(_) => resolver::list_known(None),
+    }
+}
+
+fn collect_project_init_verification(
+    expected_project: &str,
+    repo_root: &Path,
+) -> ProjectInitVerification {
+    let known_projects = list_known_projects_for_scope();
+    let resolved_project = finalize_status_project_filter(
+        resolve_status_project_filter(None, Some(repo_root), &known_projects),
+        Some(repo_root),
+    );
+
+    ProjectInitVerification {
+        expected_project: expected_project.to_string(),
+        status_scope_label: format_status_scope_label(resolved_project.as_deref()),
+        resolved_project,
+        vcs_status: format_vcs_status(detect_vcs_mode(repo_root)).to_string(),
+    }
+}
+
+fn format_project_init_verification(verification: &ProjectInitVerification) -> String {
+    let resolved_project = verification.resolved_project.as_deref().unwrap_or("(none)");
+    format!(
+        "Verification:\n  expected project: {}\n  resolved project: {}\n  status scope: {}\n  {}\n",
+        verification.expected_project,
+        resolved_project,
+        verification.status_scope_label,
+        verification.vcs_status,
     )
 }
 
@@ -4602,6 +4763,85 @@ mod tests {
         assert!(rendered.contains("Project: interviewcoach"));
         assert!(rendered.contains("Bootstrap file (created):"));
         assert!(rendered.contains("Skill (existing): interviewcoach-core"));
+    }
+
+    #[test]
+    fn validate_init_project_flags_rejects_enable_jj_or_verify_without_project() {
+        let err = validate_init_project_flags(None, true, false).unwrap_err();
+        assert!(err.contains("--enable-jj"));
+        assert!(err.contains("--project"));
+
+        let err = validate_init_project_flags(None, false, true).unwrap_err();
+        assert!(err.contains("--verify"));
+        assert!(err.contains("--project"));
+
+        assert!(validate_init_project_flags(Some("interviewcoach"), true, true).is_ok());
+    }
+
+    #[test]
+    fn project_init_verification_prefers_known_project_scope() {
+        let tmp = temp_test_dir("punk-run-init-verify-known");
+        let repo_root = tmp.join("interviewcoach");
+        let cwd = repo_root.join("apps/web");
+        fs::create_dir_all(&cwd).unwrap();
+        let known = vec![ResolvedProject {
+            id: "interviewcoach".to_string(),
+            path: repo_root.clone(),
+            source: ResolveSource::LazyScan,
+            stack: Some("rust".to_string()),
+        }];
+
+        let resolved = finalize_status_project_filter(
+            resolve_status_project_filter(None, Some(&cwd), &known),
+            Some(&cwd),
+        );
+
+        let verification = ProjectInitVerification {
+            expected_project: "interviewcoach".to_string(),
+            resolved_project: resolved.clone(),
+            status_scope_label: format_status_scope_label(resolved.as_deref()),
+            vcs_status: format_vcs_status(VcsMode::NoVcs).to_string(),
+        };
+        let rendered = format_project_init_verification(&verification);
+
+        assert_eq!(resolved.as_deref(), Some("interviewcoach"));
+        assert!(rendered.contains("resolved project: interviewcoach"));
+        assert!(rendered.contains("status scope: project:interviewcoach"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn project_init_verification_falls_back_to_git_repo_basename() {
+        let tmp = temp_test_dir("punk-run-init-verify-git-fallback");
+        let repo_root = tmp.join("interviewcoach");
+        let cwd = repo_root.join("apps/web");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(repo_root.join(".git")).unwrap();
+
+        let resolved = finalize_status_project_filter(
+            resolve_status_project_filter(None, Some(&cwd), &[]),
+            Some(&cwd),
+        );
+
+        assert_eq!(resolved.as_deref(), Some("interviewcoach"));
+        assert_eq!(
+            format_status_scope_label(resolved.as_deref()),
+            "project:interviewcoach"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn init_agent_notes_are_actionable() {
+        let jj_note = format_init_enable_jj_skipped_note("interviewcoach");
+        assert!(jj_note.contains("--enable-jj"));
+        assert!(jj_note.contains("punk-run vcs enable-jj"));
+
+        let verify_note = format_init_verify_skipped_note("interviewcoach");
+        assert!(verify_note.contains("--verify"));
+        assert!(verify_note.contains("verification skipped"));
     }
 
     #[test]
