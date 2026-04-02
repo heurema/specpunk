@@ -95,6 +95,27 @@ fn load_budget_backpressure(bus: &Path, configured_max_slots: u32) -> BudgetBack
     }
 }
 
+fn resolve_agent_reference(
+    requested: &str,
+    cfg: Option<&crate::config::Config>,
+) -> (String, String, String) {
+    if let Some(cfg) = cfg {
+        if let Some(agent) = cfg.agents.agents.get(requested) {
+            return (
+                agent.provider.clone(),
+                agent.model.clone(),
+                requested.to_string(),
+            );
+        }
+    }
+
+    (
+        requested.to_string(),
+        String::new(),
+        requested.to_string(),
+    )
+}
+
 fn budget_allows_dispatch(
     entry: &queue::QueuedEntry,
     backpressure: &BudgetBackpressure,
@@ -364,23 +385,11 @@ async fn dispatch_queued(
             }
         };
 
-        // Resolve agent → provider/model via agents.toml
+        // Resolve agent → provider/model via zero-config config fallback
         let config_dir = crate::config::config_dir();
-        let (provider, agent_model, agent_id) = if let Ok(cfg) = crate::config::load(&config_dir) {
-            if let Some(agent) = cfg.agents.agents.get(&entry.model) {
-                // Task specified an agent ID (e.g. "claude-reviewer")
-                (
-                    agent.provider.clone(),
-                    agent.model.clone(),
-                    entry.model.clone(),
-                )
-            } else {
-                // Fallback: treat entry.model as raw provider name
-                (entry.model.clone(), String::new(), entry.model.clone())
-            }
-        } else {
-            (entry.model.clone(), String::new(), entry.model.clone())
-        };
+        let cfg = crate::config::load_or_default(&config_dir).ok();
+        let (provider, agent_model, agent_id) =
+            resolve_agent_reference(&entry.model, cfg.as_ref());
 
         let adapter = match Adapter::from_provider(&provider) {
             Some(a) => a,
@@ -1220,8 +1229,12 @@ fn extract_cost(stdout_path: &Path) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        Agent, AgentsFile, BudgetPolicy, Config, PolicyDefaults, PolicyFile, Project, ProjectsFile,
+    };
     use crate::goal::{self, Goal, Plan, Step};
     use crate::queue::QueuedEntry;
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn active_goal(steps: Vec<Step>) -> Goal {
@@ -1262,6 +1275,49 @@ mod tests {
             worktree: false,
             priority: priority.into(),
             depends_on: vec![],
+        }
+    }
+
+    fn config_with_agents(agents: &[(&str, &str, &str)]) -> Config {
+        let mut map = HashMap::new();
+        for (id, provider, model) in agents {
+            map.insert(
+                (*id).to_string(),
+                Agent {
+                    provider: (*provider).to_string(),
+                    model: (*model).to_string(),
+                    role: "engineer".into(),
+                    invoke: "cli".into(),
+                    budget_usd: 1.0,
+                    system_prompt: None,
+                    skills: vec![],
+                },
+            );
+        }
+        Config {
+            projects: ProjectsFile {
+                projects: vec![Project {
+                    id: "test".into(),
+                    path: "/tmp/test".into(),
+                    stack: String::new(),
+                    active: true,
+                    budget_usd: 0.0,
+                    checkpoint: String::new(),
+                }],
+            },
+            agents: AgentsFile { agents: map },
+            policy: PolicyFile {
+                defaults: PolicyDefaults {
+                    model: "sonnet".into(),
+                    budget_usd: 1.0,
+                    timeout_s: 600,
+                    max_slots: 1,
+                },
+                budget: BudgetPolicy::default(),
+                rules: vec![],
+                features: HashMap::new(),
+            },
+            dir: PathBuf::from("/tmp/config"),
         }
     }
 
@@ -1312,6 +1368,33 @@ mod tests {
         assert!(budget_allows_dispatch(&queued_entry("p0"), &stop, 0));
         assert!(!budget_allows_dispatch(&queued_entry("p1"), &stop, 0));
         assert!(!budget_allows_dispatch(&queued_entry("p0"), &stop, 1));
+    }
+
+    #[test]
+    fn resolve_agent_reference_prefers_explicit_alias_when_present() {
+        let cfg = config_with_agents(&[("claude-reviewer", "claude", "sonnet-review")]);
+        let (provider, model, agent_id) =
+            resolve_agent_reference("claude-reviewer", Some(&cfg));
+        assert_eq!(provider, "claude");
+        assert_eq!(model, "sonnet-review");
+        assert_eq!(agent_id, "claude-reviewer");
+    }
+
+    #[test]
+    fn resolve_agent_reference_falls_back_to_raw_provider_without_config() {
+        let (provider, model, agent_id) = resolve_agent_reference("claude", None);
+        assert_eq!(provider, "claude");
+        assert_eq!(model, "");
+        assert_eq!(agent_id, "claude");
+    }
+
+    #[test]
+    fn resolve_agent_reference_falls_back_to_raw_provider_when_alias_missing() {
+        let cfg = config_with_agents(&[("codex-review", "codex", "o4-mini")]);
+        let (provider, model, agent_id) = resolve_agent_reference("gemini", Some(&cfg));
+        assert_eq!(provider, "gemini");
+        assert_eq!(model, "");
+        assert_eq!(agent_id, "gemini");
     }
 
     #[test]
