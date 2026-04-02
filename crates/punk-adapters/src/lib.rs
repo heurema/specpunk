@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use context_pack::{
     build_context_pack, ensure_retry_patch_seed, format_context_pack, format_patch_context_pack,
-    format_plan_context_pack, materialize_missing_entry_points,
+    format_plan_context_pack, derive_plan_seed, materialize_missing_entry_points,
     restore_missing_materialized_entry_points, restore_stale_entry_point_masks,
     scaffold_only_entry_points, ContextPack, ContextPlanSeed, ContextPlanTarget,
     EntryPointExcerptGuard,
@@ -508,6 +508,7 @@ impl CodexCliExecutor {
                                 symbol: target.symbol,
                                 insertion_point: target.insertion_point,
                                 execution_sketch: target.execution_sketch,
+                                anchor_excerpt: String::new(),
                             })
                             .collect(),
                     });
@@ -704,10 +705,7 @@ impl CodexCliExecutor {
         context_pack: &ContextPack,
     ) -> Result<PlanPrepassResponse> {
         let mut prepass_context = context_pack.clone();
-        prepass_context.plan_seed = Some(derive_controller_plan_skeleton(
-            &input.contract,
-            context_pack,
-        ));
+        prepass_context.plan_seed = Some(derive_plan_seed(&input.contract, context_pack));
         let prompt = build_patch_plan_prompt(&input.contract, &prepass_context);
         let mut command = Command::new("codex");
         command
@@ -1374,78 +1372,6 @@ fn needs_patch_plan_prepass(contract: &Contract, context_pack: &ContextPack) -> 
             .filter(|needle| text.contains(**needle))
             .count()
             >= 3
-}
-
-fn derive_controller_plan_skeleton(contract: &Contract, context_pack: &ContextPack) -> ContextPlanSeed {
-    let summary = contract
-        .behavior_requirements
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "tighten patch generation around exact allowed-scope targets".to_string());
-    let targets = context_pack
-        .files
-        .iter()
-        .take(3)
-        .map(|file| ContextPlanTarget {
-            path: file.path.clone(),
-            symbol: infer_plan_symbol(&file.content),
-            insertion_point: format!("within visible excerpt lines {}-{}", file.start_line, file.end_line),
-            execution_sketch: infer_plan_sketch(contract, &file.path),
-        })
-        .collect::<Vec<_>>();
-    ContextPlanSeed {
-        title: "Controller-supplied target hints".to_string(),
-        summary,
-        targets,
-    }
-}
-
-fn infer_plan_symbol(content: &str) -> String {
-    content
-        .lines()
-        .map(str::trim)
-        .find_map(|line| {
-            [
-                "pub fn ",
-                "fn ",
-                "pub struct ",
-                "struct ",
-                "pub enum ",
-                "enum ",
-                "impl ",
-            ]
-            .iter()
-            .find(|prefix| line.starts_with(**prefix))
-            .map(|_| {
-                line.split('{')
-                    .next()
-                    .unwrap_or(line)
-                    .split("where")
-                    .next()
-                    .unwrap_or(line)
-                    .trim()
-                    .to_string()
-            })
-        })
-        .unwrap_or_else(|| "visible production section".to_string())
-}
-
-fn infer_plan_sketch(contract: &Contract, path: &str) -> String {
-    contract
-        .behavior_requirements
-        .iter()
-        .find(|requirement| {
-            let lower = requirement.to_ascii_lowercase();
-            path.contains("main.rs") && (lower.contains("print") || lower.contains("output"))
-                || path.contains("lib.rs")
-                    && (lower.contains("summary")
-                        || lower.contains("window")
-                        || lower.contains("data")
-                        || lower.contains("snapshot"))
-        })
-        .cloned()
-        .or_else(|| contract.behavior_requirements.first().cloned())
-        .unwrap_or_else(|| "implement the approved bounded change in this file".to_string())
 }
 
 fn manual_mode_block_summary(contract: &Contract) -> Option<String> {

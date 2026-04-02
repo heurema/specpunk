@@ -53,6 +53,7 @@ pub(crate) struct ContextPlanTarget {
     pub symbol: String,
     pub insertion_point: String,
     pub execution_sketch: String,
+    pub anchor_excerpt: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,6 +415,11 @@ pub(crate) fn format_patch_context_pack(pack: &ContextPack) -> String {
                 target.path, target.symbol, target.insertion_point
             ));
             sections.push(format!("  sketch: {}", target.execution_sketch));
+            if !target.anchor_excerpt.trim().is_empty() {
+                sections.push("```rust".to_string());
+                sections.push(target.anchor_excerpt.clone());
+                sections.push("```".to_string());
+            }
         }
     } else if pack.patch_seed.is_none() {
         if let Some(seed) = &pack.recipe_seed {
@@ -474,6 +480,11 @@ pub(crate) fn format_plan_context_pack(pack: &ContextPack) -> String {
                 target.path, target.symbol, target.insertion_point
             ));
             sections.push(format!("  sketch: {}", target.execution_sketch));
+            if !target.anchor_excerpt.trim().is_empty() {
+                sections.push("```rust".to_string());
+                sections.push(target.anchor_excerpt.clone());
+                sections.push("```".to_string());
+            }
         }
     }
 
@@ -499,6 +510,80 @@ pub(crate) fn format_plan_context_pack(pack: &ContextPack) -> String {
     }
 
     sections.join("\n")
+}
+
+pub(crate) fn derive_plan_seed(contract: &Contract, pack: &ContextPack) -> ContextPlanSeed {
+    let summary = contract
+        .behavior_requirements
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "tighten patch generation around exact allowed-scope targets".to_string());
+    let targets = pack
+        .files
+        .iter()
+        .take(3)
+        .map(|file| derive_plan_target(contract, file))
+        .collect();
+    ContextPlanSeed {
+        title: "Controller-supplied target hints".to_string(),
+        summary,
+        targets,
+    }
+}
+
+fn derive_plan_target(contract: &Contract, file: &ContextFileExcerpt) -> ContextPlanTarget {
+    let anchors = highest_confidence_symbols(contract, file);
+    let best_anchor = anchors.first();
+    ContextPlanTarget {
+        path: file.path.clone(),
+        symbol: best_anchor
+            .map(|anchor| anchor.signature.clone())
+            .unwrap_or_else(|| fallback_symbol(file)),
+        insertion_point: best_anchor
+            .map(|anchor| format!("around line {}", anchor.line_number))
+            .unwrap_or_else(|| format!("within visible excerpt lines {}-{}", file.start_line, file.end_line)),
+        execution_sketch: infer_plan_sketch(contract, &file.path),
+        anchor_excerpt: best_anchor
+            .map(|anchor| render_anchor_excerpt(file, anchor))
+            .unwrap_or_else(|| fallback_anchor_excerpt(file)),
+    }
+}
+
+fn fallback_symbol(file: &ContextFileExcerpt) -> String {
+    file.content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "visible production section".to_string())
+}
+
+fn fallback_anchor_excerpt(file: &ContextFileExcerpt) -> String {
+    file.content
+        .lines()
+        .take(4)
+        .enumerate()
+        .map(|(idx, line)| format!("// {:>4} | {}", file.start_line + idx, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn infer_plan_sketch(contract: &Contract, path: &str) -> String {
+    contract
+        .behavior_requirements
+        .iter()
+        .find(|requirement| {
+            let lower = requirement.to_ascii_lowercase();
+            path.contains("main.rs") && (lower.contains("print") || lower.contains("output"))
+                || path.contains("lib.rs")
+                    && (lower.contains("summary")
+                        || lower.contains("window")
+                        || lower.contains("data")
+                        || lower.contains("snapshot"))
+        })
+        .cloned()
+        .or_else(|| contract.behavior_requirements.first().cloned())
+        .unwrap_or_else(|| "implement the approved bounded change in this file".to_string())
 }
 
 fn compact_patch_excerpt(content: &str, max_lines: usize, max_chars: usize) -> String {
@@ -1377,6 +1462,7 @@ mod tests {
                     symbol: "fn status".into(),
                     insertion_point: "after benchmark output".into(),
                     execution_sketch: "add one skill eval summary line".into(),
+                    anchor_excerpt: "//    1 | fn status() {}".into(),
                 }],
             }),
         };
@@ -1384,6 +1470,47 @@ mod tests {
         assert!(rendered.contains("Controller-owned plan prepass:"));
         assert!(rendered.contains("src/lib.rs"));
         assert!(rendered.contains("fn status"));
+        assert!(rendered.contains("fn status() {}"));
+    }
+
+    #[test]
+    fn derive_plan_seed_prefers_matching_symbols_from_bounded_excerpt() {
+        let contract = Contract {
+            id: "ct_status".into(),
+            feature_id: "feat_status".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Add a skill eval summary line to status output".into(),
+            entry_points: vec!["punk/punk-run/src/main.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["status output gains a concise skill eval line".into()],
+            behavior_requirements: vec![
+                "print a concise human-readable skill eval summary line".into(),
+            ],
+            allowed_scope: vec!["punk/punk-run/src/main.rs".into()],
+            target_checks: vec!["cargo test -p punk-run".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let pack = ContextPack {
+            files: vec![ContextFileExcerpt {
+                path: "punk/punk-run/src/main.rs".into(),
+                start_line: 100,
+                end_line: 110,
+                truncated_at_test_boundary: false,
+                content: "fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {\n    println!(\"Status\");\n}\n\nfn cmd_ratchet() {}\n".into(),
+            }],
+            missing_paths: vec![],
+            recipe_seed: None,
+            patch_seed: None,
+            plan_seed: None,
+        };
+        let seed = derive_plan_seed(&contract, &pack);
+        assert_eq!(seed.targets.len(), 1);
+        assert!(seed.targets[0].symbol.contains("fn cmd_status"));
+        assert!(seed.targets[0].anchor_excerpt.contains("cmd_status"));
     }
 
     #[test]
