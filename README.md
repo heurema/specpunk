@@ -74,22 +74,64 @@ It is meant to ensure AI agents do not merely write code, but leave the project 
 - migrations actually finished
 - high-stakes decisions reviewed through structured council protocols when needed
 
-## First vertical slice
+## Current practical flow
 
-The first usable version is intentionally narrow:
+The current usable flow is split into:
 
-```text
-plot contract -> approve -> cut run -> gate run -> proof
-```
+- **project bootstrap** — explicit admin action
+- **goal-only intake** — user describes the goal, `punk` drafts/contracts internally
+- **mode-level control** — `plot / cut / gate` remain available when you want manual staging
 
-Initial commands:
+### Project bootstrap
+
+Bootstrap a repo once:
 
 ```bash
-punk plot contract "<prompt>"
+punk init --enable-jj --verify
+```
+
+If the repo basename is not a good project id, use:
+
+```bash
+punk init --project <id> --enable-jj --verify
+```
+
+Bootstrap creates repo-local agent guidance:
+
+- `AGENTS.md`
+- `.punk/AGENT_START.md`
+
+### Default autonomous path
+
+The default autonomous intake is goal-only:
+
+```bash
+punk go --fallback-staged "<goal>"
+```
+
+This path runs:
+
+```text
+goal -> draft -> approve -> cut -> gate -> proof
+```
+
+If autonomy blocks or escalates, `punk` prepares a staged recovery contract and returns a non-zero exit.
+
+### Staged/manual path
+
+When you want explicit review between stages:
+
+```bash
+punk start "<goal>"
 punk plot approve <contract-id>
 punk cut run <contract-id>
 punk gate run <run-id>
 punk gate proof <run-id|decision-id>
+```
+
+Read-only inspection:
+
+```bash
 punk status [id]
 punk inspect <id> --json
 ```
