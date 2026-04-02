@@ -521,7 +521,11 @@ impl CodexCliExecutor {
         let start = Instant::now();
         restore_stale_entry_point_masks(&input.repo_root)?;
         let mut context_pack = build_context_pack(&input.repo_root, &input.contract)?;
-        let controller_plan_seed = derive_plan_seed(&input.contract, &context_pack);
+        let mut controller_plan_seed = derive_plan_seed(&input.contract, &context_pack);
+        hydrate_plan_seed_excerpts(&context_pack, &mut controller_plan_seed);
+        if !controller_plan_seed.targets.is_empty() {
+            context_pack.plan_seed = Some(controller_plan_seed.clone());
+        }
         let mut excerpt_guard = EntryPointExcerptGuard::apply(&input.repo_root, &context_pack)?;
         if needs_patch_plan_prepass(&input.contract, &context_pack) {
             match self.run_patch_plan_prepass(&input, &context_pack) {
