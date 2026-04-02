@@ -233,15 +233,9 @@ pub fn build_bounded_fallback_proposal(
 }
 
 pub fn canonicalize_draft_proposal(repo_root: &Path, prompt: &str, proposal: &mut DraftProposal) {
-    let explicit_scope = explicit_scope_paths(prompt, repo_root);
-    if !explicit_scope.is_empty() {
+    if let Some(explicit_scope) = explicit_scope_override(prompt, repo_root) {
         proposal.allowed_scope = explicit_scope.clone();
-        let explicit_entry_points = explicit_scope
-            .iter()
-            .filter(|path| is_file_like_scope(path))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !explicit_entry_points.is_empty() {
+        if let Some(explicit_entry_points) = explicit_entry_points_override(&explicit_scope) {
             proposal.entry_points = explicit_entry_points;
         }
     } else {
@@ -249,34 +243,37 @@ pub fn canonicalize_draft_proposal(repo_root: &Path, prompt: &str, proposal: &mu
         stable_dedupe(&mut proposal.entry_points);
     }
 
-    let explicit_target_checks = explicit_checks_from_prompt(
-        repo_root,
-        prompt,
-        &[
-            "target checks should include",
-            "target checks to satisfy",
-            "target checks:",
-        ],
-    );
-    if !explicit_target_checks.is_empty() {
+    if let Some(explicit_target_checks) = explicit_target_checks_override(repo_root, prompt) {
         proposal.target_checks = explicit_target_checks;
     } else {
         stable_dedupe(&mut proposal.target_checks);
     }
 
-    let explicit_integrity_checks = explicit_checks_from_prompt(
-        repo_root,
-        prompt,
-        &[
-            "integrity checks should include",
-            "integrity checks to keep passing",
-            "integrity checks:",
-        ],
-    );
-    if !explicit_integrity_checks.is_empty() {
+    if let Some(explicit_integrity_checks) = explicit_integrity_checks_override(repo_root, prompt) {
         proposal.integrity_checks = explicit_integrity_checks;
     } else {
         stable_dedupe(&mut proposal.integrity_checks);
+    }
+}
+
+pub fn apply_explicit_prompt_overrides(
+    repo_root: &Path,
+    prompt: &str,
+    proposal: &mut DraftProposal,
+) {
+    if let Some(explicit_scope) = explicit_scope_override(prompt, repo_root) {
+        proposal.allowed_scope = explicit_scope.clone();
+        if let Some(explicit_entry_points) = explicit_entry_points_override(&explicit_scope) {
+            proposal.entry_points = explicit_entry_points;
+        }
+    }
+
+    if let Some(explicit_target_checks) = explicit_target_checks_override(repo_root, prompt) {
+        proposal.target_checks = explicit_target_checks;
+    }
+
+    if let Some(explicit_integrity_checks) = explicit_integrity_checks_override(repo_root, prompt) {
+        proposal.integrity_checks = explicit_integrity_checks;
     }
 }
 
@@ -1596,6 +1593,46 @@ fn explicit_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
     paths
 }
 
+fn explicit_scope_override(prompt: &str, repo_root: &Path) -> Option<Vec<String>> {
+    let explicit_scope = explicit_scope_paths(prompt, repo_root);
+    (!explicit_scope.is_empty()).then_some(explicit_scope)
+}
+
+fn explicit_entry_points_override(explicit_scope: &[String]) -> Option<Vec<String>> {
+    let explicit_entry_points = explicit_scope
+        .iter()
+        .filter(|path| is_file_like_scope(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!explicit_entry_points.is_empty()).then_some(explicit_entry_points)
+}
+
+fn explicit_target_checks_override(repo_root: &Path, prompt: &str) -> Option<Vec<String>> {
+    let explicit_target_checks = explicit_checks_from_prompt(
+        repo_root,
+        prompt,
+        &[
+            "target checks should include",
+            "target checks to satisfy",
+            "target checks:",
+        ],
+    );
+    (!explicit_target_checks.is_empty()).then_some(explicit_target_checks)
+}
+
+fn explicit_integrity_checks_override(repo_root: &Path, prompt: &str) -> Option<Vec<String>> {
+    let explicit_integrity_checks = explicit_checks_from_prompt(
+        repo_root,
+        prompt,
+        &[
+            "integrity checks should include",
+            "integrity checks to keep passing",
+            "integrity checks:",
+        ],
+    );
+    (!explicit_integrity_checks.is_empty()).then_some(explicit_integrity_checks)
+}
+
 fn explicit_checks_from_prompt(repo_root: &Path, prompt: &str, markers: &[&str]) -> Vec<String> {
     let lower = prompt.to_ascii_lowercase();
     let mut commands = Vec::new();
@@ -2193,6 +2230,72 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.message.contains("covered by allowed_scope")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_prompt_overrides_replace_scope_and_checks() {
+        let root =
+            std::env::temp_dir().join(format!("punk-core-refine-overrides-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Packages/InterviewCoachKit/Sources/InterviewCoachDevUI"))
+            .unwrap();
+        fs::create_dir_all(root.join("Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests"))
+            .unwrap();
+        fs::write(
+            root.join(
+                "Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/DevAppViewModel.swift",
+            ),
+            "struct DevAppViewModel {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(
+                "Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/MainWindowView.swift",
+            ),
+            "struct MainWindowView {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests/DevAppViewModelTests.swift"),
+            "func testExample() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("Makefile"), "test:\n\t@echo ok\n").unwrap();
+
+        let guidance = "Expand allowed_scope exactly to the files needed for the copy/export trace slice: `Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/DevAppViewModel.swift`; `Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/MainWindowView.swift`; `Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests/DevAppViewModelTests.swift`. Target checks should include make test. Integrity checks should include make test.";
+        let mut proposal = DraftProposal {
+            title: "trace copy/export".into(),
+            summary: "trace copy/export".into(),
+            entry_points: vec![
+                "Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/LegacyView.swift".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["Packages/InterviewCoachKit/Sources/InterviewCoachDevUI".into()],
+            target_checks: vec!["swift test".into()],
+            integrity_checks: vec!["swift test".into()],
+            risk_level: "low".into(),
+        };
+
+        apply_explicit_prompt_overrides(&root, guidance, &mut proposal);
+
+        assert_eq!(
+            proposal.allowed_scope,
+            vec![
+                "Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/DevAppViewModel.swift"
+                    .to_string(),
+                "Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/MainWindowView.swift"
+                    .to_string(),
+                "Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests/DevAppViewModelTests.swift"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(proposal.entry_points, proposal.allowed_scope);
+        assert_eq!(proposal.target_checks, vec!["make test".to_string()]);
+        assert_eq!(proposal.integrity_checks, vec!["make test".to_string()]);
 
         let _ = fs::remove_dir_all(&root);
     }
