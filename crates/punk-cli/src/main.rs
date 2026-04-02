@@ -27,6 +27,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Init(InitCommand),
+    Go(GoCommand),
     Start(StartCommand),
     Plot(PlotCommand),
     Cut(CutCommand),
@@ -44,6 +45,13 @@ struct InitCommand {
     enable_jj: bool,
     #[arg(long)]
     verify: bool,
+}
+
+#[derive(Args)]
+struct GoCommand {
+    goal: String,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -163,6 +171,7 @@ fn run() -> Result<()> {
             init.enable_jj,
             init.verify,
         ),
+        Command::Go(go) => cmd_go(&repo_root, &global_root, &go.goal, go.json),
         Command::Start(start) => cmd_start(&repo_root, &global_root, &start.goal, start.json),
         Command::Plot(plot) => match plot.action {
             PlotAction::Contract { prompt, json } => {
@@ -336,6 +345,7 @@ fn bootstrap_json_mode(command: &Command) -> Option<bool> {
         Command::Plot(PlotCommand {
             action: PlotAction::Contract { json, .. },
         }) => Some(*json),
+        Command::Go(GoCommand { json, .. }) => Some(*json),
         Command::Start(StartCommand { json, .. }) => Some(*json),
         _ => None,
     }
@@ -509,6 +519,53 @@ fn cmd_start(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Re
     Ok(())
 }
 
+fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Result<()> {
+    let trimmed_goal = goal.trim();
+    if trimmed_goal.is_empty() {
+        return Err(anyhow!("goal must not be empty"));
+    }
+
+    let orch = OrchService::new(repo_root, global_root)?;
+    let drafter = CodexCliContractDrafter::default();
+    let contract = orch.draft_contract(&drafter, trimmed_goal)?;
+    let approved = orch.approve_contract(&contract.id)?;
+    let executor = CodexCliExecutor::default();
+    let (run, receipt) = orch.cut_run(&executor, &approved.id)?;
+    let status = orch.status(Some(&run.id))?;
+    let project_root = resolve_project_root(repo_root);
+    let project = infer_project_id(&project_root).unwrap_or_else(|| status.project_id.clone());
+    let follow_up = format!("punk status {}", run.id);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "goal": trimmed_goal,
+                "project": project,
+                "project_id": status.project_id,
+                "contract": approved,
+                "run": run,
+                "receipt": receipt,
+                "follow_up": follow_up,
+            }))?
+        );
+    } else {
+        println!(
+            "{}",
+            format_go_summary(
+                &project,
+                trimmed_goal,
+                &approved.id,
+                &run.id,
+                &receipt.status,
+                &receipt.summary,
+                &follow_up,
+            )
+        );
+    }
+    Ok(())
+}
+
 fn format_start_summary(
     project: &str,
     goal: &str,
@@ -517,6 +574,20 @@ fn format_start_summary(
 ) -> String {
     format!(
         "Goal: {goal}\nProject: {project}\nDrafted contract: {contract_id}\nNext: {next_command}"
+    )
+}
+
+fn format_go_summary(
+    project: &str,
+    goal: &str,
+    contract_id: &str,
+    run_id: &str,
+    receipt_status: &str,
+    receipt_summary: &str,
+    follow_up: &str,
+) -> String {
+    format!(
+        "Goal: {goal}\nProject: {project}\nApproved contract: {contract_id}\nRun: {run_id} ({receipt_status})\nSummary: {receipt_summary}\nFollow-up: {follow_up}"
     )
 }
 
@@ -842,6 +913,10 @@ mod tests {
 
     #[test]
     fn bootstrap_json_mode_supports_start_and_plot_contract() {
+        let go = Command::Go(GoCommand {
+            goal: "ship interview summary".into(),
+            json: true,
+        });
         let start = Command::Start(StartCommand {
             goal: "ship interview summary".into(),
             json: true,
@@ -857,6 +932,7 @@ mod tests {
             json: false,
         });
 
+        assert_eq!(bootstrap_json_mode(&go), Some(true));
         assert_eq!(bootstrap_json_mode(&start), Some(true));
         assert_eq!(bootstrap_json_mode(&plot), Some(false));
         assert_eq!(bootstrap_json_mode(&status), None);
@@ -874,6 +950,25 @@ mod tests {
         assert!(rendered.contains("Project: interviewcoach"));
         assert!(rendered.contains("Drafted contract: ct_123"));
         assert!(rendered.contains("Next: punk plot approve ct_123"));
+    }
+
+    #[test]
+    fn go_summary_mentions_run_and_follow_up() {
+        let rendered = format_go_summary(
+            "interviewcoach",
+            "add interview feedback summary endpoint",
+            "ct_123",
+            "run_456",
+            "success",
+            "implemented bounded change",
+            "punk status run_456",
+        );
+        assert!(rendered.contains("Goal: add interview feedback summary endpoint"));
+        assert!(rendered.contains("Project: interviewcoach"));
+        assert!(rendered.contains("Approved contract: ct_123"));
+        assert!(rendered.contains("Run: run_456 (success)"));
+        assert!(rendered.contains("Summary: implemented bounded change"));
+        assert!(rendered.contains("Follow-up: punk status run_456"));
     }
 
     #[test]
