@@ -1,5 +1,6 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
@@ -131,7 +132,10 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let repo_root = env::current_dir()?;
     let global_root = default_global_root()?;
-    maybe_warn_jj_degraded_mode(&repo_root, &cli.command);
+    let bootstrapped = maybe_auto_bootstrap_project(&repo_root, &cli.command)?;
+    if !bootstrapped {
+        maybe_warn_jj_degraded_mode(&repo_root, &cli.command);
+    }
 
     match cli.command {
         Command::Plot(plot) => match plot.action {
@@ -276,6 +280,94 @@ fn default_global_root() -> Result<PathBuf> {
     Ok(home.join(".punk"))
 }
 
+fn maybe_auto_bootstrap_project(repo_root: &Path, command: &Command) -> Result<bool> {
+    if !matches!(
+        command,
+        Command::Plot(PlotCommand {
+            action: PlotAction::Contract { .. }
+        })
+    ) {
+        return Ok(false);
+    }
+
+    let project_root = resolve_project_root(repo_root);
+    let Some(project_id) = infer_project_id(&project_root) else {
+        return Ok(false);
+    };
+    if !needs_project_bootstrap(&project_root, &project_id) {
+        return Ok(false);
+    }
+
+    run_project_bootstrap(&project_root, &project_id)?;
+    Ok(true)
+}
+
+fn resolve_project_root(repo_root: &Path) -> PathBuf {
+    detect_backend(repo_root)
+        .and_then(|backend| backend.workspace_root())
+        .unwrap_or_else(|_| repo_root.to_path_buf())
+}
+
+fn infer_project_id(project_root: &Path) -> Option<String> {
+    project_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn project_bootstrap_file_path(project_root: &Path, project_id: &str) -> PathBuf {
+    project_root
+        .join(".punk")
+        .join("bootstrap")
+        .join(format!("{project_id}-core.md"))
+}
+
+fn needs_project_bootstrap(project_root: &Path, project_id: &str) -> bool {
+    !project_bootstrap_file_path(project_root, project_id).exists()
+}
+
+fn run_project_bootstrap(project_root: &Path, project_id: &str) -> Result<()> {
+    let output = ProcessCommand::new("punk-run")
+        .current_dir(project_root)
+        .arg("init")
+        .arg("--project")
+        .arg(project_id)
+        .arg("--verify")
+        .output()
+        .map_err(|err| {
+            anyhow!(format_bootstrap_error(
+                project_id,
+                &format!("failed to execute punk-run: {err}")
+            ))
+        })?;
+
+    if !output.stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let reason = output
+        .status
+        .code()
+        .map(|code| format!("punk-run init exited with code {code}"))
+        .unwrap_or_else(|| "punk-run init terminated by signal".to_string());
+    Err(anyhow!(format_bootstrap_error(project_id, &reason)))
+}
+
+fn format_bootstrap_error(project_id: &str, reason: &str) -> String {
+    format!(
+        "project bootstrap failed for `{project_id}`: {reason}. Run `punk-run init --project {project_id} --enable-jj --verify` manually and retry."
+    )
+}
+
 fn maybe_warn_jj_degraded_mode(repo_root: &PathBuf, command: &Command) {
     if matches!(command, Command::Vcs(_)) {
         return;
@@ -362,8 +454,12 @@ fn cmd_vcs_enable_jj(repo_root: &PathBuf) -> Result<()> {
             println!("Enabled jj for this repo.");
             Ok(())
         }
-        VcsMode::GitOnly => Err(anyhow!("jj is not installed; cannot enable jj for this repo")),
-        VcsMode::NoVcs => Err(anyhow!("no Git or jj repo detected in the current directory")),
+        VcsMode::GitOnly => Err(anyhow!(
+            "jj is not installed; cannot enable jj for this repo"
+        )),
+        VcsMode::NoVcs => Err(anyhow!(
+            "no Git or jj repo detected in the current directory"
+        )),
     }
 }
 
@@ -374,6 +470,19 @@ mod tests {
         CheckStatus, Decision, DecisionObject, DeterministicStatus, Receipt, ReceiptArtifacts, Run,
         RunStatus, RunVcs, VcsKind,
     };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("punk-cli-{label}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn only_disabled_jj_git_mode_warns() {
@@ -498,5 +607,33 @@ mod tests {
         assert!(rendered.contains("vcs=Some(Jj)"));
         assert!(rendered.contains("ref=Some(\"abc123\")"));
         assert!(rendered.contains("dirty=true"));
+    }
+
+    #[test]
+    fn infer_project_id_uses_repo_root_basename() {
+        let root = PathBuf::from("/tmp/interviewcoach");
+        assert_eq!(infer_project_id(&root).as_deref(), Some("interviewcoach"));
+    }
+
+    #[test]
+    fn bootstrap_detection_checks_repo_local_skill_file() {
+        let root = temp_test_dir("bootstrap-detect");
+
+        assert!(needs_project_bootstrap(&root, "interviewcoach"));
+
+        let bootstrap = project_bootstrap_file_path(&root, "interviewcoach");
+        fs::create_dir_all(bootstrap.parent().unwrap()).unwrap();
+        fs::write(&bootstrap, "core rules\n").unwrap();
+
+        assert!(!needs_project_bootstrap(&root, "interviewcoach"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bootstrap_error_mentions_manual_recovery_command() {
+        let message = format_bootstrap_error("interviewcoach", "failed to execute punk-run");
+        assert!(message.contains("project bootstrap failed"));
+        assert!(message.contains("punk-run init --project interviewcoach --enable-jj --verify"));
     }
 }
