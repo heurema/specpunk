@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::bus;
 use crate::config;
+use crate::goal;
 
 /// Generate a morning briefing from current state.
 pub fn briefing(bus_path: &Path, config_dir: &Path) -> String {
@@ -80,12 +81,26 @@ pub fn briefing(bus_path: &Path, config_dir: &Path) -> String {
     }
 
     let state_dir = bus_path.join("state");
-    let goals = load_goals_summary(&state_dir);
+    let replan_needed = count_replan_needed_goals(bus_path);
+    let goals = load_goals_summary(&state_dir).map(|mut goals| {
+        goals.replan_needed = replan_needed;
+        goals
+    });
+    let goals = goals.or_else(|| {
+        if replan_needed > 0 {
+            Some(GoalsSummary {
+                replan_needed,
+                ..GoalsSummary::default()
+            })
+        } else {
+            None
+        }
+    });
     if let Some(goals) = goals.as_ref() {
         out.push_str("### Goals\n");
         out.push_str(&format!(
-            "  {} active, {} blocked, {} done\n",
-            goals.active, goals.blocked, goals.done
+            "  {} active, {} blocked, {} done, {} replan-needed\n",
+            goals.active, goals.blocked, goals.done, goals.replan_needed
         ));
         if !goals.focus.is_empty() {
             out.push_str(&format!("  focus: {}\n", goals.focus.join(", ")));
@@ -110,6 +125,7 @@ pub fn briefing(bus_path: &Path, config_dir: &Path) -> String {
         state.failed.len(),
         dead_count,
         state.queued.len(),
+        replan_needed,
         pipeline.as_ref(),
     );
     if !directives.is_empty() {
@@ -173,6 +189,7 @@ struct GoalsSummary {
     active: usize,
     blocked: usize,
     done: usize,
+    replan_needed: usize,
     focus: Vec<String>,
 }
 
@@ -212,10 +229,7 @@ fn load_goals_summary(state_dir: &Path) -> Option<GoalsSummary> {
     }
 }
 
-fn load_pipeline_summary(
-    state_dir: &Path,
-    now: chrono::DateTime<Utc>,
-) -> Option<PipelineSummary> {
+fn load_pipeline_summary(state_dir: &Path, now: chrono::DateTime<Utc>) -> Option<PipelineSummary> {
     let value = read_state_value(state_dir, &["pipeline.json", "pipelines.json"])?;
     let mut summary = PipelineSummary::default();
 
@@ -246,10 +260,18 @@ fn load_pipeline_summary(
     }
 }
 
+fn count_replan_needed_goals(bus_path: &Path) -> usize {
+    goal::list_goals(bus_path)
+        .into_iter()
+        .filter(|goal| goal.status_reason.as_deref() == Some("replan_needed_dead_end"))
+        .count()
+}
+
 fn build_directives(
     failed_count: usize,
     dead_count: usize,
     queued_count: usize,
+    replan_needed: usize,
     pipeline: Option<&PipelineSummary>,
 ) -> Vec<String> {
     let mut directives = Vec::new();
@@ -259,6 +281,10 @@ fn build_directives(
             "triage failed/dead-letter tasks first ({} failed, {} dead)",
             failed_count, dead_count
         ));
+    }
+
+    if replan_needed > 0 {
+        directives.push(format!("replan dead-end goals ({replan_needed})"));
     }
 
     if let Some(pipeline) = pipeline {
@@ -356,13 +382,7 @@ fn is_blocked_status(status: &str) -> bool {
 fn is_terminal_pipeline_status(status: &str) -> bool {
     matches!(
         status,
-        "done"
-            | "complete"
-            | "completed"
-            | "failed"
-            | "cancelled"
-            | "canceled"
-            | "aborted"
+        "done" | "complete" | "completed" | "failed" | "cancelled" | "canceled" | "aborted"
     )
 }
 
@@ -395,6 +415,7 @@ fn item_is_stale(item: &Value, now: chrono::DateTime<Utc>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::goal::{Goal, GoalStatus};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -409,6 +430,7 @@ mod tests {
         fs::create_dir_all(&state_dir).unwrap();
         fs::create_dir_all(&config_dir).unwrap();
         fs::create_dir_all(&receipts_dir).unwrap();
+        fs::create_dir_all(root.join("goals")).unwrap();
         fs::write(receipts_dir.join("index.jsonl"), "").unwrap();
         fs::write(
             state_dir.join("goals.json"),
@@ -437,11 +459,29 @@ mod tests {
             ),
         )
         .unwrap();
+        fs::write(
+            root.join("goals/replan.json"),
+            serde_json::to_string_pretty(&Goal {
+                id: "replan".into(),
+                project: "specpunk".into(),
+                objective: "Recover dead-end".into(),
+                deadline: None,
+                budget_usd: 5.0,
+                spent_usd: 1.0,
+                status: GoalStatus::Failed,
+                status_reason: Some("replan_needed_dead_end".into()),
+                plan: None,
+                created_at: Utc::now(),
+                completed_at: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
 
         let output = briefing(&bus_path, &config_dir);
 
         assert!(output.contains("### Goals"));
-        assert!(output.contains("1 active, 1 blocked, 1 done"));
+        assert!(output.contains("1 active, 1 blocked, 1 done, 1 replan-needed"));
         assert!(output.contains("focus: Ship council sync, Fix flaky gate"));
         assert!(output.contains("### Pipeline"));
         assert!(output.contains("2 active, 1 awaiting approval, 1 stale"));
@@ -463,8 +503,27 @@ mod tests {
         fs::create_dir_all(&dead_dir).unwrap();
         fs::create_dir_all(&config_dir).unwrap();
         fs::create_dir_all(&receipts_dir).unwrap();
+        fs::create_dir_all(root.join("goals")).unwrap();
         fs::write(receipts_dir.join("index.jsonl"), "").unwrap();
         fs::create_dir_all(dead_dir.join("task-1")).unwrap();
+        fs::write(
+            root.join("goals/replan.json"),
+            serde_json::to_string_pretty(&Goal {
+                id: "replan".into(),
+                project: "specpunk".into(),
+                objective: "Recover dead-end".into(),
+                deadline: None,
+                budget_usd: 5.0,
+                spent_usd: 1.0,
+                status: GoalStatus::Failed,
+                status_reason: Some("replan_needed_dead_end".into()),
+                plan: None,
+                created_at: Utc::now(),
+                completed_at: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
 
         let stale = (Utc::now() - Duration::days(4)).to_rfc3339();
         fs::write(
@@ -484,11 +543,13 @@ mod tests {
         let triage_idx = output
             .find("triage failed/dead-letter tasks first")
             .unwrap();
+        let replan_idx = output.find("replan dead-end goals").unwrap();
         let approval_idx = output.find("review approval queue").unwrap();
         let stale_idx = output.find("follow up on stale pipeline items").unwrap();
 
         assert!(output.contains("### Directives"));
-        assert!(triage_idx < approval_idx);
+        assert!(triage_idx < replan_idx);
+        assert!(replan_idx < approval_idx);
         assert!(approval_idx < stale_idx);
 
         cleanup(root);
