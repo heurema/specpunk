@@ -115,4 +115,47 @@ mod tests {
         assert_eq!(loaded[0].event_id, "evt_1");
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn load_all_rejects_malformed_lines() {
+        let root =
+            std::env::temp_dir().join(format!("punk-events-skip-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = EventStore::new(&root);
+        store.ensure_dirs().unwrap();
+        let path = store.month_file();
+        fs::write(
+            &path,
+            concat!(
+                "{\"event_id\":\"evt_ok\",\"ts\":\"2026-03-29T00:00:00Z\",\"project_id\":\"demo\",\"feature_id\":null,\"task_id\":null,\"run_id\":null,\"actor\":\"operator\",\"mode\":\"plot\",\"kind\":\"feature.created\",\"payload_ref\":null,\"payload_sha256\":null}\n",
+                "{not-json}\n",
+                "{\"event_id\":\"evt_ok_2\",\"ts\":\"2026-03-29T00:00:01Z\",\"project_id\":\"demo\",\"feature_id\":null,\"task_id\":null,\"run_id\":null,\"actor\":\"operator\",\"mode\":\"plot\",\"kind\":\"feature.created\",\"payload_ref\":null,\"payload_sha256\":null}\n"
+            ),
+        )
+        .unwrap();
+
+        let error = store.load_all().unwrap_err().to_string();
+        assert!(error.contains("parse"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_all_accepts_legacy_events_without_actor() {
+        let root =
+            std::env::temp_dir().join(format!("punk-events-legacy-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = EventStore::new(&root);
+        store.ensure_dirs().unwrap();
+        let path = store.month_file();
+        fs::write(
+            &path,
+            "{\"event_id\":\"evt_legacy\",\"ts\":\"2026-03-29T00:00:00Z\",\"project_id\":\"demo\",\"feature_id\":null,\"task_id\":null,\"run_id\":null,\"mode\":\"plot\",\"kind\":\"feature.created\",\"payload_ref\":null,\"payload_sha256\":null}\n",
+        )
+        .unwrap();
+
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].actor, "unknown");
+        let _ = fs::remove_dir_all(&root);
+    }
 }
