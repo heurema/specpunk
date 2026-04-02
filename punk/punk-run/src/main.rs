@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use punk_core::vcs::{VcsMode, detect_mode as detect_vcs_mode, enable_jj as enable_jj_for_repo};
 use punk_orch::{
     benchmark, bus, config, context, daemon, diverge, doctor, eval, goal, graph, morning, ops,
-    panel, pipeline, ratchet, recall, research, resolver, skill,
+    panel, pipeline, ratchet, recall, research, resolver, sanitize, skill,
 };
 
 #[derive(Parser)]
@@ -219,7 +219,11 @@ enum Command {
     /// List all known projects (TOML + cache + discovered)
     Projects,
     /// Generate config files from detected environment
-    Init,
+    Init {
+        /// Bootstrap the current repo as a project after normal init
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Version-control integration helpers
     Vcs {
         #[command(subcommand)]
@@ -1202,7 +1206,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Resolve { name, path } => cmd_resolve(&name, path.as_deref()),
         Command::Forget { name } => cmd_forget(&name),
         Command::Projects => cmd_projects(),
-        Command::Init => cmd_init(),
+        Command::Init { project } => cmd_init(project.as_deref()),
         Command::Vcs { action } => match action {
             VcsAction::Status => cmd_vcs_status(),
             VcsAction::EnableJj => cmd_vcs_enable_jj(),
@@ -1407,17 +1411,11 @@ fn finalize_status_project_filter(
 }
 
 fn infer_git_repo_root_basename(cwd: Option<&Path>) -> Option<String> {
-    let mut current = cwd?;
-    loop {
-        let dot_git = current.join(".git");
-        if dot_git.is_dir() || dot_git.is_file() {
-            return current
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.to_string());
-        }
-        current = current.parent()?;
-    }
+    detect_git_repo_root(cwd?).and_then(|root| {
+        root.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+    })
 }
 
 #[cfg(test)]
@@ -1448,8 +1446,10 @@ mod status_scope_tests {
         create_dir(&nested);
         create_dir(&repo_root.join(".git"));
 
-        let resolved =
-            finalize_status_project_filter(Some("known-project".to_string()), Some(nested.as_path()));
+        let resolved = finalize_status_project_filter(
+            Some("known-project".to_string()),
+            Some(nested.as_path()),
+        );
 
         assert_eq!(resolved.as_deref(), Some("known-project"));
 
@@ -1483,7 +1483,10 @@ mod status_scope_tests {
         create_dir(&nested);
 
         assert_eq!(infer_git_repo_root_basename(Some(nested.as_path())), None);
-        assert_eq!(finalize_status_project_filter(None, Some(nested.as_path())), None);
+        assert_eq!(
+            finalize_status_project_filter(None, Some(nested.as_path())),
+            None
+        );
 
         fs::remove_dir_all(&outside).expect("remove temp dir");
     }
@@ -3200,7 +3203,17 @@ fn cmd_projects() {
     }
 }
 
-fn cmd_init() {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectBootstrapSummary {
+    project: String,
+    repo_root: PathBuf,
+    bootstrap_file: PathBuf,
+    bootstrap_file_created: bool,
+    skill_name: String,
+    skill_created: bool,
+}
+
+fn cmd_init(project: Option<&str>) {
     maybe_warn_jj_degraded_mode();
     let dir = config::config_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -3236,6 +3249,142 @@ fn cmd_init() {
         discovered.len()
     );
     println!("Config:  {}", dir.display());
+
+    if let Some(project) = project {
+        let cwd = std::env::current_dir().unwrap_or_else(|e| {
+            eprintln!("Failed to resolve current directory: {e}");
+            std::process::exit(1);
+        });
+        match bootstrap_current_project(&bus::bus_dir(), project, &cwd) {
+            Ok(summary) => {
+                println!();
+                print!("{}", format_project_bootstrap_summary(&summary));
+            }
+            Err(e) => {
+                eprintln!("Project bootstrap failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn bootstrap_current_project(
+    bus_path: &Path,
+    project: &str,
+    cwd: &Path,
+) -> Result<ProjectBootstrapSummary, String> {
+    let safe_project = sanitize::safe_id(project)?;
+    let repo_root = detect_repo_root_or_cwd(cwd);
+
+    resolver::pin_project(&safe_project, &repo_root).map_err(|e| e.to_string())?;
+
+    let (bootstrap_file, bootstrap_file_created) =
+        ensure_project_bootstrap_file(&repo_root, &safe_project)?;
+    let skill_name = format!("{safe_project}-core");
+    let skill_created =
+        ensure_project_bootstrap_skill(bus_path, &safe_project, &skill_name, &bootstrap_file)?;
+
+    Ok(ProjectBootstrapSummary {
+        project: safe_project,
+        repo_root,
+        bootstrap_file,
+        bootstrap_file_created,
+        skill_name,
+        skill_created,
+    })
+}
+
+fn detect_repo_root_or_cwd(cwd: &Path) -> PathBuf {
+    detect_git_repo_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}
+
+fn detect_git_repo_root(cwd: &Path) -> Option<PathBuf> {
+    let mut current = cwd;
+    loop {
+        let dot_git = current.join(".git");
+        if dot_git.is_dir() || dot_git.is_file() {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+}
+
+fn ensure_project_bootstrap_file(
+    repo_root: &Path,
+    project: &str,
+) -> Result<(PathBuf, bool), String> {
+    let bootstrap_dir = repo_root.join(".punk/bootstrap");
+    std::fs::create_dir_all(&bootstrap_dir).map_err(|e| e.to_string())?;
+
+    let path = bootstrap_dir.join(format!("{project}-core.md"));
+    if path.exists() {
+        return Ok((path, false));
+    }
+
+    std::fs::write(&path, default_project_skill_template())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok((path, true))
+}
+
+fn ensure_project_bootstrap_skill(
+    bus_path: &Path,
+    project: &str,
+    skill_name: &str,
+    bootstrap_file: &Path,
+) -> Result<bool, String> {
+    let active_skill_path = bus_path
+        .parent()
+        .unwrap_or(bus_path)
+        .join("skills")
+        .join(format!("{skill_name}.md"));
+    if active_skill_path.exists() {
+        return Ok(false);
+    }
+
+    let content = std::fs::read_to_string(bootstrap_file)
+        .map_err(|e| format!("read {}: {e}", bootstrap_file.display()))?;
+    let categories = vec![
+        "plan".to_string(),
+        "planning".to_string(),
+        "fix".to_string(),
+        "codegen".to_string(),
+        "goal".to_string(),
+    ];
+    let projects = vec![project.to_string()];
+    skill::create_skill_with_triggers(
+        bus_path,
+        skill_name,
+        &format!("Core project rules for {project}"),
+        &content,
+        &projects,
+        &categories,
+    )?;
+    Ok(true)
+}
+
+fn default_project_skill_template() -> &'static str {
+    "Use existing architecture and naming before introducing new abstractions.\n\nPrefer additive changes over rewrites.\n\nKeep slices bounded:\n- 1-3 files when possible\n- one diff, one purpose\n\nPrefer existing helpers, modules, and interfaces before creating new ones.\n\nFor behavior changes:\n- preserve schemas unless acceptance explicitly changes them\n- no silent broad refactors\n\nFor tests:\n- prefer focused tests near changed behavior\n- no change without verification\n\nFail closed instead of guessing.\n"
+}
+
+fn format_project_bootstrap_summary(summary: &ProjectBootstrapSummary) -> String {
+    let bootstrap_status = if summary.bootstrap_file_created {
+        "created"
+    } else {
+        "existing"
+    };
+    let skill_status = if summary.skill_created {
+        "created"
+    } else {
+        "existing"
+    };
+
+    format!(
+        "Project: {project}\nPinned:   {repo_root}\nBootstrap file ({bootstrap_status}): {bootstrap_file}\nSkill ({skill_status}): {skill_name}\n",
+        project = summary.project,
+        repo_root = summary.repo_root.display(),
+        bootstrap_file = summary.bootstrap_file.display(),
+        skill_name = summary.skill_name,
+    )
 }
 
 fn cmd_vcs_status() {
@@ -4363,6 +4512,96 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{}-{}-{}", prefix, std::process::id(), nanos));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn detect_repo_root_or_cwd_prefers_nearest_git_root() {
+        let tmp = temp_test_dir("punk-run-init-repo-root");
+        let repo_root = tmp.join("interviewcoach");
+        let nested = repo_root.join("apps/web");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(repo_root.join(".git")).unwrap();
+
+        let resolved = detect_repo_root_or_cwd(&nested);
+        assert_eq!(resolved, repo_root);
+
+        let no_git = tmp.join("plain/subdir");
+        fs::create_dir_all(&no_git).unwrap();
+        assert_eq!(detect_repo_root_or_cwd(&no_git), no_git);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ensure_project_bootstrap_file_is_idempotent() {
+        let tmp = temp_test_dir("punk-run-init-bootstrap-file");
+
+        let (path, created) = ensure_project_bootstrap_file(&tmp, "interviewcoach").unwrap();
+        assert!(created);
+        assert!(path.exists());
+        let first = fs::read_to_string(&path).unwrap();
+        assert!(first.contains("Prefer additive changes over rewrites."));
+
+        fs::write(&path, "custom content\n").unwrap();
+        let (_, created_again) = ensure_project_bootstrap_file(&tmp, "interviewcoach").unwrap();
+        assert!(!created_again);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "custom content\n");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ensure_project_bootstrap_skill_is_idempotent() {
+        let tmp = temp_test_dir("punk-run-init-skill");
+        let bus = tmp.join("bus");
+        let bootstrap = tmp.join("interviewcoach-core.md");
+        fs::write(&bootstrap, "Prefer focused tests.\n").unwrap();
+
+        let created = ensure_project_bootstrap_skill(
+            &bus,
+            "interviewcoach",
+            "interviewcoach-core",
+            &bootstrap,
+        )
+        .unwrap();
+        assert!(created);
+
+        let active = tmp.join("skills/interviewcoach-core.md");
+        let content = fs::read_to_string(&active).unwrap();
+        assert!(content.contains("project: [\"interviewcoach\"]"));
+        assert!(
+            content.contains("category: [\"plan\", \"planning\", \"fix\", \"codegen\", \"goal\"]")
+        );
+
+        let created_again = ensure_project_bootstrap_skill(
+            &bus,
+            "interviewcoach",
+            "interviewcoach-core",
+            &bootstrap,
+        )
+        .unwrap();
+        assert!(!created_again);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn format_project_bootstrap_summary_marks_created_vs_existing() {
+        let summary = ProjectBootstrapSummary {
+            project: "interviewcoach".to_string(),
+            repo_root: PathBuf::from("/tmp/interviewcoach"),
+            bootstrap_file: PathBuf::from(
+                "/tmp/interviewcoach/.punk/bootstrap/interviewcoach-core.md",
+            ),
+            bootstrap_file_created: true,
+            skill_name: "interviewcoach-core".to_string(),
+            skill_created: false,
+        };
+
+        let rendered = format_project_bootstrap_summary(&summary);
+        assert!(rendered.contains("Project: interviewcoach"));
+        assert!(rendered.contains("Bootstrap file (created):"));
+        assert!(rendered.contains("Skill (existing): interviewcoach-core"));
     }
 
     #[test]
