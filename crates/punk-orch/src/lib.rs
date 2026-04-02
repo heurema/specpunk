@@ -23,6 +23,7 @@ use punk_domain::{
 use punk_events::EventStore;
 use punk_vcs::{current_snapshot_ref, detect_backend};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
 pub struct RepoPaths {
@@ -102,6 +103,10 @@ impl OrchService {
         if project_path.exists() {
             let mut project: Project = read_json(&project_path)?;
             let mut changed = false;
+            if project.id != project_id {
+                project.id = project_id.clone();
+                changed = true;
+            }
             if project.path != current_path {
                 project.path = current_path.clone();
                 changed = true;
@@ -461,6 +466,8 @@ impl OrchService {
 
         let backend = detect_backend(&self.paths.repo_root)?;
         let isolated = backend.create_isolated_change(&task.id)?;
+        let workspace_root = PathBuf::from(&isolated.workspace_ref);
+        let isolated_backend = detect_backend(&workspace_root)?;
         let run_id = new_id("run");
         let run_dir = self.paths.runs_dir.join(&run_id);
         fs::create_dir_all(&run_dir)?;
@@ -541,10 +548,10 @@ impl OrchService {
             write_json(&receipt_path, &receipt)?;
             return Ok((run, receipt));
         }
-        let provenance_baseline = backend.capture_provenance_baseline().ok();
+        let provenance_baseline = isolated_backend.capture_provenance_baseline().ok();
         let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             executor.execute_contract(ExecuteInput {
-                repo_root: self.paths.repo_root.clone(),
+                repo_root: workspace_root.clone(),
                 contract: contract.clone(),
                 stdout_path: stdout_path.clone(),
                 stderr_path: stderr_path.clone(),
@@ -609,7 +616,7 @@ impl OrchService {
             executor_name: executor.name().to_string(),
             changed_files: provenance_baseline
                 .as_ref()
-                .and_then(|baseline| backend.changed_files_since(baseline).ok())
+                .and_then(|baseline| isolated_backend.changed_files_since(baseline).ok())
                 .unwrap_or_default(),
             artifacts: ReceiptArtifacts {
                 stdout_ref: relative_ref(&self.paths.repo_root, &stdout_path)?,
@@ -855,10 +862,15 @@ fn attach_live_vcs(value: &mut serde_json::Value, live_vcs: serde_json::Value) {
 }
 
 pub fn project_id(root: &Path) -> Result<String> {
-    root.file_name()
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let basename = canonical_root
+        .file_name()
         .and_then(|v| v.to_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("unable to infer project id from repo root"))
+        .ok_or_else(|| anyhow!("unable to infer project id from repo root"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_root.to_string_lossy().as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    Ok(format!("{basename}-{}", &digest[..10]))
 }
 
 fn summarize_prompt(prompt: &str) -> String {
@@ -2035,5 +2047,66 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn project_id_is_unique_for_distinct_paths_with_same_basename() {
+        let base = std::env::temp_dir().join(format!(
+            "punk-orch-project-id-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first = base.join("work/api");
+        let second = base.join("oss/api");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+
+        let first_id = project_id(&first).unwrap();
+        let second_id = project_id(&second).unwrap();
+
+        assert_ne!(first_id, second_id);
+        assert!(first_id.starts_with("api-"));
+        assert!(second_id.starts_with("api-"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bootstrap_project_refreshes_legacy_project_id() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-bootstrap-project-id-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk")).unwrap();
+        let legacy = Project {
+            id: "demo".into(),
+            path: root.display().to_string(),
+            vcs_backend: None,
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/project.json"), &legacy).unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let refreshed = service.bootstrap_project().unwrap();
+
+        assert_ne!(refreshed.id, "demo");
+        assert!(refreshed
+            .id
+            .starts_with("punk-orch-bootstrap-project-id-refresh-"));
+
+        let persisted: Project = read_json(&service.paths.dot_punk.join("project.json")).unwrap();
+        assert_eq!(persisted.id, refreshed.id);
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

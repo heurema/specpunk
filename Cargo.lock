@@ -407,6 +407,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hex",
  "punk-adapters",
  "punk-core",
  "punk-domain",
@@ -414,6 +415,7 @@ dependencies = [
  "punk-vcs",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

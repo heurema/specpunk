@@ -113,9 +113,9 @@ fn validate_scope(allowed_scope: &[String], changed_files: &[String]) -> bool {
         return false;
     }
     changed_files.iter().all(|file| {
-        allowed_scope.iter().any(|prefix| {
-            file == prefix || file.starts_with(&format!("{prefix}/")) || file.starts_with(prefix)
-        })
+        allowed_scope
+            .iter()
+            .any(|prefix| file == prefix || file.starts_with(&format!("{prefix}/")))
     })
 }
 
@@ -241,5 +241,18 @@ mod tests {
         let decision = gate.gate_run("run_1").unwrap();
         assert_eq!(decision.decision, Decision::Block);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_scope_rejects_string_prefix_escape() {
+        assert!(validate_scope(
+            &["src/lib.rs".into(), "foo".into()],
+            &["src/lib.rs".into(), "foo/bar.rs".into()]
+        ));
+        assert!(!validate_scope(
+            &["src/lib.rs".into()],
+            &["src/lib.rs.bak".into()]
+        ));
+        assert!(!validate_scope(&["foo".into()], &["foobar".into()]));
     }
 }

@@ -281,14 +281,14 @@ fn default_global_root() -> Result<PathBuf> {
 }
 
 fn maybe_auto_bootstrap_project(repo_root: &Path, command: &Command) -> Result<bool> {
-    if !matches!(
-        command,
+    let json = match command {
         Command::Plot(PlotCommand {
-            action: PlotAction::Contract { .. }
-        })
-    ) {
-        return Ok(false);
-    }
+            action: PlotAction::Contract { json, .. },
+        }) => *json,
+        _ => {
+            return Ok(false);
+        }
+    };
 
     let project_root = resolve_project_root(repo_root);
     let Some(project_id) = infer_project_id(&project_root) else {
@@ -298,7 +298,15 @@ fn maybe_auto_bootstrap_project(repo_root: &Path, command: &Command) -> Result<b
         return Ok(false);
     }
 
-    run_project_bootstrap(&project_root, &project_id)?;
+    match detect_punk_run_bootstrap_support(&project_root) {
+        BootstrapSupport::Supported => run_project_bootstrap(&project_root, &project_id, json)?,
+        BootstrapSupport::Unavailable(reason) | BootstrapSupport::Incompatible(reason) => {
+            if !json {
+                eprintln!("{}", format_bootstrap_skip_note(&project_id, &reason));
+            }
+            return Ok(false);
+        }
+    }
     Ok(true)
 }
 
@@ -328,7 +336,40 @@ fn needs_project_bootstrap(project_root: &Path, project_id: &str) -> bool {
     !project_bootstrap_file_path(project_root, project_id).exists()
 }
 
-fn run_project_bootstrap(project_root: &Path, project_id: &str) -> Result<()> {
+enum BootstrapSupport {
+    Supported,
+    Unavailable(String),
+    Incompatible(String),
+}
+
+fn detect_punk_run_bootstrap_support(project_root: &Path) -> BootstrapSupport {
+    let output = match ProcessCommand::new("punk-run")
+        .current_dir(project_root)
+        .arg("init")
+        .arg("--help")
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            return BootstrapSupport::Unavailable(format!("punk-run not available in PATH: {err}"));
+        }
+    };
+
+    let help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.status.success() && help.contains("--project") && help.contains("--verify") {
+        BootstrapSupport::Supported
+    } else {
+        BootstrapSupport::Incompatible(
+            "compatible `punk-run init --project ... --verify` support not detected".to_string(),
+        )
+    }
+}
+
+fn run_project_bootstrap(project_root: &Path, project_id: &str, json: bool) -> Result<()> {
     let output = ProcessCommand::new("punk-run")
         .current_dir(project_root)
         .arg("init")
@@ -343,10 +384,10 @@ fn run_project_bootstrap(project_root: &Path, project_id: &str) -> Result<()> {
             ))
         })?;
 
-    if !output.stdout.is_empty() {
+    if !json && !output.stdout.is_empty() {
         print!("{}", String::from_utf8_lossy(&output.stdout));
     }
-    if !output.stderr.is_empty() {
+    if !json && !output.stderr.is_empty() {
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
     }
 
@@ -365,6 +406,12 @@ fn run_project_bootstrap(project_root: &Path, project_id: &str) -> Result<()> {
 fn format_bootstrap_error(project_id: &str, reason: &str) -> String {
     format!(
         "project bootstrap failed for `{project_id}`: {reason}. Run `punk-run init --project {project_id} --enable-jj --verify` manually and retry."
+    )
+}
+
+fn format_bootstrap_skip_note(project_id: &str, reason: &str) -> String {
+    format!(
+        "Bootstrap note: skipping optional project bootstrap for `{project_id}` because {reason}. If you need full onboarding, run `punk-run init --project {project_id} --enable-jj --verify` manually."
     )
 }
 

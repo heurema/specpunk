@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use punk_domain::VcsKind;
@@ -238,13 +238,28 @@ impl VcsBackend for GitBackend {
     }
     fn create_isolated_change(&self, name: &str) -> Result<IsolatedChange> {
         let base = self.current_change_ref().ok();
-        let branch = sanitize_branch_name(name);
-        if run_capture(&self.root, "git", &["switch", "-c", &branch]).is_err() {
-            run_capture(&self.root, "git", &["checkout", "--orphan", &branch])?;
+        let branch = unique_branch_name(name);
+        let workspace_root = unique_git_worktree_path(&self.root, &branch);
+        if let Some(parent) = workspace_root.parent() {
+            fs::create_dir_all(parent)?;
         }
-        let change_ref = self.current_change_ref()?;
+        run_capture(
+            &self.root,
+            "git",
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                workspace_root.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        )?;
+        let change_ref = run_capture(&workspace_root, "git", &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string();
         Ok(IsolatedChange {
-            workspace_ref: self.root.display().to_string(),
+            workspace_ref: workspace_root.display().to_string(),
             change_ref,
             base_ref: base,
         })
@@ -304,7 +319,7 @@ impl VcsBackend for GitBackend {
 }
 
 fn sanitize_branch_name(input: &str) -> String {
-    input
+    let sanitized = input
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {
@@ -314,6 +329,27 @@ fn sanitize_branch_name(input: &str) -> String {
             }
         })
         .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if sanitized.is_empty() {
+        "punk-change".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn unique_branch_name(input: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{}", sanitize_branch_name(input), nanos)
+}
+
+fn unique_git_worktree_path(root: &Path, branch: &str) -> PathBuf {
+    root.join(".punk")
+        .join("worktrees")
+        .join(branch.replace('/', "-"))
 }
 
 fn lines(output: String) -> Vec<String> {
@@ -373,6 +409,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn detect_git_repo() {
@@ -547,5 +584,53 @@ mod tests {
     #[test]
     fn classify_mode_prefers_jj() {
         assert_eq!(classify_mode(true, true, true), VcsMode::Jj);
+    }
+
+    #[test]
+    fn git_isolated_change_uses_separate_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-vcs-git-isolated-worktree-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        run_capture(&root, "git", &["init"]).unwrap();
+        run_capture(&root, "git", &["config", "user.name", "Test User"]).unwrap();
+        run_capture(&root, "git", &["config", "user.email", "test@example.com"]).unwrap();
+        fs::write(root.join("README.md"), "init\n").unwrap();
+        run_capture(&root, "git", &["add", "README.md"]).unwrap();
+        run_capture(&root, "git", &["commit", "-m", "init"]).unwrap();
+        let original_ref = run_capture(&root, "git", &["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let isolated = GitBackend::new(&root)
+            .unwrap()
+            .create_isolated_change("Stage 4 polish")
+            .unwrap();
+        let workspace_root = PathBuf::from(&isolated.workspace_ref);
+        let canonical_workspace_root = fs::canonicalize(&workspace_root).unwrap();
+        let canonical_worktrees_root = fs::canonicalize(root.join(".punk/worktrees")).unwrap();
+
+        assert_ne!(canonical_workspace_root, fs::canonicalize(&root).unwrap());
+        assert!(canonical_workspace_root.starts_with(&canonical_worktrees_root));
+        assert_eq!(
+            run_capture(&root, "git", &["rev-parse", "--abbrev-ref", "HEAD"])
+                .unwrap()
+                .trim(),
+            original_ref
+        );
+
+        let _ = run_capture(
+            &root,
+            "git",
+            &["worktree", "remove", "--force", &isolated.workspace_ref],
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }
