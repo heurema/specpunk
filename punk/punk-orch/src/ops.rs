@@ -47,7 +47,23 @@ pub fn list_triage(bus: &Path) -> Vec<TriageEntry> {
         }
     }
 
+    entries.sort_by(|a, b| {
+        triage_source_rank(&a.source)
+            .cmp(&triage_source_rank(&b.source))
+            .then_with(|| a.task_id.cmp(&b.task_id))
+            .then_with(|| a.project.cmp(&b.project))
+            .then_with(|| a.model.cmp(&b.model))
+    });
+
     entries
+}
+
+fn triage_source_rank(source: &str) -> u8 {
+    match source {
+        "dead" => 0,
+        "failed" => 1,
+        _ => 2,
+    }
 }
 
 #[derive(Debug)]
@@ -119,4 +135,65 @@ fn json_str(v: &Value, key: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_test_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{}-{}-{}", prefix, std::process::id(), nanos));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_receipt(dir: &Path, project: &str, model: &str, summary: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("receipt.json"),
+            format!(r#"{{"project":"{project}","model":"{model}","summary":"{summary}"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_triage_orders_dead_before_failed_then_task_id() {
+        let bus = temp_test_dir("punk-ops-triage");
+        write_receipt(
+            &bus.join("failed/task-b"),
+            "specpunk",
+            "codex",
+            "failed summary",
+        );
+        write_receipt(
+            &bus.join("dead/task-c"),
+            "specpunk",
+            "codex",
+            "dead summary c",
+        );
+        write_receipt(
+            &bus.join("dead/task-a"),
+            "specpunk",
+            "claude",
+            "dead summary a",
+        );
+
+        let entries = list_triage(&bus);
+        let pairs: Vec<_> = entries
+            .iter()
+            .map(|entry| (entry.source.as_str(), entry.task_id.as_str()))
+            .collect();
+
+        assert_eq!(
+            pairs,
+            vec![("dead", "task-a"), ("dead", "task-c"), ("failed", "task-b")]
+        );
+
+        let _ = fs::remove_dir_all(&bus);
+    }
 }

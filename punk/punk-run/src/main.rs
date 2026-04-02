@@ -1404,28 +1404,82 @@ fn cmd_config() {
 fn cmd_triage() {
     let bus_path = bus::bus_dir();
     let entries = ops::list_triage(&bus_path);
+    print!("{}", format_triage_report(&entries));
+}
 
+fn format_triage_report(entries: &[ops::TriageEntry]) -> String {
     if entries.is_empty() {
-        println!("No tasks pending triage.");
+        return "No tasks pending triage.\n".to_string();
+    }
+
+    let dead_count = entries
+        .iter()
+        .filter(|entry| entry.source == "dead")
+        .count();
+    let failed_count = entries
+        .iter()
+        .filter(|entry| entry.source == "failed")
+        .count();
+
+    let mut out = format!("Tasks pending triage ({})\n", entries.len());
+    out.push_str(&format!(
+        "Sources: dead-letter={} failed={}\n",
+        dead_count, failed_count
+    ));
+
+    append_triage_group(
+        &mut out,
+        entries,
+        "dead",
+        "Dead-letter",
+        "inspect the dead-letter receipt, then retry if the task is still valid or cancel it if obsolete",
+    );
+    append_triage_group(
+        &mut out,
+        entries,
+        "failed",
+        "Failed",
+        "review the error excerpt, fix the root cause, then retry or cancel the task",
+    );
+
+    out.push_str("\nActions:\n");
+    out.push_str("  punk-run retry <id>\n");
+    out.push_str("  punk-run cancel <id>\n");
+    out
+}
+
+fn append_triage_group(
+    out: &mut String,
+    entries: &[ops::TriageEntry],
+    source: &str,
+    title: &str,
+    hint: &str,
+) {
+    let group: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.source == source)
+        .collect();
+    if group.is_empty() {
         return;
     }
 
-    println!("Tasks pending triage ({})\n", entries.len());
-    println!(
-        "  {:<40} {:<12} {:<8} {:<8} ERROR",
-        "ID", "PROJECT", "MODEL", "SOURCE"
-    );
-    for e in &entries {
-        println!(
-            "  {:<40} {:<12} {:<8} {:<8} {}",
-            truncate(&e.task_id, 40),
-            e.project,
-            e.model,
-            e.source,
-            truncate(&e.error_excerpt, 30)
-        );
+    out.push_str(&format!("\n{} ({})\n", title, group.len()));
+    out.push_str(&format!(
+        "  {:<40} {:<12} {:<8} ERROR\n",
+        "ID", "PROJECT", "MODEL"
+    ));
+
+    for entry in group {
+        out.push_str(&format!(
+            "  {:<40} {:<12} {:<8} {}\n",
+            truncate(&entry.task_id, 40),
+            entry.project,
+            entry.model,
+            truncate(&entry.error_excerpt, 48)
+        ));
     }
-    println!("\nActions: punk-run retry <id> | punk-run cancel <id>");
+
+    out.push_str(&format!("  Hint: {hint}\n"));
 }
 
 fn cmd_goal(project: &str, objective: &str, budget: f64, deadline: Option<&str>) {
@@ -3667,6 +3721,42 @@ mod tests {
         assert!(rendered.contains("project 'demo' is ambiguous"));
         assert!(rendered.contains("punk-run resolve demo --path /absolute/path/to/project"));
         assert!(rendered.contains("punk-run use demo /path/to/project"));
+    }
+
+    #[test]
+    fn format_triage_report_groups_dead_before_failed_and_shows_hints() {
+        let entries = vec![
+            ops::TriageEntry {
+                task_id: "dead-1".to_string(),
+                project: "specpunk".to_string(),
+                model: "codex".to_string(),
+                source: "dead".to_string(),
+                error_excerpt: "stale worktree".to_string(),
+            },
+            ops::TriageEntry {
+                task_id: "failed-1".to_string(),
+                project: "specpunk".to_string(),
+                model: "claude".to_string(),
+                source: "failed".to_string(),
+                error_excerpt: "test failure".to_string(),
+            },
+        ];
+
+        let rendered = format_triage_report(&entries);
+        assert!(rendered.contains("Tasks pending triage (2)"));
+        assert!(rendered.contains("Sources: dead-letter=1 failed=1"));
+        let dead_idx = rendered.find("Dead-letter (1)").unwrap();
+        let failed_idx = rendered.find("Failed (1)").unwrap();
+        assert!(dead_idx < failed_idx);
+        assert!(rendered.contains("Hint: inspect the dead-letter receipt"));
+        assert!(rendered.contains("Hint: review the error excerpt"));
+        assert!(rendered.contains("punk-run retry <id>"));
+        assert!(rendered.contains("punk-run cancel <id>"));
+    }
+
+    #[test]
+    fn format_triage_report_handles_empty_entries() {
+        assert_eq!(format_triage_report(&[]), "No tasks pending triage.\n");
     }
 
     #[test]
