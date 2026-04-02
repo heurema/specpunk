@@ -518,12 +518,23 @@ pub(crate) fn derive_plan_seed(contract: &Contract, pack: &ContextPack) -> Conte
         .first()
         .cloned()
         .unwrap_or_else(|| "tighten patch generation around exact allowed-scope targets".to_string());
-    let targets = pack
+    let mut targets = pack
         .files
         .iter()
-        .take(3)
-        .map(|file| derive_plan_target(contract, file))
-        .collect();
+        .flat_map(|file| derive_plan_targets(contract, file))
+        .collect::<Vec<_>>();
+    if targets.iter().any(|item| item.priority > 0) {
+        targets.retain(|item| item.priority > 0);
+    }
+    targets.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.target.path.cmp(&right.target.path))
+            .then_with(|| left.target.symbol.cmp(&right.target.symbol))
+    });
+    targets.truncate(3);
+    let targets = targets.into_iter().map(|item| item.target).collect();
     ContextPlanSeed {
         title: "Controller-supplied target hints".to_string(),
         summary,
@@ -531,22 +542,53 @@ pub(crate) fn derive_plan_seed(contract: &Contract, pack: &ContextPack) -> Conte
     }
 }
 
-fn derive_plan_target(contract: &Contract, file: &ContextFileExcerpt) -> ContextPlanTarget {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScoredPlanTarget {
+    priority: usize,
+    target: ContextPlanTarget,
+}
+
+fn derive_plan_targets(contract: &Contract, file: &ContextFileExcerpt) -> Vec<ScoredPlanTarget> {
     let anchors = highest_confidence_symbols(contract, file);
-    let best_anchor = anchors.first();
-    ContextPlanTarget {
-        path: file.path.clone(),
-        symbol: best_anchor
-            .map(|anchor| anchor.signature.clone())
-            .unwrap_or_else(|| fallback_symbol(file)),
-        insertion_point: best_anchor
-            .map(|anchor| format!("around line {}", anchor.line_number))
-            .unwrap_or_else(|| format!("within visible excerpt lines {}-{}", file.start_line, file.end_line)),
-        execution_sketch: infer_plan_sketch(contract, &file.path),
-        anchor_excerpt: best_anchor
-            .map(|anchor| render_anchor_excerpt(file, anchor))
-            .unwrap_or_else(|| fallback_anchor_excerpt(file)),
+    let mut targets = anchors
+        .iter()
+        .take(2)
+        .filter(|anchor| {
+            anchor.score > 0
+                && !(is_thin_module_facade(file)
+                    && (anchor.signature.starts_with("pub mod ")
+                        || anchor.signature.starts_with("mod ")
+                        || anchor.signature.starts_with("pub use ")))
+        })
+        .map(|anchor| ScoredPlanTarget {
+            priority: anchor.score,
+            target: ContextPlanTarget {
+                path: file.path.clone(),
+                symbol: anchor.signature.clone(),
+                insertion_point: format!("around line {}", anchor.line_number),
+                execution_sketch: infer_plan_sketch(contract, &file.path, &anchor.signature),
+                anchor_excerpt: render_compound_anchor_excerpt(file, &anchors, anchor),
+            },
+        })
+        .collect::<Vec<_>>();
+
+    if targets.is_empty() {
+        targets.push(ScoredPlanTarget {
+            priority: if is_thin_module_facade(file) { 0 } else { 1 },
+            target: ContextPlanTarget {
+                path: file.path.clone(),
+                symbol: fallback_symbol(file),
+                insertion_point: format!(
+                    "within visible excerpt lines {}-{}",
+                    file.start_line, file.end_line
+                ),
+                execution_sketch: infer_plan_sketch(contract, &file.path, ""),
+                anchor_excerpt: fallback_anchor_excerpt(file),
+            },
+        });
     }
+
+    targets
 }
 
 fn fallback_symbol(file: &ContextFileExcerpt) -> String {
@@ -568,7 +610,17 @@ fn fallback_anchor_excerpt(file: &ContextFileExcerpt) -> String {
         .join("\n")
 }
 
-fn infer_plan_sketch(contract: &Contract, path: &str) -> String {
+fn infer_plan_sketch(contract: &Contract, path: &str, symbol: &str) -> String {
+    let symbol_lc = symbol.to_ascii_lowercase();
+    if symbol_lc.contains("cmd_status") {
+        return "Reuse the existing status rendering block and add the new summary line immediately near the current eval or benchmark window lines.".to_string();
+    }
+    if symbol_lc.contains("cmd_eval_skill_summary") {
+        return "Reuse the existing skill eval summary helper or output formatting from this function instead of inventing a parallel formatter.".to_string();
+    }
+    if symbol_lc.contains("status") && path.ends_with("main.rs") {
+        return "Thread any new status-window text through the existing status command output with one conservative extra line.".to_string();
+    }
     contract
         .behavior_requirements
         .iter()
@@ -584,6 +636,43 @@ fn infer_plan_sketch(contract: &Contract, path: &str) -> String {
         .cloned()
         .or_else(|| contract.behavior_requirements.first().cloned())
         .unwrap_or_else(|| "implement the approved bounded change in this file".to_string())
+}
+
+fn is_thin_module_facade(file: &ContextFileExcerpt) -> bool {
+    let mut visible_lines = 0usize;
+    let mut module_lines = 0usize;
+    for line in file.content.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        visible_lines += 1;
+        if line.starts_with("pub mod ")
+            || line.starts_with("mod ")
+            || line.starts_with("pub use ")
+        {
+            module_lines += 1;
+        }
+    }
+    visible_lines > 0 && module_lines == visible_lines
+}
+
+fn render_compound_anchor_excerpt(
+    file: &ContextFileExcerpt,
+    anchors: &[SymbolAnchor],
+    primary: &SymbolAnchor,
+) -> String {
+    let mut excerpts = vec![render_anchor_excerpt(file, primary)];
+    if let Some(secondary) = anchors.iter().find(|candidate| {
+        candidate.line_number != primary.line_number
+            && (candidate.signature.starts_with("fn ")
+                || candidate.signature.starts_with("pub fn "))
+    }) {
+        let secondary_excerpt = render_anchor_excerpt(file, secondary);
+        if secondary_excerpt != excerpts[0] {
+            excerpts.push(secondary_excerpt);
+        }
+    }
+    excerpts.join("\n")
 }
 
 fn compact_patch_excerpt(content: &str, max_lines: usize, max_chars: usize) -> String {
@@ -1508,9 +1597,78 @@ mod tests {
             plan_seed: None,
         };
         let seed = derive_plan_seed(&contract, &pack);
-        assert_eq!(seed.targets.len(), 1);
-        assert!(seed.targets[0].symbol.contains("fn cmd_status"));
-        assert!(seed.targets[0].anchor_excerpt.contains("cmd_status"));
+        assert!(seed.targets.iter().any(|target| target.symbol.contains("fn cmd_status")));
+        assert!(seed
+            .targets
+            .iter()
+            .any(|target| target.anchor_excerpt.contains("cmd_status")));
+    }
+
+    #[test]
+    fn derive_plan_seed_deprioritizes_thin_module_facades() {
+        let contract = Contract {
+            id: "ct_status".into(),
+            feature_id: "feat_status".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Add a skill eval summary line to status output".into(),
+            entry_points: vec![
+                "punk/punk-orch/src/lib.rs".into(),
+                "punk/punk-run/src/main.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["status output gains a concise skill eval line".into()],
+            behavior_requirements: vec![
+                "print a concise human-readable skill eval summary line".into(),
+            ],
+            allowed_scope: vec![
+                "punk/punk-orch/src/lib.rs".into(),
+                "punk/punk-run/src/main.rs".into(),
+            ],
+            target_checks: vec!["cargo test -p punk-run".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let pack = ContextPack {
+            files: vec![
+                ContextFileExcerpt {
+                    path: "punk/punk-orch/src/lib.rs".into(),
+                    start_line: 1,
+                    end_line: 4,
+                    truncated_at_test_boundary: false,
+                    content: "pub mod eval;\npub mod graph;\npub mod run;\n".into(),
+                },
+                ContextFileExcerpt {
+                    path: "punk/punk-run/src/main.rs".into(),
+                    start_line: 1172,
+                    end_line: 1185,
+                    truncated_at_test_boundary: false,
+                    content: "fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {\n    println!(\"Status\");\n}\n\nfn cmd_eval_skill_summary(\n    project_filter: Option<&str>,\n    skill_filter: Option<&str>,\n    limit: Option<usize>,\n) {\n}\n".into(),
+                },
+            ],
+            missing_paths: vec![],
+            recipe_seed: None,
+            patch_seed: None,
+            plan_seed: None,
+        };
+        let seed = derive_plan_seed(&contract, &pack);
+        assert!(!seed.targets.is_empty());
+        assert_eq!(seed.targets[0].path, "punk/punk-run/src/main.rs");
+        assert!(seed
+            .targets
+            .iter()
+            .any(|target| target.symbol.contains("cmd_status")));
+        assert!(seed
+            .targets
+            .iter()
+            .any(|target| target.symbol.contains("cmd_eval_skill_summary")));
+        assert!(
+            seed.targets
+                .iter()
+                .all(|target| target.symbol != "pub mod eval;")
+        );
     }
 
     #[test]
