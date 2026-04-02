@@ -538,10 +538,12 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
     let status = orch.status(Some(&run.id))?;
     let project_root = resolve_project_root(repo_root);
     let project = infer_project_id(&project_root).unwrap_or_else(|| status.project_id.clone());
-    let follow_up = format!("punk inspect {} --json", proof.id);
+    let next_command = format!("punk inspect {} --json", proof.id);
     let outcome = go_outcome_label(&decision.decision);
     let success = go_decision_succeeds(&decision.decision);
     let basis_summary = summarize_decision_basis(&decision.decision_basis);
+    let recovery_command = go_recovery_command(&decision.decision, trimmed_goal);
+    let recommended_mode = go_recommended_mode(&decision.decision);
 
     if json {
         println!(
@@ -558,7 +560,10 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
                 "outcome": outcome,
                 "success": success,
                 "decision_basis_summary": basis_summary,
-                "follow_up": follow_up,
+                "recommended_mode": recommended_mode,
+                "next_command": next_command,
+                "recovery_command": recovery_command,
+                "follow_up": next_command,
             }))?
         );
     } else {
@@ -575,7 +580,8 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
                 decision_label(&decision.decision),
                 &basis_summary,
                 &proof.id,
-                &follow_up,
+                &next_command,
+                recovery_command.as_deref(),
             )
         );
     }
@@ -585,7 +591,8 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
         Err(anyhow!(format_go_error(
             &decision.decision,
             &proof.id,
-            &follow_up
+            &next_command,
+            recovery_command.as_deref(),
         )))
     }
 }
@@ -612,11 +619,16 @@ fn format_go_summary(
     decision: &str,
     basis_summary: &str,
     proof_id: &str,
-    follow_up: &str,
+    next_command: &str,
+    recovery_command: Option<&str>,
 ) -> String {
-    format!(
-        "Goal: {goal}\nProject: {project}\nApproved contract: {contract_id}\nRun: {run_id} ({receipt_status})\nSummary: {receipt_summary}\nOutcome: {outcome}\nGate: {decision}\nBasis: {basis_summary}\nProof: {proof_id}\nFollow-up: {follow_up}"
-    )
+    let mut rendered = format!(
+        "Goal: {goal}\nProject: {project}\nApproved contract: {contract_id}\nRun: {run_id} ({receipt_status})\nSummary: {receipt_summary}\nOutcome: {outcome}\nGate: {decision}\nBasis: {basis_summary}\nProof: {proof_id}\nNext: {next_command}"
+    );
+    if let Some(recovery_command) = recovery_command {
+        rendered.push_str(&format!("\nRecovery: {recovery_command}"));
+    }
+    rendered
 }
 
 fn decision_label(decision: &punk_domain::Decision) -> &'static str {
@@ -653,13 +665,42 @@ fn summarize_decision_basis(basis: &[String]) -> String {
     }
 }
 
-fn format_go_error(decision: &punk_domain::Decision, proof_id: &str, follow_up: &str) -> String {
-    format!(
+fn go_recommended_mode(decision: &punk_domain::Decision) -> &'static str {
+    match decision {
+        punk_domain::Decision::Accept => "autonomous",
+        punk_domain::Decision::Block | punk_domain::Decision::Escalate => "staged_review",
+    }
+}
+
+fn go_recovery_command(decision: &punk_domain::Decision, goal: &str) -> Option<String> {
+    match decision {
+        punk_domain::Decision::Accept => None,
+        punk_domain::Decision::Block | punk_domain::Decision::Escalate => {
+            Some(format!("punk start {}", shell_quote_goal(goal)))
+        }
+    }
+}
+
+fn shell_quote_goal(goal: &str) -> String {
+    format!("\"{}\"", goal.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn format_go_error(
+    decision: &punk_domain::Decision,
+    proof_id: &str,
+    next_command: &str,
+    recovery_command: Option<&str>,
+) -> String {
+    let mut rendered = format!(
         "punk go ended with gate decision {} (proof: {}). Inspect details with `{}`.",
         decision_label(decision),
         proof_id,
-        follow_up
-    )
+        next_command
+    );
+    if let Some(recovery_command) = recovery_command {
+        rendered.push_str(&format!(" Retry in staged mode with `{recovery_command}`."));
+    }
+    rendered
 }
 
 fn resolve_init_project_id(project_root: &Path, explicit_project: Option<&str>) -> Result<String> {
@@ -1037,6 +1078,7 @@ mod tests {
             "target checks passed; integrity checks passed",
             "proof_789",
             "punk inspect proof_789 --json",
+            None,
         );
         assert!(rendered.contains("Goal: add interview feedback summary endpoint"));
         assert!(rendered.contains("Project: interviewcoach"));
@@ -1047,7 +1089,7 @@ mod tests {
         assert!(rendered.contains("Gate: accept"));
         assert!(rendered.contains("Basis: target checks passed; integrity checks passed"));
         assert!(rendered.contains("Proof: proof_789"));
-        assert!(rendered.contains("Follow-up: punk inspect proof_789 --json"));
+        assert!(rendered.contains("Next: punk inspect proof_789 --json"));
     }
 
     #[test]
@@ -1056,10 +1098,12 @@ mod tests {
             &punk_domain::Decision::Block,
             "proof_789",
             "punk inspect proof_789 --json",
+            Some("punk start \"retry goal\""),
         );
         assert!(rendered.contains("gate decision block"));
         assert!(rendered.contains("proof: proof_789"));
         assert!(rendered.contains("punk inspect proof_789 --json"));
+        assert!(rendered.contains("punk start \"retry goal\""));
     }
 
     #[test]
@@ -1092,6 +1136,22 @@ mod tests {
         assert_eq!(
             summarize_decision_basis(&[]),
             "no explicit decision basis recorded"
+        );
+    }
+
+    #[test]
+    fn go_recovery_command_switches_blocked_runs_to_staged_mode() {
+        assert_eq!(
+            go_recovery_command(&punk_domain::Decision::Accept, "ship feature"),
+            None
+        );
+        assert_eq!(
+            go_recovery_command(&punk_domain::Decision::Block, "ship \"feature\""),
+            Some("punk start \"ship \\\"feature\\\"\"".to_string())
+        );
+        assert_eq!(
+            go_recommended_mode(&punk_domain::Decision::Escalate),
+            "staged_review"
         );
     }
 
