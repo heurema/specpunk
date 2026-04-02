@@ -1279,6 +1279,14 @@ fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {
     {
         println!("{}", eval::format_skill_eval_summary_line(&skill_eval_summary));
     }
+    if let Ok(benchmark_summary) =
+        benchmark::summarize_benchmarks(Path::new("."), Some(recent_limit), project_filter, None)
+    {
+        println!(
+            "{}",
+            benchmark::format_benchmark_summary_line(&benchmark_summary)
+        );
+    }
 }
 
 fn cmd_config() {

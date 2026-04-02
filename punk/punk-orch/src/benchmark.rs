@@ -73,6 +73,17 @@ pub struct BenchmarkSummary {
     pub weakest: Vec<WeakBenchmarkResult>,
 }
 
+pub fn format_benchmark_summary_line(summary: &BenchmarkSummary) -> String {
+    format!(
+        "Benchmark summary: {} total ({} pass, {} fail, {} flaky), avg {:.2}",
+        summary.total,
+        summary.pass_count,
+        summary.fail_count,
+        summary.flaky_count,
+        summary.avg_score
+    )
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordBenchmarkRequest {
     pub suite: String,
