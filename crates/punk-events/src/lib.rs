@@ -34,21 +34,6 @@ impl EventStore {
     }
 
     pub fn load_all(&self) -> Result<Vec<EventEnvelope>> {
-        let (events, warnings) = self.load_all_with_warnings()?;
-        if !warnings.is_empty() {
-            eprintln!(
-                "punk: warning: skipped {} malformed event line(s) under {}",
-                warnings.len(),
-                self.events_dir().display()
-            );
-            for warning in warnings {
-                eprintln!("punk: warning: {warning}");
-            }
-        }
-        Ok(events)
-    }
-
-    pub fn load_all_with_warnings(&self) -> Result<(Vec<EventEnvelope>, Vec<String>)> {
         self.ensure_dirs()?;
         let mut entries: Vec<PathBuf> = fs::read_dir(self.events_dir())?
             .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -56,7 +41,6 @@ impl EventStore {
             .collect();
         entries.sort();
         let mut events = Vec::new();
-        let mut warnings = Vec::new();
         for path in entries {
             let file =
                 File::open(&path).with_context(|| format!("open event log {}", path.display()))?;
@@ -65,18 +49,12 @@ impl EventStore {
                 if line.trim().is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<EventEnvelope>(&line) {
-                    Ok(event) => events.push(event),
-                    Err(error) => warnings.push(format!(
-                        "parse {}:{}: {}",
-                        path.display(),
-                        line_no + 1,
-                        error
-                    )),
-                }
+                let event: EventEnvelope = serde_json::from_str(&line)
+                    .with_context(|| format!("parse {}:{}", path.display(), line_no + 1))?;
+                events.push(event);
             }
         }
-        Ok((events, warnings))
+        Ok(events)
     }
 
     pub fn file_sha256(&self, path: impl AsRef<Path>) -> Result<String> {
@@ -139,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn load_all_skips_malformed_lines() {
+    fn load_all_rejects_malformed_lines() {
         let root =
             std::env::temp_dir().join(format!("punk-events-skip-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -156,10 +134,8 @@ mod tests {
         )
         .unwrap();
 
-        let (loaded, warnings) = store.load_all_with_warnings().unwrap();
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("parse"));
+        let error = store.load_all().unwrap_err().to_string();
+        assert!(error.contains("parse"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -177,8 +153,7 @@ mod tests {
         )
         .unwrap();
 
-        let (loaded, warnings) = store.load_all_with_warnings().unwrap();
-        assert_eq!(warnings.len(), 0);
+        let loaded = store.load_all().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].actor, "unknown");
         let _ = fs::remove_dir_all(&root);
