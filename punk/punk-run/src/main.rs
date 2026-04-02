@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use punk_core::vcs::{VcsMode, detect_mode as detect_vcs_mode, enable_jj as enable_jj_for_repo};
+use punk_core::vcs::{detect_mode as detect_vcs_mode, enable_jj as enable_jj_for_repo, VcsMode};
 use punk_orch::{
     benchmark, bus, config, context, daemon, diverge, doctor, eval, goal, graph, morning, ops,
     panel, pipeline, ratchet, recall, research, resolver, sanitize, skill,
@@ -3221,6 +3221,8 @@ struct ProjectBootstrapSummary {
     bootstrap_file_created: bool,
     agent_start_file: PathBuf,
     agent_start_file_created: bool,
+    repo_agents_file: PathBuf,
+    repo_agents_file_created: bool,
     skill_name: String,
     skill_created: bool,
 }
@@ -3333,6 +3335,8 @@ fn bootstrap_current_project(
         ensure_project_bootstrap_file(&repo_root, &safe_project)?;
     let (agent_start_file, agent_start_file_created) =
         ensure_agent_start_file(&repo_root, &safe_project)?;
+    let (repo_agents_file, repo_agents_file_created) =
+        ensure_repo_agents_file(&repo_root, &safe_project)?;
     let skill_name = format!("{safe_project}-core");
     let skill_created =
         ensure_project_bootstrap_skill(bus_path, &safe_project, &skill_name, &bootstrap_file)?;
@@ -3344,6 +3348,8 @@ fn bootstrap_current_project(
         bootstrap_file_created,
         agent_start_file,
         agent_start_file_created,
+        repo_agents_file,
+        repo_agents_file_created,
         skill_name,
         skill_created,
     })
@@ -3395,6 +3401,17 @@ fn ensure_agent_start_file(repo_root: &Path, project: &str) -> Result<(PathBuf, 
     Ok((path, true))
 }
 
+fn ensure_repo_agents_file(repo_root: &Path, project: &str) -> Result<(PathBuf, bool), String> {
+    let path = repo_root.join("AGENTS.md");
+    if path.exists() {
+        return Ok((path, false));
+    }
+
+    std::fs::write(&path, default_repo_agents_template(project))
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok((path, true))
+}
+
 fn ensure_project_bootstrap_skill(
     bus_path: &Path,
     project: &str,
@@ -3441,6 +3458,12 @@ fn default_agent_start_template(project: &str) -> String {
     )
 }
 
+fn default_repo_agents_template(project: &str) -> String {
+    format!(
+        "# AGENTS.md\n\nIf this repository is initialized for punk, treat a plain user goal as input to punk automation.\n\n## Default autonomous path\n\n```bash\npunk go \"<goal>\"\n```\n\n## Project bootstrap\n\n```bash\npunk init --project {project} --enable-jj --verify\n```\n\n## If autonomy blocks or escalates\n\nRetry in staged mode:\n\n```bash\npunk start \"<goal>\"\n```\n\nMore local instructions live in `.punk/AGENT_START.md`.\n"
+    )
+}
+
 fn format_project_bootstrap_summary(summary: &ProjectBootstrapSummary) -> String {
     let bootstrap_status = if summary.bootstrap_file_created {
         "created"
@@ -3452,6 +3475,11 @@ fn format_project_bootstrap_summary(summary: &ProjectBootstrapSummary) -> String
     } else {
         "existing"
     };
+    let repo_agents_status = if summary.repo_agents_file_created {
+        "created"
+    } else {
+        "existing"
+    };
     let skill_status = if summary.skill_created {
         "created"
     } else {
@@ -3459,11 +3487,12 @@ fn format_project_bootstrap_summary(summary: &ProjectBootstrapSummary) -> String
     };
 
     format!(
-        "Project: {project}\nPinned:   {repo_root}\nBootstrap file ({bootstrap_status}): {bootstrap_file}\nAgent start ({agent_start_status}): {agent_start_file}\nSkill ({skill_status}): {skill_name}\n",
+        "Project: {project}\nPinned:   {repo_root}\nBootstrap file ({bootstrap_status}): {bootstrap_file}\nAgent start ({agent_start_status}): {agent_start_file}\nRepo AGENTS ({repo_agents_status}): {repo_agents_file}\nSkill ({skill_status}): {skill_name}\n",
         project = summary.project,
         repo_root = summary.repo_root.display(),
         bootstrap_file = summary.bootstrap_file.display(),
         agent_start_file = summary.agent_start_file.display(),
+        repo_agents_file = summary.repo_agents_file.display(),
         skill_name = summary.skill_name,
     )
 }
@@ -4799,6 +4828,29 @@ mod tests {
     }
 
     #[test]
+    fn ensure_repo_agents_file_is_idempotent() {
+        let tmp = temp_test_dir("punk-run-init-repo-agents");
+
+        let (path, created) = ensure_repo_agents_file(&tmp, "interviewcoach").unwrap();
+        assert!(created);
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("plain user goal as input to punk automation"));
+        assert!(content.contains("punk go \"<goal>\""));
+        assert!(content.contains("punk start \"<goal>\""));
+        assert!(content.contains(".punk/AGENT_START.md"));
+
+        fs::write(&path, "custom agents instructions\n").unwrap();
+        let (_, created_again) = ensure_repo_agents_file(&tmp, "interviewcoach").unwrap();
+        assert!(!created_again);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "custom agents instructions\n"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn format_project_bootstrap_summary_marks_created_vs_existing() {
         let summary = ProjectBootstrapSummary {
             project: "interviewcoach".to_string(),
@@ -4809,6 +4861,8 @@ mod tests {
             bootstrap_file_created: true,
             agent_start_file: PathBuf::from("/tmp/interviewcoach/.punk/AGENT_START.md"),
             agent_start_file_created: false,
+            repo_agents_file: PathBuf::from("/tmp/interviewcoach/AGENTS.md"),
+            repo_agents_file_created: true,
             skill_name: "interviewcoach-core".to_string(),
             skill_created: false,
         };
@@ -4817,6 +4871,7 @@ mod tests {
         assert!(rendered.contains("Project: interviewcoach"));
         assert!(rendered.contains("Bootstrap file (created):"));
         assert!(rendered.contains("Agent start (existing):"));
+        assert!(rendered.contains("Repo AGENTS (created):"));
         assert!(rendered.contains("Skill (existing): interviewcoach-core"));
     }
 
@@ -5004,12 +5059,10 @@ mod tests {
         let policy = fs::read_to_string(tmp.join("policy.toml")).unwrap();
         assert!(policy.contains("soft_alert_pct = 80"));
         assert!(policy.contains("hard_stop_pct = 90"));
-        assert!(
-            summary
-                .notices
-                .iter()
-                .any(|n| n.contains("Skipped agents.toml"))
-        );
+        assert!(summary
+            .notices
+            .iter()
+            .any(|n| n.contains("Skipped agents.toml")));
         let _ = fs::remove_dir_all(&tmp);
     }
 
