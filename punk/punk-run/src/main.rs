@@ -2295,28 +2295,77 @@ fn format_deterministic_ask_fallback(
 fn cmd_pipeline_list() {
     let bus_path = bus::bus_dir();
     let opps = pipeline::load_pipeline(&bus_path);
+    let today = punk_orch::chrono::Utc::now().format("%Y-%m-%d").to_string();
+    print!("{}", format_pipeline_report(&opps, &today));
+}
 
+fn format_pipeline_report(opps: &[pipeline::Opportunity], today: &str) -> String {
     if opps.is_empty() {
-        println!("Pipeline empty.");
+        return "Pipeline empty.\n".to_string();
+    }
+
+    let summary = pipeline::summarize(opps, today);
+    let ordered = pipeline::ordered_for_review(opps, today);
+    let active: Vec<_> = ordered
+        .iter()
+        .filter(|opp| !pipeline::is_terminal_stage(&opp.stage))
+        .collect();
+    let closed: Vec<_> = ordered
+        .iter()
+        .filter(|opp| pipeline::is_terminal_stage(&opp.stage))
+        .collect();
+
+    let mut out = format!("Pipeline ({} opportunities)\n", summary.total);
+    out.push_str(&format!(
+        "Summary: active={} stale={} won={} lost={}\n",
+        summary.active, summary.stale, summary.won, summary.lost
+    ));
+
+    append_pipeline_group(&mut out, "Active", &active, today);
+    append_pipeline_group(&mut out, "Closed", &closed, today);
+
+    out.push_str("\nActions:\n");
+    out.push_str("  punk-run pipeline add <project> <contact> <next-step> <due>\n");
+    out.push_str("  punk-run pipeline advance <id>\n");
+    out.push_str("  punk-run pipeline win <id> | lose <id>\n");
+    if summary.stale > 0 {
+        out.push_str("  Hint: punk-run pipeline stale\n");
+    }
+    out
+}
+
+fn append_pipeline_group(
+    out: &mut String,
+    title: &str,
+    entries: &[&pipeline::Opportunity],
+    today: &str,
+) {
+    if entries.is_empty() {
         return;
     }
 
-    println!("Pipeline ({} opportunities)\n", opps.len());
-    println!(
-        "  {:<4} {:<12} {:<15} {:<14} {:<20} {:>8}",
-        "ID", "PROJECT", "CONTACT", "STAGE", "NEXT STEP", "VALUE"
-    );
-    for o in &opps {
-        let val = o.value_usd.map(|v| format!("${v}")).unwrap_or_default();
-        println!(
-            "  {:<4} {:<12} {:<15} {:<14} {:<20} {:>8}",
-            o.id,
-            truncate(&o.project, 12),
-            truncate(&o.contact, 15),
-            format!("{:?}", o.stage).to_lowercase(),
-            truncate(&o.next_step, 20),
+    out.push_str(&format!("\n{} ({})\n", title, entries.len()));
+    out.push_str(&format!(
+        "  {:<4} {:<12} {:<15} {:<14} {:<20} {:<12} {:>8}\n",
+        "ID", "PROJECT", "CONTACT", "STAGE", "NEXT STEP", "DUE", "VALUE"
+    ));
+    for opp in entries {
+        let val = opp.value_usd.map(|v| format!("${v}")).unwrap_or_default();
+        let due = if pipeline::is_stale(opp, today) {
+            format!("{} !", opp.due)
+        } else {
+            opp.due.clone()
+        };
+        out.push_str(&format!(
+            "  {:<4} {:<12} {:<15} {:<14} {:<20} {:<12} {:>8}\n",
+            opp.id,
+            truncate(&opp.project, 12),
+            truncate(&opp.contact, 15),
+            format!("{:?}", opp.stage).to_lowercase(),
+            truncate(&opp.next_step, 20),
+            truncate(&due, 12),
             val
-        );
+        ));
     }
 }
 
@@ -3915,6 +3964,62 @@ mod tests {
         assert!(rendered.contains("claude: exit 1"));
         assert!(rendered.contains("codex: timeout"));
         assert!(rendered.contains("Provenance:"));
+    }
+
+    fn sample_pipeline_opps() -> Vec<pipeline::Opportunity> {
+        vec![
+            pipeline::Opportunity {
+                id: 1,
+                project: "alpha".to_string(),
+                contact: "Alice".to_string(),
+                stage: pipeline::Stage::Lead,
+                next_step: "Send intro".to_string(),
+                due: "2026-04-01".to_string(),
+                value_usd: Some(5000),
+                updated_at: punk_orch::chrono::Utc::now(),
+            },
+            pipeline::Opportunity {
+                id: 2,
+                project: "beta".to_string(),
+                contact: "Bob".to_string(),
+                stage: pipeline::Stage::Negotiation,
+                next_step: "Review terms".to_string(),
+                due: "2026-04-03".to_string(),
+                value_usd: Some(9000),
+                updated_at: punk_orch::chrono::Utc::now(),
+            },
+            pipeline::Opportunity {
+                id: 3,
+                project: "gamma".to_string(),
+                contact: "Carol".to_string(),
+                stage: pipeline::Stage::Won,
+                next_step: "Archive".to_string(),
+                due: "2026-04-04".to_string(),
+                value_usd: Some(12000),
+                updated_at: punk_orch::chrono::Utc::now(),
+            },
+        ]
+    }
+
+    #[test]
+    fn format_pipeline_report_groups_active_and_closed_and_flags_stale() {
+        let rendered = format_pipeline_report(&sample_pipeline_opps(), "2026-04-02");
+        assert!(rendered.contains("Pipeline (3 opportunities)"));
+        assert!(rendered.contains("Summary: active=2 stale=1 won=1 lost=0"));
+        let active_idx = rendered.find("Active (2)").unwrap();
+        let closed_idx = rendered.find("Closed (1)").unwrap();
+        assert!(active_idx < closed_idx);
+        assert!(rendered.contains("2026-04-01 !"));
+        assert!(rendered.contains("Hint: punk-run pipeline stale"));
+        assert!(rendered.contains("punk-run pipeline advance <id>"));
+    }
+
+    #[test]
+    fn format_pipeline_report_handles_empty_pipeline() {
+        assert_eq!(
+            format_pipeline_report(&[], "2026-04-02"),
+            "Pipeline empty.\n"
+        );
     }
 
     #[test]
