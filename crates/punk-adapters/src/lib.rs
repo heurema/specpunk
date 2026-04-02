@@ -703,7 +703,12 @@ impl CodexCliExecutor {
         input: &ExecuteInput,
         context_pack: &ContextPack,
     ) -> Result<PlanPrepassResponse> {
-        let prompt = build_patch_plan_prompt(&input.contract, context_pack);
+        let mut prepass_context = context_pack.clone();
+        prepass_context.plan_seed = Some(derive_controller_plan_skeleton(
+            &input.contract,
+            context_pack,
+        ));
+        let prompt = build_patch_plan_prompt(&input.contract, &prepass_context);
         let mut command = Command::new("codex");
         command
             .arg("exec")
@@ -996,6 +1001,12 @@ Allowed scope: {}\n\
 Entry points: {}\n\
 Expected interfaces: {}\n\
 {}\n\
+Fail-closed rules:\n\
+- rely only on the bounded context and controller-supplied plan skeleton shown below\n\
+- do not inspect, search, or mention any file outside allowed scope\n\
+- do not run broad repo-wide search commands\n\
+- do not run shell commands for orientation during this prepass\n\
+- if the bounded context plus controller skeleton is insufficient, emit `{blocked}` immediately\n\
 Plan format requirements:\n\
 - first line inside the envelope must be `SUMMARY: <one-line summary>`\n\
 - each target must use exactly these three lines:\n\
@@ -1363,6 +1374,78 @@ fn needs_patch_plan_prepass(contract: &Contract, context_pack: &ContextPack) -> 
             .filter(|needle| text.contains(**needle))
             .count()
             >= 3
+}
+
+fn derive_controller_plan_skeleton(contract: &Contract, context_pack: &ContextPack) -> ContextPlanSeed {
+    let summary = contract
+        .behavior_requirements
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "tighten patch generation around exact allowed-scope targets".to_string());
+    let targets = context_pack
+        .files
+        .iter()
+        .take(3)
+        .map(|file| ContextPlanTarget {
+            path: file.path.clone(),
+            symbol: infer_plan_symbol(&file.content),
+            insertion_point: format!("within visible excerpt lines {}-{}", file.start_line, file.end_line),
+            execution_sketch: infer_plan_sketch(contract, &file.path),
+        })
+        .collect::<Vec<_>>();
+    ContextPlanSeed {
+        title: "Controller-supplied target hints".to_string(),
+        summary,
+        targets,
+    }
+}
+
+fn infer_plan_symbol(content: &str) -> String {
+    content
+        .lines()
+        .map(str::trim)
+        .find_map(|line| {
+            [
+                "pub fn ",
+                "fn ",
+                "pub struct ",
+                "struct ",
+                "pub enum ",
+                "enum ",
+                "impl ",
+            ]
+            .iter()
+            .find(|prefix| line.starts_with(**prefix))
+            .map(|_| {
+                line.split('{')
+                    .next()
+                    .unwrap_or(line)
+                    .split("where")
+                    .next()
+                    .unwrap_or(line)
+                    .trim()
+                    .to_string()
+            })
+        })
+        .unwrap_or_else(|| "visible production section".to_string())
+}
+
+fn infer_plan_sketch(contract: &Contract, path: &str) -> String {
+    contract
+        .behavior_requirements
+        .iter()
+        .find(|requirement| {
+            let lower = requirement.to_ascii_lowercase();
+            path.contains("main.rs") && (lower.contains("print") || lower.contains("output"))
+                || path.contains("lib.rs")
+                    && (lower.contains("summary")
+                        || lower.contains("window")
+                        || lower.contains("data")
+                        || lower.contains("snapshot"))
+        })
+        .cloned()
+        .or_else(|| contract.behavior_requirements.first().cloned())
+        .unwrap_or_else(|| "implement the approved bounded change in this file".to_string())
 }
 
 fn manual_mode_block_summary(contract: &Contract) -> Option<String> {

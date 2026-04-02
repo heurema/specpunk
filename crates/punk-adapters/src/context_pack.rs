@@ -464,6 +464,19 @@ pub(crate) fn format_plan_context_pack(pack: &ContextPack) -> String {
         ));
     }
 
+    if let Some(seed) = &pack.plan_seed {
+        sections.push("Controller-supplied plan skeleton:".to_string());
+        sections.push(format!("- title: {}", seed.title));
+        sections.push(format!("- summary: {}", seed.summary));
+        for target in &seed.targets {
+            sections.push(format!(
+                "- target: {} | symbol: {} | insert: {}",
+                target.path, target.symbol, target.insertion_point
+            ));
+            sections.push(format!("  sketch: {}", target.execution_sketch));
+        }
+    }
+
     if let Some(seed) = &pack.patch_seed {
         sections.push("Existing patch seed hints:".to_string());
         sections.push(format!("- title: {}", seed.title));
