@@ -11,8 +11,8 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use punk_adapters::{ContractDrafter, ExecuteInput, Executor};
 use punk_core::{
-    build_bounded_fallback_proposal, canonicalize_draft_proposal, scan_repo,
-    validate_draft_proposal,
+    apply_explicit_prompt_overrides, build_bounded_fallback_proposal, canonicalize_draft_proposal,
+    scan_repo, validate_draft_proposal,
 };
 pub use punk_core::{find_object_path, read_json, relative_ref, write_json};
 use punk_domain::{
@@ -226,7 +226,8 @@ impl OrchService {
         contract_id: &str,
         guidance: &str,
     ) -> Result<Contract> {
-        if guidance.trim().is_empty() {
+        let guidance = guidance.trim();
+        if guidance.is_empty() {
             return Err(anyhow!("guidance must not be empty"));
         }
         let project = self.bootstrap_project()?;
@@ -250,7 +251,7 @@ impl OrchService {
         let mut proposal = drafter.refine(RefineInput {
             repo_root: self.paths.repo_root.display().to_string(),
             prompt: current_contract.prompt_source.clone(),
-            guidance: guidance.trim().to_string(),
+            guidance: guidance.to_string(),
             current,
             scan: scan.clone(),
         })?;
@@ -259,6 +260,7 @@ impl OrchService {
             &current_contract.prompt_source,
             &mut proposal,
         );
+        apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
         let mut errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
         if errors.is_empty() {
             if let Some(fallback) = build_bounded_fallback_proposal(
@@ -269,6 +271,7 @@ impl OrchService {
                 &errors,
             ) {
                 proposal = fallback;
+                apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
         }
@@ -281,6 +284,7 @@ impl OrchService {
                 &errors,
             ) {
                 proposal = fallback;
+                apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
         }
@@ -1683,6 +1687,74 @@ mod tests {
             .unwrap();
         assert_eq!(refined.id, contract.id);
         assert_eq!(refined.version, contract.version);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refine_contract_applies_explicit_guidance_scope_exactly() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-refine-explicit-scope-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("Packages/InterviewCoachKit/Sources/InterviewCoachDevUI"))
+            .unwrap();
+        fs::create_dir_all(root.join("Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests"))
+            .unwrap();
+        fs::write(root.join("Makefile"), "test:\n\t@echo ok\n").unwrap();
+        fs::write(
+            root.join(
+                "Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/DevAppViewModel.swift",
+            ),
+            "struct DevAppViewModel {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(
+                "Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/MainWindowView.swift",
+            ),
+            "struct MainWindowView {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests/DevAppViewModelTests.swift"),
+            "func testExample() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &FakeDrafter,
+                "Add the next bounded dev-only slice for interviewcoach.",
+            )
+            .unwrap();
+        let guidance = "Expand allowed_scope exactly to the files needed for the copy/export trace slice: `Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/DevAppViewModel.swift`; `Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/MainWindowView.swift`; `Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests/DevAppViewModelTests.swift`. Target checks should include make test. Integrity checks should include make test.";
+        let refined = service
+            .refine_contract(&FakeDrafter, &contract.id, guidance)
+            .unwrap();
+
+        assert_eq!(
+            refined.allowed_scope,
+            vec![
+                "Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/DevAppViewModel.swift"
+                    .to_string(),
+                "Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/MainWindowView.swift"
+                    .to_string(),
+                "Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests/DevAppViewModelTests.swift"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(refined.entry_points, refined.allowed_scope);
+        assert_eq!(refined.target_checks, vec!["make test".to_string()]);
+        assert_eq!(refined.integrity_checks, vec!["make test".to_string()]);
+
         let _ = fs::remove_dir_all(&root);
     }
 
