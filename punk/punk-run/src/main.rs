@@ -73,8 +73,8 @@ enum Command {
         /// Task prompt
         prompt: String,
         /// Agent/model (claude, codex, gemini)
-        #[arg(long, default_value = "claude")]
-        agent: String,
+        #[arg(long)]
+        agent: Option<String>,
         /// Task category
         #[arg(long, default_value = "codegen")]
         category: String,
@@ -690,7 +690,7 @@ async fn main() -> anyhow::Result<()> {
             cmd_queue(
                 &project,
                 &prompt,
-                &agent,
+                agent.as_deref(),
                 &category,
                 &priority,
                 timeout,
@@ -1883,7 +1883,7 @@ fn cmd_policy_check(project: &str, category: &str, priority: &str) {
 fn cmd_queue(
     project: &str,
     prompt: &str,
-    agent: &str,
+    agent: Option<&str>,
     category: &str,
     priority: &str,
     timeout: u64,
@@ -1893,6 +1893,13 @@ fn cmd_queue(
 ) {
     let bus_path = bus::bus_dir();
     let cfg = load_config_or_exit(&config::config_dir());
+    let agent = match resolve_queue_agent(&cfg, agent) {
+        Ok(agent) => agent,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    };
 
     // Resolve project path via resolution chain
     let resolved = match resolver::resolve(project, None, Some(&cfg)) {
@@ -1952,6 +1959,42 @@ fn cmd_queue(
             std::process::exit(1);
         }
     }
+}
+
+fn resolve_queue_agent(cfg: &config::Config, explicit_agent: Option<&str>) -> Result<String, String> {
+    if let Some(agent) = explicit_agent {
+        return Ok(agent.to_string());
+    }
+
+    preferred_queue_agent(cfg).ok_or_else(|| {
+        "No supported agents detected.\n\nHint: install claude, codex, or gemini, or pass --agent <provider-or-alias> explicitly.".to_string()
+    })
+}
+
+fn preferred_queue_agent(cfg: &config::Config) -> Option<String> {
+    let agents = &cfg.agents.agents;
+
+    for preferred in ["claude", "codex", "gemini"] {
+        if agents.contains_key(preferred) {
+            return Some(preferred.to_string());
+        }
+    }
+
+    for preferred_provider in ["claude", "codex", "gemini"] {
+        let mut matching: Vec<_> = agents
+            .iter()
+            .filter(|(_, agent)| agent.provider == preferred_provider)
+            .map(|(id, _)| id.clone())
+            .collect();
+        matching.sort();
+        if let Some(id) = matching.into_iter().next() {
+            return Some(id);
+        }
+    }
+
+    let mut fallback_ids: Vec<_> = agents.keys().cloned().collect();
+    fallback_ids.sort();
+    fallback_ids.into_iter().next()
 }
 
 fn cmd_receipts(project_filter: Option<&str>, since_days: i64) {
@@ -3456,7 +3499,10 @@ mod tests {
     use super::*;
 
     use punk_core::vcs::VcsMode;
-    use punk_orch::config::{Agent, AgentsFile, ConfigStatus};
+    use punk_orch::config::{
+        Agent, AgentsFile, BudgetPolicy, Config as OrchConfig, ConfigStatus, PolicyDefaults,
+        PolicyFile, Project, ProjectsFile,
+    };
     use punk_orch::resolver::{ResolveSource, ResolvedProject};
     use std::collections::HashMap;
     use std::fs;
@@ -3477,6 +3523,34 @@ mod tests {
             },
         );
         AgentsFile { agents }
+    }
+
+    fn config_with_agents(agents: AgentsFile) -> OrchConfig {
+        OrchConfig {
+            projects: ProjectsFile {
+                projects: vec![Project {
+                    id: "demo".to_string(),
+                    path: "/tmp/demo".to_string(),
+                    stack: String::new(),
+                    active: true,
+                    budget_usd: 0.0,
+                    checkpoint: String::new(),
+                }],
+            },
+            agents,
+            policy: PolicyFile {
+                defaults: PolicyDefaults {
+                    model: "sonnet".to_string(),
+                    budget_usd: 1.0,
+                    timeout_s: 600,
+                    max_slots: 1,
+                },
+                budget: BudgetPolicy::default(),
+                rules: vec![],
+                features: HashMap::new(),
+            },
+            dir: PathBuf::from("/tmp/config"),
+        }
     }
 
     fn empty_status(dir: &Path) -> ConfigStatus {
@@ -3593,6 +3667,57 @@ mod tests {
         assert!(rendered.contains("project 'demo' is ambiguous"));
         assert!(rendered.contains("punk-run resolve demo --path /absolute/path/to/project"));
         assert!(rendered.contains("punk-run use demo /path/to/project"));
+    }
+
+    #[test]
+    fn resolve_queue_agent_prefers_detected_provider_order() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "gemini".to_string(),
+            Agent {
+                provider: "gemini".to_string(),
+                model: "gemini-2.5-flash".to_string(),
+                role: "engineer".to_string(),
+                invoke: "cli".to_string(),
+                budget_usd: 1.0,
+                system_prompt: None,
+                skills: vec![],
+            },
+        );
+        agents.insert(
+            "codex".to_string(),
+            Agent {
+                provider: "codex".to_string(),
+                model: "o4-mini".to_string(),
+                role: "engineer".to_string(),
+                invoke: "cli".to_string(),
+                budget_usd: 1.0,
+                system_prompt: None,
+                skills: vec![],
+            },
+        );
+        let cfg = config_with_agents(AgentsFile { agents });
+
+        assert_eq!(resolve_queue_agent(&cfg, None).unwrap(), "codex");
+    }
+
+    #[test]
+    fn resolve_queue_agent_preserves_explicit_override() {
+        let cfg = config_with_agents(sample_agents());
+        assert_eq!(
+            resolve_queue_agent(&cfg, Some("gemini-custom")).unwrap(),
+            "gemini-custom"
+        );
+    }
+
+    #[test]
+    fn resolve_queue_agent_fails_when_no_agents_and_no_override() {
+        let cfg = config_with_agents(AgentsFile {
+            agents: HashMap::new(),
+        });
+        let err = resolve_queue_agent(&cfg, None).unwrap_err();
+        assert!(err.contains("No supported agents detected"));
+        assert!(err.contains("--agent"));
     }
 
     #[test]
