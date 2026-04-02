@@ -26,6 +26,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Init(InitCommand),
+    Go(GoCommand),
     Start(StartCommand),
     Plot(PlotCommand),
     Cut(CutCommand),
@@ -33,6 +35,25 @@ enum Command {
     Status(StatusCommand),
     Inspect(InspectCommand),
     Vcs(VcsCommand),
+}
+
+#[derive(Args)]
+struct InitCommand {
+    #[arg(long)]
+    project: Option<String>,
+    #[arg(long)]
+    enable_jj: bool,
+    #[arg(long)]
+    verify: bool,
+}
+
+#[derive(Args)]
+struct GoCommand {
+    goal: String,
+    #[arg(long)]
+    fallback_staged: bool,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -146,6 +167,19 @@ fn run() -> Result<()> {
     }
 
     match cli.command {
+        Command::Init(init) => cmd_init(
+            &repo_root,
+            init.project.as_deref(),
+            init.enable_jj,
+            init.verify,
+        ),
+        Command::Go(go) => cmd_go(
+            &repo_root,
+            &global_root,
+            &go.goal,
+            go.fallback_staged,
+            go.json,
+        ),
         Command::Start(start) => cmd_start(&repo_root, &global_root, &start.goal, start.json),
         Command::Plot(plot) => match plot.action {
             PlotAction::Contract { prompt, json } => {
@@ -319,6 +353,7 @@ fn bootstrap_json_mode(command: &Command) -> Option<bool> {
         Command::Plot(PlotCommand {
             action: PlotAction::Contract { json, .. },
         }) => Some(*json),
+        Command::Go(GoCommand { json, .. }) => Some(*json),
         Command::Start(StartCommand { json, .. }) => Some(*json),
         _ => None,
     }
@@ -429,6 +464,35 @@ fn format_bootstrap_skip_note(project_id: &str, reason: &str) -> String {
     )
 }
 
+fn cmd_init(
+    repo_root: &Path,
+    explicit_project: Option<&str>,
+    enable_jj: bool,
+    verify: bool,
+) -> Result<()> {
+    let project_root = resolve_project_root(repo_root);
+    let project_id = resolve_init_project_id(&project_root, explicit_project)?;
+    let output = run_explicit_project_init(&project_root, &project_id, enable_jj, verify)?;
+
+    if !output.stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let reason = output
+        .status
+        .code()
+        .map(|code| format!("punk-run init exited with code {code}"))
+        .unwrap_or_else(|| "punk-run init terminated by signal".to_string());
+    Err(anyhow!(format_init_error(&project_id, &reason)))
+}
+
 fn cmd_start(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Result<()> {
     let trimmed_goal = goal.trim();
     if trimmed_goal.is_empty() {
@@ -463,6 +527,105 @@ fn cmd_start(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Re
     Ok(())
 }
 
+fn cmd_go(
+    repo_root: &Path,
+    global_root: &Path,
+    goal: &str,
+    fallback_staged: bool,
+    json: bool,
+) -> Result<()> {
+    let trimmed_goal = goal.trim();
+    if trimmed_goal.is_empty() {
+        return Err(anyhow!("goal must not be empty"));
+    }
+
+    let orch = OrchService::new(repo_root, global_root)?;
+    let drafter = CodexCliContractDrafter::default();
+    let contract = orch.draft_contract(&drafter, trimmed_goal)?;
+    let approved = orch.approve_contract(&contract.id)?;
+    let executor = CodexCliExecutor::default();
+    let (run, receipt) = orch.cut_run(&executor, &approved.id)?;
+    let gate = GateService::new(repo_root, global_root);
+    let decision = gate.gate_run(&run.id)?;
+    let proof_service = ProofService::new(repo_root, global_root);
+    let proof = proof_service.write_proofpack(&decision.id)?;
+    let status = orch.status(Some(&run.id))?;
+    let project_root = resolve_project_root(repo_root);
+    let project = infer_project_id(&project_root).unwrap_or_else(|| status.project_id.clone());
+    let next_command = format!("punk inspect {} --json", proof.id);
+    let outcome = go_outcome_label(&decision.decision);
+    let success = go_decision_succeeds(&decision.decision);
+    let basis_summary = summarize_decision_basis(&decision.decision_basis);
+    let recovery_command = go_recovery_command(&decision.decision, trimmed_goal);
+    let recommended_mode = go_recommended_mode(&decision.decision);
+    let staged_recovery = if fallback_staged && !success {
+        Some(orch.draft_contract(&drafter, trimmed_goal)?)
+    } else {
+        None
+    };
+    let recovery_next_command = staged_recovery
+        .as_ref()
+        .map(|contract| format!("punk plot approve {}", contract.id));
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "goal": trimmed_goal,
+                "project": project,
+                "project_id": status.project_id,
+                "contract": approved,
+                "run": run,
+                "receipt": receipt,
+                "decision": decision,
+                "proof": proof,
+                "outcome": outcome,
+                "success": success,
+                "decision_basis_summary": basis_summary,
+                "recommended_mode": recommended_mode,
+                "fallback_staged_enabled": fallback_staged,
+                "next_command": next_command,
+                "recovery_command": recovery_command,
+                "recovery_contract": staged_recovery,
+                "recovery_next_command": recovery_next_command,
+                "follow_up": next_command,
+            }))?
+        );
+    } else {
+        println!(
+            "{}",
+            format_go_summary(
+                &project,
+                trimmed_goal,
+                &approved.id,
+                &run.id,
+                &receipt.status,
+                &receipt.summary,
+                outcome,
+                decision_label(&decision.decision),
+                &basis_summary,
+                &proof.id,
+                &next_command,
+                recovery_command.as_deref(),
+                staged_recovery
+                    .as_ref()
+                    .map(|contract| contract.id.as_str()),
+                recovery_next_command.as_deref(),
+            )
+        );
+    }
+    if success {
+        Ok(())
+    } else {
+        Err(anyhow!(format_go_error(
+            &decision.decision,
+            &proof.id,
+            &next_command,
+            recovery_command.as_deref(),
+        )))
+    }
+}
+
 fn format_start_summary(
     project: &str,
     goal: &str,
@@ -474,8 +637,162 @@ fn format_start_summary(
     )
 }
 
+fn format_go_summary(
+    project: &str,
+    goal: &str,
+    contract_id: &str,
+    run_id: &str,
+    receipt_status: &str,
+    receipt_summary: &str,
+    outcome: &str,
+    decision: &str,
+    basis_summary: &str,
+    proof_id: &str,
+    next_command: &str,
+    recovery_command: Option<&str>,
+    recovery_contract_id: Option<&str>,
+    recovery_next_command: Option<&str>,
+) -> String {
+    let mut rendered = format!(
+        "Goal: {goal}\nProject: {project}\nApproved contract: {contract_id}\nRun: {run_id} ({receipt_status})\nSummary: {receipt_summary}\nOutcome: {outcome}\nGate: {decision}\nBasis: {basis_summary}\nProof: {proof_id}\nNext: {next_command}"
+    );
+    if let Some(recovery_command) = recovery_command {
+        rendered.push_str(&format!("\nRecovery: {recovery_command}"));
+    }
+    if let Some(recovery_contract_id) = recovery_contract_id {
+        rendered.push_str(&format!("\nRecovery contract: {recovery_contract_id}"));
+    }
+    if let Some(recovery_next_command) = recovery_next_command {
+        rendered.push_str(&format!("\nRecovery next: {recovery_next_command}"));
+    }
+    rendered
+}
+
+fn decision_label(decision: &punk_domain::Decision) -> &'static str {
+    match decision {
+        punk_domain::Decision::Accept => "accept",
+        punk_domain::Decision::Block => "block",
+        punk_domain::Decision::Escalate => "escalate",
+    }
+}
+
+fn go_decision_succeeds(decision: &punk_domain::Decision) -> bool {
+    matches!(decision, punk_domain::Decision::Accept)
+}
+
+fn go_outcome_label(decision: &punk_domain::Decision) -> &'static str {
+    match decision {
+        punk_domain::Decision::Accept => "success",
+        punk_domain::Decision::Block => "blocked",
+        punk_domain::Decision::Escalate => "escalated",
+    }
+}
+
+fn summarize_decision_basis(basis: &[String]) -> String {
+    let trimmed: Vec<_> = basis
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .take(2)
+        .collect();
+    if trimmed.is_empty() {
+        "no explicit decision basis recorded".to_string()
+    } else {
+        trimmed.join("; ")
+    }
+}
+
+fn go_recommended_mode(decision: &punk_domain::Decision) -> &'static str {
+    match decision {
+        punk_domain::Decision::Accept => "autonomous",
+        punk_domain::Decision::Block | punk_domain::Decision::Escalate => "staged_review",
+    }
+}
+
+fn go_recovery_command(decision: &punk_domain::Decision, goal: &str) -> Option<String> {
+    match decision {
+        punk_domain::Decision::Accept => None,
+        punk_domain::Decision::Block | punk_domain::Decision::Escalate => {
+            Some(format!("punk start {}", shell_quote_goal(goal)))
+        }
+    }
+}
+
+fn shell_quote_goal(goal: &str) -> String {
+    format!("\"{}\"", goal.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn format_go_error(
+    decision: &punk_domain::Decision,
+    proof_id: &str,
+    next_command: &str,
+    recovery_command: Option<&str>,
+) -> String {
+    let mut rendered = format!(
+        "punk go ended with gate decision {} (proof: {}). Inspect details with `{}`.",
+        decision_label(decision),
+        proof_id,
+        next_command
+    );
+    if let Some(recovery_command) = recovery_command {
+        rendered.push_str(&format!(" Retry in staged mode with `{recovery_command}`."));
+    }
+    rendered
+}
+
+fn resolve_init_project_id(project_root: &Path, explicit_project: Option<&str>) -> Result<String> {
+    if let Some(project) = explicit_project
+        .map(str::trim)
+        .filter(|project| !project.is_empty())
+    {
+        return Ok(project.to_string());
+    }
+    infer_project_id(project_root).ok_or_else(|| {
+        anyhow!("unable to infer project id from repo root; rerun with `punk init --project <id>`")
+    })
+}
+
+fn run_explicit_project_init(
+    project_root: &Path,
+    project_id: &str,
+    enable_jj: bool,
+    verify: bool,
+) -> Result<std::process::Output> {
+    match detect_punk_run_bootstrap_support(project_root) {
+        BootstrapSupport::Supported => {
+            let mut command = ProcessCommand::new("punk-run");
+            command
+                .current_dir(project_root)
+                .arg("init")
+                .arg("--project")
+                .arg(project_id);
+            if enable_jj {
+                command.arg("--enable-jj");
+            }
+            if verify {
+                command.arg("--verify");
+            }
+            command.output().map_err(|err| {
+                anyhow!(format_init_error(
+                    project_id,
+                    &format!("failed to execute punk-run: {err}")
+                ))
+            })
+        }
+        BootstrapSupport::Unavailable(reason) | BootstrapSupport::Incompatible(reason) => {
+            Err(anyhow!(format_init_error(project_id, &reason)))
+        }
+    }
+}
+
+fn format_init_error(project_id: &str, reason: &str) -> String {
+    format!(
+        "project init failed for `{project_id}`: {reason}. Ensure a compatible `punk-run init --project ...` is available and retry."
+    )
+}
+
 fn maybe_warn_jj_degraded_mode(repo_root: &PathBuf, command: &Command) {
-    if matches!(command, Command::Vcs(_)) {
+    if matches!(command, Command::Vcs(_) | Command::Init(_)) {
         return;
     }
     if should_warn_about_disabled_jj(detect_vcs_mode(repo_root)) {
@@ -745,6 +1062,11 @@ mod tests {
 
     #[test]
     fn bootstrap_json_mode_supports_start_and_plot_contract() {
+        let go = Command::Go(GoCommand {
+            goal: "ship interview summary".into(),
+            fallback_staged: false,
+            json: true,
+        });
         let start = Command::Start(StartCommand {
             goal: "ship interview summary".into(),
             json: true,
@@ -760,6 +1082,7 @@ mod tests {
             json: false,
         });
 
+        assert_eq!(bootstrap_json_mode(&go), Some(true));
         assert_eq!(bootstrap_json_mode(&start), Some(true));
         assert_eq!(bootstrap_json_mode(&plot), Some(false));
         assert_eq!(bootstrap_json_mode(&status), None);
@@ -777,5 +1100,145 @@ mod tests {
         assert!(rendered.contains("Project: interviewcoach"));
         assert!(rendered.contains("Drafted contract: ct_123"));
         assert!(rendered.contains("Next: punk plot approve ct_123"));
+    }
+
+    #[test]
+    fn go_summary_mentions_run_and_follow_up() {
+        let rendered = format_go_summary(
+            "interviewcoach",
+            "add interview feedback summary endpoint",
+            "ct_123",
+            "run_456",
+            "success",
+            "implemented bounded change",
+            "success",
+            "accept",
+            "target checks passed; integrity checks passed",
+            "proof_789",
+            "punk inspect proof_789 --json",
+            None,
+            None,
+            None,
+        );
+        assert!(rendered.contains("Goal: add interview feedback summary endpoint"));
+        assert!(rendered.contains("Project: interviewcoach"));
+        assert!(rendered.contains("Approved contract: ct_123"));
+        assert!(rendered.contains("Run: run_456 (success)"));
+        assert!(rendered.contains("Summary: implemented bounded change"));
+        assert!(rendered.contains("Outcome: success"));
+        assert!(rendered.contains("Gate: accept"));
+        assert!(rendered.contains("Basis: target checks passed; integrity checks passed"));
+        assert!(rendered.contains("Proof: proof_789"));
+        assert!(rendered.contains("Next: punk inspect proof_789 --json"));
+    }
+
+    #[test]
+    fn go_error_mentions_blocking_decision_and_proof() {
+        let rendered = format_go_error(
+            &punk_domain::Decision::Block,
+            "proof_789",
+            "punk inspect proof_789 --json",
+            Some("punk start \"retry goal\""),
+        );
+        assert!(rendered.contains("gate decision block"));
+        assert!(rendered.contains("proof: proof_789"));
+        assert!(rendered.contains("punk inspect proof_789 --json"));
+        assert!(rendered.contains("punk start \"retry goal\""));
+    }
+
+    #[test]
+    fn go_decision_only_accepts_accept() {
+        assert!(go_decision_succeeds(&punk_domain::Decision::Accept));
+        assert!(!go_decision_succeeds(&punk_domain::Decision::Block));
+        assert!(!go_decision_succeeds(&punk_domain::Decision::Escalate));
+    }
+
+    #[test]
+    fn go_outcome_labels_follow_decision() {
+        assert_eq!(go_outcome_label(&punk_domain::Decision::Accept), "success");
+        assert_eq!(go_outcome_label(&punk_domain::Decision::Block), "blocked");
+        assert_eq!(
+            go_outcome_label(&punk_domain::Decision::Escalate),
+            "escalated"
+        );
+    }
+
+    #[test]
+    fn summarize_decision_basis_is_concise_and_stable() {
+        assert_eq!(
+            summarize_decision_basis(&[
+                " first reason ".into(),
+                "second reason".into(),
+                "third reason".into(),
+            ]),
+            "first reason; second reason"
+        );
+        assert_eq!(
+            summarize_decision_basis(&[]),
+            "no explicit decision basis recorded"
+        );
+    }
+
+    #[test]
+    fn go_recovery_command_switches_blocked_runs_to_staged_mode() {
+        assert_eq!(
+            go_recovery_command(&punk_domain::Decision::Accept, "ship feature"),
+            None
+        );
+        assert_eq!(
+            go_recovery_command(&punk_domain::Decision::Block, "ship \"feature\""),
+            Some("punk start \"ship \\\"feature\\\"\"".to_string())
+        );
+        assert_eq!(
+            go_recommended_mode(&punk_domain::Decision::Escalate),
+            "staged_review"
+        );
+    }
+
+    #[test]
+    fn go_summary_includes_prepared_staged_recovery() {
+        let rendered = format_go_summary(
+            "interviewcoach",
+            "ship feature",
+            "ct_123",
+            "run_456",
+            "failure",
+            "blocked by checks",
+            "blocked",
+            "block",
+            "target checks failed",
+            "proof_789",
+            "punk inspect proof_789 --json",
+            Some("punk start \"ship feature\""),
+            Some("ct_999"),
+            Some("punk plot approve ct_999"),
+        );
+        assert!(rendered.contains("Recovery: punk start \"ship feature\""));
+        assert!(rendered.contains("Recovery contract: ct_999"));
+        assert!(rendered.contains("Recovery next: punk plot approve ct_999"));
+    }
+
+    #[test]
+    fn resolve_init_project_id_prefers_explicit_then_repo_basename() {
+        let root = PathBuf::from("/tmp/interviewcoach");
+        assert_eq!(
+            resolve_init_project_id(&root, Some("custom-project")).unwrap(),
+            "custom-project"
+        );
+        assert_eq!(
+            resolve_init_project_id(&root, None).unwrap(),
+            "interviewcoach"
+        );
+    }
+
+    #[test]
+    fn init_error_mentions_punk_run_requirement() {
+        let rendered = format_init_error(
+            "interviewcoach",
+            "compatible `punk-run init --project ...` support not detected",
+        );
+        assert!(rendered.contains("project init failed"));
+        assert!(rendered.contains("compatible `punk-run init --project ...` support not detected"));
+        assert!(rendered.contains("Ensure a compatible `punk-run init --project ...` is available"));
     }
 }

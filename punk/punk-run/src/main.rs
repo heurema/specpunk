@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use punk_core::vcs::{VcsMode, detect_mode as detect_vcs_mode, enable_jj as enable_jj_for_repo};
+use punk_core::vcs::{detect_mode as detect_vcs_mode, enable_jj as enable_jj_for_repo, VcsMode};
 use punk_orch::{
     benchmark, bus, config, context, daemon, diverge, doctor, eval, goal, graph, morning, ops,
     panel, pipeline, ratchet, recall, research, resolver, sanitize, skill,
@@ -3219,6 +3219,10 @@ struct ProjectBootstrapSummary {
     repo_root: PathBuf,
     bootstrap_file: PathBuf,
     bootstrap_file_created: bool,
+    agent_start_file: PathBuf,
+    agent_start_file_created: bool,
+    repo_agents_file: PathBuf,
+    repo_agents_file_created: bool,
     skill_name: String,
     skill_created: bool,
 }
@@ -3329,6 +3333,10 @@ fn bootstrap_current_project(
 
     let (bootstrap_file, bootstrap_file_created) =
         ensure_project_bootstrap_file(&repo_root, &safe_project)?;
+    let (agent_start_file, agent_start_file_created) =
+        ensure_agent_start_file(&repo_root, &safe_project)?;
+    let (repo_agents_file, repo_agents_file_created) =
+        ensure_repo_agents_file(&repo_root, &safe_project)?;
     let skill_name = format!("{safe_project}-core");
     let skill_created =
         ensure_project_bootstrap_skill(bus_path, &safe_project, &skill_name, &bootstrap_file)?;
@@ -3338,6 +3346,10 @@ fn bootstrap_current_project(
         repo_root,
         bootstrap_file,
         bootstrap_file_created,
+        agent_start_file,
+        agent_start_file_created,
+        repo_agents_file,
+        repo_agents_file_created,
         skill_name,
         skill_created,
     })
@@ -3371,6 +3383,31 @@ fn ensure_project_bootstrap_file(
     }
 
     std::fs::write(&path, default_project_skill_template())
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok((path, true))
+}
+
+fn ensure_agent_start_file(repo_root: &Path, project: &str) -> Result<(PathBuf, bool), String> {
+    let punk_dir = repo_root.join(".punk");
+    std::fs::create_dir_all(&punk_dir).map_err(|e| e.to_string())?;
+
+    let path = punk_dir.join("AGENT_START.md");
+    if path.exists() {
+        return Ok((path, false));
+    }
+
+    std::fs::write(&path, default_agent_start_template(project))
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok((path, true))
+}
+
+fn ensure_repo_agents_file(repo_root: &Path, project: &str) -> Result<(PathBuf, bool), String> {
+    let path = repo_root.join("AGENTS.md");
+    if path.exists() {
+        return Ok((path, false));
+    }
+
+    std::fs::write(&path, default_repo_agents_template(project))
         .map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok((path, true))
 }
@@ -3415,8 +3452,30 @@ fn default_project_skill_template() -> &'static str {
     "Use existing architecture and naming before introducing new abstractions.\n\nPrefer additive changes over rewrites.\n\nKeep slices bounded:\n- 1-3 files when possible\n- one diff, one purpose\n\nPrefer existing helpers, modules, and interfaces before creating new ones.\n\nFor behavior changes:\n- preserve schemas unless acceptance explicitly changes them\n- no silent broad refactors\n\nFor tests:\n- prefer focused tests near changed behavior\n- no change without verification\n\nFail closed instead of guessing.\n"
 }
 
+fn default_agent_start_template(project: &str) -> String {
+    format!(
+        "# Agent start\n\nProject id: `{project}`\n\n## Project onboarding\n\nUse:\n\n```bash\npunk init --project {project} --enable-jj --verify\n```\n\nIf the project is already bootstrapped, this is safe to rerun.\n\n## Default rule\n\nIf the user gives only a plain goal in chat, treat it as input to punk automation. Do not ask the user to spell out the `punk` command first.\n\n## Preferred work intake\n\nRun the autonomous lane with staged fallback prepared:\n\n```bash\npunk go --fallback-staged \"<goal>\"\n```\n\n## Staged alternative\n\nIf the user explicitly wants manual review between stages, use:\n\n```bash\npunk start \"<goal>\"\npunk plot approve <contract_id>\npunk cut run <contract_id>\n```\n"
+    )
+}
+
+fn default_repo_agents_template(project: &str) -> String {
+    format!(
+        "# AGENTS.md\n\nIf this repository is initialized for punk, treat a plain user goal as input to punk automation.\n\n## Default autonomous path\n\n```bash\npunk go --fallback-staged \"<goal>\"\n```\n\n## Project bootstrap\n\n```bash\npunk init --project {project} --enable-jj --verify\n```\n\n## If autonomy blocks or escalates\n\nA staged recovery contract should already be prepared. If you need to restart manually, use:\n\n```bash\npunk start \"<goal>\"\n```\n\nMore local instructions live in `.punk/AGENT_START.md`.\n"
+    )
+}
+
 fn format_project_bootstrap_summary(summary: &ProjectBootstrapSummary) -> String {
     let bootstrap_status = if summary.bootstrap_file_created {
+        "created"
+    } else {
+        "existing"
+    };
+    let agent_start_status = if summary.agent_start_file_created {
+        "created"
+    } else {
+        "existing"
+    };
+    let repo_agents_status = if summary.repo_agents_file_created {
         "created"
     } else {
         "existing"
@@ -3428,10 +3487,12 @@ fn format_project_bootstrap_summary(summary: &ProjectBootstrapSummary) -> String
     };
 
     format!(
-        "Project: {project}\nPinned:   {repo_root}\nBootstrap file ({bootstrap_status}): {bootstrap_file}\nSkill ({skill_status}): {skill_name}\n",
+        "Project: {project}\nPinned:   {repo_root}\nBootstrap file ({bootstrap_status}): {bootstrap_file}\nAgent start ({agent_start_status}): {agent_start_file}\nRepo AGENTS ({repo_agents_status}): {repo_agents_file}\nSkill ({skill_status}): {skill_name}\n",
         project = summary.project,
         repo_root = summary.repo_root.display(),
         bootstrap_file = summary.bootstrap_file.display(),
+        agent_start_file = summary.agent_start_file.display(),
+        repo_agents_file = summary.repo_agents_file.display(),
         skill_name = summary.skill_name,
     )
 }
@@ -4747,6 +4808,50 @@ mod tests {
     }
 
     #[test]
+    fn ensure_agent_start_file_is_idempotent() {
+        let tmp = temp_test_dir("punk-run-init-agent-start");
+
+        let (path, created) = ensure_agent_start_file(&tmp, "interviewcoach").unwrap();
+        assert!(created);
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("punk init --project interviewcoach --enable-jj --verify"));
+        assert!(content.contains("plain goal in chat"));
+        assert!(content.contains("punk go --fallback-staged \"<goal>\""));
+        assert!(content.contains("punk start \"<goal>\""));
+
+        fs::write(&path, "custom instructions\n").unwrap();
+        let (_, created_again) = ensure_agent_start_file(&tmp, "interviewcoach").unwrap();
+        assert!(!created_again);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "custom instructions\n");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ensure_repo_agents_file_is_idempotent() {
+        let tmp = temp_test_dir("punk-run-init-repo-agents");
+
+        let (path, created) = ensure_repo_agents_file(&tmp, "interviewcoach").unwrap();
+        assert!(created);
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("plain user goal as input to punk automation"));
+        assert!(content.contains("punk go --fallback-staged \"<goal>\""));
+        assert!(content.contains("staged recovery contract should already be prepared"));
+        assert!(content.contains("punk start \"<goal>\""));
+        assert!(content.contains(".punk/AGENT_START.md"));
+
+        fs::write(&path, "custom agents instructions\n").unwrap();
+        let (_, created_again) = ensure_repo_agents_file(&tmp, "interviewcoach").unwrap();
+        assert!(!created_again);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "custom agents instructions\n"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn format_project_bootstrap_summary_marks_created_vs_existing() {
         let summary = ProjectBootstrapSummary {
             project: "interviewcoach".to_string(),
@@ -4755,6 +4860,10 @@ mod tests {
                 "/tmp/interviewcoach/.punk/bootstrap/interviewcoach-core.md",
             ),
             bootstrap_file_created: true,
+            agent_start_file: PathBuf::from("/tmp/interviewcoach/.punk/AGENT_START.md"),
+            agent_start_file_created: false,
+            repo_agents_file: PathBuf::from("/tmp/interviewcoach/AGENTS.md"),
+            repo_agents_file_created: true,
             skill_name: "interviewcoach-core".to_string(),
             skill_created: false,
         };
@@ -4762,6 +4871,8 @@ mod tests {
         let rendered = format_project_bootstrap_summary(&summary);
         assert!(rendered.contains("Project: interviewcoach"));
         assert!(rendered.contains("Bootstrap file (created):"));
+        assert!(rendered.contains("Agent start (existing):"));
+        assert!(rendered.contains("Repo AGENTS (created):"));
         assert!(rendered.contains("Skill (existing): interviewcoach-core"));
     }
 
@@ -4949,12 +5060,10 @@ mod tests {
         let policy = fs::read_to_string(tmp.join("policy.toml")).unwrap();
         assert!(policy.contains("soft_alert_pct = 80"));
         assert!(policy.contains("hard_stop_pct = 90"));
-        assert!(
-            summary
-                .notices
-                .iter()
-                .any(|n| n.contains("Skipped agents.toml"))
-        );
+        assert!(summary
+            .notices
+            .iter()
+            .any(|n| n.contains("Skipped agents.toml")));
         let _ = fs::remove_dir_all(&tmp);
     }
 
