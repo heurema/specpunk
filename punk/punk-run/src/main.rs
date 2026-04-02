@@ -1219,8 +1219,10 @@ fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {
         Err(_) => resolver::list_known(None),
     };
     let cwd = std::env::current_dir().ok();
-    let resolved_project_filter =
-        resolve_status_project_filter(project_filter, cwd.as_deref(), &known_projects);
+    let resolved_project_filter = finalize_status_project_filter(
+        resolve_status_project_filter(project_filter, cwd.as_deref(), &known_projects),
+        cwd.as_deref(),
+    );
     let bus_recent_limit = if resolved_project_filter.is_some() {
         usize::MAX
     } else {
@@ -1394,6 +1396,96 @@ fn format_status_scope_label(project_filter: Option<&str>) -> String {
     match project_filter {
         Some(project) => format!("project:{project}"),
         None => "global".to_string(),
+    }
+}
+
+fn finalize_status_project_filter(
+    resolved_project_filter: Option<String>,
+    cwd: Option<&Path>,
+) -> Option<String> {
+    resolved_project_filter.or_else(|| infer_git_repo_root_basename(cwd))
+}
+
+fn infer_git_repo_root_basename(cwd: Option<&Path>) -> Option<String> {
+    let mut current = cwd?;
+    loop {
+        let dot_git = current.join(".git");
+        if dot_git.is_dir() || dot_git.is_file() {
+            return current
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_string());
+        }
+        current = current.parent()?;
+    }
+}
+
+#[cfg(test)]
+mod status_scope_tests {
+    use super::{finalize_status_project_filter, infer_git_repo_root_basename};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("punk-run-{label}-{nanos}"))
+    }
+
+    fn create_dir(path: &Path) {
+        fs::create_dir_all(path).expect("create temp dir");
+    }
+
+    #[test]
+    fn explicit_project_scope_keeps_precedence_over_git_repo_fallback() {
+        let repo_root = unique_temp_dir("explicit-precedence");
+        let nested = repo_root.join("nested").join("deeper");
+        create_dir(&nested);
+        create_dir(&repo_root.join(".git"));
+
+        let resolved =
+            finalize_status_project_filter(Some("known-project".to_string()), Some(nested.as_path()));
+
+        assert_eq!(resolved.as_deref(), Some("known-project"));
+
+        fs::remove_dir_all(&repo_root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn unknown_nested_git_repo_falls_back_to_repo_root_basename() {
+        let repo_root = unique_temp_dir("nested-repo");
+        let nested = repo_root.join("a").join("b");
+        create_dir(&nested);
+        create_dir(&repo_root.join(".git"));
+
+        let inferred = infer_git_repo_root_basename(Some(nested.as_path()));
+        let resolved = finalize_status_project_filter(None, Some(nested.as_path()));
+        let expected = repo_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("repo root basename");
+
+        assert_eq!(inferred.as_deref(), Some(expected));
+        assert_eq!(resolved.as_deref(), Some(expected));
+
+        fs::remove_dir_all(&repo_root).expect("remove temp dir");
+    }
+
+    #[test]
+    fn non_git_cwd_falls_back_to_global_scope() {
+        let outside = unique_temp_dir("non-git");
+        let nested = outside.join("workspace").join("leaf");
+        create_dir(&nested);
+
+        assert_eq!(infer_git_repo_root_basename(Some(nested.as_path())), None);
+        assert_eq!(finalize_status_project_filter(None, Some(nested.as_path())), None);
+
+        fs::remove_dir_all(&outside).expect("remove temp dir");
     }
 }
 
