@@ -20,6 +20,8 @@ pub struct Goal {
     pub spent_usd: f64,
     pub status: GoalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<Plan>,
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +179,7 @@ pub fn create_goal(
         budget_usd,
         spent_usd: 0.0,
         status: GoalStatus::Planning,
+        status_reason: None,
         plan: None,
         created_at: Utc::now(),
         completed_at: None,
@@ -528,6 +531,7 @@ mod tests {
                     budget_usd: 1.0,
                     spent_usd: 0.0,
                     status,
+                    status_reason: None,
                     plan: None,
                     created_at: Utc::now(),
                     completed_at: None,
@@ -554,6 +558,7 @@ mod tests {
             budget_usd: 5.0,
             spent_usd: 0.0,
             status: GoalStatus::Planning,
+            status_reason: None,
             plan: None,
             created_at: Utc::now(),
             completed_at: None,
@@ -721,6 +726,7 @@ mod tests {
             budget_usd: 5.0,
             spent_usd: 0.0,
             status: GoalStatus::Planning,
+            status_reason: None,
             plan: None,
             created_at: Utc::now(),
             completed_at: None,
@@ -794,6 +800,7 @@ mod tests {
                 budget_usd: 5.0,
                 spent_usd: 0.0,
                 status: GoalStatus::Active,
+                status_reason: None,
                 plan: Some(plan),
                 created_at: Utc::now(),
                 completed_at: None,
@@ -863,6 +870,7 @@ mod tests {
             budget_usd: 5.0,
             spent_usd: 0.0,
             status: GoalStatus::Active,
+            status_reason: None,
             plan: Some(Plan {
                 version: 1,
                 created_by: "test".into(),
@@ -906,6 +914,7 @@ mod tests {
             budget_usd: 5.0,
             spent_usd: 0.0,
             status: GoalStatus::Active,
+            status_reason: None,
             plan: Some(Plan {
                 version: 1,
                 created_by: "test".into(),
@@ -947,6 +956,7 @@ mod tests {
             budget_usd: 5.0,
             spent_usd: 0.0,
             status: GoalStatus::Active,
+            status_reason: None,
             plan: Some(Plan {
                 version: 1,
                 created_by: "test".into(),
@@ -1088,6 +1098,7 @@ mod tests {
             budget_usd: 0.0,
             spent_usd: 0.0,
             status: GoalStatus::Planning,
+            status_reason: None,
             plan: None,
             created_at: Utc::now(),
             completed_at: None,

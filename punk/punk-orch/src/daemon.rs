@@ -1104,6 +1104,7 @@ fn evaluate_goals(bus: &Path) {
             if all_done {
                 if g.status != GoalStatus::Done {
                     g.status = GoalStatus::Done;
+                    g.status_reason = None;
                     g.completed_at = Some(Utc::now());
                     status_changed = true;
                     eprintln!("daemon: goal {} completed", g.id);
@@ -1125,6 +1126,7 @@ fn evaluate_goals(bus: &Path) {
                     && g.status != GoalStatus::Failed
                 {
                     g.status = GoalStatus::Failed;
+                    g.status_reason = Some("replan_needed_dead_end".into());
                     status_changed = true;
                     eprintln!("daemon: goal {} failed (blocked or failed steps)", g.id);
                     log_event(bus, "goal_failed", &format!(",\"goal\":\"{}\"", g.id));
@@ -1246,6 +1248,7 @@ mod tests {
             budget_usd: 5.0,
             spent_usd: 0.0,
             status: GoalStatus::Active,
+            status_reason: None,
             plan: Some(Plan {
                 version: 1,
                 created_by: "test".into(),
@@ -1474,6 +1477,10 @@ mod tests {
 
         let loaded = goal::load_goal(&bus, "goal-stage3").unwrap();
         assert_eq!(loaded.status, GoalStatus::Failed);
+        assert_eq!(
+            loaded.status_reason.as_deref(),
+            Some("replan_needed_dead_end")
+        );
         let plan = loaded.plan.unwrap();
         assert_eq!(plan.steps[1].status, StepStatus::Blocked);
     }

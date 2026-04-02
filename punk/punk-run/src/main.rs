@@ -1159,6 +1159,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 g.plan = None;
                 g.status = goal::GoalStatus::Planning;
+                g.status_reason = None;
                 g.completed_at = None;
                 goal::save_goal(&bus_path, &g).ok();
                 print!(
@@ -2658,6 +2659,13 @@ fn format_goal_status_report(goal: &goal::Goal) -> String {
         }
     } else {
         out.push_str("No plan yet.\n");
+    }
+
+    if let Some(reason) = goal.status_reason.as_deref() {
+        out.push_str(&format!("\nreason:    {reason}\n"));
+        if reason == "replan_needed_dead_end" {
+            out.push_str("replan needed: blocked or failed steps left no runnable work\n");
+        }
     }
 
     out.push('\n');
@@ -4572,6 +4580,7 @@ mod cli_goal_tests {
             budget_usd: 5.0,
             spent_usd: 1.0,
             status,
+            status_reason: None,
             plan: Some(goal::Plan {
                 version: 1,
                 created_by: "test".into(),
@@ -4684,6 +4693,20 @@ mod cli_goal_tests {
             "Step summary: pending=0 queued=1 running=0 done=1 blocked=1 failed=0 skipped=0"
         ));
         assert!(rendered.contains("punk-run goal approve goal-1"));
+    }
+
+    #[test]
+    fn format_goal_status_report_shows_replan_needed_reason() {
+        let mut goal = sample_goal(
+            goal::GoalStatus::Failed,
+            &[goal::StepStatus::Failed, goal::StepStatus::Blocked],
+        );
+        goal.status_reason = Some("replan_needed_dead_end".into());
+
+        let rendered = format_goal_status_report(&goal);
+        assert!(rendered.contains("reason:    replan_needed_dead_end"));
+        assert!(rendered.contains("replan needed: blocked or failed steps left no runnable work"));
+        assert!(rendered.contains("punk-run goal replan goal-1"));
     }
 
     #[test]
