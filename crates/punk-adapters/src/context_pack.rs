@@ -1246,8 +1246,22 @@ fn anchor_score(
     {
         score += 20;
     }
+    if path_lc.ends_with("benchmark.rs")
+        && signature_lc.contains("summarize_benchmarks")
+        && (contract_surface_lc.contains("reuse existing benchmark summary helper")
+            || contract_surface_lc.contains("reuse existing benchmark summary helpers")
+            || contract_surface_lc.contains("single source of summary formatting"))
+    {
+        score += 20;
+    }
     if path_lc.ends_with("main.rs")
         && signature_lc.contains("cmd_eval_skill_summary")
+        && contract_surface_lc.contains("status output")
+    {
+        score = score.saturating_sub(10);
+    }
+    if path_lc.ends_with("main.rs")
+        && signature_lc.contains("cmd_benchmark_summary")
         && contract_surface_lc.contains("status output")
     {
         score = score.saturating_sub(10);
@@ -1259,6 +1273,13 @@ fn anchor_score(
         score = score.saturating_sub(10);
     }
     if path_lc.ends_with("eval.rs")
+        && (signature_lc.starts_with("pub struct ") || signature_lc.starts_with("struct "))
+        && contract_surface_lc.contains("reuse existing")
+        && contract_surface_lc.contains("helper")
+    {
+        score = score.saturating_sub(4);
+    }
+    if path_lc.ends_with("benchmark.rs")
         && (signature_lc.starts_with("pub struct ") || signature_lc.starts_with("struct "))
         && contract_surface_lc.contains("reuse existing")
         && contract_surface_lc.contains("helper")
@@ -1962,6 +1983,81 @@ mod tests {
         assert!(!seed.targets.iter().any(|target| {
             target.path == "punk/punk-run/src/main.rs"
                 && target.symbol.contains("fn cmd_eval_skill_summary")
+                && seed.targets.iter().any(|other| {
+                    other.path == "punk/punk-run/src/main.rs"
+                        && other.symbol.contains("fn cmd_status")
+                })
+        }));
+    }
+
+    #[test]
+    fn derive_plan_seed_prefers_status_entry_point_and_benchmark_summary_helper() {
+        let contract = Contract {
+            id: "ct_nested_benchmark_status".into(),
+            feature_id: "feat_nested_benchmark_status".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source:
+                "Add a benchmark summary line to nested punk status output and reuse existing benchmark summary helpers."
+                    .into(),
+            entry_points: vec![
+                "punk/punk-run/src/main.rs".into(),
+                "punk/punk-orch/src/benchmark.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "Nested status rendering continues to emit existing status fields unchanged, with an added benchmark summary line when benchmark data is available.".into(),
+                "Benchmark summary text is produced via existing helper logic rather than new parallel formatting code.".into(),
+            ],
+            behavior_requirements: vec![
+                "Add a benchmark summary line to nested punk status output only.".into(),
+                "Reuse existing benchmark summary helpers for formatting instead of introducing duplicate summary formatting logic.".into(),
+            ],
+            allowed_scope: vec![
+                "punk/punk-run/src/main.rs".into(),
+                "punk/punk-orch/src/benchmark.rs".into(),
+            ],
+            target_checks: vec!["cargo test -p punk-run".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let pack = ContextPack {
+            files: vec![
+                ContextFileExcerpt {
+                    path: "punk/punk-run/src/main.rs".into(),
+                    start_line: 1172,
+                    end_line: 1188,
+                    truncated_at_test_boundary: false,
+                    content: "fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {\n    println!(\"Status\");\n}\n\nfn cmd_benchmark_summary(\n    project_filter: Option<&str>,\n    suite_filter: Option<&str>,\n    limit: Option<usize>,\n) {\n}\n".into(),
+                },
+                ContextFileExcerpt {
+                    path: "punk/punk-orch/src/benchmark.rs".into(),
+                    start_line: 120,
+                    end_line: 150,
+                    truncated_at_test_boundary: false,
+                    content: "pub fn summarize_benchmarks(\n    cwd: &Path,\n    limit: Option<usize>,\n    project_filter: Option<&str>,\n    suite_filter: Option<&str>,\n) -> Result<BenchmarkSummary, String> {\n    todo!()\n}\n\npub struct ProjectBenchmarkSummary {\n    pub project_id: String,\n}\n".into(),
+                },
+            ],
+            missing_paths: vec![],
+            recipe_seed: None,
+            patch_seed: None,
+            plan_seed: None,
+        };
+
+        let seed = derive_plan_seed(&contract, &pack);
+
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "punk/punk-run/src/main.rs" && target.symbol.contains("fn cmd_status")
+        }));
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "punk/punk-orch/src/benchmark.rs"
+                && target.symbol.contains("pub fn summarize_benchmarks")
+        }));
+        assert!(!seed.targets.iter().any(|target| {
+            target.path == "punk/punk-run/src/main.rs"
+                && target.symbol.contains("fn cmd_benchmark_summary")
                 && seed.targets.iter().any(|other| {
                     other.path == "punk/punk-run/src/main.rs"
                         && other.symbol.contains("fn cmd_status")
