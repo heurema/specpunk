@@ -696,8 +696,13 @@ impl OrchService {
                 vcs_backend: vcs_snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.vcs.clone()),
-                vcs_ref: vcs_snapshot.as_ref().and_then(|snapshot| snapshot.head_ref.clone()),
-                vcs_dirty: vcs_snapshot.as_ref().map(|snapshot| snapshot.dirty).unwrap_or(false),
+                vcs_ref: vcs_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.head_ref.clone()),
+                vcs_dirty: vcs_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.dirty)
+                    .unwrap_or(false),
                 workspace_root,
             });
         }
@@ -754,8 +759,13 @@ impl OrchService {
             vcs_backend: vcs_snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.vcs.clone()),
-            vcs_ref: vcs_snapshot.as_ref().and_then(|snapshot| snapshot.head_ref.clone()),
-            vcs_dirty: vcs_snapshot.as_ref().map(|snapshot| snapshot.dirty).unwrap_or(false),
+            vcs_ref: vcs_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.head_ref.clone()),
+            vcs_dirty: vcs_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.dirty)
+                .unwrap_or(false),
             workspace_root,
         })
     }
@@ -1168,10 +1178,10 @@ mod tests {
         }
 
         fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
-            let scope = if input.scan.candidate_scope_paths.is_empty() {
+            let scope = if input.scan.candidate_file_scope_paths.is_empty() {
                 vec!["demo.txt".into()]
             } else {
-                vec![input.scan.candidate_scope_paths[0].clone()]
+                vec![input.scan.candidate_file_scope_paths[0].clone()]
             };
             let check = input
                 .scan
@@ -1849,7 +1859,11 @@ mod tests {
             Some(fs::canonicalize(&root).unwrap())
         );
 
-        fs::write(root.join("src/lib.rs"), "pub fn demo() { println!(\"x\"); }\n").unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn demo() { println!(\"x\"); }\n",
+        )
+        .unwrap();
         let dirty = service.status(None).unwrap();
         assert!(dirty.vcs_dirty);
 
@@ -1927,10 +1941,7 @@ mod tests {
         let service = OrchService::new(&root, &global).unwrap();
         let project = service.bootstrap_project().unwrap();
         let project_inspect = service.inspect(&project.id).unwrap();
-        assert_eq!(
-            project_inspect["live_vcs"]["backend"].as_str(),
-            Some("git")
-        );
+        assert_eq!(project_inspect["live_vcs"]["backend"].as_str(), Some("git"));
         assert!(project_inspect["live_vcs"]["workspace_root"]
             .as_str()
             .is_some());

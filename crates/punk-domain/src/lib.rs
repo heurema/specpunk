@@ -156,6 +156,8 @@ pub struct RepoScanSummary {
     pub available_scripts: BTreeMap<String, String>,
     pub candidate_entry_points: Vec<String>,
     pub candidate_scope_paths: Vec<String>,
+    pub candidate_file_scope_paths: Vec<String>,
+    pub candidate_directory_scope_paths: Vec<String>,
     pub candidate_target_checks: Vec<String>,
     pub candidate_integrity_checks: Vec<String>,
     pub notes: Vec<String>,

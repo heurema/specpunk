@@ -20,8 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use context_pack::{
-    build_context_pack, ensure_retry_patch_seed, format_context_pack, format_patch_context_pack,
-    format_plan_context_pack, derive_plan_seed, materialize_missing_entry_points,
+    build_context_pack, derive_plan_seed, ensure_retry_patch_seed, format_context_pack,
+    format_patch_context_pack, format_plan_context_pack, materialize_missing_entry_points,
     restore_missing_materialized_entry_points, restore_stale_entry_point_masks,
     scaffold_only_entry_points, ContextPack, ContextPlanSeed, ContextPlanTarget,
     EntryPointExcerptGuard,
@@ -211,8 +211,8 @@ impl Drop for GitGuardEnv {
 }
 
 const ORIENTATION_BLOCKED_COMMANDS: &[&str] = &[
-    "rg", "grep", "sed", "cat", "awk", "find", "fd", "ls", "head", "tail", "tree", "bat",
-    "less", "more", "perl", "python", "python3", "ruby", "git", "bash", "sh", "zsh",
+    "rg", "grep", "sed", "cat", "awk", "find", "fd", "ls", "head", "tail", "tree", "bat", "less",
+    "more", "perl", "python", "python3", "ruby", "git", "bash", "sh", "zsh",
 ];
 
 impl OrientationGuardEnv {
@@ -250,7 +250,10 @@ impl OrientationGuardEnv {
         let zdotdir = dir.join("zdotdir");
         fs::create_dir_all(&zdotdir)?;
         let mut zshenv = String::new();
-        zshenv.push_str(&format!("export PATH={}:$PATH\n", sh_single_quote(&dir.to_string_lossy())));
+        zshenv.push_str(&format!(
+            "export PATH={}:$PATH\n",
+            sh_single_quote(&dir.to_string_lossy())
+        ));
         for command_name in ORIENTATION_BLOCKED_COMMANDS {
             zshenv.push_str(&format!(
                 "{name}() {{\n  print -r -- \"{blocked} shell orientation forbidden in patch/apply lane: {name} $*\" >&2\n  return 97\n}}\n",
@@ -1110,7 +1113,8 @@ Do not invent ids, timestamps, statuses, or event metadata.\n\
 Use only repo-relative paths.\n\
 Keep scope bounded and conservative.\n\
 If the user prompt names exact file paths or exact shell commands, prefer those explicit user-provided details over weaker scan guesses.\n\
-Prefer `allowed_scope` entries from `candidate_scope_paths`.\n\
+For bounded file-level changes, prefer `allowed_scope` entries from `candidate_file_scope_paths`.\n\
+Use `candidate_directory_scope_paths` only when the user explicitly requests directory/module/package scope.\n\
 Prefer `entry_points` from `candidate_entry_points` when the change is file-level.\n\
 Choose at least one `target_checks` command from `candidate_target_checks` when available, and keep it as specific as possible.\n\
 Choose `integrity_checks` from `candidate_integrity_checks`; do not invent checks outside the scan summary.\n\
@@ -1150,6 +1154,7 @@ Do not invent ids, timestamps, statuses, or event metadata.\n\
 Use repo-relative paths only.\n\
 Keep scope bounded and conservative.\n\
 Prefer exact file paths and shell commands explicitly named in the user prompt.\n\
+For bounded file-level changes, prefer `candidate_file_scope_paths`; use `candidate_directory_scope_paths` only if the prompt explicitly asks for directory/module/package scope.\n\
 Use only target and integrity checks grounded in the repo scan.\n\n\
 User prompt:\n{}\n\n\
 Repo scan JSON:\n{}\n",
@@ -2284,7 +2289,9 @@ fn load_patch_lane_response(stdout: &str, stderr: &str) -> Result<PatchLaneRespo
         .or_else(|| extract_apply_patch_envelope(stderr))
         .or_else(|| extract_apply_patch_envelope(&format!("{stdout}\n{stderr}")))
         .map(PatchLaneResponse::Patch)
-        .ok_or_else(|| anyhow!("patch lane returned no complete patch artifact or blocked sentinel"))
+        .ok_or_else(|| {
+            anyhow!("patch lane returned no complete patch artifact or blocked sentinel")
+        })
 }
 
 fn load_plan_prepass_response(stdout: &str, stderr: &str) -> Result<PlanPrepassResponse> {
@@ -2464,7 +2471,9 @@ fn validate_plan_prepass_scope(
             ));
         }
         if target.symbol.trim().is_empty() || target.insertion_point.trim().is_empty() {
-            return Err(anyhow!("plan prepass requires non-empty symbol and insertion point"));
+            return Err(anyhow!(
+                "plan prepass requires non-empty symbol and insertion point"
+            ));
         }
     }
     Ok(())
@@ -2473,8 +2482,8 @@ fn validate_plan_prepass_scope(
 fn parse_apply_patch_updates(patch: &str) -> Result<Vec<ApplyPatchUpdate>> {
     let patch = normalize_patch_text(patch);
     let lines: Vec<&str> = patch.lines().collect();
-    let (begin, end) =
-        find_apply_patch_boundaries(&lines).ok_or_else(|| anyhow!("patch envelope is incomplete"))?;
+    let (begin, end) = find_apply_patch_boundaries(&lines)
+        .ok_or_else(|| anyhow!("patch envelope is incomplete"))?;
     if begin != 0 || end + 1 != lines.len() {
         return Err(anyhow!(
             "patch lane output must contain only one apply_patch envelope"
@@ -2532,13 +2541,7 @@ fn parse_apply_patch_updates(patch: &str) -> Result<Vec<ApplyPatchUpdate>> {
                     }
                     match line.chars().next() {
                         Some(' ') | Some('+') | Some('-') => hunk_lines.push(line.to_string()),
-                        _ => {
-                            return Err(anyhow!(
-                                "invalid hunk line for {}: `{}`",
-                                path,
-                                line
-                            ))
-                        }
+                        _ => return Err(anyhow!("invalid hunk line for {}: `{}`", path, line)),
                     }
                     i += 1;
                 }
@@ -2613,8 +2616,14 @@ fn apply_hunk_to_lines(
 ) -> Result<()> {
     let old_lines = apply_patch_old_lines(&hunk.lines);
     let new_lines = apply_patch_new_lines(&hunk.lines);
-    let position = locate_hunk_position(file_lines, &old_lines, *cursor, hunk.eof, hunk.header.as_deref())
-        .ok_or_else(|| anyhow!("unable to locate hunk context"))?;
+    let position = locate_hunk_position(
+        file_lines,
+        &old_lines,
+        *cursor,
+        hunk.eof,
+        hunk.header.as_deref(),
+    )
+    .ok_or_else(|| anyhow!("unable to locate hunk context"))?;
     let end = position + old_lines.len();
     file_lines.splice(position..end, new_lines);
     *cursor = position + apply_patch_new_line_count(&hunk.lines);
@@ -2656,17 +2665,16 @@ fn locate_hunk_position(
     _header: Option<&str>,
 ) -> Option<usize> {
     if old_lines.is_empty() {
-        return Some(if eof { file_lines.len() } else { start.min(file_lines.len()) });
+        return Some(if eof {
+            file_lines.len()
+        } else {
+            start.min(file_lines.len())
+        });
     }
     seek_sequence(file_lines, old_lines, start, eof)
 }
 
-fn seek_sequence(
-    haystack: &[String],
-    needle: &[String],
-    start: usize,
-    eof: bool,
-) -> Option<usize> {
+fn seek_sequence(haystack: &[String], needle: &[String], start: usize, eof: bool) -> Option<usize> {
     if needle.is_empty() {
         return Some(start.min(haystack.len()));
     }
@@ -2674,17 +2682,21 @@ fn seek_sequence(
         return None;
     }
     let exact = matching_sequence_positions(haystack, needle, |left, right| left == right);
-    if let Some(position) = choose_sequence_position(&exact, needle.len(), start, eof, haystack.len()) {
+    if let Some(position) =
+        choose_sequence_position(&exact, needle.len(), start, eof, haystack.len())
+    {
         return Some(position);
     }
-    let trimmed_end =
-        matching_sequence_positions(haystack, needle, |left, right| left.trim_end() == right.trim_end());
+    let trimmed_end = matching_sequence_positions(haystack, needle, |left, right| {
+        left.trim_end() == right.trim_end()
+    });
     if let Some(position) =
         choose_sequence_position(&trimmed_end, needle.len(), start, eof, haystack.len())
     {
         return Some(position);
     }
-    let trimmed = matching_sequence_positions(haystack, needle, |left, right| left.trim() == right.trim());
+    let trimmed =
+        matching_sequence_positions(haystack, needle, |left, right| left.trim() == right.trim());
     choose_sequence_position(&trimmed, needle.len(), start, eof, haystack.len())
 }
 
@@ -2727,7 +2739,11 @@ fn choose_sequence_position(
             return Some(position);
         }
     }
-    if let Some(position) = positions.iter().copied().find(|position| *position >= start) {
+    if let Some(position) = positions
+        .iter()
+        .copied()
+        .find(|position| *position >= start)
+    {
         return Some(position);
     }
     if positions.len() == 1 {
@@ -3532,8 +3548,8 @@ mod tests {
                 execution_sketch: "edit old".into(),
             }],
         };
-        let err = validate_plan_prepass_scope(&response, &[String::from("src/main.rs")])
-            .unwrap_err();
+        let err =
+            validate_plan_prepass_scope(&response, &[String::from("src/main.rs")]).unwrap_err();
         assert!(err.to_string().contains("out-of-scope path src/lib.rs"));
     }
 
@@ -3838,6 +3854,8 @@ mod tests {
                 available_scripts: BTreeMap::new(),
                 candidate_entry_points: vec!["src/lib.rs".into()],
                 candidate_scope_paths: vec!["src".into()],
+                candidate_file_scope_paths: vec!["src/lib.rs".into()],
+                candidate_directory_scope_paths: vec!["src".into()],
                 candidate_target_checks: vec!["cargo test".into()],
                 candidate_integrity_checks: vec!["cargo test".into()],
                 notes: vec![],
@@ -3860,6 +3878,8 @@ mod tests {
                 available_scripts: BTreeMap::new(),
                 candidate_entry_points: vec!["src/lib.rs".into()],
                 candidate_scope_paths: vec!["src".into()],
+                candidate_file_scope_paths: vec!["src/lib.rs".into()],
+                candidate_directory_scope_paths: vec!["src".into()],
                 candidate_target_checks: vec![
                     "cargo build -p punk-cli".into(),
                     "cargo test -p punk-adapters".into(),
@@ -3899,6 +3919,8 @@ mod tests {
                 available_scripts: BTreeMap::new(),
                 candidate_entry_points: vec!["src/lib.rs".into()],
                 candidate_scope_paths: vec!["src".into()],
+                candidate_file_scope_paths: vec!["src/lib.rs".into()],
+                candidate_directory_scope_paths: vec!["src".into()],
                 candidate_target_checks: vec![
                     "cargo build -p punk-cli".into(),
                     "cargo test -p punk-adapters".into(),

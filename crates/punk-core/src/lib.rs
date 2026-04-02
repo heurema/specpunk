@@ -9,6 +9,11 @@ pub mod artifacts;
 
 pub use artifacts::{find_object_path, read_json, relative_ref, write_json};
 
+struct ScopeCandidates {
+    files: Vec<String>,
+    directories: Vec<String>,
+}
+
 pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
     let mut manifests = Vec::new();
     let mut package_manager = None;
@@ -72,8 +77,9 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
         notes.push("no trustworthy integrity checks inferred".to_string());
     }
 
-    let candidate_scope_paths = collect_scope_candidates(repo_root, prompt)?;
-    let candidate_entry_points = infer_entry_points(repo_root, prompt, &candidate_scope_paths);
+    let scope_candidates = collect_scope_candidates(repo_root, prompt)?;
+    let candidate_entry_points = infer_entry_points(repo_root, prompt, &scope_candidates.files);
+    let candidate_scope_paths = combined_scope_candidates(&scope_candidates);
 
     Ok(RepoScanSummary {
         project_kind,
@@ -82,6 +88,8 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
         available_scripts,
         candidate_entry_points,
         candidate_scope_paths,
+        candidate_file_scope_paths: scope_candidates.files,
+        candidate_directory_scope_paths: scope_candidates.directories,
         candidate_target_checks,
         candidate_integrity_checks,
         notes,
@@ -178,7 +186,7 @@ pub fn build_bounded_fallback_proposal(
     if !is_low_risk_bounded_candidate(proposal) {
         return None;
     }
-    if !has_structural_invalidity(repo_root, prompt, proposal, errors) {
+    if !has_structural_invalidity(repo_root, prompt, proposal, scan, errors) {
         return None;
     }
 
@@ -324,10 +332,12 @@ fn node_checks(
     }
 }
 
-fn collect_scope_candidates(repo_root: &Path, prompt: &str) -> Result<Vec<String>> {
-    let mut candidates = BTreeMap::new();
+fn collect_scope_candidates(repo_root: &Path, prompt: &str) -> Result<ScopeCandidates> {
+    let mut file_candidates = BTreeMap::new();
+    let mut directory_candidates = BTreeMap::new();
     let tokens = prompt_tokens(prompt);
-    let mut top_level = Vec::new();
+    let mut top_level_files = Vec::new();
+    let mut top_level_directories = Vec::new();
     for entry in fs::read_dir(repo_root)? {
         let entry = entry?;
         let path = entry.path();
@@ -335,32 +345,46 @@ fn collect_scope_candidates(repo_root: &Path, prompt: &str) -> Result<Vec<String
         if ignored_name(&name) || ignored_relative_path(Path::new(&name)) {
             continue;
         }
-        top_level.push(name.clone());
         if path.is_dir() {
-            candidates.insert(name, 1);
+            top_level_directories.push(name.clone());
+            directory_candidates.insert(name, 1);
         } else {
-            candidates.insert(name, 1);
+            top_level_files.push(name.clone());
+            file_candidates.insert(name, 1);
         }
     }
 
-    walk_repo(repo_root, repo_root, &tokens, &mut candidates)?;
+    walk_repo(
+        repo_root,
+        repo_root,
+        &tokens,
+        &mut file_candidates,
+        &mut directory_candidates,
+    )?;
 
-    if candidates.is_empty() {
-        for name in top_level {
-            candidates.insert(name, 1);
+    if file_candidates.is_empty() {
+        for name in top_level_files {
+            file_candidates.insert(name, 1);
+        }
+    }
+    if directory_candidates.is_empty() {
+        for name in top_level_directories {
+            directory_candidates.insert(name, 1);
         }
     }
 
-    let mut items: Vec<(String, i32)> = candidates.into_iter().collect();
-    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    Ok(items.into_iter().map(|(path, _)| path).take(20).collect())
+    Ok(ScopeCandidates {
+        files: sort_scored_candidates(file_candidates),
+        directories: sort_scored_candidates(directory_candidates),
+    })
 }
 
 fn walk_repo(
     repo_root: &Path,
     current: &Path,
     tokens: &[String],
-    candidates: &mut BTreeMap<String, i32>,
+    file_candidates: &mut BTreeMap<String, i32>,
+    directory_candidates: &mut BTreeMap<String, i32>,
 ) -> Result<()> {
     for entry in fs::read_dir(current)? {
         let entry = entry?;
@@ -376,13 +400,21 @@ fn walk_repo(
             continue;
         }
         if path.is_dir() {
-            walk_repo(repo_root, &path, tokens, candidates)?;
+            walk_repo(
+                repo_root,
+                &path,
+                tokens,
+                file_candidates,
+                directory_candidates,
+            )?;
             continue;
         }
         let relative = relative_path.to_string_lossy().to_string();
-        let score = relevance_score(&relative, tokens);
+        let score = relevance_score(&relative, tokens)
+            + content_relevance_score(repo_root, &relative, tokens, false)
+            + entry_point_hint_score(repo_root, &relative, tokens);
         if score > 0 {
-            candidates
+            file_candidates
                 .entry(relative.clone())
                 .and_modify(|value| *value = (*value).max(score))
                 .or_insert(score);
@@ -390,7 +422,7 @@ fn walk_repo(
                 let parent = parent.to_string_lossy().to_string();
                 if !parent.is_empty() && parent != "." {
                     let parent_score = score.saturating_sub(1).max(1);
-                    candidates
+                    directory_candidates
                         .entry(parent)
                         .and_modify(|value| *value = (*value).max(parent_score))
                         .or_insert(parent_score);
@@ -399,6 +431,22 @@ fn walk_repo(
         }
     }
     Ok(())
+}
+
+fn sort_scored_candidates(candidates: BTreeMap<String, i32>) -> Vec<String> {
+    let mut items: Vec<(String, i32)> = candidates.into_iter().collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items.into_iter().map(|(path, _)| path).take(20).collect()
+}
+
+fn combined_scope_candidates(candidates: &ScopeCandidates) -> Vec<String> {
+    candidates
+        .files
+        .iter()
+        .chain(candidates.directories.iter())
+        .cloned()
+        .take(20)
+        .collect()
 }
 
 fn ignored_name(name: &str) -> bool {
@@ -432,14 +480,25 @@ fn prompt_tokens(prompt: &str) -> Vec<String> {
 }
 
 fn infer_entry_points(repo_root: &Path, prompt: &str, candidates: &[String]) -> Vec<String> {
-    let lowered = prompt.to_ascii_lowercase();
-    let mut results = Vec::new();
-    for candidate in candidates {
-        let path = repo_root.join(candidate);
-        if path.is_file() && lowered.contains(&file_stem(candidate)) {
-            results.push(candidate.clone());
-        }
-    }
+    let tokens = prompt_tokens(prompt);
+    let mut scored = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let path = repo_root.join(candidate);
+            if !path.is_file() {
+                return None;
+            }
+            let score = entry_point_score(repo_root, candidate, &tokens);
+            (score > 0).then_some((candidate.clone(), score))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut results = scored
+        .into_iter()
+        .map(|(path, _)| path)
+        .take(5)
+        .collect::<Vec<_>>();
+
     if results.is_empty() {
         for fallback in ["src", "src/main.rs", "src/lib.rs", "lib", "app", "server"] {
             let path = repo_root.join(fallback);
@@ -581,6 +640,35 @@ fn file_stem(path: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn entry_point_score(repo_root: &Path, candidate: &str, tokens: &[String]) -> i32 {
+    let mut score = relevance_score(candidate, tokens);
+    let stem = file_stem(candidate);
+    if tokens.iter().any(|token| stem.contains(token)) {
+        score += 6;
+    }
+    let content_score = content_relevance_score(repo_root, candidate, tokens, true);
+    if candidate.ends_with("/main.rs") && content_score > 0 {
+        score += 20;
+    }
+    score + content_score
+}
+
+fn entry_point_hint_score(repo_root: &Path, relative: &str, tokens: &[String]) -> i32 {
+    if !relative.ends_with(".rs") {
+        return 0;
+    }
+    let content_score = content_relevance_score(repo_root, relative, tokens, true);
+    if content_score <= 0 {
+        return 0;
+    }
+    let capped = content_score.min(120);
+    if relative.ends_with("/main.rs") {
+        capped + 20
+    } else {
+        capped / 2
+    }
+}
+
 fn claims_file_level_work(repo_root: &Path, allowed_scope: &[String]) -> bool {
     allowed_scope.iter().any(|scope| {
         let path = repo_root.join(scope);
@@ -599,6 +687,7 @@ fn has_structural_invalidity(
     repo_root: &Path,
     prompt: &str,
     proposal: &DraftProposal,
+    scan: &RepoScanSummary,
     errors: &[DraftValidationError],
 ) -> bool {
     if proposal
@@ -670,6 +759,14 @@ fn has_structural_invalidity(
         return true;
     }
 
+    if proposal_misses_primary_candidate_entry_point(proposal, scan) {
+        return true;
+    }
+
+    if broad_directory_scope_needs_file_fallback(repo_root, prompt, proposal, scan) {
+        return true;
+    }
+
     if let Some(recipe) = best_protocol_recipe(prompt, proposal) {
         if !proposal
             .entry_points
@@ -686,6 +783,76 @@ fn has_structural_invalidity(
             || error.field.starts_with("entry_points")
             || error.field.starts_with("check[")
     })
+}
+
+fn broad_directory_scope_needs_file_fallback(
+    repo_root: &Path,
+    prompt: &str,
+    proposal: &DraftProposal,
+    scan: &RepoScanSummary,
+) -> bool {
+    if scan.candidate_file_scope_paths.is_empty()
+        || prompt_explicitly_requests_directory_scope(prompt)
+    {
+        return false;
+    }
+    if !proposal_prefers_file_scope(proposal, scan) {
+        return false;
+    }
+    proposal
+        .allowed_scope
+        .iter()
+        .any(|path| is_directory_scope_path(repo_root, path))
+}
+
+fn proposal_prefers_file_scope(proposal: &DraftProposal, scan: &RepoScanSummary) -> bool {
+    proposal
+        .entry_points
+        .iter()
+        .any(|path| is_file_like_scope(path))
+        || proposal
+            .allowed_scope
+            .iter()
+            .any(|path| is_file_like_scope(path))
+        || !scan.candidate_entry_points.is_empty()
+        || !scan.candidate_file_scope_paths.is_empty()
+}
+
+fn prompt_explicitly_requests_directory_scope(prompt: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    [
+        "directory scope",
+        "module scope",
+        "package scope",
+        "workspace scope",
+        "whole module",
+        "entire module",
+        "entire package",
+        "whole package",
+        "directory-wide",
+        "workspace-wide",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn is_directory_scope_path(repo_root: &Path, path: &str) -> bool {
+    !is_file_like_scope(path) && repo_root.join(path).is_dir()
+}
+
+fn proposal_misses_primary_candidate_entry_point(
+    proposal: &DraftProposal,
+    scan: &RepoScanSummary,
+) -> bool {
+    let Some(primary) = scan
+        .candidate_entry_points
+        .iter()
+        .find(|path| is_file_like_scope(path))
+    else {
+        return false;
+    };
+    !proposal.entry_points.iter().any(|path| path == primary)
+        && !proposal.allowed_scope.iter().any(|path| path == primary)
 }
 
 fn fallback_source_paths(
@@ -705,6 +872,33 @@ fn fallback_source_paths(
         if !recipe_paths.is_empty() {
             paths = recipe_paths;
             recovered_from_recipe = true;
+        }
+    }
+
+    if paths.is_empty() {
+        for candidate in scan
+            .candidate_entry_points
+            .iter()
+            .filter(|path| is_fallback_source_path(repo_root, path))
+            .take(2)
+        {
+            if validate_scope_path(repo_root, candidate).is_ok() {
+                push_unique(&mut paths, candidate.clone());
+            }
+        }
+    }
+
+    if paths.is_empty() {
+        for candidate in scan
+            .candidate_file_scope_paths
+            .iter()
+            .filter(|path| is_fallback_source_path(repo_root, path))
+            .filter(|path| !is_repo_root_file(path))
+            .take(4)
+        {
+            if validate_scope_path(repo_root, candidate).is_ok() {
+                push_unique(&mut paths, candidate.clone());
+            }
         }
     }
 
@@ -925,11 +1119,7 @@ fn find_recipe_source_path(
     basename: &str,
 ) -> Option<String> {
     let mut candidates = Vec::new();
-    for candidate in scan
-        .candidate_entry_points
-        .iter()
-        .chain(scan.candidate_scope_paths.iter())
-    {
+    for candidate in scan_candidate_paths(scan) {
         if candidate.ends_with(&format!("/{basename}"))
             && repo_root.join(candidate).is_file()
             && validate_scope_path(repo_root, candidate).is_ok()
@@ -972,11 +1162,7 @@ fn infer_recipe_source_candidates(
     basename: &str,
 ) -> Vec<String> {
     let mut candidates = Vec::new();
-    for candidate in scan
-        .candidate_entry_points
-        .iter()
-        .chain(scan.candidate_scope_paths.iter())
-    {
+    for candidate in scan_candidate_paths(scan) {
         let Some(src_dir) = infer_source_dir_from_candidate(candidate) else {
             continue;
         };
@@ -991,6 +1177,22 @@ fn infer_recipe_source_candidates(
             if validate_scope_path(repo_root, &inferred).is_ok() {
                 push_unique(&mut candidates, inferred);
             }
+        }
+    }
+    candidates
+}
+
+fn scan_candidate_paths(scan: &RepoScanSummary) -> Vec<&String> {
+    let mut candidates = Vec::new();
+    for candidate in scan
+        .candidate_entry_points
+        .iter()
+        .chain(scan.candidate_file_scope_paths.iter())
+        .chain(scan.candidate_directory_scope_paths.iter())
+        .chain(scan.candidate_scope_paths.iter())
+    {
+        if !candidates.iter().any(|existing| *existing == candidate) {
+            candidates.push(candidate);
         }
     }
     candidates
@@ -1257,6 +1459,102 @@ fn relevance_score(path: &str, tokens: &[String]) -> i32 {
     score
 }
 
+fn content_relevance_score(
+    repo_root: &Path,
+    relative: &str,
+    tokens: &[String],
+    entry_point_mode: bool,
+) -> i32 {
+    let path = repo_root.join(relative);
+    if !path.is_file() || tokens.is_empty() {
+        return 0;
+    }
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return 0;
+    };
+    let mut score = 0;
+    let lines = if entry_point_mode {
+        contents.lines().collect::<Vec<_>>()
+    } else {
+        contents.lines().take(200).collect::<Vec<_>>()
+    };
+    for line in lines {
+        score += content_line_score(line, tokens, entry_point_mode);
+    }
+    score
+}
+
+fn content_line_score(line: &str, tokens: &[String], entry_point_mode: bool) -> i32 {
+    let lowered = line.to_ascii_lowercase();
+    let mut score = 0;
+    if is_symbol_like_line(line) {
+        let match_count = symbol_token_match_count(line, tokens);
+        if match_count > 0 {
+            score += match_count * 5;
+            if match_count >= 2 {
+                score += 6;
+            }
+        }
+    }
+    if entry_point_mode && lowered.contains("fn cmd_") {
+        let match_count = symbol_token_match_count(line, tokens);
+        if match_count > 0 {
+            score += 32;
+        } else {
+            score += 4;
+        }
+    }
+    if !entry_point_mode && lowered.contains("fn cmd_") {
+        let match_count = symbol_token_match_count(line, tokens);
+        if match_count > 0 {
+            score += 12;
+        }
+    }
+    if lowered.contains("summarize_") {
+        let match_count = symbol_token_match_count(line, tokens);
+        if match_count > 0 {
+            score += 10;
+        }
+    }
+    score
+}
+
+fn is_symbol_like_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    [
+        "fn ",
+        "pub fn ",
+        "struct ",
+        "pub struct ",
+        "enum ",
+        "pub enum ",
+        "impl ",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+}
+
+fn symbol_token_match_count(line: &str, tokens: &[String]) -> i32 {
+    let lowered = line.to_ascii_lowercase();
+    tokens
+        .iter()
+        .filter(|token| semantic_token_match(&lowered, token))
+        .count() as i32
+}
+
+fn semantic_token_match(haystack: &str, token: &str) -> bool {
+    if haystack.contains(token) {
+        return true;
+    }
+    match token {
+        "summary" => haystack.contains("summarize"),
+        "summaries" => haystack.contains("summarize"),
+        "eval" => haystack.contains("evals"),
+        "status" => haystack.contains("cmd_status") || haystack.contains("status"),
+        _ => false,
+    }
+}
+
 fn explicit_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
     let mut paths = Vec::new();
     for candidate in code_spans(prompt)
@@ -1467,9 +1765,85 @@ mod tests {
         fs::write(root.join("src/lib.rs"), "pub mod auth;\n").unwrap();
         let summary = scan_repo(&root, "tighten auth behavior").unwrap();
         assert!(summary
-            .candidate_scope_paths
+            .candidate_file_scope_paths
             .first()
             .is_some_and(|path| path.contains("auth")));
+        assert!(summary
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "src/auth"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_repo_separates_file_and_directory_candidates() {
+        let root =
+            std::env::temp_dir().join(format!("punk-core-scope-split-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("punk/punk-orch/src")).unwrap();
+        fs::write(
+            root.join("punk/punk-orch/src/eval.rs"),
+            "pub fn summarize_skill_evals() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("punk/punk-orch/src/lib.rs"), "pub mod eval;\n").unwrap();
+
+        let summary = scan_repo(&root, "reuse existing eval summary helpers").unwrap();
+        assert!(summary
+            .candidate_file_scope_paths
+            .iter()
+            .any(|path| path == "punk/punk-orch/src/eval.rs"));
+        assert!(summary
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "punk/punk-orch/src"));
+        assert!(summary
+            .candidate_scope_paths
+            .first()
+            .is_some_and(|path| path.ends_with(".rs")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn infer_entry_points_prefers_cli_status_handler_and_eval_helper() {
+        let root =
+            std::env::temp_dir().join(format!("punk-core-entry-points-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("punk/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
+        fs::write(
+            root.join("punk/punk-orch/src/eval.rs"),
+            "pub fn summarize_skill_evals() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("punk/punk-orch/src/skill.rs"),
+            "pub fn promote_skill() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("punk/punk-run/src/main.rs"),
+            "fn cmd_status() {}\nfn cmd_eval_skill_summary() {}\n",
+        )
+        .unwrap();
+
+        let prompt =
+            "Add a skill eval summary line to nested punk status and reuse existing eval summary helpers.";
+        let summary = scan_repo(&root, prompt).unwrap();
+        assert!(summary
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "punk/punk-run/src/main.rs"));
+        assert!(summary
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "punk/punk-orch/src/eval.rs"));
+        assert!(summary
+            .candidate_entry_points
+            .first()
+            .is_some_and(|path| path == "punk/punk-run/src/main.rs"));
+
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1512,6 +1886,14 @@ mod tests {
             .candidate_scope_paths
             .iter()
             .all(|path| !path.starts_with("docs/reference-repos")));
+        assert!(summary
+            .candidate_file_scope_paths
+            .iter()
+            .all(|path| !path.starts_with("docs/reference-repos")));
+        assert!(summary
+            .candidate_directory_scope_paths
+            .iter()
+            .all(|path| !path.starts_with("docs/reference-repos")));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1531,6 +1913,14 @@ mod tests {
         let summary = scan_repo(&root, "tighten auth helpers").unwrap();
         assert!(summary
             .candidate_scope_paths
+            .iter()
+            .all(|path| !path.starts_with("docs/research/_delve_runs")));
+        assert!(summary
+            .candidate_file_scope_paths
+            .iter()
+            .all(|path| !path.starts_with("docs/research/_delve_runs")));
+        assert!(summary
+            .candidate_directory_scope_paths
             .iter()
             .all(|path| !path.starts_with("docs/research/_delve_runs")));
         assert!(summary
@@ -2043,6 +2433,137 @@ mod tests {
             fallback.integrity_checks,
             vec!["cargo test --workspace".to_string()]
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bounded_fallback_replaces_directory_scope_with_concrete_file_candidates() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-directory-fallback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("punk/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
+        fs::write(
+            root.join("punk/punk-orch/src/eval.rs"),
+            "pub fn summarize_skill_evals() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("punk/punk-run/src/main.rs"),
+            "fn cmd_status() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("punk/punk-orch/src/lib.rs"), "pub mod eval;\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"punk/*\"]\n",
+        )
+        .unwrap();
+
+        let prompt = "Add a skill eval summary line to nested punk status and reuse existing eval summary helpers. Keep the slice bounded to files.";
+        let scan = scan_repo(&root, prompt).unwrap();
+        let proposal = DraftProposal {
+            title: "status eval summary".into(),
+            summary: "status eval summary".into(),
+            entry_points: vec!["punk/punk-run/src/main.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["status output".into()],
+            behavior_requirements: vec!["print skill eval summary".into()],
+            allowed_scope: vec!["punk/punk-run/src".into(), "punk/punk-orch/src".into()],
+            target_checks: vec!["cargo test -p punk-run".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+        };
+        let errors = validate_draft_proposal(&root, &proposal);
+        let fallback =
+            build_bounded_fallback_proposal(&root, prompt, &proposal, &scan, &errors).unwrap();
+
+        assert_eq!(
+            fallback.allowed_scope.first().map(String::as_str),
+            Some("punk/punk-run/src/main.rs")
+        );
+        assert_eq!(
+            fallback.allowed_scope.get(1).map(String::as_str),
+            Some("punk/punk-orch/src/eval.rs")
+        );
+        assert!(fallback
+            .allowed_scope
+            .iter()
+            .all(|path| path.ends_with(".rs")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bounded_fallback_recovers_primary_candidate_entry_point_when_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-primary-entry-fallback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("punk/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
+        fs::write(
+            root.join("punk/punk-orch/src/eval.rs"),
+            "pub fn summarize_skill_evals() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("punk/punk-orch/src/skill.rs"),
+            "pub fn promote_skill() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("punk/punk-run/src/main.rs"),
+            "fn cmd_status() {}\nfn cmd_eval_skill_summary() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"punk/*\"]\n",
+        )
+        .unwrap();
+
+        let prompt =
+            "Add a skill eval summary line to nested punk status and reuse existing eval summary helpers. Keep the slice bounded and additive.";
+        let scan = scan_repo(&root, prompt).unwrap();
+        assert_eq!(
+            scan.candidate_entry_points.first().map(String::as_str),
+            Some("punk/punk-run/src/main.rs")
+        );
+        let proposal = DraftProposal {
+            title: "status eval summary".into(),
+            summary: "status eval summary".into(),
+            entry_points: vec![
+                "punk/punk-orch/src/skill.rs".into(),
+                "punk/punk-orch/src/eval.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["status output".into()],
+            behavior_requirements: vec!["print skill eval summary".into()],
+            allowed_scope: vec![
+                "punk/punk-orch/src/skill.rs".into(),
+                "punk/punk-orch/src/eval.rs".into(),
+            ],
+            target_checks: vec!["cargo test -p punk-orch".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+        };
+        let errors = validate_draft_proposal(&root, &proposal);
+        let fallback =
+            build_bounded_fallback_proposal(&root, prompt, &proposal, &scan, &errors).unwrap();
+
+        assert_eq!(
+            fallback.allowed_scope,
+            vec![
+                "punk/punk-run/src/main.rs".to_string(),
+                "punk/punk-orch/src/eval.rs".to_string(),
+            ]
+        );
+        assert_eq!(fallback.entry_points, fallback.allowed_scope);
 
         let _ = fs::remove_dir_all(&root);
     }
