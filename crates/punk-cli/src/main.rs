@@ -51,6 +51,8 @@ struct InitCommand {
 struct GoCommand {
     goal: String,
     #[arg(long)]
+    fallback_staged: bool,
+    #[arg(long)]
     json: bool,
 }
 
@@ -171,7 +173,13 @@ fn run() -> Result<()> {
             init.enable_jj,
             init.verify,
         ),
-        Command::Go(go) => cmd_go(&repo_root, &global_root, &go.goal, go.json),
+        Command::Go(go) => cmd_go(
+            &repo_root,
+            &global_root,
+            &go.goal,
+            go.fallback_staged,
+            go.json,
+        ),
         Command::Start(start) => cmd_start(&repo_root, &global_root, &start.goal, start.json),
         Command::Plot(plot) => match plot.action {
             PlotAction::Contract { prompt, json } => {
@@ -519,7 +527,13 @@ fn cmd_start(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Re
     Ok(())
 }
 
-fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Result<()> {
+fn cmd_go(
+    repo_root: &Path,
+    global_root: &Path,
+    goal: &str,
+    fallback_staged: bool,
+    json: bool,
+) -> Result<()> {
     let trimmed_goal = goal.trim();
     if trimmed_goal.is_empty() {
         return Err(anyhow!("goal must not be empty"));
@@ -544,6 +558,14 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
     let basis_summary = summarize_decision_basis(&decision.decision_basis);
     let recovery_command = go_recovery_command(&decision.decision, trimmed_goal);
     let recommended_mode = go_recommended_mode(&decision.decision);
+    let staged_recovery = if fallback_staged && !success {
+        Some(orch.draft_contract(&drafter, trimmed_goal)?)
+    } else {
+        None
+    };
+    let recovery_next_command = staged_recovery
+        .as_ref()
+        .map(|contract| format!("punk plot approve {}", contract.id));
 
     if json {
         println!(
@@ -561,8 +583,11 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
                 "success": success,
                 "decision_basis_summary": basis_summary,
                 "recommended_mode": recommended_mode,
+                "fallback_staged_enabled": fallback_staged,
                 "next_command": next_command,
                 "recovery_command": recovery_command,
+                "recovery_contract": staged_recovery,
+                "recovery_next_command": recovery_next_command,
                 "follow_up": next_command,
             }))?
         );
@@ -582,6 +607,10 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
                 &proof.id,
                 &next_command,
                 recovery_command.as_deref(),
+                staged_recovery
+                    .as_ref()
+                    .map(|contract| contract.id.as_str()),
+                recovery_next_command.as_deref(),
             )
         );
     }
@@ -621,12 +650,20 @@ fn format_go_summary(
     proof_id: &str,
     next_command: &str,
     recovery_command: Option<&str>,
+    recovery_contract_id: Option<&str>,
+    recovery_next_command: Option<&str>,
 ) -> String {
     let mut rendered = format!(
         "Goal: {goal}\nProject: {project}\nApproved contract: {contract_id}\nRun: {run_id} ({receipt_status})\nSummary: {receipt_summary}\nOutcome: {outcome}\nGate: {decision}\nBasis: {basis_summary}\nProof: {proof_id}\nNext: {next_command}"
     );
     if let Some(recovery_command) = recovery_command {
         rendered.push_str(&format!("\nRecovery: {recovery_command}"));
+    }
+    if let Some(recovery_contract_id) = recovery_contract_id {
+        rendered.push_str(&format!("\nRecovery contract: {recovery_contract_id}"));
+    }
+    if let Some(recovery_next_command) = recovery_next_command {
+        rendered.push_str(&format!("\nRecovery next: {recovery_next_command}"));
     }
     rendered
 }
@@ -1027,6 +1064,7 @@ mod tests {
     fn bootstrap_json_mode_supports_start_and_plot_contract() {
         let go = Command::Go(GoCommand {
             goal: "ship interview summary".into(),
+            fallback_staged: false,
             json: true,
         });
         let start = Command::Start(StartCommand {
@@ -1078,6 +1116,8 @@ mod tests {
             "target checks passed; integrity checks passed",
             "proof_789",
             "punk inspect proof_789 --json",
+            None,
+            None,
             None,
         );
         assert!(rendered.contains("Goal: add interview feedback summary endpoint"));
@@ -1153,6 +1193,29 @@ mod tests {
             go_recommended_mode(&punk_domain::Decision::Escalate),
             "staged_review"
         );
+    }
+
+    #[test]
+    fn go_summary_includes_prepared_staged_recovery() {
+        let rendered = format_go_summary(
+            "interviewcoach",
+            "ship feature",
+            "ct_123",
+            "run_456",
+            "failure",
+            "blocked by checks",
+            "blocked",
+            "block",
+            "target checks failed",
+            "proof_789",
+            "punk inspect proof_789 --json",
+            Some("punk start \"ship feature\""),
+            Some("ct_999"),
+            Some("punk plot approve ct_999"),
+        );
+        assert!(rendered.contains("Recovery: punk start \"ship feature\""));
+        assert!(rendered.contains("Recovery contract: ct_999"));
+        assert!(rendered.contains("Recovery next: punk plot approve ct_999"));
     }
 
     #[test]
