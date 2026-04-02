@@ -571,7 +571,15 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
             )
         );
     }
-    Ok(())
+    if go_decision_succeeds(&decision.decision) {
+        Ok(())
+    } else {
+        Err(anyhow!(format_go_error(
+            &decision.decision,
+            &proof.id,
+            &follow_up
+        )))
+    }
 }
 
 fn format_start_summary(
@@ -607,6 +615,19 @@ fn decision_label(decision: &punk_domain::Decision) -> &'static str {
         punk_domain::Decision::Block => "block",
         punk_domain::Decision::Escalate => "escalate",
     }
+}
+
+fn go_decision_succeeds(decision: &punk_domain::Decision) -> bool {
+    matches!(decision, punk_domain::Decision::Accept)
+}
+
+fn format_go_error(decision: &punk_domain::Decision, proof_id: &str, follow_up: &str) -> String {
+    format!(
+        "punk go ended with gate decision {} (proof: {}). Inspect details with `{}`.",
+        decision_label(decision),
+        proof_id,
+        follow_up
+    )
 }
 
 fn resolve_init_project_id(project_root: &Path, explicit_project: Option<&str>) -> Result<String> {
@@ -991,6 +1012,25 @@ mod tests {
         assert!(rendered.contains("Gate: accept"));
         assert!(rendered.contains("Proof: proof_789"));
         assert!(rendered.contains("Follow-up: punk inspect proof_789 --json"));
+    }
+
+    #[test]
+    fn go_error_mentions_blocking_decision_and_proof() {
+        let rendered = format_go_error(
+            &punk_domain::Decision::Block,
+            "proof_789",
+            "punk inspect proof_789 --json",
+        );
+        assert!(rendered.contains("gate decision block"));
+        assert!(rendered.contains("proof: proof_789"));
+        assert!(rendered.contains("punk inspect proof_789 --json"));
+    }
+
+    #[test]
+    fn go_decision_only_accepts_accept() {
+        assert!(go_decision_succeeds(&punk_domain::Decision::Accept));
+        assert!(!go_decision_succeeds(&punk_domain::Decision::Block));
+        assert!(!go_decision_succeeds(&punk_domain::Decision::Escalate));
     }
 
     #[test]
