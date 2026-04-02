@@ -1214,15 +1214,34 @@ async fn main() -> anyhow::Result<()> {
 
 fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {
     let bus_path = bus::bus_dir();
-    let mut state = bus::read_state(&bus_path, recent_limit);
+    let known_projects = match config::load_or_default(&config::config_dir()) {
+        Ok(cfg) => resolver::list_known(Some(&cfg)),
+        Err(_) => resolver::list_known(None),
+    };
+    let cwd = std::env::current_dir().ok();
+    let resolved_project_filter =
+        resolve_status_project_filter(project_filter, cwd.as_deref(), &known_projects);
+    let bus_recent_limit = if resolved_project_filter.is_some() {
+        usize::MAX
+    } else {
+        recent_limit
+    };
+    let mut state = bus::read_state(&bus_path, bus_recent_limit);
 
     // Apply project filter
-    if let Some(proj) = project_filter {
+    if let Some(proj) = resolved_project_filter.as_deref() {
         state.queued.retain(|t| t.project == proj);
         state.running.retain(|t| t.project == proj);
         state.done.retain(|t| t.project == proj);
         state.failed.retain(|t| t.project == proj);
+        state.done.truncate(recent_limit);
     }
+
+    println!(
+        "Scope: {}",
+        format_status_scope_label(resolved_project_filter.as_deref())
+    );
+    println!();
 
     println!(
         "Running ({} task{})",
@@ -1317,25 +1336,64 @@ fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {
         fail_count,
         total_cost
     );
-    println!("{}", goal::format_goal_summary_line(&bus_path));
-    if let Some(attention) = goal::format_goal_attention_line(&bus_path) {
+    println!(
+        "{}",
+        goal::format_goal_summary_line_for_project(&bus_path, resolved_project_filter.as_deref())
+    );
+    if let Some(attention) =
+        goal::format_goal_attention_line_for_project(&bus_path, resolved_project_filter.as_deref())
+    {
         println!("{attention}");
     }
-    if let Ok(skill_eval_summary) =
-        eval::summarize_skill_evals(Path::new("."), Some(recent_limit), project_filter, None)
-    {
+    if let Ok(skill_eval_summary) = eval::summarize_skill_evals(
+        Path::new("."),
+        Some(recent_limit),
+        resolved_project_filter.as_deref(),
+        None,
+    ) {
         println!(
             "{}",
             eval::format_skill_eval_summary_line(&skill_eval_summary)
         );
     }
-    if let Ok(benchmark_summary) =
-        benchmark::summarize_benchmarks(Path::new("."), Some(recent_limit), project_filter, None)
-    {
+    if let Ok(benchmark_summary) = benchmark::summarize_benchmarks(
+        Path::new("."),
+        Some(recent_limit),
+        resolved_project_filter.as_deref(),
+        None,
+    ) {
         println!(
             "{}",
             benchmark::format_benchmark_summary_line(&benchmark_summary)
         );
+    }
+}
+
+fn resolve_status_project_filter(
+    explicit_project: Option<&str>,
+    cwd: Option<&Path>,
+    known_projects: &[resolver::ResolvedProject],
+) -> Option<String> {
+    explicit_project
+        .map(str::to_string)
+        .or_else(|| cwd.and_then(|cwd| infer_project_from_cwd(cwd, known_projects)))
+}
+
+fn infer_project_from_cwd(
+    cwd: &Path,
+    known_projects: &[resolver::ResolvedProject],
+) -> Option<String> {
+    known_projects
+        .iter()
+        .filter(|project| cwd.starts_with(&project.path))
+        .max_by_key(|project| project.path.components().count())
+        .map(|project| project.id.clone())
+}
+
+fn format_status_scope_label(project_filter: Option<&str>) -> String {
+    match project_filter {
+        Some(project) => format!("project:{project}"),
+        None => "global".to_string(),
     }
 }
 
@@ -4213,6 +4271,62 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{}-{}-{}", prefix, std::process::id(), nanos));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn resolve_status_project_filter_prefers_explicit_project() {
+        let tmp = temp_test_dir("punk-run-status-scope-explicit");
+        let cwd = tmp.join("projects/interviewcoach/app");
+        fs::create_dir_all(&cwd).unwrap();
+        let known = vec![ResolvedProject {
+            id: "interviewcoach".to_string(),
+            path: tmp.join("projects/interviewcoach"),
+            source: ResolveSource::LazyScan,
+            stack: Some("rust".to_string()),
+        }];
+
+        let resolved = resolve_status_project_filter(Some("signum"), Some(&cwd), &known);
+        assert_eq!(resolved.as_deref(), Some("signum"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_status_project_filter_infers_project_from_cwd() {
+        let tmp = temp_test_dir("punk-run-status-scope-cwd");
+        let project_root = tmp.join("projects/interviewcoach");
+        let cwd = project_root.join("apps/web");
+        fs::create_dir_all(&cwd).unwrap();
+        let known = vec![ResolvedProject {
+            id: "interviewcoach".to_string(),
+            path: project_root,
+            source: ResolveSource::LazyScan,
+            stack: Some("typescript".to_string()),
+        }];
+
+        let resolved = resolve_status_project_filter(None, Some(&cwd), &known);
+        assert_eq!(resolved.as_deref(), Some("interviewcoach"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_status_project_filter_falls_back_to_global_when_cwd_unknown() {
+        let tmp = temp_test_dir("punk-run-status-scope-global");
+        let cwd = tmp.join("random-project");
+        fs::create_dir_all(&cwd).unwrap();
+        let known = vec![ResolvedProject {
+            id: "interviewcoach".to_string(),
+            path: tmp.join("projects/interviewcoach"),
+            source: ResolveSource::LazyScan,
+            stack: Some("typescript".to_string()),
+        }];
+
+        let resolved = resolve_status_project_filter(None, Some(&cwd), &known);
+        assert!(resolved.is_none());
+        assert_eq!(format_status_scope_label(resolved.as_deref()), "global");
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

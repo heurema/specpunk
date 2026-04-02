@@ -116,6 +116,11 @@ pub fn list_goals(bus: &Path) -> Vec<Goal> {
 
 /// Format a concise one-line summary of goal counts for status output.
 pub fn format_goal_summary_line(bus: &Path) -> String {
+    format_goal_summary_line_for_project(bus, None)
+}
+
+/// Format a concise one-line summary of goal counts scoped to an optional project.
+pub fn format_goal_summary_line_for_project(bus: &Path, project_filter: Option<&str>) -> String {
     let mut active = 0usize;
     let mut paused = 0usize;
     let mut awaiting_approval = 0usize;
@@ -123,7 +128,10 @@ pub fn format_goal_summary_line(bus: &Path) -> String {
     let mut failed = 0usize;
     let mut replan_needed = 0usize;
 
-    for goal in list_goals(bus) {
+    for goal in list_goals(bus)
+        .into_iter()
+        .filter(|goal| project_filter.map_or(true, |project| goal.project == project))
+    {
         match goal.status {
             GoalStatus::Active => active += 1,
             GoalStatus::Paused => paused += 1,
@@ -147,8 +155,17 @@ pub fn format_goal_summary_line(bus: &Path) -> String {
 
 /// Return an operator attention line when any failed goals need replan.
 pub fn format_goal_attention_line(bus: &Path) -> Option<String> {
+    format_goal_attention_line_for_project(bus, None)
+}
+
+/// Return an operator attention line when any failed goals in an optional project need replan.
+pub fn format_goal_attention_line_for_project(
+    bus: &Path,
+    project_filter: Option<&str>,
+) -> Option<String> {
     let count = list_goals(bus)
         .into_iter()
+        .filter(|goal| project_filter.map_or(true, |project| goal.project == project))
         .filter(|goal| goal.status_reason.as_deref() == Some("replan_needed_dead_end"))
         .count();
     if count > 0 {
@@ -570,6 +587,87 @@ mod tests {
         assert!(line.contains("done 1"));
         assert!(line.contains("failed 1"));
         assert!(line.contains("replan-needed 1"));
+    }
+
+    #[test]
+    fn format_goal_summary_line_for_project_filters_goals() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+
+        for (id, project, status, status_reason) in [
+            ("goal-a", "alpha", GoalStatus::Active, None),
+            (
+                "goal-b",
+                "alpha",
+                GoalStatus::Failed,
+                Some("replan_needed_dead_end"),
+            ),
+            ("goal-c", "beta", GoalStatus::Paused, None),
+        ] {
+            save_goal(
+                &bus,
+                &Goal {
+                    id: id.into(),
+                    project: project.into(),
+                    objective: "test".into(),
+                    deadline: None,
+                    budget_usd: 1.0,
+                    spent_usd: 0.0,
+                    status,
+                    status_reason: status_reason.map(str::to_string),
+                    plan: None,
+                    created_at: Utc::now(),
+                    completed_at: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let line = format_goal_summary_line_for_project(&bus, Some("alpha"));
+        assert!(line.contains("active 1"));
+        assert!(line.contains("paused 0"));
+        assert!(line.contains("failed 1"));
+        assert!(line.contains("replan-needed 1"));
+    }
+
+    #[test]
+    fn format_goal_attention_line_for_project_filters_goals() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+
+        for (id, project, status_reason) in [
+            ("goal-a", "alpha", Some("replan_needed_dead_end")),
+            ("goal-b", "beta", Some("replan_needed_dead_end")),
+            ("goal-c", "alpha", None),
+        ] {
+            save_goal(
+                &bus,
+                &Goal {
+                    id: id.into(),
+                    project: project.into(),
+                    objective: "test".into(),
+                    deadline: None,
+                    budget_usd: 1.0,
+                    spent_usd: 0.0,
+                    status: GoalStatus::Failed,
+                    status_reason: status_reason.map(str::to_string),
+                    plan: None,
+                    created_at: Utc::now(),
+                    completed_at: None,
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            format_goal_attention_line_for_project(&bus, Some("alpha")).as_deref(),
+            Some("Goal attention: replan dead-end goals (1)")
+        );
+        assert_eq!(
+            format_goal_attention_line_for_project(&bus, Some("beta")).as_deref(),
+            Some("Goal attention: replan dead-end goals (1)")
+        );
+        assert!(format_goal_attention_line_for_project(&bus, Some("gamma")).is_none());
     }
 
     #[test]
