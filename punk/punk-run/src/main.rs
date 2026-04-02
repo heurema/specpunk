@@ -3437,7 +3437,7 @@ fn default_project_skill_template() -> &'static str {
 
 fn default_agent_start_template(project: &str) -> String {
     format!(
-        "# Agent start\n\nProject id: `{project}`\n\n## Project onboarding\n\nUse:\n\n```bash\npunk init --project {project} --enable-jj --verify\n```\n\nIf the project is already bootstrapped, this is safe to rerun.\n\n## Work intake\n\nStart from a goal only:\n\n```bash\npunk start \"<goal>\"\n```\n\nThen continue with:\n\n```bash\npunk plot approve <contract_id>\npunk cut run <contract_id>\n```\n"
+        "# Agent start\n\nProject id: `{project}`\n\n## Project onboarding\n\nUse:\n\n```bash\npunk init --project {project} --enable-jj --verify\n```\n\nIf the project is already bootstrapped, this is safe to rerun.\n\n## Default rule\n\nIf the user gives only a plain goal in chat, treat it as input to punk automation. Do not ask the user to spell out the `punk` command first.\n\n## Preferred work intake\n\nRun the full-auto lane:\n\n```bash\npunk go \"<goal>\"\n```\n\n## Staged alternative\n\nIf the user explicitly wants manual review between stages, use:\n\n```bash\npunk start \"<goal>\"\npunk plot approve <contract_id>\npunk cut run <contract_id>\n```\n"
     )
 }
 
@@ -4786,6 +4786,8 @@ mod tests {
         assert!(created);
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains("punk init --project interviewcoach --enable-jj --verify"));
+        assert!(content.contains("plain goal in chat"));
+        assert!(content.contains("punk go \"<goal>\""));
         assert!(content.contains("punk start \"<goal>\""));
 
         fs::write(&path, "custom instructions\n").unwrap();
