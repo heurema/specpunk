@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use punk_core::vcs::{detect_mode as detect_vcs_mode, enable_jj as enable_jj_for_repo, VcsMode};
+use punk_core::vcs::{VcsMode, detect_mode as detect_vcs_mode, enable_jj as enable_jj_for_repo};
 use punk_orch::{
     benchmark, bus, config, context, daemon, diverge, doctor, eval, goal, graph, morning, ops,
     panel, pipeline, ratchet, recall, research, resolver, skill,
@@ -1277,7 +1277,10 @@ fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {
     if let Ok(skill_eval_summary) =
         eval::summarize_skill_evals(Path::new("."), Some(recent_limit), project_filter, None)
     {
-        println!("{}", eval::format_skill_eval_summary_line(&skill_eval_summary));
+        println!(
+            "{}",
+            eval::format_skill_eval_summary_line(&skill_eval_summary)
+        );
     }
     if let Ok(benchmark_summary) =
         benchmark::summarize_benchmarks(Path::new("."), Some(recent_limit), project_filter, None)
@@ -1895,8 +1898,7 @@ fn cmd_queue(
     let resolved = match resolver::resolve(project, None, Some(&cfg)) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{e}");
-            eprintln!("\nHint: punk-run use {project} /path/to/project");
+            eprintln!("{}", format_project_resolution_error(project, &e));
             std::process::exit(1);
         }
     };
@@ -2298,9 +2300,17 @@ fn cmd_resolve(name: &str, cli_path: Option<&str>) {
         }
         Err(e) => {
             eprintln!("{e}");
-            eprintln!("\nHint: punk-run use {name} /path/to/project");
             std::process::exit(1);
         }
+    }
+}
+
+fn format_project_resolution_error(name: &str, err: &resolver::ResolveError) -> String {
+    match err {
+        resolver::ResolveError::Ambiguous { .. } => format!(
+            "{err}\n\nHint: punk-run resolve {name} --path /absolute/path/to/project\nHint: punk-run use {name} /path/to/project"
+        ),
+        _ => format!("{err}\n\nHint: punk-run use {name} /path/to/project"),
     }
 }
 
@@ -2311,11 +2321,12 @@ fn resolve_for_cli(
 ) -> Result<resolver::ResolvedProject, String> {
     let path = cli_path.map(expand_path);
     if path.is_some() {
-        return resolver::resolve(name, path.as_deref(), None).map_err(|e| e.to_string());
+        return resolver::resolve(name, path.as_deref(), None)
+            .map_err(|e| format_project_resolution_error(name, &e));
     }
     let cfg = config::load_or_default(config_dir)
         .map_err(|e| format!("Config error in {}: {e}", config_dir.display()))?;
-    resolver::resolve(name, None, Some(&cfg)).map_err(|e| e.to_string())
+    resolver::resolve(name, None, Some(&cfg)).map_err(|e| format_project_resolution_error(name, &e))
 }
 
 fn cmd_forget(name: &str) {
@@ -3536,10 +3547,12 @@ mod tests {
         let policy = fs::read_to_string(tmp.join("policy.toml")).unwrap();
         assert!(policy.contains("soft_alert_pct = 80"));
         assert!(policy.contains("hard_stop_pct = 90"));
-        assert!(summary
-            .notices
-            .iter()
-            .any(|n| n.contains("Skipped agents.toml")));
+        assert!(
+            summary
+                .notices
+                .iter()
+                .any(|n| n.contains("Skipped agents.toml"))
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -3558,6 +3571,28 @@ mod tests {
 
         let _ = fs::remove_dir_all(&config_dir);
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn project_resolution_error_includes_ambiguity_hints() {
+        let err = punk_orch::resolver::ResolveError::Ambiguous {
+            name: "demo".to_string(),
+            candidates: vec![
+                punk_orch::resolver::AmbiguousProjectCandidate {
+                    path: PathBuf::from("/tmp/a"),
+                    sources: vec![ResolveSource::Toml],
+                },
+                punk_orch::resolver::AmbiguousProjectCandidate {
+                    path: PathBuf::from("/tmp/b"),
+                    sources: vec![ResolveSource::LazyScan],
+                },
+            ],
+        };
+
+        let rendered = format_project_resolution_error("demo", &err);
+        assert!(rendered.contains("project 'demo' is ambiguous"));
+        assert!(rendered.contains("punk-run resolve demo --path /absolute/path/to/project"));
+        assert!(rendered.contains("punk-run use demo /path/to/project"));
     }
 
     #[test]
