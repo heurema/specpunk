@@ -75,10 +75,35 @@ pub struct TriageEntry {
     pub error_excerpt: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryOutcome {
+    pub task_id: String,
+    pub project: String,
+    pub model: String,
+    pub source: String,
+    pub destination: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelOutcome {
+    Queued {
+        task_id: String,
+        queue_lane: String,
+    },
+    Running {
+        task_id: String,
+        signal_path: String,
+    },
+}
+
 /// Retry a failed/dead task by moving it back to new/p1/.
-pub fn retry_task(bus: &Path, task_id: &str) -> Result<(), String> {
-    let task_json = find_task_json(bus, task_id)?;
+pub fn retry_task(bus: &Path, task_id: &str) -> Result<RetryOutcome, String> {
+    let (task_json, source) = find_task_json(bus, task_id)?;
+    let task = read_json(&task_json).ok_or_else(|| format!("invalid task.json for '{task_id}'"))?;
     let dest = bus.join("new/p1").join(format!("{task_id}.json"));
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("queue lane init failed: {e}"))?;
+    }
     fs::copy(&task_json, &dest).map_err(|e| format!("copy failed: {e}"))?;
 
     // Remove from failed/dead
@@ -88,17 +113,26 @@ pub fn retry_task(bus: &Path, task_id: &str) -> Result<(), String> {
             fs::remove_dir_all(&src).ok();
         }
     }
-    Ok(())
+    Ok(RetryOutcome {
+        task_id: task_id.to_string(),
+        project: json_str(&task, "project"),
+        model: json_str(&task, "model"),
+        source: source.to_string(),
+        destination: "new/p1".to_string(),
+    })
 }
 
 /// Cancel a task (remove from queue or kill running process).
-pub fn cancel_task(bus: &Path, task_id: &str) -> Result<(), String> {
+pub fn cancel_task(bus: &Path, task_id: &str) -> Result<CancelOutcome, String> {
     // Check new/ (queued)
     for sub in &["new/p0", "new/p1", "new/p2", "new"] {
         let path = bus.join(sub).join(format!("{task_id}.json"));
         if path.exists() {
             fs::remove_file(&path).map_err(|e| format!("remove failed: {e}"))?;
-            return Ok(());
+            return Ok(CancelOutcome::Queued {
+                task_id: task_id.to_string(),
+                queue_lane: sub.to_string(),
+            });
         }
     }
 
@@ -107,18 +141,22 @@ pub fn cancel_task(bus: &Path, task_id: &str) -> Result<(), String> {
     if cur_path.exists() {
         let cancel_dir = bus.join(".cancel");
         fs::create_dir_all(&cancel_dir).ok();
-        fs::write(cancel_dir.join(task_id), "cancel").map_err(|e| format!("signal failed: {e}"))?;
-        return Ok(());
+        let signal_path = cancel_dir.join(task_id);
+        fs::write(&signal_path, "cancel").map_err(|e| format!("signal failed: {e}"))?;
+        return Ok(CancelOutcome::Running {
+            task_id: task_id.to_string(),
+            signal_path: signal_path.display().to_string(),
+        });
     }
 
     Err(format!("task '{task_id}' not found in queue or running"))
 }
 
-fn find_task_json(bus: &Path, task_id: &str) -> Result<std::path::PathBuf, String> {
-    for dir in &["failed", "dead"] {
-        let path = bus.join(dir).join(task_id).join("task.json");
+fn find_task_json(bus: &Path, task_id: &str) -> Result<(std::path::PathBuf, &'static str), String> {
+    for dir in [("failed", "failed"), ("dead", "dead")] {
+        let path = bus.join(dir.0).join(task_id).join("task.json");
         if path.exists() {
-            return Ok(path);
+            return Ok((path, dir.1));
         }
     }
     Err(format!("no task.json for '{task_id}' in failed/ or dead/"))
@@ -192,6 +230,78 @@ mod tests {
         assert_eq!(
             pairs,
             vec![("dead", "task-a"), ("dead", "task-c"), ("failed", "task-b")]
+        );
+
+        let _ = fs::remove_dir_all(&bus);
+    }
+
+    #[test]
+    fn retry_task_returns_project_model_and_source() {
+        let bus = temp_test_dir("punk-ops-retry");
+        let task_dir = bus.join("failed/task-1");
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(
+            task_dir.join("task.json"),
+            r#"{"id":"task-1","project":"specpunk","model":"codex"}"#,
+        )
+        .unwrap();
+
+        let outcome = retry_task(&bus, "task-1").unwrap();
+        assert_eq!(
+            outcome,
+            RetryOutcome {
+                task_id: "task-1".into(),
+                project: "specpunk".into(),
+                model: "codex".into(),
+                source: "failed".into(),
+                destination: "new/p1".into(),
+            }
+        );
+        assert!(bus.join("new/p1/task-1.json").is_file());
+        assert!(!bus.join("failed/task-1").exists());
+
+        let _ = fs::remove_dir_all(&bus);
+    }
+
+    #[test]
+    fn cancel_task_reports_queue_lane_for_queued_task() {
+        let bus = temp_test_dir("punk-ops-cancel-queued");
+        fs::create_dir_all(bus.join("new/p2")).unwrap();
+        fs::write(bus.join("new/p2/task-2.json"), "{}").unwrap();
+
+        let outcome = cancel_task(&bus, "task-2").unwrap();
+        assert_eq!(
+            outcome,
+            CancelOutcome::Queued {
+                task_id: "task-2".into(),
+                queue_lane: "new/p2".into(),
+            }
+        );
+        assert!(!bus.join("new/p2/task-2.json").exists());
+
+        let _ = fs::remove_dir_all(&bus);
+    }
+
+    #[test]
+    fn cancel_task_reports_signal_for_running_task() {
+        let bus = temp_test_dir("punk-ops-cancel-running");
+        fs::create_dir_all(bus.join("cur")).unwrap();
+        fs::write(bus.join("cur/task-3.json"), "{}").unwrap();
+
+        let outcome = cancel_task(&bus, "task-3").unwrap();
+        match outcome {
+            CancelOutcome::Running {
+                task_id,
+                signal_path,
+            } => {
+                assert_eq!(task_id, "task-3");
+                assert!(signal_path.ends_with("/.cancel/task-3"));
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+        assert_eq!(
+            fs::read_to_string(bus.join(".cancel/task-3")).unwrap(),
+            "cancel"
         );
 
         let _ = fs::remove_dir_all(&bus);

@@ -645,7 +645,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Retry { task_id } => {
             let bus_path = bus::bus_dir();
             match ops::retry_task(&bus_path, &task_id) {
-                Ok(()) => println!("Requeued: {task_id}"),
+                Ok(outcome) => println!("{}", format_retry_outcome(&outcome)),
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
@@ -655,7 +655,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Cancel { task_id } => {
             let bus_path = bus::bus_dir();
             match ops::cancel_task(&bus_path, &task_id) {
-                Ok(()) => println!("Cancelled: {task_id}"),
+                Ok(outcome) => println!("{}", format_cancel_outcome(&outcome)),
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
@@ -1405,6 +1405,26 @@ fn cmd_triage() {
     let bus_path = bus::bus_dir();
     let entries = ops::list_triage(&bus_path);
     print!("{}", format_triage_report(&entries));
+}
+
+fn format_retry_outcome(outcome: &ops::RetryOutcome) -> String {
+    format!(
+        "Requeued: {} (project={}, model={}) from {} -> {}",
+        outcome.task_id, outcome.project, outcome.model, outcome.source, outcome.destination
+    )
+}
+
+fn format_cancel_outcome(outcome: &ops::CancelOutcome) -> String {
+    match outcome {
+        ops::CancelOutcome::Queued {
+            task_id,
+            queue_lane,
+        } => format!("Cancelled queued task: {task_id} ({queue_lane})"),
+        ops::CancelOutcome::Running {
+            task_id,
+            signal_path,
+        } => format!("Cancellation signaled for running task: {task_id}\n  signal: {signal_path}"),
+    }
 }
 
 fn format_triage_report(entries: &[ops::TriageEntry]) -> String {
@@ -4020,6 +4040,37 @@ mod tests {
             format_pipeline_report(&[], "2026-04-02"),
             "Pipeline empty.\n"
         );
+    }
+
+    #[test]
+    fn format_retry_outcome_includes_project_model_and_source() {
+        let rendered = format_retry_outcome(&ops::RetryOutcome {
+            task_id: "task-1".into(),
+            project: "specpunk".into(),
+            model: "codex".into(),
+            source: "failed".into(),
+            destination: "new/p1".into(),
+        });
+        assert_eq!(
+            rendered,
+            "Requeued: task-1 (project=specpunk, model=codex) from failed -> new/p1"
+        );
+    }
+
+    #[test]
+    fn format_cancel_outcome_distinguishes_queued_and_running() {
+        let queued = format_cancel_outcome(&ops::CancelOutcome::Queued {
+            task_id: "task-2".into(),
+            queue_lane: "new/p2".into(),
+        });
+        assert_eq!(queued, "Cancelled queued task: task-2 (new/p2)");
+
+        let running = format_cancel_outcome(&ops::CancelOutcome::Running {
+            task_id: "task-3".into(),
+            signal_path: "/tmp/bus/.cancel/task-3".into(),
+        });
+        assert!(running.contains("Cancellation signaled for running task: task-3"));
+        assert!(running.contains("/tmp/bus/.cancel/task-3"));
     }
 
     #[test]
