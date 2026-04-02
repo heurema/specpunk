@@ -1596,37 +1596,7 @@ fn cmd_goal(project: &str, objective: &str, budget: f64, deadline: Option<&str>)
 fn cmd_goals() {
     let bus_path = bus::bus_dir();
     let goals = goal::list_goals(&bus_path);
-
-    if goals.is_empty() {
-        println!("No goals.");
-        return;
-    }
-
-    println!("Goals ({})\n", goals.len());
-    println!(
-        "  {:<35} {:<12} {:<10} {:>8} {:>8} OBJECTIVE",
-        "ID", "PROJECT", "STATUS", "SPENT", "BUDGET"
-    );
-    for g in &goals {
-        println!(
-            "  {:<35} {:<12} {:<10} {:>8} {:>8} {}",
-            truncate(&g.id, 35),
-            g.project,
-            format!("{:?}", g.status).to_lowercase(),
-            format_cost(g.spent_usd),
-            format_cost(g.budget_usd),
-            truncate(&g.objective, 40)
-        );
-        if let Some(ref plan) = g.plan {
-            let done = plan
-                .steps
-                .iter()
-                .filter(|s| s.status == goal::StepStatus::Done)
-                .count();
-            let total = plan.steps.len();
-            println!("    plan v{}: {done}/{total} steps done", plan.version);
-        }
-    }
+    print!("{}", format_goals_report(&goals));
 }
 
 fn cmd_approve(goal_id: &str) {
@@ -2398,22 +2368,113 @@ fn cmd_goal_status(goal_id: &str) {
             std::process::exit(1);
         }
     };
+    print!("{}", format_goal_status_report(&g));
+}
 
-    println!("Goal: {}", g.id);
-    println!("  project:   {}", g.project);
-    println!("  objective: {}", g.objective);
-    println!("  status:    {:?}", g.status);
-    println!(
-        "  budget:    ${:.2} (spent: ${:.2})",
-        g.budget_usd, g.spent_usd
-    );
-    if let Some(ref d) = g.deadline {
-        println!("  deadline:  {d}");
+#[derive(Default)]
+struct GoalStatusSummary {
+    planning: usize,
+    awaiting_approval: usize,
+    active: usize,
+    paused: usize,
+    done: usize,
+    failed: usize,
+}
+
+#[derive(Default)]
+struct StepStatusSummary {
+    pending: usize,
+    queued: usize,
+    running: usize,
+    done: usize,
+    blocked: usize,
+    failed: usize,
+    skipped: usize,
+}
+
+fn format_goals_report(goals: &[goal::Goal]) -> String {
+    if goals.is_empty() {
+        return "No goals.\n".to_string();
     }
-    println!();
 
-    if let Some(ref plan) = g.plan {
-        println!("Plan v{} ({} steps):\n", plan.version, plan.steps.len());
+    let summary = summarize_goal_statuses(goals);
+    let mut out = format!("Goals ({})\n", goals.len());
+    out.push_str(&format!(
+        "Summary: planning={} awaiting_approval={} active={} paused={} done={} failed={}\n\n",
+        summary.planning,
+        summary.awaiting_approval,
+        summary.active,
+        summary.paused,
+        summary.done,
+        summary.failed
+    ));
+    out.push_str(&format!(
+        "  {:<35} {:<12} {:<17} {:>8} {:>8} OBJECTIVE\n",
+        "ID", "PROJECT", "STATUS", "SPENT", "BUDGET"
+    ));
+    for g in goals {
+        out.push_str(&format!(
+            "  {:<35} {:<12} {:<17} {:>8} {:>8} {}\n",
+            truncate(&g.id, 35),
+            g.project,
+            format!("{:?}", g.status).to_lowercase(),
+            format_cost(g.spent_usd),
+            format_cost(g.budget_usd),
+            truncate(&g.objective, 40)
+        ));
+        if let Some(ref plan) = g.plan {
+            let done = plan
+                .steps
+                .iter()
+                .filter(|s| s.status == goal::StepStatus::Done)
+                .count();
+            let total = plan.steps.len();
+            out.push_str(&format!(
+                "    plan v{}: {done}/{total} steps done\n",
+                plan.version
+            ));
+        } else {
+            out.push_str("    no plan yet\n");
+        }
+    }
+    out
+}
+
+fn format_goal_status_report(goal: &goal::Goal) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Goal: {}\n", goal.id));
+    out.push_str(&format!("  project:   {}\n", goal.project));
+    out.push_str(&format!("  objective: {}\n", goal.objective));
+    out.push_str(&format!(
+        "  status:    {}\n",
+        format!("{:?}", goal.status).to_lowercase()
+    ));
+    out.push_str(&format!(
+        "  budget:    ${:.2} (spent: ${:.2})\n",
+        goal.budget_usd, goal.spent_usd
+    ));
+    if let Some(ref d) = goal.deadline {
+        out.push_str(&format!("  deadline:  {d}\n"));
+    }
+    out.push('\n');
+
+    if let Some(ref plan) = goal.plan {
+        let summary = summarize_step_statuses(plan);
+        out.push_str(&format!(
+            "Plan v{} ({} steps)\n",
+            plan.version,
+            plan.steps.len()
+        ));
+        out.push_str(&format!(
+            "Step summary: pending={} queued={} running={} done={} blocked={} failed={} skipped={}\n\n",
+            summary.pending,
+            summary.queued,
+            summary.running,
+            summary.done,
+            summary.blocked,
+            summary.failed,
+            summary.skipped
+        ));
         for step in &plan.steps {
             let status_icon = match step.status {
                 goal::StepStatus::Done => "[x]",
@@ -2424,17 +2485,75 @@ fn cmd_goal_status(goal_id: &str) {
                 goal::StepStatus::Pending => "[ ]",
                 goal::StepStatus::Skipped => "[-]",
             };
-            println!(
-                "  {} {}. [{}] {} (${:.2})",
+            out.push_str(&format!(
+                "  {} {}. [{}] {} (${:.2})\n",
                 status_icon, step.step, step.category, step.prompt, step.est_cost_usd
-            );
+            ));
             if let Some(ref tid) = step.task_id {
-                println!("      task: {tid}");
+                out.push_str(&format!("      task: {tid}\n"));
             }
         }
     } else {
-        println!("  No plan yet.");
+        out.push_str("No plan yet.\n");
     }
+
+    out.push('\n');
+    out.push_str("Actions:\n");
+    match goal.status {
+        goal::GoalStatus::Planning => {
+            out.push_str("  waiting for planner output or manual plan edit\n");
+        }
+        goal::GoalStatus::AwaitingApproval => {
+            out.push_str(&format!("  punk-run goal approve {}\n", goal.id));
+        }
+        goal::GoalStatus::Active => {
+            out.push_str(&format!("  punk-run status --project {}\n", goal.project));
+            out.push_str(&format!("  punk-run goal pause {}\n", goal.id));
+        }
+        goal::GoalStatus::Paused => {
+            out.push_str(&format!("  punk-run goal resume {}\n", goal.id));
+            out.push_str(&format!("  punk-run goal replan {}\n", goal.id));
+        }
+        goal::GoalStatus::Done => {
+            out.push_str("  completed; no further action required\n");
+        }
+        goal::GoalStatus::Failed => {
+            out.push_str(&format!("  punk-run goal replan {}\n", goal.id));
+            out.push_str(&format!("  punk-run goal budget {} <usd>\n", goal.id));
+        }
+    }
+    out
+}
+
+fn summarize_goal_statuses(goals: &[goal::Goal]) -> GoalStatusSummary {
+    let mut summary = GoalStatusSummary::default();
+    for goal in goals {
+        match goal.status {
+            goal::GoalStatus::Planning => summary.planning += 1,
+            goal::GoalStatus::AwaitingApproval => summary.awaiting_approval += 1,
+            goal::GoalStatus::Active => summary.active += 1,
+            goal::GoalStatus::Paused => summary.paused += 1,
+            goal::GoalStatus::Done => summary.done += 1,
+            goal::GoalStatus::Failed => summary.failed += 1,
+        }
+    }
+    summary
+}
+
+fn summarize_step_statuses(plan: &goal::Plan) -> StepStatusSummary {
+    let mut summary = StepStatusSummary::default();
+    for step in &plan.steps {
+        match step.status {
+            goal::StepStatus::Pending => summary.pending += 1,
+            goal::StepStatus::Queued => summary.queued += 1,
+            goal::StepStatus::Running => summary.running += 1,
+            goal::StepStatus::Done => summary.done += 1,
+            goal::StepStatus::Blocked => summary.blocked += 1,
+            goal::StepStatus::Failed => summary.failed += 1,
+            goal::StepStatus::Skipped => summary.skipped += 1,
+        }
+    }
+    summary
 }
 
 fn cmd_goal_set_status(goal_id: &str, new_status: goal::GoalStatus) {
@@ -4266,5 +4385,40 @@ mod cli_goal_tests {
             ],
         );
         assert!(!goal_has_inflight_steps(&settled));
+    }
+
+    #[test]
+    fn format_goals_report_includes_status_summary() {
+        let mut paused = sample_goal(goal::GoalStatus::Paused, &[goal::StepStatus::Queued]);
+        paused.id = "goal-2".into();
+        paused.project = "signum".into();
+
+        let rendered = format_goals_report(&[
+            sample_goal(goal::GoalStatus::Active, &[goal::StepStatus::Running]),
+            paused,
+        ]);
+        assert!(rendered.contains("Goals (2)"));
+        assert!(rendered.contains("active=1"));
+        assert!(rendered.contains("paused=1"));
+        assert!(rendered.contains("plan v1: 0/1 steps done"));
+    }
+
+    #[test]
+    fn format_goal_status_report_shows_step_summary_and_actions() {
+        let goal = sample_goal(
+            goal::GoalStatus::AwaitingApproval,
+            &[
+                goal::StepStatus::Done,
+                goal::StepStatus::Queued,
+                goal::StepStatus::Blocked,
+            ],
+        );
+        let rendered = format_goal_status_report(&goal);
+        assert!(rendered.contains("Goal: goal-1"));
+        assert!(rendered.contains("status:    awaitingapproval"));
+        assert!(rendered.contains(
+            "Step summary: pending=0 queued=1 running=0 done=1 blocked=1 failed=0 skipped=0"
+        ));
+        assert!(rendered.contains("punk-run goal approve goal-1"));
     }
 }
