@@ -343,6 +343,9 @@ pub fn queue_ready_steps(bus: &Path, goal: &mut Goal) -> Result<Vec<String>, Que
         }
 
         let queue_path = bus.join("new/p1").join(format!("{task_id}.json"));
+        if let Some(parent) = queue_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let data = serde_json::to_string_pretty(&task_json).map_err(std::io::Error::other)?;
         match fs::OpenOptions::new()
             .write(true)
@@ -823,6 +826,45 @@ mod tests {
         assert_eq!(step.status, StepStatus::Queued);
         assert_eq!(step.task_id.as_deref(), Some("goal-queued-step1"));
         assert!(bus.join("new/p1/goal-queued-step1.json").exists());
+    }
+
+    #[test]
+    fn queue_ready_steps_bootstraps_missing_new_p1_dir() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        let mut goal = Goal {
+            id: "goal-bootstrap".into(),
+            project: "test".into(),
+            objective: "queue".into(),
+            deadline: None,
+            budget_usd: 5.0,
+            spent_usd: 0.0,
+            status: GoalStatus::Active,
+            plan: Some(Plan {
+                version: 1,
+                created_by: "test".into(),
+                approved_at: None,
+                steps: vec![Step {
+                    step: 1,
+                    category: "codegen".into(),
+                    prompt: "ship it".into(),
+                    agent: "claude-sonnet".into(),
+                    est_cost_usd: 0.5,
+                    depends_on: vec![],
+                    status: StepStatus::Pending,
+                    task_id: None,
+                    sub_tasks: vec![],
+                }],
+            }),
+            created_at: Utc::now(),
+            completed_at: None,
+        };
+
+        let queued = queue_ready_steps(&bus, &mut goal).unwrap();
+        assert_eq!(queued, vec!["goal-bootstrap-step1"]);
+        assert!(bus.join("new/p1/goal-bootstrap-step1.json").exists());
     }
 
     #[test]

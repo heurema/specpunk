@@ -557,6 +557,8 @@ enum GoalAction {
         budget: f64,
         #[arg(long)]
         deadline: Option<String>,
+        #[arg(long)]
+        approve: bool,
     },
     /// List all goals
     List,
@@ -1094,7 +1096,8 @@ async fn main() -> anyhow::Result<()> {
                 objective,
                 budget,
                 deadline,
-            } => cmd_goal(&project, &objective, budget, deadline.as_deref()),
+                approve,
+            } => cmd_goal(&project, &objective, budget, deadline.as_deref(), approve),
             GoalAction::List => cmd_goals(),
             GoalAction::Status { goal_id } => cmd_goal_status(&goal_id),
             GoalAction::Approve { goal_id } => cmd_approve(&goal_id),
@@ -1515,7 +1518,7 @@ fn append_triage_group(
     out.push_str(&format!("  Hint: {hint}\n"));
 }
 
-fn cmd_goal(project: &str, objective: &str, budget: f64, deadline: Option<&str>) {
+fn cmd_goal(project: &str, objective: &str, budget: f64, deadline: Option<&str>, approve: bool) {
     let bus_path = bus::bus_dir();
     let latest = punk_orch::run::latest_run_triage(&bus_path, project);
     if latest.verdict == punk_orch::run::TriageVerdict::StillAlive {
@@ -1574,8 +1577,22 @@ fn cmd_goal(project: &str, objective: &str, budget: f64, deadline: Option<&str>)
                     "Plan generated via {provider}: {} steps, ${:.2} estimated\n",
                     step_count, est_cost
                 );
-                println!("Review and approve:");
-                println!("  punk-run goal approve {}", g.id);
+                if approve {
+                    match activate_goal(&bus_path, &mut g) {
+                        Ok(queued) => {
+                            print!("{}", format_goal_approval_report(&g, &queued));
+                        }
+                        Err(err) => {
+                            eprintln!("Auto-approve failed: {err}");
+                            eprintln!("Review and approve manually:");
+                            eprintln!("  punk-run goal approve {}", g.id);
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    println!("Review and approve:");
+                    println!("  punk-run goal approve {}", g.id);
+                }
             }
             None => {
                 eprintln!("Failed to parse planner output from {provider}.");
@@ -1590,6 +1607,31 @@ fn cmd_goal(project: &str, objective: &str, budget: f64, deadline: Option<&str>)
             eprintln!("Try: install claude, codex, or gemini, or add the plan manually.");
         }
     }
+}
+
+fn activate_goal(bus_path: &Path, goal: &mut goal::Goal) -> Result<Vec<String>, String> {
+    if goal.plan.is_none() {
+        return Err("Goal has no plan yet. Run planner first.".to_string());
+    }
+    if goal.status != goal::GoalStatus::AwaitingApproval
+        && goal.status != goal::GoalStatus::Planning
+    {
+        return Err(format!("Goal status is {:?}, cannot approve.", goal.status));
+    }
+
+    let queued = goal::queue_ready_steps(bus_path, goal)
+        .map_err(|e| format!("Error queueing initial goal steps: {e}"))?;
+
+    if let Some(ref mut plan) = goal.plan {
+        plan.approved_at = Some(punk_orch::chrono::Utc::now());
+    }
+    if queued.is_empty() && !goal_has_inflight_steps(goal) {
+        return Err("No runnable goal steps were queued; refusing activation.".to_string());
+    }
+    goal.status = goal::GoalStatus::Active;
+
+    goal::save_goal(bus_path, goal).map_err(|e| format!("Error saving goal: {e}"))?;
+    Ok(queued)
 }
 
 struct GoalPlannerAttempt {
@@ -1742,16 +1784,6 @@ fn cmd_approve(goal_id: &str) {
         std::process::exit(1);
     }
 
-    if g.plan.is_none() {
-        eprintln!("Goal has no plan yet. Run planner first.");
-        std::process::exit(1);
-    }
-
-    if g.status != goal::GoalStatus::AwaitingApproval && g.status != goal::GoalStatus::Planning {
-        eprintln!("Goal status is {:?}, cannot approve.", g.status);
-        std::process::exit(1);
-    }
-
     // Show plan
     if let Some(ref plan) = g.plan {
         println!("Plan v{} ({} steps):\n", plan.version, plan.steps.len());
@@ -1781,29 +1813,13 @@ fn cmd_approve(goal_id: &str) {
         );
     }
 
-    // Queue first ready steps
-    let queued = match goal::queue_ready_steps(&bus_path, &mut g) {
+    let queued = match activate_goal(&bus_path, &mut g) {
         Ok(queued) => queued,
-        Err(e) => {
-            eprintln!("Error queueing initial goal steps: {e}");
+        Err(err) => {
+            eprintln!("{err}");
             std::process::exit(1);
         }
     };
-
-    // Approve only after queueing succeeds
-    if let Some(ref mut plan) = g.plan {
-        plan.approved_at = Some(punk_orch::chrono::Utc::now());
-    }
-    if queued.is_empty() && !goal_has_inflight_steps(&g) {
-        eprintln!("No runnable goal steps were queued; refusing activation.");
-        std::process::exit(1);
-    }
-    g.status = goal::GoalStatus::Active;
-
-    if let Err(e) = goal::save_goal(&bus_path, &g) {
-        eprintln!("Error saving goal: {e}");
-        std::process::exit(1);
-    }
 
     print!("{}", format_goal_approval_report(&g, &queued));
 }
@@ -4678,6 +4694,32 @@ mod cli_goal_tests {
         assert!(rendered.contains("tasks:   task-1, task-2"));
         assert!(rendered.contains("punk-run goal status goal-1"));
         assert!(rendered.contains("punk-run status --project specpunk"));
+    }
+
+    #[test]
+    fn activate_goal_queues_steps_and_marks_goal_active() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-run-goal-activate-{}",
+            punk_orch::chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or_default()
+        ));
+        let bus = root.join("bus");
+        std::fs::create_dir_all(&bus).unwrap();
+        std::fs::create_dir_all(bus.join("new/p1")).unwrap();
+
+        let mut goal = sample_goal(
+            goal::GoalStatus::AwaitingApproval,
+            &[goal::StepStatus::Pending],
+        );
+        goal::save_goal(&bus, &goal).unwrap();
+
+        let queued = activate_goal(&bus, &mut goal).unwrap();
+        assert_eq!(goal.status, goal::GoalStatus::Active);
+        assert_eq!(queued, vec!["goal-1-step1".to_string()]);
+        assert!(goal.plan.as_ref().unwrap().approved_at.is_some());
+        assert!(bus.join("new/p1/goal-1-step1.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
