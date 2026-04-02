@@ -280,9 +280,14 @@ pub struct EventEnvelope {
     pub feature_id: Option<String>,
     pub task_id: Option<String>,
     pub run_id: Option<String>,
+    #[serde(default = "default_event_actor")]
     pub actor: String,
     pub mode: ModeId,
     pub kind: String,
     pub payload_ref: Option<String>,
     pub payload_sha256: Option<String>,
+}
+
+fn default_event_actor() -> String {
+    "unknown".to_string()
 }
