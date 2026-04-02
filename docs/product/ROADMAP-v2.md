@@ -13,7 +13,7 @@ projects and providers (Claude, Codex, Gemini) — on subscription billing.
 ## Primary UX Target
 
 - Project bootstrap is an explicit admin action: `punk init [--project <id>] --enable-jj --verify`
-- Default autonomous work intake is goal-only: `punk go "<goal>"`
+- Default autonomous work intake is goal-only: `punk go --fallback-staged "<goal>"`
 - Staged/manual work intake remains available: `punk start "<goal>"`
 - Users describe the goal; the system decomposes it into contracts/tasks internally
 - Target autonomous mode: `punk` should be able to go from goal to verified result without
