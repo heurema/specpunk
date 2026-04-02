@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
 
-use punk_core::vcs::{detect_mode as detect_vcs_mode, VcsMode};
+use punk_core::vcs::{VcsMode, detect_mode as detect_vcs_mode};
 
 /// Provider health check result.
 #[derive(Debug)]
@@ -24,6 +24,10 @@ pub fn check_all(bus_path: &Path, config_dir: &Path, repo_path: &Path) -> Health
     ];
     let cfg = crate::config::load_or_default(config_dir).ok();
     let queue_state = crate::bus::read_state(bus_path, 10);
+    let replan_needed_goals = crate::goal::list_goals(bus_path)
+        .into_iter()
+        .filter(|g| g.status_reason.as_deref() == Some("replan_needed_dead_end"))
+        .count();
 
     let bus_ok = bus_path.join("new").is_dir() && bus_path.join("cur").is_dir();
     let status = crate::config::config_status(config_dir);
@@ -60,6 +64,7 @@ pub fn check_all(bus_path: &Path, config_dir: &Path, repo_path: &Path) -> Health
         running_count: queue_state.running.len(),
         done_count: queue_state.done.len(),
         failed_count: queue_state.failed.len(),
+        replan_needed_goals,
         occupied_slots,
         vcs_mode,
     }
@@ -78,6 +83,7 @@ pub struct HealthReport {
     pub queued_count: usize,
     pub running_count: usize,
     pub done_count: usize,
+    pub replan_needed_goals: usize,
     pub failed_count: usize,
     pub occupied_slots: u32,
     pub vcs_mode: VcsMode,
@@ -127,6 +133,10 @@ impl HealthReport {
             "Tasks:  queued={} running={} done={} failed={}\n",
             self.queued_count, self.running_count, self.done_count, self.failed_count
         ));
+        out.push_str(&format!(
+            "Goals:  replan-needed={}\n",
+            self.replan_needed_goals
+        ));
         out.push_str(&format!("VCS:    {}\n", format_vcs_mode(self.vcs_mode)));
         out.push_str(&format!("Slots:  {}/5 occupied\n\n", self.occupied_slots));
 
@@ -155,6 +165,11 @@ impl HealthReport {
             }
             if self.vcs_mode == VcsMode::GitWithJjAvailableButDisabled {
                 out.push_str("  vcs: punk-run vcs enable-jj  (enable fuller punk functionality)\n");
+            }
+            if self.replan_needed_goals > 0 {
+                out.push_str(
+                    "  goals: review dead-end goals with punk-run goal status <id> / punk-run goal replan <id>\n",
+                );
             }
         }
 
@@ -327,6 +342,7 @@ mod tests {
             queued_count: 0,
             running_count: 0,
             done_count: 0,
+            replan_needed_goals: 0,
             failed_count: 0,
             occupied_slots: 0,
             vcs_mode: VcsMode::GitWithJjAvailableButDisabled,
@@ -356,6 +372,7 @@ mod tests {
             queued_count: 0,
             running_count: 0,
             done_count: 0,
+            replan_needed_goals: 0,
             failed_count: 0,
             occupied_slots: 0,
             vcs_mode: VcsMode::Jj,
@@ -380,6 +397,7 @@ mod tests {
             queued_count: 2,
             running_count: 1,
             done_count: 4,
+            replan_needed_goals: 0,
             failed_count: 1,
             occupied_slots: 0,
             vcs_mode: VcsMode::Jj,
@@ -405,6 +423,7 @@ mod tests {
             queued_count: 0,
             running_count: 0,
             done_count: 0,
+            replan_needed_goals: 0,
             failed_count: 0,
             occupied_slots: 0,
             vcs_mode: VcsMode::Jj,
@@ -412,6 +431,59 @@ mod tests {
 
         let rendered = report.display();
         assert!(rendered.contains("Queue:  default agent = unavailable"));
+    }
+
+    #[test]
+    fn doctor_display_shows_replan_needed_goals_line() {
+        let report = HealthReport {
+            providers: vec![sample_provider("codex")],
+            bus_ok: true,
+            bus_path: "/tmp/bus".to_string(),
+            config_ok: true,
+            config_detail: "defaults".to_string(),
+            config_path: "/tmp/config".to_string(),
+            known_projects: 1,
+            default_queue_agent: Some("codex".to_string()),
+            queued_count: 1,
+            running_count: 2,
+            done_count: 3,
+            replan_needed_goals: 5,
+            failed_count: 4,
+            occupied_slots: 0,
+            vcs_mode: VcsMode::Jj,
+        };
+
+        let rendered = report.display();
+        assert!(
+            rendered
+                .contains("Tasks:  queued=1 running=2 done=3 failed=4\nGoals:  replan-needed=5\n")
+        );
+    }
+
+    #[test]
+    fn doctor_display_shows_goals_hint_when_degraded_and_replan_needed() {
+        let report = HealthReport {
+            providers: vec![sample_provider("codex")],
+            bus_ok: true,
+            bus_path: "/tmp/bus".to_string(),
+            config_ok: true,
+            config_detail: "defaults".to_string(),
+            config_path: "/tmp/config".to_string(),
+            known_projects: 1,
+            default_queue_agent: None,
+            queued_count: 0,
+            running_count: 0,
+            done_count: 0,
+            replan_needed_goals: 2,
+            failed_count: 0,
+            occupied_slots: 0,
+            vcs_mode: VcsMode::GitWithJjAvailableButDisabled,
+        };
+
+        let rendered = report.display();
+        assert!(rendered.contains(
+            "  goals: review dead-end goals with punk-run goal status <id> / punk-run goal replan <id>\n"
+        ));
     }
 
     #[test]
