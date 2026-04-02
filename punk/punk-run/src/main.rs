@@ -239,6 +239,10 @@ enum SkillAction {
         /// Path to skill content file
         #[arg(long)]
         file: String,
+        #[arg(long = "project")]
+        project: Vec<String>,
+        #[arg(long = "category")]
+        category: Vec<String>,
     },
     /// Register a repo-local candidate skill patch with evidence refs
     Candidate {
@@ -251,6 +255,10 @@ enum SkillAction {
         /// Evidence refs such as run ids, receipts, or incident ids
         #[arg(long = "evidence", required = true)]
         evidence: Vec<String>,
+        #[arg(long = "project")]
+        project: Vec<String>,
+        #[arg(long = "category")]
+        category: Vec<String>,
     },
     /// Draft a candidate skill from an existing task receipt
     Propose {
@@ -820,13 +828,22 @@ async fn main() -> anyhow::Result<()> {
                 name,
                 description,
                 file,
+                project,
+                category,
             } => {
                 let bus_path = bus::bus_dir();
                 let content = std::fs::read_to_string(&file).unwrap_or_else(|e| {
                     eprintln!("Error reading {file}: {e}");
                     std::process::exit(1);
                 });
-                match skill::create_skill(&bus_path, &name, &description, &content) {
+                match skill::create_skill_with_triggers(
+                    &bus_path,
+                    &name,
+                    &description,
+                    &content,
+                    &project,
+                    &category,
+                ) {
                     Ok(path) => println!("Created: {}", path.display()),
                     Err(e) => {
                         eprintln!("Error: {e}");
@@ -839,6 +856,8 @@ async fn main() -> anyhow::Result<()> {
                 description,
                 file,
                 evidence,
+                project,
+                category,
             } => {
                 let cwd = std::env::current_dir().unwrap_or_else(|e| {
                     eprintln!("Error reading current directory: {e}");
@@ -848,8 +867,15 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("Error reading {file}: {e}");
                     std::process::exit(1);
                 });
-                match skill::create_candidate_skill(&cwd, &name, &description, &content, &evidence)
-                {
+                match skill::create_candidate_skill_with_triggers(
+                    &cwd,
+                    &name,
+                    &description,
+                    &content,
+                    &evidence,
+                    &project,
+                    &category,
+                ) {
                     Ok(path) => println!("Created candidate: {}", path.display()),
                     Err(e) => {
                         eprintln!("Error: {e}");

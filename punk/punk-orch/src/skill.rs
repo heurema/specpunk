@@ -59,6 +59,17 @@ pub fn create_skill(
     description: &str,
     content: &str,
 ) -> Result<PathBuf, String> {
+    create_skill_with_triggers(bus, name, description, content, &[], &[])
+}
+
+pub fn create_skill_with_triggers(
+    bus: &Path,
+    name: &str,
+    description: &str,
+    content: &str,
+    projects: &[String],
+    categories: &[String],
+) -> Result<PathBuf, String> {
     // Security scan on both content and description
     if let Some(issue) = security_scan(content) {
         return Err(format!("security scan failed (content): {issue}"));
@@ -72,7 +83,9 @@ pub fn create_skill(
     let dir = skills_dir(bus);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let skill_content = format!("---\nname: {name}\ndescription: {description}\n---\n\n{content}");
+    let trigger_block = render_trigger_frontmatter(projects, categories);
+    let skill_content =
+        format!("---\nname: {name}\ndescription: {description}{trigger_block}---\n\n{content}");
 
     let path = dir.join(format!("{name}.md"));
 
@@ -90,6 +103,18 @@ pub fn create_candidate_skill(
     description: &str,
     content: &str,
     evidence_refs: &[String],
+) -> Result<PathBuf, String> {
+    create_candidate_skill_with_triggers(cwd, name, description, content, evidence_refs, &[], &[])
+}
+
+pub fn create_candidate_skill_with_triggers(
+    cwd: &Path,
+    name: &str,
+    description: &str,
+    content: &str,
+    evidence_refs: &[String],
+    projects: &[String],
+    categories: &[String],
 ) -> Result<PathBuf, String> {
     if evidence_refs.is_empty() {
         return Err("candidate skills require at least one --evidence reference".to_string());
@@ -123,8 +148,9 @@ pub fn create_candidate_skill(
         .map(|evidence| format!("  - {evidence}"))
         .collect::<Vec<_>>()
         .join("\n");
+    let trigger_block = render_trigger_frontmatter(projects, categories);
     let skill_content = format!(
-        "---\nname: {name}\ndescription: {description}\nstate: candidate\nevidence:\n{evidence_block}\n---\n\n{content}"
+        "---\nname: {name}\ndescription: {description}\nstate: candidate\nevidence:\n{evidence_block}\n{trigger_block}---\n\n{content}"
     );
 
     let path = dir.join(format!("{name}.md"));
@@ -215,6 +241,31 @@ fn security_scan(content: &str) -> Option<String> {
     }
 
     None
+}
+
+fn render_trigger_frontmatter(projects: &[String], categories: &[String]) -> String {
+    let mut out = String::new();
+    if !projects.is_empty() {
+        out.push_str("\nproject: ");
+        out.push_str(&render_inline_list(projects));
+    }
+    if !categories.is_empty() {
+        out.push_str("\ncategory: ");
+        out.push_str(&render_inline_list(categories));
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+fn render_inline_list(values: &[String]) -> String {
+    let rendered = values
+        .iter()
+        .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{rendered}]")
 }
 
 fn extract_description(content: &str) -> String {
@@ -519,6 +570,40 @@ mod tests {
     }
 
     #[test]
+    fn create_skill_with_triggers_writes_project_and_category_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        let path = create_skill_with_triggers(
+            &bus,
+            "triggered",
+            "desc",
+            "body",
+            &["interviewcoach".to_string()],
+            &["plan".to_string(), "fix".to_string()],
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("project: [\"interviewcoach\"]"));
+        assert!(content.contains("category: [\"plan\", \"fix\"]"));
+    }
+
+    #[test]
+    fn create_skill_with_triggers_omits_empty_trigger_fields() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        let path = create_skill_with_triggers(&bus, "plain", "desc", "body", &[], &[]).unwrap();
+
+        let content = fs::read_to_string(path).unwrap();
+        assert!(!content.contains("\nproject: "));
+        assert!(!content.contains("\ncategory: "));
+    }
+
+    #[test]
     fn propose_candidate_from_task_creates_repo_local_candidate() {
         let tmp = TempDir::new().unwrap();
         let bus = tmp.path().join("bus");
@@ -613,6 +698,35 @@ mod tests {
         assert!(!content.contains("state: candidate"));
         assert!(content.contains("evidence:"));
         assert!(content.contains("task:task-123"));
+    }
+
+    #[test]
+    fn create_candidate_skill_with_triggers_writes_project_and_category_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .output()
+            .unwrap();
+
+        let path = create_candidate_skill_with_triggers(
+            &repo,
+            "triggered-candidate",
+            "desc",
+            "body",
+            &["run_1".to_string()],
+            &["interviewcoach".to_string()],
+            &["plan".to_string()],
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("state: candidate"));
+        assert!(content.contains("evidence:\n  - run_1"));
+        assert!(content.contains("project: [\"interviewcoach\"]"));
+        assert!(content.contains("category: [\"plan\"]"));
     }
 
     #[test]
