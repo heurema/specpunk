@@ -31,7 +31,26 @@ pub enum EntryType {
     CostOverrun,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub project: String,
+    pub entries: Vec<SnapshotEntry>,
+    pub updated_at: DateTime<Utc>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotEntry {
+    pub entry_type: EntryType,
+    pub fact: String,
+    pub task_id: String,
+}
+
 const MAX_ENTRIES: usize = 10;
+const SNAPSHOT_MAX_ENTRIES: usize = 6;
+const SNAPSHOT_MAX_FACT_CHARS: usize = 180;
+const SNAPSHOT_MAX_TASK_ID_CHARS: usize = 64;
+const SNAPSHOT_MAX_AGE_DAYS: i64 = 14;
 
 fn sessions_dir(bus: &Path) -> PathBuf {
     let state_dir = bus.parent().unwrap_or(bus);
@@ -42,11 +61,13 @@ fn sessions_dir(bus: &Path) -> PathBuf {
 pub fn load(bus: &Path, project: &str) -> SessionContext {
     let safe_project = match crate::sanitize::safe_id(project) {
         Ok(s) => s,
-        Err(_) => return SessionContext {
-            project: project.to_string(),
-            entries: vec![],
-            updated_at: Utc::now(),
-        },
+        Err(_) => {
+            return SessionContext {
+                project: project.to_string(),
+                entries: vec![],
+                updated_at: Utc::now(),
+            }
+        }
     };
     let path = sessions_dir(bus).join(format!("{safe_project}.json"));
     fs::read_to_string(path)
@@ -59,6 +80,38 @@ pub fn load(bus: &Path, project: &str) -> SessionContext {
         })
 }
 
+pub fn snapshot_for_prompt(ctx: &SessionContext) -> SessionSnapshot {
+    let now = Utc::now();
+    let mut truncated = false;
+
+    let mut entries: Vec<SnapshotEntry> = ctx
+        .entries
+        .iter()
+        .filter(|entry| entry.ttl_tasks > 0)
+        .filter(|entry| {
+            now.signed_duration_since(entry.created_at).num_days() <= SNAPSHOT_MAX_AGE_DAYS
+        })
+        .map(|entry| SnapshotEntry {
+            entry_type: entry.entry_type.clone(),
+            fact: sanitize_fact_for_prompt(&entry.fact),
+            task_id: sanitize_inline_text(&entry.task_id, SNAPSHOT_MAX_TASK_ID_CHARS),
+        })
+        .collect();
+
+    if entries.len() > SNAPSHOT_MAX_ENTRIES {
+        let drain = entries.len() - SNAPSHOT_MAX_ENTRIES;
+        entries.drain(..drain);
+        truncated = true;
+    }
+
+    SessionSnapshot {
+        project: ctx.project.clone(),
+        entries,
+        updated_at: ctx.updated_at,
+        truncated,
+    }
+}
+
 /// Save session context.
 pub fn save(bus: &Path, ctx: &SessionContext) -> std::io::Result<()> {
     crate::sanitize::safe_id(&ctx.project)
@@ -66,8 +119,7 @@ pub fn save(bus: &Path, ctx: &SessionContext) -> std::io::Result<()> {
     let dir = sessions_dir(bus);
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", ctx.project));
-    let json = serde_json::to_string_pretty(ctx)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(ctx).map_err(std::io::Error::other)?;
     fs::write(path, json)
 }
 
@@ -130,60 +182,91 @@ pub fn add_from_receipt(
 }
 
 /// Compression threshold: if raw format exceeds this many chars, compress.
-const COMPRESSION_THRESHOLD: usize = 2000;
+const COMPRESSION_THRESHOLD: usize = 1000;
 
 /// Format session context for agent prompt injection.
 /// If context exceeds threshold, uses 7-section Hermes compression template.
 pub fn format_for_prompt(ctx: &SessionContext) -> String {
-    if ctx.entries.is_empty() {
+    let snapshot = snapshot_for_prompt(ctx);
+
+    if snapshot.entries.is_empty() {
         return String::new();
     }
 
-    let raw = format_raw(ctx);
+    let raw = format_raw(&snapshot);
 
     if raw.len() <= COMPRESSION_THRESHOLD {
         return raw;
     }
 
     // Compress using deterministic template (no LLM needed)
-    compress(ctx)
+    compress(&snapshot)
 }
 
 /// Raw format — one line per entry.
-fn format_raw(ctx: &SessionContext) -> String {
+fn format_raw(snapshot: &SessionSnapshot) -> String {
     let mut out = String::new();
     out.push_str("## Recent session context\n\n");
 
-    for entry in &ctx.entries {
+    if snapshot.truncated {
+        out.push_str("- [i] older session entries omitted from frozen snapshot\n");
+    }
+
+    for entry in &snapshot.entries {
         let icon = match entry.entry_type {
             EntryType::Success => "+",
             EntryType::Failure => "!",
             EntryType::Surprise => "?",
             EntryType::CostOverrun => "$",
         };
-        out.push_str(&format!("- [{}] {} ({})\n", icon, entry.fact, entry.task_id));
+        out.push_str(&format!(
+            "- [{}] {} ({})\n",
+            icon, entry.fact, entry.task_id
+        ));
     }
 
     out
 }
 
 /// Hermes-style 7-section compression: condense entries into structured summary.
-fn compress(ctx: &SessionContext) -> String {
-    let successes: Vec<_> = ctx.entries.iter().filter(|e| e.entry_type == EntryType::Success).collect();
-    let failures: Vec<_> = ctx.entries.iter().filter(|e| e.entry_type == EntryType::Failure).collect();
-    let surprises: Vec<_> = ctx.entries.iter().filter(|e| e.entry_type == EntryType::Surprise).collect();
-    let overruns: Vec<_> = ctx.entries.iter().filter(|e| e.entry_type == EntryType::CostOverrun).collect();
+fn compress(snapshot: &SessionSnapshot) -> String {
+    let successes: Vec<_> = snapshot
+        .entries
+        .iter()
+        .filter(|e| e.entry_type == EntryType::Success)
+        .collect();
+    let failures: Vec<_> = snapshot
+        .entries
+        .iter()
+        .filter(|e| e.entry_type == EntryType::Failure)
+        .collect();
+    let surprises: Vec<_> = snapshot
+        .entries
+        .iter()
+        .filter(|e| e.entry_type == EntryType::Surprise)
+        .collect();
+    let overruns: Vec<_> = snapshot
+        .entries
+        .iter()
+        .filter(|e| e.entry_type == EntryType::CostOverrun)
+        .collect();
 
     let mut out = String::new();
     out.push_str(&format!(
         "## Session context (compressed, {} entries)\n\n",
-        ctx.entries.len()
+        snapshot.entries.len()
     ));
+    if snapshot.truncated {
+        out.push_str("**Snapshot:** older session entries omitted\n\n");
+    }
 
     // 1. Summary stats
     out.push_str(&format!(
         "**Stats:** {} ok, {} fail, {} surprise, {} cost overrun\n\n",
-        successes.len(), failures.len(), surprises.len(), overruns.len()
+        successes.len(),
+        failures.len(),
+        surprises.len(),
+        overruns.len()
     ));
 
     // 2. Recent successes (last 3)
@@ -225,6 +308,53 @@ fn compress(ctx: &SessionContext) -> String {
     out
 }
 
+fn sanitize_fact_for_prompt(fact: &str) -> String {
+    if looks_sensitive(fact) {
+        return "[redacted sensitive session fact]".to_string();
+    }
+    sanitize_inline_text(fact, SNAPSHOT_MAX_FACT_CHARS)
+}
+
+fn sanitize_inline_text(text: &str, max_chars: usize) -> String {
+    let collapsed = text
+        .chars()
+        .map(|ch| {
+            if ch.is_control() && ch != '\n' && ch != '\t' {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut chars = collapsed.chars();
+    let mut out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
+fn looks_sensitive(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "authorization:",
+        "bearer ",
+        "api_key",
+        "apikey",
+        "password=",
+        "secret=",
+        "token=",
+        "sk-",
+        "-----begin",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,7 +367,15 @@ mod tests {
         fs::create_dir_all(&bus).unwrap();
 
         add_from_receipt(&bus, "signum", "task-1", "success", 0.1, 1.0, "fixed auth");
-        add_from_receipt(&bus, "signum", "task-2", "failure", 0.0, 1.0, "build failed");
+        add_from_receipt(
+            &bus,
+            "signum",
+            "task-2",
+            "failure",
+            0.0,
+            1.0,
+            "build failed",
+        );
 
         let ctx = load(&bus, "signum");
         assert_eq!(ctx.entries.len(), 2);
@@ -336,8 +474,12 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        let raw = super::format_raw(&ctx);
-        assert!(raw.len() > super::COMPRESSION_THRESHOLD, "raw should exceed threshold: {}", raw.len());
+        let raw = super::format_raw(&snapshot_for_prompt(&ctx));
+        assert!(
+            raw.len() > super::COMPRESSION_THRESHOLD,
+            "raw should exceed threshold: {}",
+            raw.len()
+        );
 
         let compressed = format_for_prompt(&ctx);
         assert!(compressed.contains("compressed"));
@@ -411,7 +553,15 @@ mod tests {
 
         // budget_usd = 0.0: overrun check is `cost > budget * 1.5 && budget > 0.0`
         // so zero budget should NOT trigger CostOverrun
-        add_from_receipt(&bus, "test", "t1", "success", 9999.0, 0.0, "huge cost zero budget");
+        add_from_receipt(
+            &bus,
+            "test",
+            "t1",
+            "success",
+            9999.0,
+            0.0,
+            "huge cost zero budget",
+        );
         let ctx = load(&bus, "test");
         assert_eq!(
             ctx.entries[0].entry_type,
@@ -460,7 +610,10 @@ mod tests {
         };
         let prompt = format_for_prompt(&ctx);
         // Should return empty string, not header without content
-        assert!(prompt.is_empty(), "empty entries should produce empty prompt");
+        assert!(
+            prompt.is_empty(),
+            "empty entries should produce empty prompt"
+        );
     }
 
     #[test]
@@ -482,6 +635,92 @@ mod tests {
         assert!(prompt.contains("brackets"));
     }
 
+    #[test]
+    fn snapshot_for_prompt_drops_stale_entries_by_age() {
+        let ctx = SessionContext {
+            project: "test".into(),
+            entries: vec![
+                SessionEntry {
+                    entry_type: EntryType::Failure,
+                    fact: "very old".into(),
+                    task_id: "old".into(),
+                    ttl_tasks: 5,
+                    created_at: Utc::now() - chrono::Duration::days(30),
+                },
+                SessionEntry {
+                    entry_type: EntryType::Success,
+                    fact: "fresh".into(),
+                    task_id: "new".into(),
+                    ttl_tasks: 5,
+                    created_at: Utc::now(),
+                },
+            ],
+            updated_at: Utc::now(),
+        };
+
+        let snapshot = snapshot_for_prompt(&ctx);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].fact, "fresh");
+    }
+
+    #[test]
+    fn snapshot_for_prompt_redacts_sensitive_facts() {
+        let ctx = SessionContext {
+            project: "test".into(),
+            entries: vec![SessionEntry {
+                entry_type: EntryType::Failure,
+                fact: "Authorization: Bearer sk-secret-token".into(),
+                task_id: "task-secret".into(),
+                ttl_tasks: 5,
+                created_at: Utc::now(),
+            }],
+            updated_at: Utc::now(),
+        };
+
+        let snapshot = snapshot_for_prompt(&ctx);
+        assert_eq!(
+            snapshot.entries[0].fact,
+            "[redacted sensitive session fact]"
+        );
+        let prompt = format_for_prompt(&ctx);
+        assert!(!prompt.contains("sk-secret-token"));
+    }
+
+    #[test]
+    fn snapshot_for_prompt_truncates_and_marks_omission() {
+        let mut entries = Vec::new();
+        for i in 0..8 {
+            entries.push(SessionEntry {
+                entry_type: EntryType::Success,
+                fact: format!("entry-{i} {}", "x".repeat(240)),
+                task_id: format!("task-{i}-{}", "y".repeat(90)),
+                ttl_tasks: 5,
+                created_at: Utc::now(),
+            });
+        }
+
+        let ctx = SessionContext {
+            project: "test".into(),
+            entries,
+            updated_at: Utc::now(),
+        };
+
+        let snapshot = snapshot_for_prompt(&ctx);
+        assert_eq!(snapshot.entries.len(), SNAPSHOT_MAX_ENTRIES);
+        assert!(snapshot.truncated);
+        assert!(snapshot
+            .entries
+            .iter()
+            .all(|entry| entry.fact.len() <= SNAPSHOT_MAX_FACT_CHARS + 3));
+        assert!(snapshot
+            .entries
+            .iter()
+            .all(|entry| entry.task_id.len() <= SNAPSHOT_MAX_TASK_ID_CHARS + 3));
+
+        let prompt = format_for_prompt(&ctx);
+        assert!(prompt.contains("older session entries omitted"));
+    }
+
     // --- Security tests: path traversal in load / save ---
 
     #[test]
@@ -495,7 +734,8 @@ mod tests {
 
         // Create a sentinel file to detect escape
         let sentinel = tmp.path().join("canary.json");
-        let sentinel_data = r#"{"project":"canary","entries":[],"updated_at":"2026-01-01T00:00:00Z"}"#;
+        let sentinel_data =
+            r#"{"project":"canary","entries":[],"updated_at":"2026-01-01T00:00:00Z"}"#;
         fs::write(&sentinel, sentinel_data).unwrap();
 
         // sessions_dir = tmp/sessions; path = tmp/sessions/../canary = tmp/canary
@@ -547,7 +787,15 @@ mod tests {
         fs::create_dir_all(&bus).unwrap();
 
         // Should not panic regardless of traversal in project name
-        add_from_receipt(&bus, "../../../tmp/evil", "task-1", "success", 0.1, 1.0, "test");
+        add_from_receipt(
+            &bus,
+            "../../../tmp/evil",
+            "task-1",
+            "success",
+            0.1,
+            1.0,
+            "test",
+        );
 
         // Verify no file was written outside tmp
         let potential_escape = std::path::Path::new("/tmp/evil.json");

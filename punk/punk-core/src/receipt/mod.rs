@@ -107,7 +107,11 @@ impl From<vcs::VcsError> for ReceiptError {
 
 /// Classify changed files into created/modified/deleted.
 /// Uses `git cat-file -e HEAD:<file>` to check if file existed in the last commit.
-fn build_file_summary(root: &Path, changed_files: &[String], scope_violations: usize) -> FileSummary {
+fn build_file_summary(
+    root: &Path,
+    changed_files: &[String],
+    scope_violations: usize,
+) -> FileSummary {
     let mut created = Vec::new();
     let mut modified = Vec::new();
     let mut deleted = Vec::new();
@@ -148,8 +152,8 @@ fn build_file_summary(root: &Path, changed_files: &[String], scope_violations: u
 /// Generate a task receipt. Requires a passing check receipt.
 pub fn run_receipt(opts: &ReceiptOptions) -> Result<(TaskReceipt, i32), ReceiptError> {
     // 1. Resolve contract (reuse check's resolution)
-    let (contract, contract_dir, contract_raw) =
-        crate::check::resolve_contract(opts.root).map_err(|e| match e {
+    let (contract, contract_dir, contract_raw) = crate::check::resolve_contract(opts.root)
+        .map_err(|e| match e {
             crate::check::CheckError::NoContract(m) => ReceiptError::NoContract(m),
             crate::check::CheckError::NotApproved(m) => ReceiptError::NoContract(m),
             crate::check::CheckError::Io(e) => ReceiptError::Io(e),
@@ -164,9 +168,10 @@ pub fn run_receipt(opts: &ReceiptOptions) -> Result<(TaskReceipt, i32), ReceiptE
     if assessment.tier >= crate::risk::AssuranceTier::T2 {
         let audit_path = contract_dir.join("audit.json");
         if !audit_path.exists() {
-            return Err(ReceiptError::NoCheckReceipt(
-                format!("T2+ task (tier={:?}) requires audit. Run `punk audit` first.", assessment.tier),
-            ));
+            return Err(ReceiptError::NoCheckReceipt(format!(
+                "T2+ task (tier={:?}) requires audit. Run `punk audit` first.",
+                assessment.tier
+            )));
         }
         if let Ok(raw) = std::fs::read_to_string(&audit_path) {
             if let Ok(audit) = serde_json::from_str::<crate::audit::AuditReport>(&raw) {
@@ -229,7 +234,8 @@ pub fn run_receipt(opts: &ReceiptOptions) -> Result<(TaskReceipt, i32), ReceiptE
     let target = receipts_dir.join("task.json");
     let mut tmp = tempfile::NamedTempFile::new_in(&receipts_dir)?;
     std::io::Write::write_all(&mut tmp, receipt_json.as_bytes())?;
-    tmp.persist(&target).map_err(|e| ReceiptError::Io(e.error))?;
+    tmp.persist(&target)
+        .map_err(|e| ReceiptError::Io(e.error))?;
 
     Ok((receipt, EXIT_OK))
 }
@@ -242,14 +248,23 @@ pub fn render_receipt_md(receipt: &TaskReceipt) -> String {
     let mut out = String::new();
 
     out.push_str(&format!("# Task Receipt: {}\n\n", receipt.contract_id));
-    out.push_str(&format!("**Status:** {}\n", match receipt.status {
-        TaskStatus::Completed => "COMPLETED",
-        TaskStatus::Failed => "FAILED",
-        TaskStatus::Abandoned => "ABANDONED",
-    }));
+    out.push_str(&format!(
+        "**Status:** {}\n",
+        match receipt.status {
+            TaskStatus::Completed => "COMPLETED",
+            TaskStatus::Failed => "FAILED",
+            TaskStatus::Abandoned => "ABANDONED",
+        }
+    ));
     out.push_str(&format!("**Timestamp:** {}\n", receipt.timestamp));
-    out.push_str(&format!("**Contract hash:** `{}`\n", &receipt.contract_hash[..16]));
-    out.push_str(&format!("**Check receipt hash:** `{}`\n\n", &receipt.check_receipt_hash[..16]));
+    out.push_str(&format!(
+        "**Contract hash:** `{}`\n",
+        &receipt.contract_hash[..16]
+    ));
+    out.push_str(&format!(
+        "**Check receipt hash:** `{}`\n\n",
+        &receipt.check_receipt_hash[..16]
+    ));
 
     out.push_str("## Files\n\n");
     let s = &receipt.summary;

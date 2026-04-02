@@ -9,11 +9,12 @@ use tokio::time;
 
 use crate::adapter::{Adapter, SpawnedProcess, TaskSpec};
 use crate::budget;
+use crate::config::{self, BudgetPolicy};
+use crate::goal::{self, GoalStatus, StepStatus};
 use crate::queue::{self, HeartbeatTracker, ProjectLock, SlotManager};
 use crate::receipt::{CallStyle, Receipt, ReceiptStatus};
-use crate::goal::{self, GoalStatus, StepStatus};
-use crate::session;
 use crate::run::{self, CircuitBreaker, RetryDecision, Run};
+use crate::session;
 
 /// Active task being tracked by the daemon.
 struct ActiveTask {
@@ -36,6 +37,13 @@ pub struct DaemonConfig {
     pub shadow: bool,
 }
 
+#[derive(Debug, Clone)]
+struct BudgetBackpressure {
+    pressure: budget::PressureLevel,
+    spent_usd: f64,
+    effective_max_slots: u32,
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -51,6 +59,72 @@ impl Default for DaemonConfig {
     }
 }
 
+impl BudgetBackpressure {
+    fn from_policy(bus: &Path, policy: &BudgetPolicy, configured_max_slots: u32) -> Self {
+        let (pressure, spent_usd) = budget::check_pressure(
+            bus,
+            policy.monthly_ceiling_usd,
+            policy.soft_alert_pct,
+            policy.hard_stop_pct,
+        );
+        let effective_max_slots = budget::effective_max_slots(&pressure, configured_max_slots);
+        Self {
+            pressure,
+            spent_usd,
+            effective_max_slots,
+        }
+    }
+
+    fn normal(configured_max_slots: u32) -> Self {
+        Self {
+            pressure: budget::PressureLevel::Normal,
+            spent_usd: 0.0,
+            effective_max_slots: configured_max_slots,
+        }
+    }
+}
+
+fn load_budget_backpressure(bus: &Path, configured_max_slots: u32) -> BudgetBackpressure {
+    let config_dir = config::config_dir();
+    match config::load_or_default(&config_dir) {
+        Ok(cfg) => BudgetBackpressure::from_policy(bus, &cfg.policy.budget, configured_max_slots),
+        Err(err) => {
+            eprintln!("daemon: budget policy unavailable ({err}); using daemon defaults");
+            BudgetBackpressure::normal(configured_max_slots)
+        }
+    }
+}
+
+fn resolve_agent_reference(
+    requested: &str,
+    cfg: Option<&crate::config::Config>,
+) -> (String, String, String) {
+    if let Some(cfg) = cfg {
+        if let Some(agent) = cfg.agents.agents.get(requested) {
+            return (
+                agent.provider.clone(),
+                agent.model.clone(),
+                requested.to_string(),
+            );
+        }
+    }
+
+    (
+        requested.to_string(),
+        String::new(),
+        requested.to_string(),
+    )
+}
+
+fn budget_allows_dispatch(
+    entry: &queue::QueuedEntry,
+    backpressure: &BudgetBackpressure,
+    occupied_slots: u32,
+) -> bool {
+    occupied_slots < backpressure.effective_max_slots
+        && budget::priority_allowed(&backpressure.pressure, &entry.priority)
+}
+
 /// Run the daemon main loop.
 pub async fn run(dcfg: DaemonConfig) {
     let bus = &dcfg.bus_dir;
@@ -62,7 +136,9 @@ pub async fn run(dcfg: DaemonConfig) {
     );
 
     // Ensure directories exist
-    for sub in &["new/p0", "new/p1", "new/p2", "cur", "done", "failed", "dead"] {
+    for sub in &[
+        "new/p0", "new/p1", "new/p2", "cur", "done", "failed", "dead",
+    ] {
         fs::create_dir_all(bus.join(sub)).ok();
     }
 
@@ -78,7 +154,11 @@ pub async fn run(dcfg: DaemonConfig) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "json") {
-                let task_id = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                let task_id = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 let pid_file = bus.join(".pids").join(format!("{task_id}.pid"));
                 let process_alive = fs::read_to_string(&pid_file)
                     .ok()
@@ -118,13 +198,23 @@ pub async fn run(dcfg: DaemonConfig) {
                 if let Some(mut task) = active.remove(&task_id) {
                     // Kill the process
                     if let Some(pid) = task.process.child.id() {
-                        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGTERM);
+                        }
                     }
-                    task.run.mark_failed(130, task.run.duration_ms, crate::run::TerminationReason::UserCancel);
+                    task.run.mark_failed(
+                        130,
+                        task.run.duration_ms,
+                        crate::run::TerminationReason::UserCancel,
+                    );
                     save_run(bus, &task.run);
                     heartbeats.unregister(&task_id);
                     slots.release(task.run.slot_id);
-                    let proj = task.task_json.get("project").and_then(|v| v.as_str()).unwrap_or("");
+                    let proj = task
+                        .task_json
+                        .get("project")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     locks.release(proj);
                     move_staging(bus, &task.staging_dir, &task_id, "failed");
                     fs::remove_file(bus.join("cur").join(format!("{task_id}.json"))).ok();
@@ -142,7 +232,16 @@ pub async fn run(dcfg: DaemonConfig) {
         }
 
         // 1. Collect completed processes
-        collect_completed(bus, &mut active, &slots, &locks, &heartbeats, &mut circuits, &dcfg).await;
+        collect_completed(
+            bus,
+            &mut active,
+            &slots,
+            &locks,
+            &heartbeats,
+            &mut circuits,
+            &dcfg,
+        )
+        .await;
 
         // 2. Check heartbeats for stale tasks
         reap_stale(bus, &heartbeats, &mut active, &slots, &locks).await;
@@ -154,11 +253,14 @@ pub async fn run(dcfg: DaemonConfig) {
         evaluate_goals(bus);
 
         // 4. Budget backpressure check
-        let (pressure, spent) = budget::check_pressure(bus, 50.0, 80, 95);
-        if pressure != budget::PressureLevel::Normal {
+        let backpressure = load_budget_backpressure(bus, dcfg.max_slots);
+        if backpressure.pressure != budget::PressureLevel::Normal {
             eprintln!(
-                "daemon: budget pressure {:?} (${:.2} spent)",
-                pressure, spent
+                "daemon: budget pressure {:?} (${:.2} spent, slots {}/{})",
+                backpressure.pressure,
+                backpressure.spent_usd,
+                backpressure.effective_max_slots,
+                dcfg.max_slots
             );
         }
 
@@ -172,6 +274,7 @@ pub async fn run(dcfg: DaemonConfig) {
                 &mut active,
                 &mut circuits,
                 &dcfg,
+                &backpressure,
             )
             .await;
         } else {
@@ -198,10 +301,27 @@ async fn dispatch_queued(
     active: &mut HashMap<String, ActiveTask>,
     circuits: &mut HashMap<String, CircuitBreaker>,
     _dcfg: &DaemonConfig,
+    backpressure: &BudgetBackpressure,
 ) {
+    if slots.occupied() >= backpressure.effective_max_slots {
+        return;
+    }
+
     let entries = queue::scan_queue(bus);
 
     for entry in entries {
+        let occupied_slots = slots.occupied();
+        if !budget_allows_dispatch(&entry, backpressure, occupied_slots) {
+            if occupied_slots >= backpressure.effective_max_slots {
+                break;
+            }
+            eprintln!(
+                "daemon: skipping {} at {:?} pressure (priority={})",
+                entry.task_id, backpressure.pressure, entry.priority
+            );
+            continue;
+        }
+
         // Slot available?
         let slot_id = match slots.acquire() {
             Some(s) => s,
@@ -244,7 +364,11 @@ async fn dispatch_queued(
         };
 
         slots.record_owner(slot_id, &entry.task_id);
-        log_event(bus, "claimed", &format!(",\"task\":\"{}\",\"slot\":{slot_id}", entry.task_id));
+        log_event(
+            bus,
+            "claimed",
+            &format!(",\"task\":\"{}\",\"slot\":{slot_id}", entry.task_id),
+        );
 
         // Read full task JSON
         let task_json: Value = match fs::read_to_string(&claimed_path)
@@ -261,19 +385,11 @@ async fn dispatch_queued(
             }
         };
 
-        // Resolve agent → provider/model via agents.toml
+        // Resolve agent → provider/model via zero-config config fallback
         let config_dir = crate::config::config_dir();
-        let (provider, agent_model, agent_id) = if let Ok(cfg) = crate::config::load(&config_dir) {
-            if let Some(agent) = cfg.agents.agents.get(&entry.model) {
-                // Task specified an agent ID (e.g. "claude-reviewer")
-                (agent.provider.clone(), agent.model.clone(), entry.model.clone())
-            } else {
-                // Fallback: treat entry.model as raw provider name
-                (entry.model.clone(), String::new(), entry.model.clone())
-            }
-        } else {
-            (entry.model.clone(), String::new(), entry.model.clone())
-        };
+        let cfg = crate::config::load_or_default(&config_dir).ok();
+        let (provider, agent_model, agent_id) =
+            resolve_agent_reference(&entry.model, cfg.as_ref());
 
         let adapter = match Adapter::from_provider(&provider) {
             Some(a) => a,
@@ -299,10 +415,15 @@ async fn dispatch_queued(
             .unwrap_or("")
             .replace('~', &dirs::home_dir().unwrap_or_default().to_string_lossy());
 
-        let raw_prompt = task_json.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let raw_prompt = task_json
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         // Auto-triage: infer category if not specified
-        let task_category = task_json.get("category")
+        let task_category = task_json
+            .get("category")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let effective_category = if task_category.is_empty() {
@@ -315,7 +436,9 @@ async fn dispatch_queued(
         let explicit_model = if !agent_model.is_empty() {
             agent_model.clone()
         } else {
-            task_json.get("claude_model").and_then(|v| v.as_str())
+            task_json
+                .get("claude_model")
+                .and_then(|v| v.as_str())
                 .or_else(|| task_json.get("model_override").and_then(|v| v.as_str()))
                 .unwrap_or("")
                 .to_string()
@@ -329,7 +452,11 @@ async fn dispatch_queued(
         // Unified context injection (Linear Next pattern):
         // agent guidance + skills + recall + session + project stats
         let context_pack = crate::context::ContextPack::build(
-            bus, &entry.project, effective_category, &agent_id, &config_dir,
+            bus,
+            &entry.project,
+            effective_category,
+            &agent_id,
+            &config_dir,
         );
         let context_prefix = context_pack.format();
         let prompt_with_context = if context_prefix.is_empty() {
@@ -370,7 +497,10 @@ async fn dispatch_queued(
                 log_event(
                     bus,
                     "started",
-                    &format!(",\"task\":\"{}\",\"pid\":{pid},\"run\":\"{}\"", entry.task_id, run_entity.run_id),
+                    &format!(
+                        ",\"task\":\"{}\",\"pid\":{pid},\"run\":\"{}\"",
+                        entry.task_id, run_entity.run_id
+                    ),
                 );
 
                 active.insert(
@@ -416,14 +546,24 @@ async fn collect_completed(
     for task_id in to_collect {
         if let Some(mut task) = active.remove(&task_id) {
             let result = task.process.wait().await;
-            let project = task.task_json.get("project").and_then(|v| v.as_str()).unwrap_or("");
-            let category = task.task_json.get("category").and_then(|v| v.as_str()).unwrap_or("codegen");
+            let project = task
+                .task_json
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let category = task
+                .task_json
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("codegen");
 
             if result.exit_code == 0 {
                 // Success
                 task.run.mark_success(result.duration_ms);
 
-                let cb = circuits.entry(task.adapter_name.clone()).or_insert_with(|| CircuitBreaker::new(&task.adapter_name));
+                let cb = circuits
+                    .entry(task.adapter_name.clone())
+                    .or_insert_with(|| CircuitBreaker::new(&task.adapter_name));
                 cb.record_success();
 
                 // Write v1 receipt
@@ -453,10 +593,25 @@ async fn collect_completed(
                 save_run(bus, &task.run);
                 move_staging(bus, &task.staging_dir, &task_id, "done");
 
-                log_event(bus, "completed", &format!(",\"task\":\"{task_id}\",\"duration\":{}", result.duration_ms));
+                log_event(
+                    bus,
+                    "completed",
+                    &format!(
+                        ",\"task\":\"{task_id}\",\"duration\":{}",
+                        result.duration_ms
+                    ),
+                );
 
                 // Update session context
-                session::add_from_receipt(bus, project, &task_id, "success", receipt.cost_usd, 0.0, &receipt.summary);
+                session::add_from_receipt(
+                    bus,
+                    project,
+                    &task_id,
+                    "success",
+                    receipt.cost_usd,
+                    0.0,
+                    &receipt.summary,
+                );
 
                 // Skill auto-authoring trigger (Hermes pattern):
                 // complex task (long duration + high cost) may warrant a skill
@@ -467,7 +622,10 @@ async fn collect_completed(
                          Write it to state/skills/<name>.md",
                         task_id, project, result.duration_ms, receipt.cost_usd
                     );
-                    eprintln!("daemon: skill authoring candidate: {task_id} ({}ms, ${:.2})", result.duration_ms, receipt.cost_usd);
+                    eprintln!(
+                        "daemon: skill authoring candidate: {task_id} ({}ms, ${:.2})",
+                        result.duration_ms, receipt.cost_usd
+                    );
                     // Queue a skill-authoring meta-task
                     let skill_task = serde_json::json!({
                         "project": project,
@@ -483,26 +641,40 @@ async fn collect_completed(
                     let skill_path = bus.join("new/p2").join(format!("{skill_task_id}.json"));
                     if let Ok(data) = serde_json::to_string_pretty(&skill_task) {
                         fs::write(skill_path, data).ok();
-                        log_event(bus, "skill_authoring_queued", &format!(",\"task\":\"{task_id}\",\"trigger\":\"complex_task\""));
+                        log_event(
+                            bus,
+                            "skill_authoring_queued",
+                            &format!(",\"task\":\"{task_id}\",\"trigger\":\"complex_task\""),
+                        );
                     }
                 }
 
                 // Follow-up task extraction (Linear Next pattern)
-                let followups = crate::followup::extract_and_queue(
-                    bus, &task_id, project, &result.stdout_path,
-                );
+                let followups =
+                    crate::followup::extract_and_queue(bus, &task_id, project, &result.stdout_path);
                 if !followups.is_empty() {
-                    eprintln!("daemon: {} follow-up(s) queued from {task_id}: {}", followups.len(), followups.join(", "));
-                    log_event(bus, "followups_queued", &format!(",\"task\":\"{task_id}\",\"count\":{}", followups.len()));
+                    eprintln!(
+                        "daemon: {} follow-up(s) queued from {task_id}: {}",
+                        followups.len(),
+                        followups.join(", ")
+                    );
+                    log_event(
+                        bus,
+                        "followups_queued",
+                        &format!(",\"task\":\"{task_id}\",\"count\":{}", followups.len()),
+                    );
                 }
             } else {
                 // Failure — classify and maybe retry
                 let stderr = fs::read_to_string(&result.stderr_path).unwrap_or_default();
                 let reason = run::classify_failure(result.exit_code, &stderr);
 
-                task.run.mark_failed(result.exit_code, result.duration_ms, reason.clone());
+                task.run
+                    .mark_failed(result.exit_code, result.duration_ms, reason.clone());
 
-                let cb = circuits.entry(task.adapter_name.clone()).or_insert_with(|| CircuitBreaker::new(&task.adapter_name));
+                let cb = circuits
+                    .entry(task.adapter_name.clone())
+                    .or_insert_with(|| CircuitBreaker::new(&task.adapter_name));
                 cb.record_failure();
 
                 save_run(bus, &task.run);
@@ -520,7 +692,9 @@ async fn collect_completed(
                     RetryDecision::Retry { delay_s } => {
                         // 429 → fallback to different provider (Hermes pattern)
                         let mut retry_task = task.task_json.clone();
-                        if reason == run::TerminationReason::Provider429 || reason == run::TerminationReason::Provider529 {
+                        if reason == run::TerminationReason::Provider429
+                            || reason == run::TerminationReason::Provider529
+                        {
                             if let Some(fallback) = run::fallback_provider(&task.adapter_name) {
                                 eprintln!(
                                     "daemon: {} rate-limited on {}, falling back to {fallback}",
@@ -543,17 +717,34 @@ async fn collect_completed(
                         fs::create_dir_all(&retry_staging).ok();
                         let retry_ok = serde_json::to_string_pretty(&retry_task)
                             .ok()
-                            .and_then(|task_data| fs::write(retry_staging.join("retry-pending.json"), &task_data).ok())
-                            .and_then(|_| fs::write(
-                                retry_staging.join("retry-meta.json"),
-                                format!("{{\"requeue_at\":{requeue_at},\"requeue_path\":\"{}\"}}", requeue_path.display()),
-                            ).ok())
+                            .and_then(|task_data| {
+                                fs::write(retry_staging.join("retry-pending.json"), &task_data).ok()
+                            })
+                            .and_then(|_| {
+                                fs::write(
+                                    retry_staging.join("retry-meta.json"),
+                                    format!(
+                                        "{{\"requeue_at\":{requeue_at},\"requeue_path\":\"{}\"}}",
+                                        requeue_path.display()
+                                    ),
+                                )
+                                .ok()
+                            })
                             .is_some();
                         if !retry_ok {
-                            eprintln!("daemon: failed to schedule retry for {task_id}, moving to failed/");
+                            eprintln!(
+                                "daemon: failed to schedule retry for {task_id}, moving to failed/"
+                            );
                             move_staging(bus, &task.staging_dir, &task_id, "failed");
                         }
-                        log_event(bus, "retry_scheduled", &format!(",\"task\":\"{task_id}\",\"delay\":{delay_s},\"attempt\":{}", task.run.attempt + 1));
+                        log_event(
+                            bus,
+                            "retry_scheduled",
+                            &format!(
+                                ",\"task\":\"{task_id}\",\"delay\":{delay_s},\"attempt\":{}",
+                                task.run.attempt + 1
+                            ),
+                        );
                     }
                     RetryDecision::Exhausted | RetryDecision::NotRetryable => {
                         // Write failure receipt
@@ -575,7 +766,12 @@ async fn collect_completed(
                             duration_ms: result.duration_ms,
                             exit_code: result.exit_code,
                             artifacts: vec![],
-                            errors: vec![stderr.lines().take(5).map(|s| s.to_string()).collect::<Vec<_>>().join("\n")],
+                            errors: vec![stderr
+                                .lines()
+                                .take(5)
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n")],
                             summary: format!("{reason:?}"),
                             created_at: Utc::now(),
                             parent_task_id: None,
@@ -592,13 +788,31 @@ async fn collect_completed(
                         };
                         move_staging(bus, &task.staging_dir, &task_id, dest);
 
-                        log_event(bus, "failed", &format!(",\"task\":\"{task_id}\",\"reason\":\"{reason:?}\",\"attempts\":{}", task.run.attempt));
+                        log_event(
+                            bus,
+                            "failed",
+                            &format!(
+                                ",\"task\":\"{task_id}\",\"reason\":\"{reason:?}\",\"attempts\":{}",
+                                task.run.attempt
+                            ),
+                        );
 
-                        session::add_from_receipt(bus, project, &task_id, "failure", 0.0, 0.0, &format!("{reason:?}"));
+                        session::add_from_receipt(
+                            bus,
+                            project,
+                            &task_id,
+                            "failure",
+                            0.0,
+                            0.0,
+                            &format!("{reason:?}"),
+                        );
 
                         // Auto-capture to knowledge store (punk recall)
                         crate::recall::capture_from_failure(
-                            bus, &task_id, project, &format!("{reason:?}"),
+                            bus,
+                            &task_id,
+                            project,
+                            &format!("{reason:?}"),
                             &stderr.lines().take(3).collect::<Vec<_>>().join("\n"),
                             &receipt.artifacts,
                         );
@@ -609,7 +823,11 @@ async fn collect_completed(
             // Cleanup
             heartbeats.unregister(&task_id);
             slots.release(task.run.slot_id);
-            let project = task.task_json.get("project").and_then(|v| v.as_str()).unwrap_or("");
+            let project = task
+                .task_json
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             locks.release(project);
 
             // Remove from cur/
@@ -649,8 +867,16 @@ async fn reap_stale(
             task.run.mark_timeout(s.age_s * 1000);
             save_run(bus, &task.run);
 
-            let project = task.task_json.get("project").and_then(|v| v.as_str()).unwrap_or("");
-            let category = task.task_json.get("category").and_then(|v| v.as_str()).unwrap_or("codegen");
+            let project = task
+                .task_json
+                .get("project")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let category = task
+                .task_json
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("codegen");
 
             // Write timeout receipt
             let receipt = Receipt {
@@ -667,7 +893,10 @@ async fn reap_stale(
                 duration_ms: s.age_s * 1000,
                 exit_code: 124,
                 artifacts: vec![],
-                errors: vec![format!("timeout after {}s (limit: {}s)", s.age_s, s.timeout_s)],
+                errors: vec![format!(
+                    "timeout after {}s (limit: {}s)",
+                    s.age_s, s.timeout_s
+                )],
                 summary: "timeout".to_string(),
                 created_at: Utc::now(),
                 parent_task_id: None,
@@ -686,11 +915,18 @@ async fn reap_stale(
         // Remove from cur/ (prevents stuck-in-cur state)
         fs::remove_file(bus.join("cur").join(format!("{}.json", s.task_id))).ok();
         heartbeats.unregister(&s.task_id);
-        log_event(bus, "timeout", &format!(",\"task\":\"{}\",\"age\":{}", s.task_id, s.age_s));
+        log_event(
+            bus,
+            "timeout",
+            &format!(",\"task\":\"{}\",\"age\":{}", s.task_id, s.age_s),
+        );
 
         // Auto-capture timeout to knowledge store
         crate::recall::capture_from_failure(
-            bus, &s.task_id, "unknown", "Timeout",
+            bus,
+            &s.task_id,
+            "unknown",
+            "Timeout",
             &format!("Task stale after {}s (limit: {}s)", s.age_s, s.timeout_s),
             &[],
         );
@@ -766,59 +1002,78 @@ fn evaluate_goals(bus: &Path) {
             continue;
         }
 
-        let plan = match g.plan.as_mut() {
-            Some(p) => p,
-            None => continue,
-        };
-
         let mut changed = false;
+        let mut status_changed = false;
 
-        // Check running steps for completion
-        for step in &mut plan.steps {
-            if step.status != StepStatus::Running {
-                continue;
-            }
-
-            let task_id = match &step.task_id {
-                Some(id) => id.clone(),
+        {
+            let plan = match g.plan.as_mut() {
+                Some(p) => p,
                 None => continue,
             };
 
-            // Check if task completed (receipt in done/)
-            let receipt_path = bus.join("done").join(&task_id).join("receipt.json");
-            if receipt_path.exists() {
-                if let Ok(data) = fs::read_to_string(&receipt_path) {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                        let status = v.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                        let cost = v.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        g.spent_usd += cost;
-
-                        if status == "success" {
-                            step.status = StepStatus::Done;
-                            changed = true;
-                        } else {
-                            step.status = StepStatus::Blocked;
-                            changed = true;
-                        }
-                    }
+            // Sync queued/running steps from bus state.
+            for step in &mut plan.steps {
+                let Some(task_id) = step.task_id.as_ref() else {
+                    continue;
+                };
+                if matches!(
+                    step.status,
+                    StepStatus::Done
+                        | StepStatus::Blocked
+                        | StepStatus::Failed
+                        | StepStatus::Skipped
+                ) {
+                    continue;
                 }
-                continue;
+
+                let Some(next_status) = goal::task_step_status(bus, task_id) else {
+                    continue;
+                };
+                if next_status == step.status {
+                    continue;
+                }
+
+                if matches!(next_status, StepStatus::Done | StepStatus::Failed) {
+                    g.spent_usd += task_receipt_cost(bus, task_id);
+                }
+                step.status = next_status;
+                changed = true;
             }
 
-            // Check if task failed or dead (retry exhausted)
-            let failed = bus.join("failed").join(&task_id).is_dir();
-            let dead = bus.join("dead").join(&task_id).is_dir();
-            if failed || dead {
-                step.status = StepStatus::Blocked;
-                changed = true;
+            // Pending steps whose dependencies can no longer succeed should become blocked.
+            let step_statuses = plan
+                .steps
+                .iter()
+                .map(|step| (step.step, step.status.clone()))
+                .collect();
+            for step in &mut plan.steps {
+                if step.status != StepStatus::Pending {
+                    continue;
+                }
+                if goal::step_dependencies_blocked(step, &step_statuses) {
+                    step.status = StepStatus::Blocked;
+                    changed = true;
+                }
             }
         }
 
-        if changed {
-            // Queue next ready steps (borrows &mut g, so drop plan ref first)
+        let should_queue_ready = g.plan.as_ref().is_some_and(|plan| {
+            let step_statuses = plan
+                .steps
+                .iter()
+                .map(|step| (step.step, step.status.clone()))
+                .collect();
+            plan.steps.iter().any(|step| {
+                step.status == StepStatus::Pending
+                    && goal::step_dependencies_met(step, &step_statuses)
+            })
+        });
+
+        if should_queue_ready {
             match goal::queue_ready_steps(bus, &mut g) {
                 Ok(queued) => {
                     if !queued.is_empty() {
+                        changed = true;
                         eprintln!(
                             "daemon: goal {} queued {} step(s): {}",
                             g.id,
@@ -828,38 +1083,70 @@ fn evaluate_goals(bus: &Path) {
                     }
                 }
                 Err(e) => {
+                    g.status = GoalStatus::Failed;
+                    status_changed = true;
                     eprintln!("daemon: goal {} queue error: {}", g.id, e);
+                    log_event(
+                        bus,
+                        "goal_failed",
+                        &format!(",\"goal\":\"{}\",\"reason\":\"queue_error\"", g.id),
+                    );
                 }
             }
+        }
 
-            // Re-borrow plan for status checks
-            if let Some(ref plan) = g.plan {
-                let all_done = plan.steps.iter().all(|s| {
-                    s.status == StepStatus::Done || s.status == StepStatus::Skipped
-                });
-                if all_done {
+        if let Some(ref plan) = g.plan {
+            let all_done = plan
+                .steps
+                .iter()
+                .all(|s| matches!(s.status, StepStatus::Done | StepStatus::Skipped));
+
+            if all_done {
+                if g.status != GoalStatus::Done {
                     g.status = GoalStatus::Done;
+                    g.status_reason = None;
                     g.completed_at = Some(Utc::now());
+                    status_changed = true;
                     eprintln!("daemon: goal {} completed", g.id);
                     log_event(bus, "goal_completed", &format!(",\"goal\":\"{}\"", g.id));
                 }
-
-                let any_blocked = plan.steps.iter().any(|s| s.status == StepStatus::Blocked);
-                let all_resolved = plan.steps.iter().all(|s| {
-                    s.status == StepStatus::Done
-                        || s.status == StepStatus::Blocked
-                        || s.status == StepStatus::Skipped
-                });
-                if any_blocked && all_resolved && g.status != GoalStatus::Done {
+            } else {
+                let any_terminal_failure = plan
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s.status, StepStatus::Blocked | StepStatus::Failed));
+                let any_inflight = plan
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s.status, StepStatus::Queued | StepStatus::Running));
+                let any_pending = plan.steps.iter().any(|s| s.status == StepStatus::Pending);
+                if any_terminal_failure
+                    && !any_inflight
+                    && !any_pending
+                    && g.status != GoalStatus::Failed
+                {
                     g.status = GoalStatus::Failed;
-                    eprintln!("daemon: goal {} failed (blocked steps)", g.id);
+                    g.status_reason = Some("replan_needed_dead_end".into());
+                    status_changed = true;
+                    eprintln!("daemon: goal {} failed (blocked or failed steps)", g.id);
                     log_event(bus, "goal_failed", &format!(",\"goal\":\"{}\"", g.id));
                 }
             }
+        }
 
+        if changed || status_changed {
             goal::save_goal(bus, &g).ok();
         }
     }
+}
+
+fn task_receipt_cost(bus: &Path, task_id: &str) -> f64 {
+    let receipt_path = bus.join("done").join(task_id).join("receipt.json");
+    fs::read_to_string(receipt_path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|value| value.get("cost_usd").and_then(|v| v.as_f64()))
+        .unwrap_or(0.0)
 }
 
 // --- Helpers ---
@@ -939,4 +1226,290 @@ fn extract_cost(stdout_path: &Path) -> f64 {
                 .and_then(|c| c.as_f64())
         })
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        Agent, AgentsFile, BudgetPolicy, Config, PolicyDefaults, PolicyFile, Project, ProjectsFile,
+    };
+    use crate::goal::{self, Goal, Plan, Step};
+    use crate::queue::QueuedEntry;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    fn active_goal(steps: Vec<Step>) -> Goal {
+        Goal {
+            id: "goal-stage3".into(),
+            project: "test".into(),
+            objective: "stabilize".into(),
+            deadline: None,
+            budget_usd: 5.0,
+            spent_usd: 0.0,
+            status: GoalStatus::Active,
+            status_reason: None,
+            plan: Some(Plan {
+                version: 1,
+                created_by: "test".into(),
+                approved_at: None,
+                steps,
+            }),
+            created_at: Utc::now(),
+            completed_at: None,
+        }
+    }
+
+    fn write_task_json(path: &Path) {
+        let task = serde_json::json!({
+            "project": "test",
+            "model": "claude",
+            "category": "fix"
+        });
+        fs::write(path, serde_json::to_string_pretty(&task).unwrap()).unwrap();
+    }
+
+    fn queued_entry(priority: &str) -> QueuedEntry {
+        QueuedEntry {
+            task_id: format!("task-{priority}"),
+            path: PathBuf::from(format!("/tmp/{priority}.json")),
+            project: "test".into(),
+            model: "claude".into(),
+            worktree: false,
+            priority: priority.into(),
+            depends_on: vec![],
+        }
+    }
+
+    fn config_with_agents(agents: &[(&str, &str, &str)]) -> Config {
+        let mut map = HashMap::new();
+        for (id, provider, model) in agents {
+            map.insert(
+                (*id).to_string(),
+                Agent {
+                    provider: (*provider).to_string(),
+                    model: (*model).to_string(),
+                    role: "engineer".into(),
+                    invoke: "cli".into(),
+                    budget_usd: 1.0,
+                    system_prompt: None,
+                    skills: vec![],
+                },
+            );
+        }
+        Config {
+            projects: ProjectsFile {
+                projects: vec![Project {
+                    id: "test".into(),
+                    path: "/tmp/test".into(),
+                    stack: String::new(),
+                    active: true,
+                    budget_usd: 0.0,
+                    checkpoint: String::new(),
+                }],
+            },
+            agents: AgentsFile { agents: map },
+            policy: PolicyFile {
+                defaults: PolicyDefaults {
+                    model: "sonnet".into(),
+                    budget_usd: 1.0,
+                    timeout_s: 600,
+                    max_slots: 1,
+                },
+                budget: BudgetPolicy::default(),
+                rules: vec![],
+                features: HashMap::new(),
+            },
+            dir: PathBuf::from("/tmp/config"),
+        }
+    }
+
+    #[test]
+    fn budget_backpressure_uses_policy_thresholds_and_slot_cap() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(tmp.path().join("receipts")).unwrap();
+        fs::write(
+            tmp.path().join("receipts/index.jsonl"),
+            serde_json::json!({
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "cost_usd": 45.0
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let policy = BudgetPolicy {
+            monthly_ceiling_usd: 50.0,
+            soft_alert_pct: 80,
+            hard_stop_pct: 90,
+        };
+
+        let state = BudgetBackpressure::from_policy(&bus, &policy, 5);
+        assert_eq!(state.pressure, budget::PressureLevel::Hard);
+        assert_eq!(state.effective_max_slots, 2);
+    }
+
+    #[test]
+    fn budget_dispatch_blocks_low_priority_work_at_hard_and_stop_pressure() {
+        let hard = BudgetBackpressure {
+            pressure: budget::PressureLevel::Hard,
+            spent_usd: 45.0,
+            effective_max_slots: 2,
+        };
+        let stop = BudgetBackpressure {
+            pressure: budget::PressureLevel::Stop,
+            spent_usd: 48.0,
+            effective_max_slots: 1,
+        };
+
+        assert!(budget_allows_dispatch(&queued_entry("p0"), &hard, 0));
+        assert!(budget_allows_dispatch(&queued_entry("p1"), &hard, 0));
+        assert!(!budget_allows_dispatch(&queued_entry("p2"), &hard, 0));
+
+        assert!(budget_allows_dispatch(&queued_entry("p0"), &stop, 0));
+        assert!(!budget_allows_dispatch(&queued_entry("p1"), &stop, 0));
+        assert!(!budget_allows_dispatch(&queued_entry("p0"), &stop, 1));
+    }
+
+    #[test]
+    fn resolve_agent_reference_prefers_explicit_alias_when_present() {
+        let cfg = config_with_agents(&[("claude-reviewer", "claude", "sonnet-review")]);
+        let (provider, model, agent_id) =
+            resolve_agent_reference("claude-reviewer", Some(&cfg));
+        assert_eq!(provider, "claude");
+        assert_eq!(model, "sonnet-review");
+        assert_eq!(agent_id, "claude-reviewer");
+    }
+
+    #[test]
+    fn resolve_agent_reference_falls_back_to_raw_provider_without_config() {
+        let (provider, model, agent_id) = resolve_agent_reference("claude", None);
+        assert_eq!(provider, "claude");
+        assert_eq!(model, "");
+        assert_eq!(agent_id, "claude");
+    }
+
+    #[test]
+    fn resolve_agent_reference_falls_back_to_raw_provider_when_alias_missing() {
+        let cfg = config_with_agents(&[("codex-review", "codex", "o4-mini")]);
+        let (provider, model, agent_id) = resolve_agent_reference("gemini", Some(&cfg));
+        assert_eq!(provider, "gemini");
+        assert_eq!(model, "");
+        assert_eq!(agent_id, "gemini");
+    }
+
+    #[test]
+    fn evaluate_goals_queues_ready_pending_steps_without_receipt_change() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(bus.join("new/p1")).unwrap();
+
+        let goal = active_goal(vec![
+            Step {
+                step: 1,
+                category: "research".into(),
+                prompt: "done".into(),
+                agent: "claude-sonnet".into(),
+                est_cost_usd: 0.1,
+                depends_on: vec![],
+                status: StepStatus::Done,
+                task_id: Some("goal-stage3-step1".into()),
+                sub_tasks: vec![],
+            },
+            Step {
+                step: 2,
+                category: "fix".into(),
+                prompt: "next".into(),
+                agent: "claude-sonnet".into(),
+                est_cost_usd: 0.1,
+                depends_on: vec![1],
+                status: StepStatus::Pending,
+                task_id: None,
+                sub_tasks: vec![],
+            },
+        ]);
+        goal::save_goal(&bus, &goal).unwrap();
+
+        evaluate_goals(&bus);
+
+        let loaded = goal::load_goal(&bus, "goal-stage3").unwrap();
+        let step = &loaded.plan.unwrap().steps[1];
+        assert_eq!(step.status, StepStatus::Queued);
+        assert_eq!(step.task_id.as_deref(), Some("goal-stage3-step2"));
+        assert!(bus.join("new/p1/goal-stage3-step2.json").exists());
+    }
+
+    #[test]
+    fn evaluate_goals_blocks_dependents_and_fails_goal_when_progress_is_impossible() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(bus.join("new/p1")).unwrap();
+
+        let goal = active_goal(vec![
+            Step {
+                step: 1,
+                category: "fix".into(),
+                prompt: "failed".into(),
+                agent: "claude-sonnet".into(),
+                est_cost_usd: 0.1,
+                depends_on: vec![],
+                status: StepStatus::Failed,
+                task_id: Some("goal-stage3-step1".into()),
+                sub_tasks: vec![],
+            },
+            Step {
+                step: 2,
+                category: "review".into(),
+                prompt: "blocked downstream".into(),
+                agent: "claude-sonnet".into(),
+                est_cost_usd: 0.1,
+                depends_on: vec![1],
+                status: StepStatus::Pending,
+                task_id: None,
+                sub_tasks: vec![],
+            },
+        ]);
+        goal::save_goal(&bus, &goal).unwrap();
+
+        evaluate_goals(&bus);
+
+        let loaded = goal::load_goal(&bus, "goal-stage3").unwrap();
+        assert_eq!(loaded.status, GoalStatus::Failed);
+        assert_eq!(
+            loaded.status_reason.as_deref(),
+            Some("replan_needed_dead_end")
+        );
+        let plan = loaded.plan.unwrap();
+        assert_eq!(plan.steps[1].status, StepStatus::Blocked);
+    }
+
+    #[test]
+    fn evaluate_goals_promotes_queued_steps_to_running_from_cur() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(bus.join("cur")).unwrap();
+        write_task_json(&bus.join("cur/goal-stage3-step1.json"));
+
+        let goal = active_goal(vec![Step {
+            step: 1,
+            category: "fix".into(),
+            prompt: "running".into(),
+            agent: "claude-sonnet".into(),
+            est_cost_usd: 0.1,
+            depends_on: vec![],
+            status: StepStatus::Queued,
+            task_id: Some("goal-stage3-step1".into()),
+            sub_tasks: vec![],
+        }]);
+        goal::save_goal(&bus, &goal).unwrap();
+
+        evaluate_goals(&bus);
+
+        let loaded = goal::load_goal(&bus, "goal-stage3").unwrap();
+        let plan = loaded.plan.unwrap();
+        assert_eq!(plan.steps[0].status, StepStatus::Running);
+        assert_eq!(loaded.status, GoalStatus::Active);
+    }
 }

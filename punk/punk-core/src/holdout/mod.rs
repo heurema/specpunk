@@ -120,7 +120,10 @@ pub fn strip_holdouts(contract: &Contract) -> Contract {
 // ---------------------------------------------------------------------------
 
 /// Run all holdout scenarios. Uses DSL engine (Command::new, no shell).
-pub fn run_holdouts(contract: &Contract, working_dir: &Path) -> Result<HoldoutReport, HoldoutError> {
+pub fn run_holdouts(
+    contract: &Contract,
+    working_dir: &Path,
+) -> Result<HoldoutReport, HoldoutError> {
     if contract.holdout_scenarios.is_empty() {
         let min = min_holdouts_for_risk(&contract.risk_level);
         if min > 0 {
@@ -147,9 +150,16 @@ pub fn run_holdouts(contract: &Contract, working_dir: &Path) -> Result<HoldoutRe
         .collect();
 
     let total = results.len();
-    let passed = results.iter().filter(|r| r.status == HoldoutStatus::Pass).count();
+    let passed = results
+        .iter()
+        .filter(|r| r.status == HoldoutStatus::Pass)
+        .count();
     let failed = total - passed;
-    let pass_rate = if total > 0 { passed as f64 / total as f64 } else { 1.0 };
+    let pass_rate = if total > 0 {
+        passed as f64 / total as f64
+    } else {
+        1.0
+    };
     let meets_threshold = pass_rate >= required_pass_rate(&contract.risk_level);
 
     let report = HoldoutReport {
@@ -166,14 +176,18 @@ pub fn run_holdouts(contract: &Contract, working_dir: &Path) -> Result<HoldoutRe
     };
 
     // Save report
-    let dir = working_dir.join(".punk").join("contracts").join(&contract.change_id);
+    let dir = working_dir
+        .join(".punk")
+        .join("contracts")
+        .join(&contract.change_id);
     if dir.exists() {
         let json = serde_json::to_string_pretty(&report)
             .map_err(|e| HoldoutError::Parse(e.to_string()))?;
         let target = dir.join("holdout.json");
         let mut tmp = tempfile::NamedTempFile::new_in(&dir)?;
         std::io::Write::write_all(&mut tmp, json.as_bytes())?;
-        tmp.persist(&target).map_err(|e| HoldoutError::Io(e.error))?;
+        tmp.persist(&target)
+            .map_err(|e| HoldoutError::Io(e.error))?;
     }
 
     Ok(report)
@@ -224,11 +238,18 @@ pub fn render_holdout_short(report: &HoldoutReport) -> String {
         );
     }
 
-    let verdict = if report.meets_threshold { "PASS" } else { "FAIL" };
+    let verdict = if report.meets_threshold {
+        "PASS"
+    } else {
+        "FAIL"
+    };
     let mut out = format!(
         "punk holdout: {} ({}/{} passed, {:.0}% rate, risk={:?})\n",
-        verdict, report.passed, report.total,
-        report.pass_rate * 100.0, report.risk_level,
+        verdict,
+        report.passed,
+        report.total,
+        report.pass_rate * 100.0,
+        report.risk_level,
     );
 
     for r in &report.results {
@@ -239,7 +260,10 @@ pub fn render_holdout_short(report: &HoldoutReport) -> String {
             HoldoutStatus::Timeout => "  TIME",
             HoldoutStatus::Skipped => "  SKIP",
         };
-        out.push_str(&format!("  {} [{}] {} ({}ms)\n", icon, r.id, r.description, r.duration_ms));
+        out.push_str(&format!(
+            "  {} [{}] {} ({}ms)\n",
+            icon, r.id, r.description, r.duration_ms
+        ));
         if let Some(err) = &r.error {
             out.push_str(&format!("       {err}\n"));
         }
@@ -264,7 +288,10 @@ mod tests {
         Contract {
             version: CONTRACT_VERSION.to_string(),
             goal: "test".to_string(),
-            scope: Scope { touch: vec![], dont_touch: vec![] },
+            scope: Scope {
+                touch: vec![],
+                dont_touch: vec![],
+            },
             acceptance_criteria: vec![],
             assumptions: vec![],
             warnings: vec![],
@@ -276,7 +303,8 @@ mod tests {
                 complexity_score: 1,
                 ceremony_level: CeremonyLevel::Skip,
                 suggested_model_tier: ModelTier::Haiku,
-                latency_ms: 0, token_estimate: 0,
+                latency_ms: 0,
+                token_estimate: 0,
                 router_policy_version: "1.0".to_string(),
                 unfamiliarity_ratio: 0.0,
             },
@@ -303,7 +331,10 @@ mod tests {
     fn medium_risk_no_holdouts_fails() {
         let c = make_contract(RiskLevel::Medium, vec![]);
         let tmp = TempDir::new().unwrap();
-        assert!(matches!(run_holdouts(&c, tmp.path()), Err(HoldoutError::NoHoldouts)));
+        assert!(matches!(
+            run_holdouts(&c, tmp.path()),
+            Err(HoldoutError::NoHoldouts)
+        ));
     }
 
     #[test]
@@ -318,8 +349,11 @@ mod tests {
                     timeout_ms: None,
                 },
                 DslStep::Expect {
-                    source: "r".to_string(), json_path: None,
-                    exit_code: Some(0), equals: None, contains: None,
+                    source: "r".to_string(),
+                    json_path: None,
+                    exit_code: Some(0),
+                    equals: None,
+                    contains: None,
                 },
             ],
             timeout_ms: 5000,
@@ -343,8 +377,11 @@ mod tests {
                     timeout_ms: None,
                 },
                 DslStep::Expect {
-                    source: "r".to_string(), json_path: None,
-                    exit_code: Some(0), equals: None, contains: None,
+                    source: "r".to_string(),
+                    json_path: None,
+                    exit_code: Some(0),
+                    equals: None,
+                    contains: None,
                 },
             ],
             timeout_ms: 5000,
@@ -358,33 +395,64 @@ mod tests {
     #[test]
     fn mixed_results() {
         let pass = Holdout {
-            id: "HO-1".to_string(), description: "echo".to_string(),
+            id: "HO-1".to_string(),
+            description: "echo".to_string(),
             steps: vec![
-                DslStep::Exec { argv: vec!["echo".to_string(), "ok".to_string()], capture: Some("r".to_string()), timeout_ms: None },
-                DslStep::Expect { source: "r".to_string(), json_path: None, exit_code: Some(0), equals: None, contains: Some("ok".to_string()) },
+                DslStep::Exec {
+                    argv: vec!["echo".to_string(), "ok".to_string()],
+                    capture: Some("r".to_string()),
+                    timeout_ms: None,
+                },
+                DslStep::Expect {
+                    source: "r".to_string(),
+                    json_path: None,
+                    exit_code: Some(0),
+                    equals: None,
+                    contains: Some("ok".to_string()),
+                },
             ],
             timeout_ms: 5000,
         };
         let fail = Holdout {
-            id: "HO-2".to_string(), description: "nope".to_string(),
+            id: "HO-2".to_string(),
+            description: "nope".to_string(),
             steps: vec![
-                DslStep::Exec { argv: vec!["test".to_string(), "-f".to_string(), "x".to_string()], capture: Some("r".to_string()), timeout_ms: None },
-                DslStep::Expect { source: "r".to_string(), json_path: None, exit_code: Some(0), equals: None, contains: None },
+                DslStep::Exec {
+                    argv: vec!["test".to_string(), "-f".to_string(), "x".to_string()],
+                    capture: Some("r".to_string()),
+                    timeout_ms: None,
+                },
+                DslStep::Expect {
+                    source: "r".to_string(),
+                    json_path: None,
+                    exit_code: Some(0),
+                    equals: None,
+                    contains: None,
+                },
             ],
             timeout_ms: 5000,
         };
         let tmp = TempDir::new().unwrap();
-        let r = run_holdouts(&make_contract(RiskLevel::High, vec![pass, fail]), tmp.path()).unwrap();
+        let r = run_holdouts(
+            &make_contract(RiskLevel::High, vec![pass, fail]),
+            tmp.path(),
+        )
+        .unwrap();
         assert_eq!(r.pass_rate, 0.5);
         assert!(!r.meets_threshold);
     }
 
     #[test]
     fn strip_removes_holdouts() {
-        let c = make_contract(RiskLevel::Medium, vec![Holdout {
-            id: "HO-1".to_string(), description: "secret".to_string(),
-            steps: vec![], timeout_ms: 5000,
-        }]);
+        let c = make_contract(
+            RiskLevel::Medium,
+            vec![Holdout {
+                id: "HO-1".to_string(),
+                description: "secret".to_string(),
+                steps: vec![],
+                timeout_ms: 5000,
+            }],
+        );
         let view = strip_holdouts(&c);
         assert!(view.holdout_scenarios.is_empty());
         assert!(view.approval_hash.is_none());
@@ -393,10 +461,16 @@ mod tests {
     #[test]
     fn report_roundtrip() {
         let r = HoldoutReport {
-            schema_version: "1.0".to_string(), timestamp: "t".to_string(),
-            contract_id: "c".to_string(), risk_level: RiskLevel::High,
-            total: 5, passed: 4, failed: 1, pass_rate: 0.8,
-            meets_threshold: false, results: vec![],
+            schema_version: "1.0".to_string(),
+            timestamp: "t".to_string(),
+            contract_id: "c".to_string(),
+            risk_level: RiskLevel::High,
+            total: 5,
+            passed: 4,
+            failed: 1,
+            pass_rate: 0.8,
+            meets_threshold: false,
+            results: vec![],
         };
         let j = serde_json::to_string(&r).unwrap();
         let back: HoldoutReport = serde_json::from_str(&j).unwrap();
@@ -413,13 +487,34 @@ mod tests {
     #[test]
     fn render_output() {
         let r = HoldoutReport {
-            schema_version: "1.0".to_string(), timestamp: "t".to_string(),
-            contract_id: "abc".to_string(), risk_level: RiskLevel::Medium,
-            total: 2, passed: 2, failed: 0, pass_rate: 1.0,
+            schema_version: "1.0".to_string(),
+            timestamp: "t".to_string(),
+            contract_id: "abc".to_string(),
+            risk_level: RiskLevel::Medium,
+            total: 2,
+            passed: 2,
+            failed: 0,
+            pass_rate: 1.0,
             meets_threshold: true,
             results: vec![
-                HoldoutResult { id: "HO-1".to_string(), description: "api ok".to_string(), status: HoldoutStatus::Pass, steps_run: 2, failed_at_step: None, error: None, duration_ms: 30 },
-                HoldoutResult { id: "HO-2".to_string(), description: "file ok".to_string(), status: HoldoutStatus::Pass, steps_run: 1, failed_at_step: None, error: None, duration_ms: 5 },
+                HoldoutResult {
+                    id: "HO-1".to_string(),
+                    description: "api ok".to_string(),
+                    status: HoldoutStatus::Pass,
+                    steps_run: 2,
+                    failed_at_step: None,
+                    error: None,
+                    duration_ms: 30,
+                },
+                HoldoutResult {
+                    id: "HO-2".to_string(),
+                    description: "file ok".to_string(),
+                    status: HoldoutStatus::Pass,
+                    steps_run: 1,
+                    failed_at_step: None,
+                    error: None,
+                    duration_ms: 5,
+                },
             ],
         };
         let out = render_holdout_short(&r);

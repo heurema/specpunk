@@ -66,9 +66,7 @@ impl MockProvider {
     /// Create a mock that returns a malformed (non-JSON) response.
     pub fn malformed() -> Self {
         MockProvider {
-            response: Err(LlmError::MalformedResponse(
-                "not valid JSON".to_string(),
-            )),
+            response: Err(LlmError::MalformedResponse("not valid JSON".to_string())),
         }
     }
 }
@@ -81,9 +79,7 @@ impl LlmProvider for MockProvider {
             Err(LlmError::Timeout) => Err(LlmError::Timeout),
             Err(LlmError::MalformedResponse(s)) => Err(LlmError::MalformedResponse(s.clone())),
             Err(LlmError::Http(s)) => Err(LlmError::Http(s.clone())),
-            Err(LlmError::Io(e)) => Err(LlmError::Io(
-                std::io::Error::new(e.kind(), e.to_string()),
-            )),
+            Err(LlmError::Io(e)) => Err(LlmError::Io(std::io::Error::new(e.kind(), e.to_string()))),
         }
     }
 }
@@ -191,6 +187,9 @@ mod tests {
         let result = provider.generate("test prompt").await;
         assert!(matches!(result, Err(LlmError::MalformedResponse(_))));
         let err_str = result.unwrap_err().to_string();
-        assert!(err_str.contains("malformed"), "error should say malformed: {err_str}");
+        assert!(
+            err_str.contains("malformed"),
+            "error should say malformed: {err_str}"
+        );
     }
 }

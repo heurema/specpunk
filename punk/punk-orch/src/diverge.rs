@@ -5,6 +5,8 @@ use std::process::Stdio;
 use chrono::Utc;
 use tokio::process::Command;
 
+use crate::config;
+
 /// Strategy hint for each provider.
 #[derive(Debug, Clone)]
 pub struct Strategy {
@@ -42,10 +44,37 @@ pub struct SolutionResult {
     pub provider: String,
     pub strategy_hint: String,
     pub exit_code: i32,
+    pub timed_out: bool,
     pub files_changed: Vec<String>,
     pub lines_added: u32,
     pub lines_removed: u32,
+    pub worktree_path: PathBuf,
     pub stdout_path: PathBuf,
+    pub stderr_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct DivergeReport {
+    pub run_dir: PathBuf,
+    pub base_commit: String,
+    pub solutions: Vec<SolutionResult>,
+}
+
+pub fn available_strategies(strategies: &[Strategy]) -> Vec<Strategy> {
+    available_strategies_with(strategies, |provider| {
+        config::detect_agents().agents.contains_key(provider)
+    })
+}
+
+fn available_strategies_with<F>(strategies: &[Strategy], mut is_available: F) -> Vec<Strategy>
+where
+    F: FnMut(&str) -> bool,
+{
+    strategies
+        .iter()
+        .filter(|strategy| is_available(&strategy.provider))
+        .cloned()
+        .collect()
 }
 
 /// Run diverge: dispatch spec to multiple providers in isolated worktrees.
@@ -54,20 +83,29 @@ pub async fn run_diverge(
     spec: &str,
     strategies: &[Strategy],
     timeout_s: u64,
-) -> Result<Vec<SolutionResult>, String> {
+) -> Result<DivergeReport, String> {
     // Preflight: check git repo
     if !project_path.join(".git").exists() {
         return Err("not a git repository".into());
     }
 
+    let strategies = available_strategies(strategies);
+    if strategies.is_empty() {
+        return Err("no supported providers detected".into());
+    }
+
     let base_commit = git_output(project_path, &["rev-parse", "HEAD"])?;
-    let run_id = format!("{}-{}", Utc::now().format("%Y%m%dT%H%M%S"), std::process::id());
+    let run_id = format!(
+        "{}-{}",
+        Utc::now().format("%Y%m%dT%H%M%S"),
+        std::process::id()
+    );
     let run_dir = std::env::temp_dir().join(format!("punk-diverge-{run_id}"));
     fs::create_dir_all(&run_dir).map_err(|e| e.to_string())?;
 
     // Create worktrees
     let mut worktrees = Vec::new();
-    for s in strategies {
+    for s in &strategies {
         let wt_path = run_dir.join(&s.label);
         let result = std::process::Command::new("git")
             .args(["worktree", "add", "--detach"])
@@ -113,7 +151,10 @@ pub async fn run_diverge(
     let mut solutions = Vec::new();
     for (i, handle) in handles.into_iter().enumerate() {
         let (label, provider, result) = handle.await.map_err(|e| e.to_string())?;
-        let exit_code = result.unwrap_or(-1);
+        let provider_result = result.unwrap_or(ProviderRunResult {
+            exit_code: -1,
+            timed_out: false,
+        });
 
         // Get diff stats
         let (files, added, removed) = diff_stats(&worktrees[i], &base_commit);
@@ -122,18 +163,25 @@ pub async fn run_diverge(
             label,
             provider,
             strategy_hint: strategies[i].hint.clone(),
-            exit_code,
+            exit_code: provider_result.exit_code,
+            timed_out: provider_result.timed_out,
             files_changed: files,
             lines_added: added,
             lines_removed: removed,
+            worktree_path: worktrees[i].clone(),
             stdout_path: worktrees[i].join("stdout.log"),
+            stderr_path: worktrees[i].join("stderr.log"),
         });
     }
 
     // Don't cleanup worktrees yet — caller may want to inspect or merge
     // Cleanup happens when user selects or discards
 
-    Ok(solutions)
+    Ok(DivergeReport {
+        run_dir,
+        base_commit,
+        solutions,
+    })
 }
 
 /// Cleanup worktrees.
@@ -148,7 +196,16 @@ pub fn cleanup_worktrees(project_path: &Path, worktrees: &[PathBuf]) {
     }
 }
 
-async fn dispatch_provider(provider: &str, worktree: &Path, timeout_s: u64) -> Result<i32, String> {
+struct ProviderRunResult {
+    exit_code: i32,
+    timed_out: bool,
+}
+
+async fn dispatch_provider(
+    provider: &str,
+    worktree: &Path,
+    timeout_s: u64,
+) -> Result<ProviderRunResult, String> {
     let prompt_path = worktree.join(".diverge-prompt.md");
     let prompt = fs::read_to_string(&prompt_path).map_err(|e| e.to_string())?;
     let stdout_path = worktree.join("stdout.log");
@@ -191,9 +248,15 @@ async fn dispatch_provider(provider: &str, worktree: &Path, timeout_s: u64) -> R
     .await;
 
     match result {
-        Ok(Ok(output)) => Ok(output.status.code().unwrap_or(-1)),
+        Ok(Ok(output)) => Ok(ProviderRunResult {
+            exit_code: output.status.code().unwrap_or(-1),
+            timed_out: false,
+        }),
         Ok(Err(e)) => Err(format!("{provider}: {e}")),
-        Err(_) => Ok(124), // timeout
+        Err(_) => Ok(ProviderRunResult {
+            exit_code: 124,
+            timed_out: true,
+        }),
     }
 }
 
@@ -241,4 +304,19 @@ fn diff_stats(worktree: &Path, base_commit: &str) -> (Vec<String>, u32, u32) {
     }
 
     (files, added, removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_strategies_filters_missing_providers_but_keeps_order() {
+        let filtered = available_strategies_with(&Strategy::defaults(), |provider| provider != "codex");
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].label, "A");
+        assert_eq!(filtered[0].provider, "claude");
+        assert_eq!(filtered[1].label, "C");
+        assert_eq!(filtered[1].provider, "gemini");
+    }
 }

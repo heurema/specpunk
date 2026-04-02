@@ -1,14 +1,16 @@
 pub use chrono;
 
 pub mod adapter;
+pub mod benchmark;
 pub mod budget;
-pub mod context;
-pub mod followup;
 pub mod bus;
 pub mod config;
+pub mod context;
 pub mod daemon;
 pub mod diverge;
 pub mod doctor;
+pub mod eval;
+pub mod followup;
 pub mod goal;
 pub mod graph;
 pub mod morning;
@@ -19,6 +21,8 @@ pub mod queue;
 pub mod ratchet;
 pub mod recall;
 pub mod receipt;
+pub mod research;
+pub mod resolver;
 pub mod run;
 pub mod sanitize;
 pub mod session;

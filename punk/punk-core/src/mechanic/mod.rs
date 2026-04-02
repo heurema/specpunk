@@ -107,7 +107,10 @@ pub fn detect_test_commands(root: &Path) -> Vec<(String, String)> {
         if which_exists("pytest") {
             commands.push(("pytest".to_string(), "pytest -q --tb=line".to_string()));
         } else if which_exists("python3") {
-            commands.push(("python-unittest".to_string(), "python3 -m pytest -q --tb=line".to_string()));
+            commands.push((
+                "python-unittest".to_string(),
+                "python3 -m pytest -q --tb=line".to_string(),
+            ));
         }
     }
 
@@ -135,9 +138,15 @@ pub fn detect_test_commands(root: &Path) -> Vec<(String, String)> {
     let config_path = root.join(".punk").join("config.toml");
     if let Ok(raw) = std::fs::read_to_string(&config_path) {
         #[derive(Deserialize)]
-        struct Cfg { #[serde(default)] project: Proj }
+        struct Cfg {
+            #[serde(default)]
+            project: Proj,
+        }
         #[derive(Deserialize, Default)]
-        struct Proj { #[serde(default)] test_runner: Option<String> }
+        struct Proj {
+            #[serde(default)]
+            test_runner: Option<String>,
+        }
 
         if let Ok(cfg) = toml::from_str::<Cfg>(&raw) {
             if let Some(runner) = cfg.project.test_runner {
@@ -180,10 +189,7 @@ fn run_check_command(name: &str, command: &str, root: &Path) -> BaselineCheck {
     let parts: Vec<&str> = command.split_whitespace().collect();
     let (program, args) = parts.split_first().unwrap_or((&"true", &[]));
 
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(root)
-        .output();
+    let output = Command::new(program).args(args).current_dir(root).output();
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -282,7 +288,8 @@ pub fn capture_baseline(root: &Path, contract_id: &str) -> Result<Baseline, Mech
 
     if commands.is_empty() {
         return Err(MechanicError::NoBaseline(
-            "no test commands detected. Add a Cargo.toml, pyproject.toml, package.json, or go.mod.".into(),
+            "no test commands detected. Add a Cargo.toml, pyproject.toml, package.json, or go.mod."
+                .into(),
         ));
     }
 
@@ -303,13 +310,14 @@ pub fn capture_baseline(root: &Path, contract_id: &str) -> Result<Baseline, Mech
     let contracts_dir = punk_dir.join("contracts").join(contract_id);
     std::fs::create_dir_all(&contracts_dir)?;
 
-    let json = serde_json::to_string_pretty(&baseline)
-        .map_err(|e| MechanicError::Parse(e.to_string()))?;
+    let json =
+        serde_json::to_string_pretty(&baseline).map_err(|e| MechanicError::Parse(e.to_string()))?;
 
     let target = contracts_dir.join("baseline.json");
     let mut tmp = tempfile::NamedTempFile::new_in(&contracts_dir)?;
     std::io::Write::write_all(&mut tmp, json.as_bytes())?;
-    tmp.persist(&target).map_err(|e| MechanicError::Io(e.error))?;
+    tmp.persist(&target)
+        .map_err(|e| MechanicError::Io(e.error))?;
 
     Ok(baseline)
 }
@@ -402,12 +410,13 @@ pub fn run_mechanic(root: &Path, contract_id: &str) -> Result<MechanicReport, Me
 
     // Save report atomically
     let reports_dir = root.join(".punk").join("contracts").join(contract_id);
-    let json = serde_json::to_string_pretty(&report)
-        .map_err(|e| MechanicError::Parse(e.to_string()))?;
+    let json =
+        serde_json::to_string_pretty(&report).map_err(|e| MechanicError::Parse(e.to_string()))?;
     let target = reports_dir.join("mechanic.json");
     let mut tmp = tempfile::NamedTempFile::new_in(&reports_dir)?;
     std::io::Write::write_all(&mut tmp, json.as_bytes())?;
-    tmp.persist(&target).map_err(|e| MechanicError::Io(e.error))?;
+    tmp.persist(&target)
+        .map_err(|e| MechanicError::Io(e.error))?;
 
     Ok(report)
 }

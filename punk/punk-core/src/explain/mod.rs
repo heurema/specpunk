@@ -27,12 +27,7 @@ pub struct Explanation {
 // ---------------------------------------------------------------------------
 
 /// Create an explanation draft.
-pub fn create_draft(
-    contract_id: &str,
-    what: &str,
-    why: &str,
-    risks: &str,
-) -> Explanation {
+pub fn create_draft(contract_id: &str, what: &str, why: &str, risks: &str) -> Explanation {
     Explanation {
         schema_version: "1.0".to_string(),
         contract_id: contract_id.to_string(),
@@ -72,7 +67,10 @@ pub fn load(contract_dir: &Path) -> Option<Explanation> {
 pub fn render_explanation(e: &Explanation) -> String {
     let mut out = format!("## Explanation: {}\n\n", e.contract_id);
     out.push_str(&format!("**What changed:** {}\n\n", e.what_changed));
-    out.push_str(&format!("**Why this approach:** {}\n\n", e.why_this_approach));
+    out.push_str(&format!(
+        "**Why this approach:** {}\n\n",
+        e.why_this_approach
+    ));
     out.push_str(&format!("**What can break:** {}\n\n", e.what_can_break));
     if let Some(by) = &e.confirmed_by {
         out.push_str(&format!("Confirmed by: {by}\n"));
@@ -89,7 +87,12 @@ mod tests {
 
     #[test]
     fn create_and_confirm() {
-        let mut e = create_draft("c1", "added auth", "JWT is standard", "token expiry edge case");
+        let mut e = create_draft(
+            "c1",
+            "added auth",
+            "JWT is standard",
+            "token expiry edge case",
+        );
         assert!(e.confirmed_by.is_none());
         confirm(&mut e, "alice");
         assert_eq!(e.confirmed_by, Some("alice".to_string()));

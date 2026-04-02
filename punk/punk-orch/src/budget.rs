@@ -7,9 +7,9 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PressureLevel {
     Normal,
-    Soft,  // 80%+ — warn
-    Hard,  // 90%+ — reduce slots to 2, p0+p1 only
-    Stop,  // 95%+ — p0 only
+    Soft, // 80%+ — warn
+    Hard, // 90%+ — reduce slots to 2, p0+p1 only
+    Stop, // 95%+ — p0 only
 }
 
 /// Check current budget pressure.
@@ -59,10 +59,7 @@ pub fn effective_max_slots(pressure: &PressureLevel, configured_max: u32) -> u32
 
 /// Calculate total spend this month from receipts/index.jsonl.
 fn monthly_spend(bus: &Path) -> f64 {
-    let index = bus
-        .parent()
-        .unwrap_or(bus)
-        .join("receipts/index.jsonl");
+    let index = bus.parent().unwrap_or(bus).join("receipts/index.jsonl");
 
     let content = match fs::read_to_string(index) {
         Ok(c) => c,
@@ -92,8 +89,14 @@ mod tests {
 
     #[test]
     fn pressure_levels() {
-        assert_eq!(check_pressure(Path::new("/nonexistent"), 50.0, 80, 95).0, PressureLevel::Normal);
-        assert_eq!(check_pressure(Path::new("/nonexistent"), 0.0, 80, 95).0, PressureLevel::Normal);
+        assert_eq!(
+            check_pressure(Path::new("/nonexistent"), 50.0, 80, 95).0,
+            PressureLevel::Normal
+        );
+        assert_eq!(
+            check_pressure(Path::new("/nonexistent"), 0.0, 80, 95).0,
+            PressureLevel::Normal
+        );
     }
 
     #[test]

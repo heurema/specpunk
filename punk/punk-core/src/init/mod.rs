@@ -5,8 +5,8 @@ pub mod scan;
 use std::path::Path;
 
 pub use artifacts::write_artifacts;
-pub use greenfield::{GreenFieldAnswers, run_greenfield};
-pub use scan::{ScanResult, run_scan};
+pub use greenfield::{run_greenfield, GreenFieldAnswers};
+pub use scan::{run_scan, ScanResult};
 
 /// How the project was detected.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,14 +33,20 @@ pub fn run_init(root: &Path, answers: Option<GreenFieldAnswers>) -> Result<InitR
             let artifacts = run_greenfield(root, &gf)?;
             write_artifacts(root, &artifacts, false)?;
             let names = artifacts.artifact_names();
-            Ok(InitResult { mode: InitMode::Greenfield, artifacts_written: names })
+            Ok(InitResult {
+                mode: InitMode::Greenfield,
+                artifacts_written: names,
+            })
         }
         InitMode::Brownfield => {
             let scan = run_scan(root)?;
             let artifacts = scan.to_artifacts();
             write_artifacts(root, &artifacts, true)?;
             let names = artifacts.artifact_names();
-            Ok(InitResult { mode: InitMode::Brownfield, artifacts_written: names })
+            Ok(InitResult {
+                mode: InitMode::Brownfield,
+                artifacts_written: names,
+            })
         }
     }
 }
@@ -82,15 +88,17 @@ fn has_project_manifest(root: &Path) -> bool {
 /// excluding common config-only extensions.
 fn count_source_files(root: &Path) -> usize {
     let code_exts = [
-        "rs", "go", "py", "ts", "js", "tsx", "jsx", "java", "kt",
-        "cpp", "c", "h", "cs", "rb", "php", "swift",
+        "rs", "go", "py", "ts", "js", "tsx", "jsx", "java", "kt", "cpp", "c", "h", "cs", "rb",
+        "php", "swift",
     ];
     let walker = walkdir::WalkDir::new(root)
         .follow_links(false)
         .max_depth(8)
         .into_iter()
         .filter_entry(|e| {
-            if e.depth() == 0 { return true; }
+            if e.depth() == 0 {
+                return true;
+            }
             let name = e.file_name().to_string_lossy();
             !name.starts_with('.') && name != "target" && name != "node_modules" && name != "vendor"
         });

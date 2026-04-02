@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
+use crate::receipt::{Receipt, ReceiptStatus};
 use crate::sanitize;
 
 /// A skill file (markdown with YAML frontmatter).
@@ -11,39 +12,43 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub path: PathBuf,
+    pub state: SkillState,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillState {
+    Active,
+    Candidate,
 }
 
 fn skills_dir(bus: &Path) -> PathBuf {
     bus.parent().unwrap_or(bus).join("skills")
 }
 
-/// List all skills.
-pub fn list_skills(bus: &Path) -> Vec<Skill> {
-    let dir = skills_dir(bus);
+fn candidate_skills_dir(project_root: &Path) -> PathBuf {
+    project_root.join(".punk/skills/candidates")
+}
+
+/// List all active and candidate skills.
+pub fn list_skills(bus: &Path, project_root: Option<&Path>) -> Vec<Skill> {
     let mut skills = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "md") {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    let name = path
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    let description = extract_description(&content);
-                    skills.push(Skill {
-                        name,
-                        description,
-                        path,
-                    });
-                }
-            }
-        }
+    collect_skills_from_dir(&mut skills, &skills_dir(bus), SkillState::Active);
+    if let Some(root) = project_root {
+        collect_skills_from_dir(
+            &mut skills,
+            &candidate_skills_dir(root),
+            SkillState::Candidate,
+        );
     }
 
-    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills.sort_by(|a, b| {
+        a.state
+            .sort_key()
+            .cmp(&b.state.sort_key())
+            .then_with(|| a.name.cmp(&b.name))
+    });
     skills
 }
 
@@ -53,6 +58,17 @@ pub fn create_skill(
     name: &str,
     description: &str,
     content: &str,
+) -> Result<PathBuf, String> {
+    create_skill_with_triggers(bus, name, description, content, &[], &[])
+}
+
+pub fn create_skill_with_triggers(
+    bus: &Path,
+    name: &str,
+    description: &str,
+    content: &str,
+    projects: &[String],
+    categories: &[String],
 ) -> Result<PathBuf, String> {
     // Security scan on both content and description
     if let Some(issue) = security_scan(content) {
@@ -67,9 +83,9 @@ pub fn create_skill(
     let dir = skills_dir(bus);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let skill_content = format!(
-        "---\nname: {name}\ndescription: {description}\n---\n\n{content}"
-    );
+    let trigger_block = render_trigger_frontmatter(projects, categories);
+    let skill_content =
+        format!("---\nname: {name}\ndescription: {description}{trigger_block}---\n\n{content}");
 
     let path = dir.join(format!("{name}.md"));
 
@@ -81,14 +97,139 @@ pub fn create_skill(
     Ok(path)
 }
 
+pub fn create_candidate_skill(
+    cwd: &Path,
+    name: &str,
+    description: &str,
+    content: &str,
+    evidence_refs: &[String],
+) -> Result<PathBuf, String> {
+    create_candidate_skill_with_triggers(cwd, name, description, content, evidence_refs, &[], &[])
+}
+
+pub fn create_candidate_skill_with_triggers(
+    cwd: &Path,
+    name: &str,
+    description: &str,
+    content: &str,
+    evidence_refs: &[String],
+    projects: &[String],
+    categories: &[String],
+) -> Result<PathBuf, String> {
+    if evidence_refs.is_empty() {
+        return Err("candidate skills require at least one --evidence reference".to_string());
+    }
+
+    if let Some(issue) = security_scan(content) {
+        return Err(format!("security scan failed (content): {issue}"));
+    }
+    if let Some(issue) = security_scan(description) {
+        return Err(format!("security scan failed (description): {issue}"));
+    }
+
+    sanitize::safe_id(name)?;
+    let root = detect_repo_root(cwd)?;
+    let dir = candidate_skills_dir(&root);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let mut deduped = Vec::new();
+    for evidence in evidence_refs {
+        let trimmed = evidence.trim();
+        if trimmed.is_empty() {
+            return Err("evidence refs must be non-empty".to_string());
+        }
+        if !deduped.iter().any(|existing: &String| existing == trimmed) {
+            deduped.push(trimmed.to_string());
+        }
+    }
+
+    let evidence_block = deduped
+        .iter()
+        .map(|evidence| format!("  - {evidence}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trigger_block = render_trigger_frontmatter(projects, categories);
+    let skill_content = format!(
+        "---\nname: {name}\ndescription: {description}\nstate: candidate\nevidence:\n{evidence_block}\n{trigger_block}---\n\n{content}"
+    );
+
+    let path = dir.join(format!("{name}.md"));
+    let tmp_path = dir.join(format!(".{name}.tmp"));
+    fs::write(&tmp_path, &skill_content).map_err(|e| e.to_string())?;
+    fs::rename(&tmp_path, &path).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+pub fn propose_candidate_from_task(
+    bus: &Path,
+    cwd: &Path,
+    task_id: &str,
+    name_override: Option<&str>,
+) -> Result<PathBuf, String> {
+    let receipt = latest_receipt_for_task(bus, task_id)
+        .ok_or_else(|| format!("receipt not found for task: {task_id}"))?;
+
+    let suggested_name = name_override
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| default_candidate_name(&receipt));
+    let description = format!(
+        "Candidate overlay from {} task {} ({})",
+        receipt.project,
+        receipt.task_id,
+        receipt_status_label(&receipt.status)
+    );
+    let evidence_refs = build_evidence_refs(&receipt);
+    let content = build_candidate_content(&receipt);
+
+    create_candidate_skill(cwd, &suggested_name, &description, &content, &evidence_refs)
+}
+
+pub fn promote_candidate_skill(bus: &Path, cwd: &Path, name: &str) -> Result<PathBuf, String> {
+    sanitize::safe_id(name)?;
+
+    let root = detect_repo_root(cwd)?;
+    let candidate_path = candidate_skills_dir(&root).join(format!("{name}.md"));
+    if !candidate_path.exists() {
+        return Err(format!("candidate skill not found: {name}"));
+    }
+
+    let content = fs::read_to_string(&candidate_path).map_err(|e| e.to_string())?;
+    if let Some(issue) = security_scan(&content) {
+        return Err(format!("security scan failed (candidate): {issue}"));
+    }
+
+    let active_dir = skills_dir(bus);
+    fs::create_dir_all(&active_dir).map_err(|e| e.to_string())?;
+    let active_path = active_dir.join(format!("{name}.md"));
+    if active_path.exists() {
+        return Err(format!("active skill already exists: {name}"));
+    }
+
+    let normalized = strip_candidate_state(&content);
+    let tmp_path = active_dir.join(format!(".{name}.tmp"));
+    fs::write(&tmp_path, normalized).map_err(|e| e.to_string())?;
+    fs::rename(&tmp_path, &active_path).map_err(|e| e.to_string())?;
+    fs::remove_file(&candidate_path).map_err(|e| e.to_string())?;
+    Ok(active_path)
+}
+
 /// Security scan: check for prompt injection patterns.
 fn security_scan(content: &str) -> Option<String> {
     let patterns = [
-        (r"(?i)ignore\s+(all\s+)?previous\s+instructions", "prompt injection: ignore instructions"),
-        (r"(?i)you\s+are\s+now\s+a", "prompt injection: role override"),
+        (
+            r"(?i)ignore\s+(all\s+)?previous\s+instructions",
+            "prompt injection: ignore instructions",
+        ),
+        (
+            r"(?i)you\s+are\s+now\s+a",
+            "prompt injection: role override",
+        ),
         (r"(?i)system\s*:\s*", "prompt injection: system role"),
         (r"\x00|\x01|\x02", "invisible control characters"),
-        (r"[\u{200B}\u{200C}\u{200D}\u{FEFF}]", "zero-width Unicode characters"),
+        (
+            r"[\u{200B}\u{200C}\u{200D}\u{FEFF}]",
+            "zero-width Unicode characters",
+        ),
     ];
 
     for (pattern, description) in &patterns {
@@ -100,6 +241,31 @@ fn security_scan(content: &str) -> Option<String> {
     }
 
     None
+}
+
+fn render_trigger_frontmatter(projects: &[String], categories: &[String]) -> String {
+    let mut out = String::new();
+    if !projects.is_empty() {
+        out.push_str("\nproject: ");
+        out.push_str(&render_inline_list(projects));
+    }
+    if !categories.is_empty() {
+        out.push_str("\ncategory: ");
+        out.push_str(&render_inline_list(categories));
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+fn render_inline_list(values: &[String]) -> String {
+    let rendered = values
+        .iter()
+        .map(|value| format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{rendered}]")
 }
 
 fn extract_description(content: &str) -> String {
@@ -125,6 +291,254 @@ fn extract_description(content: &str) -> String {
         .collect()
 }
 
+fn latest_receipt_for_task(bus: &Path, task_id: &str) -> Option<Receipt> {
+    let index = bus.parent().unwrap_or(bus).join("receipts/index.jsonl");
+    let content = fs::read_to_string(index).ok()?;
+    content
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Receipt>(line).ok())
+        .find(|receipt| receipt.task_id == task_id)
+}
+
+fn build_evidence_refs(receipt: &Receipt) -> Vec<String> {
+    let mut refs = vec![
+        format!("task:{}", receipt.task_id),
+        format!("status:{}", receipt_status_label(&receipt.status)),
+        format!("project:{}", receipt.project),
+    ];
+
+    for artifact in receipt.artifacts.iter().take(3) {
+        refs.push(format!("artifact:{artifact}"));
+    }
+    refs
+}
+
+fn default_candidate_name(receipt: &Receipt) -> String {
+    let mut name = format!(
+        "{}-{}-candidate",
+        sanitize_name_fragment(&receipt.project),
+        sanitize_name_fragment(&receipt.task_id)
+    );
+    if name.len() > 80 {
+        name.truncate(80);
+    }
+    name
+}
+
+fn sanitize_name_fragment(raw: &str) -> String {
+    let mut out = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn build_candidate_content(receipt: &Receipt) -> String {
+    let summary = summarize_text(&receipt.summary, 240);
+    let errors = receipt
+        .errors
+        .iter()
+        .take(5)
+        .map(|error| format!("- {}", summarize_text(error, 160)))
+        .collect::<Vec<_>>();
+    let artifacts = receipt
+        .artifacts
+        .iter()
+        .take(5)
+        .map(|artifact| format!("- {artifact}"))
+        .collect::<Vec<_>>();
+
+    let mut out = String::new();
+    out.push_str("## Source Evidence\n\n");
+    out.push_str(&format!("- task: {}\n", receipt.task_id));
+    out.push_str(&format!("- project: {}\n", receipt.project));
+    out.push_str(&format!("- category: {}\n", receipt.category));
+    out.push_str(&format!(
+        "- status: {}\n",
+        receipt_status_label(&receipt.status)
+    ));
+    out.push_str(&format!("- model: {}\n", receipt.model));
+    out.push_str(&format!("- duration_ms: {}\n", receipt.duration_ms));
+    out.push_str(&format!("- cost_usd: {:.2}\n", receipt.cost_usd));
+    if !summary.is_empty() {
+        out.push_str(&format!("- summary: {summary}\n"));
+    }
+    if !errors.is_empty() {
+        out.push_str("\n### Errors\n");
+        out.push_str(&errors.join("\n"));
+        out.push('\n');
+    }
+    if !artifacts.is_empty() {
+        out.push_str("\n### Related Artifacts\n");
+        out.push_str(&artifacts.join("\n"));
+        out.push('\n');
+    }
+    out.push_str(
+        "\n## Candidate Patch\n\n### Add or improve\n- failure pattern:\n- checklist item:\n- anti-pattern warning:\n- routing hint:\n\n### Draft overlay text\n- When you see ...\n- Prefer ...\n- Avoid ...\n",
+    );
+    out
+}
+
+fn summarize_text(raw: &str, max_chars: usize) -> String {
+    let mut text = raw
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.len() > max_chars {
+        text.truncate(max_chars);
+        text.push('…');
+    }
+    text
+}
+
+fn receipt_status_label(status: &ReceiptStatus) -> &'static str {
+    match status {
+        ReceiptStatus::Success => "success",
+        ReceiptStatus::Failure => "failure",
+        ReceiptStatus::Timeout => "timeout",
+        ReceiptStatus::Cancelled => "cancelled",
+    }
+}
+
+fn strip_candidate_state(content: &str) -> String {
+    if let Some(rest) = content.strip_prefix("---") {
+        if let Some(end) = rest.find("---") {
+            let frontmatter = &rest[..end];
+            let body = &rest[end + 3..];
+            let filtered = frontmatter
+                .lines()
+                .filter(|line| line.trim() != "state: candidate")
+                .collect::<Vec<_>>()
+                .join("\n");
+            return format!("---\n{filtered}\n---{body}");
+        }
+    }
+    content.to_string()
+}
+
+fn extract_evidence_refs(content: &str) -> Vec<String> {
+    let mut refs = Vec::new();
+    if let Some(frontmatter) = frontmatter(content) {
+        let mut in_evidence = false;
+        for line in frontmatter.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("evidence:") {
+                in_evidence = true;
+                if !rest.trim().is_empty() {
+                    refs.push(rest.trim().to_string());
+                }
+                continue;
+            }
+            if in_evidence {
+                if let Some(item) = trimmed.strip_prefix("- ") {
+                    refs.push(item.trim().to_string());
+                    continue;
+                }
+                if trimmed.is_empty() {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    refs
+}
+
+fn extract_state(content: &str, default_state: SkillState) -> SkillState {
+    if let Some(frontmatter) = frontmatter(content) {
+        for line in frontmatter.lines() {
+            if let Some(state) = line.trim().strip_prefix("state:") {
+                return match state.trim() {
+                    "candidate" => SkillState::Candidate,
+                    _ => SkillState::Active,
+                };
+            }
+        }
+    }
+    default_state
+}
+
+fn frontmatter(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix("---")?;
+    let end = rest.find("---")?;
+    Some(&rest[..end])
+}
+
+fn collect_skills_from_dir(skills: &mut Vec<Skill>, dir: &Path, default_state: SkillState) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "md") {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    let name = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    skills.push(Skill {
+                        name,
+                        description: extract_description(&content),
+                        path,
+                        state: extract_state(&content, default_state.clone()),
+                        evidence_refs: extract_evidence_refs(&content),
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn detect_repo_root(cwd: &Path) -> Result<PathBuf, String> {
+    for (bin, args) in [
+        ("jj", vec!["root"]),
+        ("git", vec!["rev-parse", "--show-toplevel"]),
+    ] {
+        let output = std::process::Command::new(bin)
+            .args(&args)
+            .current_dir(cwd)
+            .output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !root.is_empty() {
+                    let root_path = PathBuf::from(root);
+                    return Ok(root_path.canonicalize().unwrap_or(root_path));
+                }
+            }
+        }
+    }
+    Err("candidate skills require running inside a Git/jj repository".to_string())
+}
+
+impl SkillState {
+    fn sort_key(&self) -> u8 {
+        match self {
+            SkillState::Candidate => 0,
+            SkillState::Active => 1,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SkillState::Active => "active",
+            SkillState::Candidate => "candidate",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +560,217 @@ mod tests {
     fn extract_desc_from_frontmatter() {
         let content = "---\nname: test\ndescription: A useful skill\n---\n\nContent here.";
         assert_eq!(extract_description(content), "A useful skill");
+    }
+
+    #[test]
+    fn create_candidate_skill_requires_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let err = create_candidate_skill(tmp.path(), "test", "desc", "content", &[]).unwrap_err();
+        assert!(err.contains("at least one --evidence"));
+    }
+
+    #[test]
+    fn create_skill_with_triggers_writes_project_and_category_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        let path = create_skill_with_triggers(
+            &bus,
+            "triggered",
+            "desc",
+            "body",
+            &["interviewcoach".to_string()],
+            &["plan".to_string(), "fix".to_string()],
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("project: [\"interviewcoach\"]"));
+        assert!(content.contains("category: [\"plan\", \"fix\"]"));
+    }
+
+    #[test]
+    fn create_skill_with_triggers_omits_empty_trigger_fields() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        let path = create_skill_with_triggers(&bus, "plain", "desc", "body", &[], &[]).unwrap();
+
+        let content = fs::read_to_string(path).unwrap();
+        assert!(!content.contains("\nproject: "));
+        assert!(!content.contains("\ncategory: "));
+    }
+
+    #[test]
+    fn propose_candidate_from_task_creates_repo_local_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+        let receipts_dir = tmp.path().join("receipts");
+        fs::create_dir_all(&receipts_dir).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .output()
+            .unwrap();
+
+        let receipt = serde_json::to_string(&Receipt {
+            schema_version: 1,
+            task_id: "task-123".into(),
+            status: ReceiptStatus::Failure,
+            agent: "claude".into(),
+            model: "sonnet".into(),
+            project: "specpunk".into(),
+            category: "fix".into(),
+            call_style: None,
+            tokens_used: 0,
+            cost_usd: 0.12,
+            duration_ms: 2_000,
+            exit_code: 1,
+            artifacts: vec!["runs/task-123/receipt.json".into()],
+            errors: vec!["compile error".into()],
+            summary: "candidate-worthy failure".into(),
+            created_at: chrono::Utc::now(),
+            parent_task_id: None,
+            punk_check_exit: None,
+        })
+        .unwrap();
+        fs::write(receipts_dir.join("index.jsonl"), receipt + "\n").unwrap();
+
+        let path = propose_candidate_from_task(&bus, &repo, "task-123", None).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let canonical_path = path.canonicalize().unwrap();
+        let canonical_candidates = repo.canonicalize().unwrap().join(".punk/skills/candidates");
+        assert!(canonical_path.starts_with(&canonical_candidates));
+        assert!(content.contains("state: candidate"));
+        assert!(content.contains("task:task-123"));
+        assert!(content.contains("candidate-worthy failure"));
+    }
+
+    #[test]
+    fn propose_candidate_from_task_requires_receipt() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .output()
+            .unwrap();
+
+        let err = propose_candidate_from_task(&bus, &repo, "missing-task", None).unwrap_err();
+        assert!(err.contains("receipt not found"));
+    }
+
+    #[test]
+    fn promote_candidate_skill_moves_candidate_to_active_dir() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .output()
+            .unwrap();
+
+        let candidate = create_candidate_skill(
+            &repo,
+            "receipt-failure",
+            "Candidate from receipt",
+            "## Candidate Patch\n- rule\n",
+            &["task:task-123".to_string()],
+        )
+        .unwrap();
+        assert!(candidate.exists());
+
+        let active = promote_candidate_skill(&bus, &repo, "receipt-failure").unwrap();
+        let content = fs::read_to_string(&active).unwrap();
+        assert!(active.starts_with(tmp.path().join("skills")));
+        assert!(!candidate.exists());
+        assert!(!content.contains("state: candidate"));
+        assert!(content.contains("evidence:"));
+        assert!(content.contains("task:task-123"));
+    }
+
+    #[test]
+    fn create_candidate_skill_with_triggers_writes_project_and_category_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .output()
+            .unwrap();
+
+        let path = create_candidate_skill_with_triggers(
+            &repo,
+            "triggered-candidate",
+            "desc",
+            "body",
+            &["run_1".to_string()],
+            &["interviewcoach".to_string()],
+            &["plan".to_string()],
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("state: candidate"));
+        assert!(content.contains("evidence:\n  - run_1"));
+        assert!(content.contains("project: [\"interviewcoach\"]"));
+        assert!(content.contains("category: [\"plan\"]"));
+    }
+
+    #[test]
+    fn promote_candidate_skill_requires_existing_candidate() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .output()
+            .unwrap();
+
+        let err = promote_candidate_skill(&bus, &repo, "missing-skill").unwrap_err();
+        assert!(err.contains("candidate skill not found"));
+    }
+
+    #[test]
+    fn list_skills_includes_repo_local_candidates() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        let root = tmp.path().join("repo");
+        fs::create_dir_all(bus.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.join(".punk/skills/candidates")).unwrap();
+        fs::create_dir_all(tmp.path().join("skills")).unwrap();
+
+        fs::write(
+            tmp.path().join("skills/base.md"),
+            "---\nname: base\ndescription: Base skill\n---\n\nContent",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".punk/skills/candidates/fix.md"),
+            "---\nname: fix\ndescription: Candidate\nstate: candidate\nevidence:\n  - run_1\n---\n\nContent",
+        )
+        .unwrap();
+
+        let listed = list_skills(&bus, Some(&root));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].state, SkillState::Candidate);
+        assert_eq!(listed[0].evidence_refs, vec!["run_1".to_string()]);
+        assert_eq!(listed[1].state, SkillState::Active);
     }
 
     // --- Security bypass attempts for security_scan() ---

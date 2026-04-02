@@ -78,8 +78,8 @@ pub fn save_config(config: &PunkConfig) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let content = toml::to_string_pretty(config)
-        .map_err(|e| ConfigError::Serialize(e.to_string()))?;
+    let content =
+        toml::to_string_pretty(config).map_err(|e| ConfigError::Serialize(e.to_string()))?;
     std::fs::write(&path, content)?;
     Ok(())
 }
@@ -201,8 +201,7 @@ mod tests {
         let content = toml::to_string_pretty(&config).unwrap();
         std::fs::write(&path, &content).unwrap();
 
-        let loaded: PunkConfig =
-            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let loaded: PunkConfig = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.default_provider, Some("test".to_string()));
         assert!(loaded.providers.contains_key("test"));
         assert_eq!(loaded.providers["test"].api_key, "sk-test");

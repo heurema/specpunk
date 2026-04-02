@@ -1,68 +1,103 @@
-# Prompt: Continue punk-run Implementation
+# Prompt: Continue `punk` Rebuild
 
-Copy this into a new Claude Code session to continue work.
+Copy this into a new coding session to continue the rebuild.
 
 ---
 
-```
+```text
 cd ~/personal/heurema/specpunk
 
 Read these files in order:
-1. docs/product/SESSION-HANDOFF.md — full state, what's done, what's not
-2. docs/product/ROADMAP-v2.md — Phase 5 (zero-config) is next
-3. docs/product/VISION.md — product spec (28 commands documented)
-4. docs/product/ARCHITECTURE.md — technical spec (queue, adapters, goal system)
+1. README.md
+2. docs/product/VISION.md
+3. docs/product/ARCHITECTURE.md
+4. docs/product/MASTER-PLAN.md
+5. docs/product/COUNCIL.md
+6. docs/product/SKILLS.md
+7. docs/product/EVAL.md
+8. docs/product/RESEARCH.md
+9. docs/product/DOGFOODING.md
+10. docs/product/CLI.md
 
 Current state:
-- punk-run is PRODUCTION (dev.punk.daemon launchd, replaced bash supervisor 2026-03-28)
-- 21 commits, ~14K LOC, 28 commands, 344 tests, 26 modules in punk-orch
-- Binary: ~/.cargo/bin/punk-run (cargo install --git https://github.com/heurema/specpunk punk-run)
-- Config: ~/.config/punk/{projects,agents,policy}.toml (currently required, Phase 5 makes optional)
-- Bus: ~/vicc/state/bus/ (filesystem protocol: new/cur/done/failed/dead)
+- This repo is in a clean-cut redesign phase.
+- Public product surface is `punk`, not `punk-run`.
+- No backward compatibility is required.
+- Legacy code under `punk/` is source material for extraction, not target architecture.
 
-CRITICAL DESIGN PRINCIPLES (violating these = wrong):
-1. CENTRAL ORCHESTRATOR — user never cd's into projects. punk-run dispatches INTO them.
-2. ZERO-CONFIG FIRST — no config required before first successful task. TOML = optional override.
-3. CLI SMART, DAEMON DUMB — CLI resolves project names, builds context, triages. Daemon only dispatches resolved absolute paths.
-4. DON'T DUPLICATE — punk orchestrates. It doesn't replace Claude Code, arbiter, delve, or loci.
-5. SCALE TO N PROJECTS — every feature must work across 5-10 projects from one place.
+Target product:
+- one CLI: `punk`
+- canonical modes: `plot`, `cut`, `gate`
+- local-first
+- `jj` preferred, `git` fallback
+- event log as runtime source of truth
+- feature-centric flow, not PR-centric flow
+- long-term shape: stewarded multi-agent engineering runtime
 
-IDENTITY CHECK (run before writing ANY code):
-- Does this feature assume CWD = project? → WRONG
-- Does this require config before first success? → WRONG
-- Does this make daemon smarter? → WRONG
-- Does this duplicate existing tool? → WRONG
+Four pillars:
+1. Kernel — small stable Rust core with replaceable edges
+2. Stewardship — cleanup, docs parity, no drift, coherent project state
+3. Council — selective multi-model and multi-role deliberation for high-stakes work
+4. Skill/Eval ratchet — project-specific skills that improve through evidence and promotion
 
-Next task: Phase 5 — Zero-Config (ROADMAP-v2.md)
-Steps:
-5.1 Project resolver: lazy cache + scan roots + ambiguity handling
-5.2 Zero-config fallbacks: agents autodetect, built-in policy defaults
-5.3 punk-run use/resolve/forget/projects/init commands
-5.4 Config load fallback chain: TOML override > cache > autodetect > built-in
-5.5 Remove mandatory TOML requirement from daemon + queue
+Canonical object chain:
+Project -> Goal -> Feature -> Contract -> Task -> Run -> Receipt -> DecisionObject -> Proofpack
 
-Architecture (ADR-2026-03-28, arbiter consensus):
-- Resolution chain: --path > pinned alias > scoped name > registries > cached discoveries > lazy scan > ask user
-- Cache: ~/.cache/punk/projects.json (auto-generated, deletable)
-- Three levels: L0 (zero files) > L1 (auto-cache) > L2 (TOML override)
-- Daemon receives resolved absolute path in task.json. Never resolves names.
-- Fuzzy match = suggestions only, never silent dispatch
-- New commands: use, resolve, forget, projects (list), init (generate TOML from state)
+Critical laws:
+1. One CLI: `punk`
+2. One vocabulary: `plot / cut / gate`
+3. Contract first: `cut` runs against approved contracts
+4. Gate writes the final decision
+5. Proof before acceptance
+6. `jj` preferred, `git` fallback
+7. Optimize for clean target architecture, not legacy compatibility
+8. Council is advisory; gate is final
+9. Skills evolve through curated ratchet, not silent mutation
+10. Self-hosting is bounded; meta-level changes require stronger review than ordinary feature work
 
-Key code files:
-- punk-orch/src/daemon.rs — main loop, dispatch, context assembly
-- punk-orch/src/config.rs — TOML loading (needs fallback chain)
-- punk-orch/src/context.rs — unified context (guidance+skills+recall+session)
-- punk-orch/src/queue.rs — filesystem bus protocol
-- punk-orch/src/triage.rs — auto-triage from prompt keywords
-- punk-run/src/main.rs — CLI entry point (28 commands)
+Current implemented baseline:
+- repo-root Cargo workspace
+- crates/
+  - punk-cli
+  - punk-domain
+  - punk-events
+  - punk-vcs
+  - punk-core
+  - punk-orch
+  - punk-gate
+  - punk-proof
+  - punk-adapters
+- `plot contract`, `plot refine`, `plot approve`
+- `cut run`
+- `gate run`
+- `gate proof`
+- `status`
+- `inspect --json`
+- event log + repo-local artifacts
+- hybrid `plot` drafting: deterministic scan + Codex structured draft + validation + one repair pass
 
-Tests: cargo test --all (344 pass, clippy -D warnings clean)
-Build: cargo build -p punk-run --release && cp target/release/punk-run ~/.cargo/bin/
+Storage split:
+- ~/.punk/ = global config, event log, materialized views
+- .punk/ = repo-local contracts, runs, decisions, proofs
 
-After Phase 5, remaining:
-- OAuth API fast path (punk-run ask latency: 3s CLI → 200ms API)
-- punk recall distillation (raw events → invariants pipeline)
-- cargo publish to crates.io
-- Close GitHub issues #8, #10, #11 (already resolved in code)
+Near-term implementation order:
+1. Keep improving the base `plot -> cut -> gate` loop
+2. Add thin `punk-shell` over the same services
+3. Add `punk-council` for architecture/contract/review protocols
+4. Add skills/eval ratchet subsystem
+5. Add bounded deep research mode
+
+Detailed subsystem specs now exist in:
+- docs/product/COUNCIL.md
+- docs/product/SKILLS.md
+- docs/product/EVAL.md
+- docs/product/RESEARCH.md
+
+Do not:
+- preserve `punk-run` public surface
+- reintroduce old daemon-first architecture into v0
+- let council write final decisions
+- let skills mutate silently from task success alone
+- let the system self-certify sensitive meta-level changes without stronger review
+- invent second vocabularies like `plan/forge/proof`
 ```

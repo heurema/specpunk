@@ -215,8 +215,8 @@ pub fn resolve_contract(root: &Path) -> Result<(Contract, PathBuf, String), Chec
     }
 
     let raw = std::fs::read_to_string(&contract_path)?;
-    let contract: Contract = serde_json::from_str(&raw)
-        .map_err(|e| CheckError::Parse(format!("contract.json: {e}")))?;
+    let contract: Contract =
+        serde_json::from_str(&raw).map_err(|e| CheckError::Parse(format!("contract.json: {e}")))?;
 
     // Verify approval: hash must be present AND match canonical form
     verify_approval_hash(&contract, &raw)?;
@@ -360,7 +360,12 @@ pub fn run_check(opts: &CheckOptions) -> Result<(CheckReceipt, i32), CheckError>
     let mut undeclared = Vec::new();
 
     for file in &changed_files {
-        if let Some(v) = classify_file(file, &contract.scope.touch, &contract.scope.dont_touch, &never_touch) {
+        if let Some(v) = classify_file(
+            file,
+            &contract.scope.touch,
+            &contract.scope.dont_touch,
+            &never_touch,
+        ) {
             if v.violation_type == ViolationType::Undeclared {
                 undeclared.push(file.clone());
             }
@@ -369,9 +374,12 @@ pub fn run_check(opts: &CheckOptions) -> Result<(CheckReceipt, i32), CheckError>
     }
 
     // 5. Determine status and exit code
-    let has_hard_violations = violations
-        .iter()
-        .any(|v| matches!(v.violation_type, ViolationType::DontTouch | ViolationType::NeverTouch));
+    let has_hard_violations = violations.iter().any(|v| {
+        matches!(
+            v.violation_type,
+            ViolationType::DontTouch | ViolationType::NeverTouch
+        )
+    });
 
     let has_undeclared = !undeclared.is_empty();
 
@@ -431,8 +439,11 @@ pub fn render_check(receipt: &CheckReceipt, strict: bool) -> String {
 
     let scope = &receipt.scope;
     let total_files = scope.actual_files.len();
-    let in_scope = total_files - scope.undeclared_files.len()
-        - scope.violations.iter()
+    let in_scope = total_files
+        - scope.undeclared_files.len()
+        - scope
+            .violations
+            .iter()
             .filter(|v| !matches!(v.violation_type, ViolationType::Undeclared))
             .count();
 
@@ -447,8 +458,15 @@ pub fn render_check(receipt: &CheckReceipt, strict: bool) -> String {
     ));
 
     // Hard violations first
-    let hard: Vec<_> = scope.violations.iter()
-        .filter(|v| matches!(v.violation_type, ViolationType::DontTouch | ViolationType::NeverTouch))
+    let hard: Vec<_> = scope
+        .violations
+        .iter()
+        .filter(|v| {
+            matches!(
+                v.violation_type,
+                ViolationType::DontTouch | ViolationType::NeverTouch
+            )
+        })
         .collect();
 
     for v in &hard {
@@ -463,7 +481,9 @@ pub fn render_check(receipt: &CheckReceipt, strict: bool) -> String {
     }
 
     // Undeclared files
-    let undeclared: Vec<_> = scope.violations.iter()
+    let undeclared: Vec<_> = scope
+        .violations
+        .iter()
         .filter(|v| matches!(v.violation_type, ViolationType::Undeclared))
         .collect();
 
@@ -496,12 +516,17 @@ mod tests {
 
     use crate::plan::ceremony::{CeremonyLevel, ModelTier};
     use crate::plan::contract::{
-        AcceptanceCriterion, Contract, ContextInheritance, Feedback, FeedbackOutcome,
-        RiskLevel, RoutingMetadata, Scope, CONTRACT_VERSION,
+        AcceptanceCriterion, ContextInheritance, Contract, Feedback, FeedbackOutcome, RiskLevel,
+        RoutingMetadata, Scope, CONTRACT_VERSION,
     };
     use crate::plan::save_contract;
 
-    fn make_approved_contract(punk_dir: &Path, change_id: &str, touch: Vec<&str>, dont_touch: Vec<&str>) {
+    fn make_approved_contract(
+        punk_dir: &Path,
+        change_id: &str,
+        touch: Vec<&str>,
+        dont_touch: Vec<&str>,
+    ) {
         let mut contract = Contract {
             version: CONTRACT_VERSION.to_string(),
             goal: "test task".to_string(),
@@ -570,12 +595,7 @@ mod tests {
 
     #[test]
     fn classify_in_scope() {
-        let result = classify_file(
-            "src/auth.rs",
-            &["src/auth.rs".to_string()],
-            &[],
-            &[],
-        );
+        let result = classify_file("src/auth.rs", &["src/auth.rs".to_string()], &[], &[]);
         assert!(result.is_none(), "in-scope file should have no violation");
     }
 
@@ -594,12 +614,7 @@ mod tests {
 
     #[test]
     fn classify_never_touch() {
-        let result = classify_file(
-            ".env",
-            &["src/".to_string()],
-            &[],
-            &[".env".to_string()],
-        );
+        let result = classify_file(".env", &["src/".to_string()], &[], &[".env".to_string()]);
         assert!(result.is_some());
         let v = result.unwrap();
         assert_eq!(v.violation_type, ViolationType::NeverTouch);
@@ -607,12 +622,7 @@ mod tests {
 
     #[test]
     fn classify_undeclared() {
-        let result = classify_file(
-            "README.md",
-            &["src/".to_string()],
-            &[],
-            &[],
-        );
+        let result = classify_file("README.md", &["src/".to_string()], &[], &[]);
         assert!(result.is_some());
         let v = result.unwrap();
         assert_eq!(v.violation_type, ViolationType::Undeclared);
@@ -621,12 +631,7 @@ mod tests {
     #[test]
     fn never_touch_takes_priority() {
         // File matches both never_touch and touch — never_touch wins
-        let result = classify_file(
-            ".env",
-            &[".env".to_string()],
-            &[],
-            &[".env".to_string()],
-        );
+        let result = classify_file(".env", &[".env".to_string()], &[], &[".env".to_string()]);
         assert!(result.is_some());
         assert_eq!(result.unwrap().violation_type, ViolationType::NeverTouch);
     }
@@ -644,7 +649,10 @@ mod tests {
         let contract = Contract {
             version: CONTRACT_VERSION.to_string(),
             goal: "test".to_string(),
-            scope: Scope { touch: vec![], dont_touch: vec![] },
+            scope: Scope {
+                touch: vec![],
+                dont_touch: vec![],
+            },
             acceptance_criteria: vec![],
             assumptions: vec![],
             warnings: vec![],
@@ -680,12 +688,15 @@ mod tests {
         let mut contract = Contract {
             version: CONTRACT_VERSION.to_string(),
             goal: "original goal".to_string(),
-            scope: Scope { touch: vec!["src/".to_string()], dont_touch: vec![] },
+            scope: Scope {
+                touch: vec!["src/".to_string()],
+                dont_touch: vec![],
+            },
             acceptance_criteria: vec![AcceptanceCriterion {
                 id: "AC-01".to_string(),
                 description: "test".to_string(),
                 verify: None,
-            verify_steps: vec![],
+                verify_steps: vec![],
             }],
             assumptions: vec![],
             warnings: vec![],
@@ -720,8 +731,10 @@ mod tests {
         let tampered_raw = serde_json::to_string_pretty(&contract).unwrap();
 
         let result = verify_approval_hash(&contract, &tampered_raw);
-        assert!(matches!(result, Err(CheckError::NotApproved(_))),
-            "tampered contract should fail hash verification");
+        assert!(
+            matches!(result, Err(CheckError::NotApproved(_))),
+            "tampered contract should fail hash verification"
+        );
     }
 
     #[test]
@@ -730,12 +743,15 @@ mod tests {
         let mut contract = Contract {
             version: CONTRACT_VERSION.to_string(),
             goal: "good goal".to_string(),
-            scope: Scope { touch: vec!["src/".to_string()], dont_touch: vec![] },
+            scope: Scope {
+                touch: vec!["src/".to_string()],
+                dont_touch: vec![],
+            },
             acceptance_criteria: vec![AcceptanceCriterion {
                 id: "AC-01".to_string(),
                 description: "test".to_string(),
                 verify: None,
-            verify_steps: vec![],
+                verify_steps: vec![],
             }],
             assumptions: vec![],
             warnings: vec![],
@@ -812,7 +828,10 @@ mod tests {
             .join("check.json");
 
         // We can't run the full check without VCS, but verify the receipt dir structure
-        let receipts_dir = punk_dir.join("contracts").join("receipt-test").join("receipts");
+        let receipts_dir = punk_dir
+            .join("contracts")
+            .join("receipt-test")
+            .join("receipts");
         fs::create_dir_all(&receipts_dir).unwrap();
 
         let receipt = CheckReceipt {
@@ -974,6 +993,9 @@ mod tests {
         let back: CheckReceipt = serde_json::from_str(&json).unwrap();
         assert_eq!(back.status, CheckStatus::Fail);
         assert_eq!(back.scope.violations.len(), 1);
-        assert_eq!(back.scope.violations[0].violation_type, ViolationType::NeverTouch);
+        assert_eq!(
+            back.scope.violations[0].violation_type,
+            ViolationType::NeverTouch
+        );
     }
 }

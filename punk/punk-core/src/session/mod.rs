@@ -36,7 +36,8 @@ pub fn build_context_pack(root: &Path) -> ContextPack {
     let punk_dir = root.join(".punk");
 
     let intent = std::fs::read_to_string(punk_dir.join("intent.md")).unwrap_or_default();
-    let conventions = std::fs::read_to_string(punk_dir.join("conventions.json")).unwrap_or_default();
+    let conventions =
+        std::fs::read_to_string(punk_dir.join("conventions.json")).unwrap_or_default();
 
     // Load never_touch from scan.json
     let never_touch = load_never_touch(&punk_dir);
@@ -53,10 +54,13 @@ pub fn build_context_pack(root: &Path) -> ContextPack {
         .collect();
 
     // Rough token estimate (4 chars ≈ 1 token)
-    let contract_chars = active_contract.as_ref()
+    let contract_chars = active_contract
+        .as_ref()
         .map(|c| c.goal.len() + c.scope_touch.join(" ").len() + c.scope_dont_touch.join(" ").len())
         .unwrap_or(0);
-    let total_chars = intent.len() + conventions.len() + contract_chars
+    let total_chars = intent.len()
+        + conventions.len()
+        + contract_chars
         + recent_events.iter().map(|e| e.len()).sum::<usize>();
     let token_estimate = total_chars / 4;
 
@@ -74,8 +78,13 @@ fn load_never_touch(punk_dir: &Path) -> Vec<String> {
     let scan_path = punk_dir.join("scan.json");
     if let Ok(raw) = std::fs::read_to_string(scan_path) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-            return v["never_touch"].as_array()
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            return v["never_touch"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default();
         }
     }
@@ -84,17 +93,31 @@ fn load_never_touch(punk_dir: &Path) -> Vec<String> {
 
 fn load_active_contract(root: &Path) -> Option<ContractSummary> {
     let change_id = crate::vcs::detect(root).ok()?.change_id().ok()?;
-    let contract_path = root.join(".punk").join("contracts").join(&change_id).join("contract.json");
+    let contract_path = root
+        .join(".punk")
+        .join("contracts")
+        .join(&change_id)
+        .join("contract.json");
     let raw = std::fs::read_to_string(contract_path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
 
     Some(ContractSummary {
         goal: v["goal"].as_str().unwrap_or("").to_string(),
-        scope_touch: v["scope"]["touch"].as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        scope_touch: v["scope"]["touch"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default(),
-        scope_dont_touch: v["scope"]["dont_touch"].as_array()
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        scope_dont_touch: v["scope"]["dont_touch"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default(),
         risk_level: v["risk_level"].as_str().unwrap_or("low").to_string(),
     })
@@ -102,7 +125,10 @@ fn load_active_contract(root: &Path) -> Option<ContractSummary> {
 
 /// Render context pack for terminal or agent injection.
 pub fn render_context_pack(pack: &ContextPack) -> String {
-    let mut out = format!("punk session: context pack (~{} tokens)\n\n", pack.token_estimate);
+    let mut out = format!(
+        "punk session: context pack (~{} tokens)\n\n",
+        pack.token_estimate
+    );
 
     if !pack.project_intent.is_empty() {
         out.push_str("## Intent\n");
@@ -118,13 +144,19 @@ pub fn render_context_pack(pack: &ContextPack) -> String {
         out.push_str(&format!("  goal: {}\n", c.goal));
         out.push_str(&format!("  touch: {}\n", c.scope_touch.join(", ")));
         if !c.scope_dont_touch.is_empty() {
-            out.push_str(&format!("  dont_touch: {}\n", c.scope_dont_touch.join(", ")));
+            out.push_str(&format!(
+                "  dont_touch: {}\n",
+                c.scope_dont_touch.join(", ")
+            ));
         }
         out.push('\n');
     }
 
     if !pack.never_touch.is_empty() {
-        out.push_str(&format!("## Boundaries: {}\n\n", pack.never_touch.join(", ")));
+        out.push_str(&format!(
+            "## Boundaries: {}\n\n",
+            pack.never_touch.join(", ")
+        ));
     }
 
     if !pack.recent_events.is_empty() {
@@ -155,7 +187,11 @@ mod tests {
     fn build_with_intent() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".punk")).unwrap();
-        std::fs::write(tmp.path().join(".punk/intent.md"), "# My Project\nDoes things.").unwrap();
+        std::fs::write(
+            tmp.path().join(".punk/intent.md"),
+            "# My Project\nDoes things.",
+        )
+        .unwrap();
         let pack = build_context_pack(tmp.path());
         assert!(pack.project_intent.contains("My Project"));
         assert!(pack.token_estimate > 0);

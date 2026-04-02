@@ -31,7 +31,9 @@ pub struct SupersedeReport {
 
 /// Check if jj CLI is available.
 pub fn jj_available() -> bool {
-    Command::new("jj").arg("--version").output()
+    Command::new("jj")
+        .arg("--version")
+        .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -40,16 +42,25 @@ pub fn jj_available() -> bool {
 /// Returns empty report if jj is not available (graceful degradation per D-004).
 pub fn detect_ghosts(root: &Path) -> SupersedeReport {
     if !jj_available() {
-        return SupersedeReport { jj_available: false, ghosts: vec![] };
+        return SupersedeReport {
+            jj_available: false,
+            ghosts: vec![],
+        };
     }
 
     // Check if this is a jj repo
-    let is_jj = Command::new("jj").arg("root").current_dir(root).output()
+    let is_jj = Command::new("jj")
+        .arg("root")
+        .current_dir(root)
+        .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
 
     if !is_jj {
-        return SupersedeReport { jj_available: true, ghosts: vec![] };
+        return SupersedeReport {
+            jj_available: true,
+            ghosts: vec![],
+        };
     }
 
     // Get predecessor chain for current change
@@ -59,14 +70,17 @@ pub fn detect_ghosts(root: &Path) -> SupersedeReport {
         .output();
 
     let predecessors: Vec<String> = match evolog {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect()
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect(),
+        _ => {
+            return SupersedeReport {
+                jj_available: true,
+                ghosts: vec![],
+            }
         }
-        _ => return SupersedeReport { jj_available: true, ghosts: vec![] },
     };
 
     // For each predecessor, check what files were modified
@@ -87,7 +101,10 @@ pub fn detect_ghosts(root: &Path) -> SupersedeReport {
                         ghosts.push(GhostFunction {
                             file: file.to_string(),
                             name: file.to_string(), // simplified: use file as name
-                            reason: format!("file removed since change {}", &pred[..8.min(pred.len())]),
+                            reason: format!(
+                                "file removed since change {}",
+                                &pred[..8.min(pred.len())]
+                            ),
                             last_modified_change: pred.clone(),
                         });
                     }
@@ -96,7 +113,10 @@ pub fn detect_ghosts(root: &Path) -> SupersedeReport {
         }
     }
 
-    SupersedeReport { jj_available: true, ghosts }
+    SupersedeReport {
+        jj_available: true,
+        ghosts,
+    }
 }
 
 pub fn render_ghosts(report: &SupersedeReport) -> String {
@@ -107,9 +127,15 @@ pub fn render_ghosts(report: &SupersedeReport) -> String {
         return "punk supersede: no ghost functions detected\n".to_string();
     }
 
-    let mut out = format!("punk supersede: {} ghosts detected\n\n", report.ghosts.len());
+    let mut out = format!(
+        "punk supersede: {} ghosts detected\n\n",
+        report.ghosts.len()
+    );
     for g in &report.ghosts {
-        out.push_str(&format!("  {} — {}\n    {}\n", g.file, g.reason, g.last_modified_change));
+        out.push_str(&format!(
+            "  {} — {}\n    {}\n",
+            g.file, g.reason, g.last_modified_change
+        ));
     }
     out
 }
@@ -133,14 +159,20 @@ mod tests {
 
     #[test]
     fn render_no_jj() {
-        let report = SupersedeReport { jj_available: false, ghosts: vec![] };
+        let report = SupersedeReport {
+            jj_available: false,
+            ghosts: vec![],
+        };
         let out = render_ghosts(&report);
         assert!(out.contains("not available"));
     }
 
     #[test]
     fn render_no_ghosts() {
-        let report = SupersedeReport { jj_available: true, ghosts: vec![] };
+        let report = SupersedeReport {
+            jj_available: true,
+            ghosts: vec![],
+        };
         let out = render_ghosts(&report);
         assert!(out.contains("no ghost"));
     }
@@ -163,7 +195,10 @@ mod tests {
 
     #[test]
     fn report_roundtrip() {
-        let r = SupersedeReport { jj_available: true, ghosts: vec![] };
+        let r = SupersedeReport {
+            jj_available: true,
+            ghosts: vec![],
+        };
         let j = serde_json::to_string(&r).unwrap();
         let back: SupersedeReport = serde_json::from_str(&j).unwrap();
         assert!(back.jj_available);

@@ -1,0 +1,15 @@
+[package]
+name = "punk-council"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+punk-core = { path = "../punk-core" }
+punk-adapters = { path = "../punk-adapters" }
+punk-domain = { path = "../punk-domain" }
+punk-events = { path = "../punk-events" }
+punk-vcs = { path = "../punk-vcs" }
+serde.workspace = true
+serde_json.workspace = true

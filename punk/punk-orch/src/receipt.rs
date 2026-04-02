@@ -191,7 +191,10 @@ mod tests {
         r.cost_usd = -999.99;
         let json = serde_json::to_string(&r).unwrap();
         let parsed: Receipt = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.cost_usd, -999.99, "negative cost_usd should roundtrip");
+        assert_eq!(
+            parsed.cost_usd, -999.99,
+            "negative cost_usd should roundtrip"
+        );
     }
 
     #[test]
@@ -221,8 +224,10 @@ mod tests {
         r.cost_usd = f64::NAN;
         let json = serde_json::to_string(&r).unwrap();
         // serde_json serializes NaN as `null` — verify it doesn't panic
-        assert!(json.contains("null") || json.contains("NaN") || !json.contains("NaN"),
-            "NaN serialization behavior documented: {json}");
+        assert!(
+            json.contains("null") || json.contains("NaN") || !json.contains("NaN"),
+            "NaN serialization behavior documented: {json}"
+        );
 
         r.cost_usd = f64::INFINITY;
         let json = serde_json::to_string(&r).unwrap();
@@ -245,7 +250,9 @@ mod tests {
         let mut r = sample_receipt();
         // 1000 artifacts and errors
         r.artifacts = (0..1000).map(|i| format!("artifact-{i}.rs")).collect();
-        r.errors = (0..1000).map(|i| format!("error line {i}: something went wrong")).collect();
+        r.errors = (0..1000)
+            .map(|i| format!("error line {i}: something went wrong"))
+            .collect();
         let json = serde_json::to_string(&r).unwrap();
         let parsed: Receipt = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.artifacts.len(), 1000);
@@ -257,7 +264,10 @@ mod tests {
         // schema_version=0 is technically valid per u32, no min validation
         let json = r#"{"schema_version":0,"task_id":"t","status":"success","agent":"x","model":"x","project":"x","category":"codegen","tokens_used":0,"cost_usd":0,"duration_ms":0,"exit_code":0,"artifacts":[],"errors":[],"summary":"","created_at":"2026-03-27T10:00:00Z"}"#;
         let parsed: Receipt = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.schema_version, 0, "schema_version=0 accepted without validation");
+        assert_eq!(
+            parsed.schema_version, 0,
+            "schema_version=0 accepted without validation"
+        );
     }
 
     #[test]

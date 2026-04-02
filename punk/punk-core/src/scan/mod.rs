@@ -68,7 +68,8 @@ pub struct TestPatterns {
 /// Run convention scan on a project.
 pub fn scan_conventions(root: &Path, language: &str) -> ScanReport {
     let files = collect_source_files(root, language);
-    let contents: Vec<(String, String)> = files.iter()
+    let contents: Vec<(String, String)> = files
+        .iter()
         .filter_map(|f| {
             let content = std::fs::read_to_string(root.join(f)).ok()?;
             Some((f.clone(), content))
@@ -129,8 +130,12 @@ fn collect_source_files(root: &Path, language: &str) -> Vec<String> {
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            !name.starts_with('.') && name != "target" && name != "node_modules"
-                && name != "vendor" && name != "__pycache__" && name != ".venv"
+            !name.starts_with('.')
+                && name != "target"
+                && name != "node_modules"
+                && name != "vendor"
+                && name != "__pycache__"
+                && name != ".venv"
         });
 
     for entry in walker.flatten() {
@@ -178,7 +183,10 @@ fn detect_naming(contents: &[(String, String)], language: &str) -> NamingConvent
             let mut snake = 0usize;
             for (_, content) in contents {
                 for line in content.lines() {
-                    if line.contains("function ") || line.contains("const ") || line.contains("let ") {
+                    if line.contains("function ")
+                        || line.contains("const ")
+                        || line.contains("let ")
+                    {
                         if line.contains('_') && !line.contains("__") {
                             snake += 1;
                         } else {
@@ -188,10 +196,20 @@ fn detect_naming(contents: &[(String, String)], language: &str) -> NamingConvent
                 }
             }
             NamingConventions {
-                functions: if snake > camel { "snake_case" } else { "camelCase" }.to_string(),
+                functions: if snake > camel {
+                    "snake_case"
+                } else {
+                    "camelCase"
+                }
+                .to_string(),
                 types: "PascalCase".to_string(),
                 constants: "SCREAMING_SNAKE_CASE".to_string(),
-                files: if snake > camel { "kebab-case.ts" } else { "camelCase.ts" }.to_string(),
+                files: if snake > camel {
+                    "kebab-case.ts"
+                } else {
+                    "camelCase.ts"
+                }
+                .to_string(),
             }
         }
         _ => NamingConventions::default(),
@@ -211,29 +229,42 @@ fn detect_imports(contents: &[(String, String)], language: &str) -> ImportPatter
             let import = match language {
                 "rust" => {
                     if trimmed.starts_with("use ") {
-                        trimmed.strip_prefix("use ")
+                        trimmed
+                            .strip_prefix("use ")
                             .and_then(|s| s.split("::").next())
                             .map(|s| s.to_string())
-                    } else { None }
+                    } else {
+                        None
+                    }
                 }
                 "python" => {
                     if trimmed.starts_with("import ") || trimmed.starts_with("from ") {
                         let parts: Vec<&str> = trimmed.split_whitespace().collect();
                         parts.get(1).map(|s| s.to_string())
-                    } else { None }
+                    } else {
+                        None
+                    }
                 }
                 "typescript" | "javascript" => {
                     if trimmed.starts_with("import ") {
                         if let Some(from_idx) = trimmed.find("from ") {
-                            let module = trimmed[from_idx + 5..].trim().trim_matches(|c| c == '\'' || c == '"' || c == ';');
+                            let module = trimmed[from_idx + 5..]
+                                .trim()
+                                .trim_matches(|c| c == '\'' || c == '"' || c == ';');
                             Some(module.to_string())
-                        } else { None }
-                    } else { None }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 }
                 "go" => {
                     if trimmed.starts_with("\"") && trimmed.ends_with("\"") {
                         Some(trimmed.trim_matches('"').to_string())
-                    } else { None }
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             };
@@ -276,14 +307,22 @@ fn detect_errors(contents: &[(String, String)], language: &str) -> ErrorPatterns
             let mut uses_unwrap = 0usize;
 
             for (_, content) in contents {
-                if content.contains("anyhow::") || content.contains("use anyhow") { uses_anyhow = true; }
-                if content.contains("thiserror::") || content.contains("use thiserror") { uses_thiserror = true; }
+                if content.contains("anyhow::") || content.contains("use anyhow") {
+                    uses_anyhow = true;
+                }
+                if content.contains("thiserror::") || content.contains("use thiserror") {
+                    uses_thiserror = true;
+                }
                 uses_result += content.matches("Result<").count();
                 uses_unwrap += content.matches(".unwrap()").count();
             }
 
-            if uses_anyhow { examples.push("anyhow for error propagation".to_string()); }
-            if uses_thiserror { examples.push("thiserror for custom error types".to_string()); }
+            if uses_anyhow {
+                examples.push("anyhow for error propagation".to_string());
+            }
+            if uses_thiserror {
+                examples.push("thiserror for custom error types".to_string());
+            }
 
             ErrorPatterns {
                 style: if uses_thiserror {
@@ -325,13 +364,21 @@ fn detect_tests(contents: &[(String, String)], language: &str) -> TestPatterns {
             "rust" => {
                 test_count += content.matches("#[test]").count();
                 test_count += content.matches("#[tokio::test]").count();
-                if content.contains("mockall") || content.contains("mock!") { has_mocks = true; }
+                if content.contains("mockall") || content.contains("mock!") {
+                    has_mocks = true;
+                }
             }
             "python" => {
                 if is_test_file {
-                    test_count += content.lines().filter(|l| l.trim().starts_with("def test_")).count();
+                    test_count += content
+                        .lines()
+                        .filter(|l| l.trim().starts_with("def test_"))
+                        .count();
                 }
-                if content.contains("mock") || content.contains("MagicMock") || content.contains("patch(") {
+                if content.contains("mock")
+                    || content.contains("MagicMock")
+                    || content.contains("patch(")
+                {
                     has_mocks = true;
                 }
             }
@@ -340,10 +387,15 @@ fn detect_tests(contents: &[(String, String)], language: &str) -> TestPatterns {
                     test_count += content.matches("it(").count();
                     test_count += content.matches("test(").count();
                 }
-                if content.contains("jest.mock") || content.contains("vi.mock") { has_mocks = true; }
+                if content.contains("jest.mock") || content.contains("vi.mock") {
+                    has_mocks = true;
+                }
             }
             "go" => {
-                test_count += content.lines().filter(|l| l.trim().starts_with("func Test")).count();
+                test_count += content
+                    .lines()
+                    .filter(|l| l.trim().starts_with("func Test"))
+                    .count();
             }
             _ => {}
         }
@@ -360,7 +412,11 @@ fn detect_tests(contents: &[(String, String)], language: &str) -> TestPatterns {
     TestPatterns {
         framework,
         style: format!("{test_count} tests found"),
-        mock_usage: if has_mocks { "mocks detected".to_string() } else { "no mocks".to_string() },
+        mock_usage: if has_mocks {
+            "mocks detected".to_string()
+        } else {
+            "no mocks".to_string()
+        },
     }
 }
 
@@ -432,7 +488,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("lib.rs"), r#"
+        std::fs::write(
+            src.join("lib.rs"),
+            r#"
 use std::collections::HashMap;
 use serde::Serialize;
 
@@ -447,19 +505,27 @@ mod tests {
         assert_eq!(hello_world().unwrap(), "hello");
     }
 }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let report = scan_conventions(tmp.path(), "rust");
         assert_eq!(report.language, "rust");
         assert_eq!(report.naming.functions, "snake_case");
         // At least 1 test should be found
-        assert!(report.tests.style.contains("tests found"), "got: {}", report.tests.style);
+        assert!(
+            report.tests.style.contains("tests found"),
+            "got: {}",
+            report.tests.style
+        );
     }
 
     #[test]
     fn scan_python_project() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("main.py"), r#"
+        std::fs::write(
+            tmp.path().join("main.py"),
+            r#"
 import os
 from pathlib import Path
 
@@ -468,18 +534,28 @@ def get_config():
         return Path("config.toml").read_text()
     except FileNotFoundError:
         return ""
-"#).unwrap();
-        std::fs::write(tmp.path().join("test_main.py"), r#"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("test_main.py"),
+            r#"
 def test_config():
     assert get_config() is not None
 
 def test_empty():
     pass
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let report = scan_conventions(tmp.path(), "python");
         assert_eq!(report.naming.functions, "snake_case");
-        assert!(report.tests.style.contains("tests found"), "got: {}", report.tests.style);
+        assert!(
+            report.tests.style.contains("tests found"),
+            "got: {}",
+            report.tests.style
+        );
         assert!(report.errors.style.contains("try/except"));
     }
 
@@ -529,9 +605,11 @@ def test_empty():
 
     #[test]
     fn import_detection_rust() {
-        let contents = vec![
-            ("lib.rs".to_string(), "use std::collections::HashMap;\nuse serde::Serialize;\nuse crate::config;\n".to_string()),
-        ];
+        let contents = vec![(
+            "lib.rs".to_string(),
+            "use std::collections::HashMap;\nuse serde::Serialize;\nuse crate::config;\n"
+                .to_string(),
+        )];
         let imports = detect_imports(&contents, "rust");
         assert!(imports.top_imports.contains(&"std".to_string()));
         assert!(imports.top_imports.contains(&"serde".to_string()));
@@ -542,8 +620,10 @@ def test_empty():
         let report = ScanReport {
             language: "rust".to_string(),
             findings: vec![ConventionFinding {
-                name: "test".into(), pattern: "pat".into(),
-                frequency: 5, confidence: "high".into(),
+                name: "test".into(),
+                pattern: "pat".into(),
+                frequency: 5,
+                confidence: "high".into(),
                 examples: vec!["ex".into()],
             }],
             naming: NamingConventions::default(),

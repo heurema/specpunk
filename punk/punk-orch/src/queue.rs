@@ -14,7 +14,10 @@ impl SlotManager {
     pub fn new(bus: &Path, max_slots: u32) -> Self {
         let slots_dir = bus.join(".slots");
         fs::create_dir_all(&slots_dir).ok();
-        Self { slots_dir, max_slots }
+        Self {
+            slots_dir,
+            max_slots,
+        }
     }
 
     /// Acquire a slot. Returns slot ID (1..=max_slots) or None.
@@ -134,7 +137,11 @@ impl HeartbeatTracker {
     /// Create heartbeat + pid tracking for a task.
     pub fn register(&self, task_id: &str, pid: u32) {
         fs::write(self.hb_dir.join(format!("{task_id}.hb")), "").ok();
-        fs::write(self.pids_dir.join(format!("{task_id}.pid")), pid.to_string()).ok();
+        fs::write(
+            self.pids_dir.join(format!("{task_id}.pid")),
+            pid.to_string(),
+        )
+        .ok();
     }
 
     /// Remove tracking files for a task.
@@ -259,9 +266,10 @@ pub fn claim_task(bus: &Path, entry: &QueuedEntry) -> Option<PathBuf> {
 
 /// Check if all dependencies of a task are completed (receipt in done/).
 pub fn deps_ready(bus: &Path, entry: &QueuedEntry) -> bool {
-    entry.depends_on.iter().all(|dep| {
-        bus.join("done").join(dep).join("receipt.json").exists()
-    })
+    entry
+        .depends_on
+        .iter()
+        .all(|dep| bus.join("done").join(dep).join("receipt.json").exists())
 }
 
 /// Move a task from cur/ to failed/ (timeout, error).
@@ -282,13 +290,26 @@ fn parse_queued_entry(path: &Path, priority: &str) -> Option<QueuedEntry> {
     Some(QueuedEntry {
         task_id,
         path: path.to_path_buf(),
-        project: v.get("project").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        model: v.get("model").and_then(|v| v.as_str()).unwrap_or("claude").to_string(),
+        project: v
+            .get("project")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        model: v
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("claude")
+            .to_string(),
         worktree: v.get("worktree").and_then(|v| v.as_bool()).unwrap_or(false),
         priority: priority.to_string(),
-        depends_on: v.get("depends_on")
+        depends_on: v
+            .get("depends_on")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default(),
     })
 }
@@ -646,7 +667,10 @@ mod tests {
         let bus = tmp.path();
         // new/ dir doesn't exist at all — should return empty, not panic
         let entries = scan_queue(bus);
-        assert!(entries.is_empty(), "missing new/ dir should return empty entries");
+        assert!(
+            entries.is_empty(),
+            "missing new/ dir should return empty entries"
+        );
     }
 
     #[test]
@@ -676,7 +700,10 @@ mod tests {
         fs::write(bus.join("new/p0/partial.json"), b"{\"project\":").unwrap();
 
         let entries = scan_queue(bus);
-        assert!(entries.is_empty(), "corrupt JSON files should be silently skipped");
+        assert!(
+            entries.is_empty(),
+            "corrupt JSON files should be silently skipped"
+        );
     }
 
     #[test]
@@ -697,7 +724,10 @@ mod tests {
 
         let result = claim_task(bus, &fake_entry);
         // rename of nonexistent src fails — should return None, not panic
-        assert!(result.is_none(), "claiming nonexistent task should return None");
+        assert!(
+            result.is_none(),
+            "claiming nonexistent task should return None"
+        );
     }
 
     #[test]
@@ -709,7 +739,7 @@ mod tests {
         // Release slots that were never acquired — remove_dir_all on nonexistent is .ok()
         sm.release(1);
         sm.release(99); // out-of-range slot
-        sm.release(0);  // boundary: slot 0 not in 1..=max_slots
+        sm.release(0); // boundary: slot 0 not in 1..=max_slots
 
         // Should still work normally after ghost releases
         assert_eq!(sm.occupied(), 0);
@@ -749,7 +779,10 @@ mod tests {
 
         let entries = scan_queue(bus);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].model, "claude", "missing model should default to 'claude'");
+        assert_eq!(
+            entries[0].model, "claude",
+            "missing model should default to 'claude'"
+        );
         assert_eq!(entries[0].project, "signum");
     }
 
@@ -773,7 +806,10 @@ mod tests {
 
         assert!(pl.try_acquire("proj", "task-1"));
         // Same task tries to acquire again — file already exists, should fail
-        assert!(!pl.try_acquire("proj", "task-1"), "re-acquiring same lock should fail");
+        assert!(
+            !pl.try_acquire("proj", "task-1"),
+            "re-acquiring same lock should fail"
+        );
         pl.release("proj");
     }
 }

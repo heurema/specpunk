@@ -198,7 +198,10 @@ fn scan_structure(root: &Path, start: Instant) -> Result<StructureScanResult, In
         }
 
         // Container
-        if file_name == "Dockerfile" || file_name == "docker-compose.yml" || file_name == "docker-compose.yaml" {
+        if file_name == "Dockerfile"
+            || file_name == "docker-compose.yml"
+            || file_name == "docker-compose.yaml"
+        {
             container_detected = true;
         }
 
@@ -208,7 +211,14 @@ fn scan_structure(root: &Path, start: Instant) -> Result<StructureScanResult, In
         }
     }
 
-    Ok((langs, dir_map, entry_points, ci_files, container_detected, build_system))
+    Ok((
+        langs,
+        dir_map,
+        entry_points,
+        ci_files,
+        container_detected,
+        build_system,
+    ))
 }
 
 fn ext_to_lang(ext: &str) -> Option<&'static str> {
@@ -299,7 +309,9 @@ fn detect_frameworks(root: &Path, primary: &Option<String>) -> Vec<String> {
         }
         Some("javascript") | Some("typescript") => {
             if let Ok(content) = std::fs::read_to_string(root.join("package.json")) {
-                for fw in &["react", "vue", "angular", "next", "nuxt", "express", "fastify"] {
+                for fw in &[
+                    "react", "vue", "angular", "next", "nuxt", "express", "fastify",
+                ] {
                     if content.contains(fw) {
                         frameworks.push(fw.to_string());
                     }
@@ -351,9 +363,7 @@ fn detect_test_runner(root: &Path, primary: &Option<String>) -> Option<String> {
             None
         }
         Some("python") => {
-            if root.join("pytest.ini").exists()
-                || root.join("pyproject.toml").exists()
-            {
+            if root.join("pytest.ini").exists() || root.join("pyproject.toml").exists() {
                 return Some("pytest".to_string());
             }
             None
@@ -372,7 +382,9 @@ fn count_tests(root: &Path, primary: &Option<String>, start: Instant) -> Option<
         Some("rust") => ("#\\[test\\]|#\\[tokio::test\\]", &["rs"]),
         Some("go") => ("func Test", &["go"]),
         Some("python") => ("def test_", &["py"]),
-        Some("javascript") | Some("typescript") => ("it(|test(|describe(", &["js", "ts", "jsx", "tsx"]),
+        Some("javascript") | Some("typescript") => {
+            ("it(|test(|describe(", &["js", "ts", "jsx", "tsx"])
+        }
         _ => return None,
     };
 
@@ -417,10 +429,7 @@ type PatternCounter = Box<dyn Fn(&str) -> usize>;
 fn regex_lite_count(pattern: &str) -> Result<PatternCounter, String> {
     // Convert simple patterns to substring matchers
     let patterns: Vec<String> = if pattern.contains('|') {
-        pattern
-            .split('|')
-            .map(unescape_pattern)
-            .collect()
+        pattern.split('|').map(unescape_pattern).collect()
     } else {
         vec![unescape_pattern(pattern)]
     };
@@ -561,7 +570,8 @@ fn extract_python_deps(content: &str) -> Vec<String> {
             in_deps = true;
             continue;
         }
-        if in_deps && trimmed.starts_with('[') && !trimmed.starts_with("[tool.poetry.dependencies") {
+        if in_deps && trimmed.starts_with('[') && !trimmed.starts_with("[tool.poetry.dependencies")
+        {
             in_deps = false;
         }
         if in_deps {
@@ -747,7 +757,10 @@ pub fn detect_never_touch(root: &Path) -> Vec<String> {
     for entry in walker.flatten() {
         if entry.file_type().is_dir() {
             let name = entry.file_name().to_string_lossy();
-            if matches!(name.as_ref(), "migrations" | "generated" | "vendor" | "dist" | "build" | "__generated__") {
+            if matches!(
+                name.as_ref(),
+                "migrations" | "generated" | "vendor" | "dist" | "build" | "__generated__"
+            ) {
                 let rel = entry
                     .path()
                     .strip_prefix(root)
@@ -833,8 +846,8 @@ fn git_log_messages(root: &Path) -> Vec<String> {
 fn is_conventional_commit(msg: &str) -> bool {
     // type(scope): description  or  type: description
     let prefixes = [
-        "feat", "fix", "docs", "style", "refactor", "perf", "test", "build",
-        "ci", "chore", "revert", "wip",
+        "feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore",
+        "revert", "wip",
     ];
     let first_word = msg.split(':').next().unwrap_or("");
     let base = first_word.split('(').next().unwrap_or(first_word);
@@ -848,12 +861,10 @@ fn count_contributors(root: &Path) -> usize {
         .output();
 
     match out {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.is_empty())
-                .count()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count(),
         _ => 0,
     }
 }
@@ -865,12 +876,10 @@ fn count_branches(root: &Path) -> usize {
         .output();
 
     match out {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| !l.is_empty())
-                .count()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count(),
         _ => 0,
     }
 }
@@ -903,7 +912,14 @@ fn grep_patterns(
         }
         for crate_name in &["tracing", "env_logger", "slog"] {
             if cargo_content.contains(crate_name) {
-                logging_crate = Some(if *crate_name == "env_logger" { "log" } else { crate_name }.to_string());
+                logging_crate = Some(
+                    if *crate_name == "env_logger" {
+                        "log"
+                    } else {
+                        crate_name
+                    }
+                    .to_string(),
+                );
                 break;
             }
         }
@@ -920,9 +936,7 @@ fn grep_patterns(
                 name != "target" && name != ".git" && name != "node_modules"
             });
         for entry in walker.flatten() {
-            if entry.file_type().is_file()
-                && entry.file_name().to_string_lossy() == "Cargo.toml"
-            {
+            if entry.file_type().is_file() && entry.file_name().to_string_lossy() == "Cargo.toml" {
                 if let Ok(content) = std::fs::read_to_string(entry.path()) {
                     if error_crate.is_none() {
                         for crate_name in &["anyhow", "thiserror", "eyre", "miette"] {
@@ -936,8 +950,12 @@ fn grep_patterns(
                         for crate_name in &["tracing", "env_logger", "slog"] {
                             if content.contains(crate_name) {
                                 logging_crate = Some(
-                                    if *crate_name == "env_logger" { "log" } else { crate_name }
-                                        .to_string(),
+                                    if *crate_name == "env_logger" {
+                                        "log"
+                                    } else {
+                                        crate_name
+                                    }
+                                    .to_string(),
                                 );
                                 break;
                             }
@@ -1027,8 +1045,7 @@ impl ScanResult {
     pub fn to_artifacts(&self) -> ArtifactSet {
         let config = build_config_toml(self);
         let intent = build_intent_md(self);
-        let conventions_json =
-            serde_json::to_string_pretty(&self.conventions).unwrap_or_default();
+        let conventions_json = serde_json::to_string_pretty(&self.conventions).unwrap_or_default();
         let scan_json = serde_json::to_string_pretty(self).unwrap_or_default();
 
         ArtifactSet {
@@ -1194,7 +1211,9 @@ mod tests {
     #[test]
     fn init_scan_performance() {
         // Use the punk workspace itself — it's small so scan should be fast.
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
         let start = Instant::now();
         let _ = run_scan(workspace);
         let elapsed = start.elapsed();
@@ -1251,15 +1270,23 @@ mod tests {
         fs::write(dir.join("Cargo.lock"), "# lock").unwrap();
 
         let never = detect_never_touch(dir);
-        assert!(never.iter().any(|s| s.contains("migrations")), "missing migrations");
+        assert!(
+            never.iter().any(|s| s.contains("migrations")),
+            "missing migrations"
+        );
         assert!(never.iter().any(|s| s.contains(".env")), "missing .env");
-        assert!(never.iter().any(|s| s.contains("Cargo.lock")), "missing Cargo.lock");
+        assert!(
+            never.iter().any(|s| s.contains("Cargo.lock")),
+            "missing Cargo.lock"
+        );
     }
 
     #[test]
     fn git_archaeology() {
         // Run on the punk workspace itself (has git history)
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
         // Walk up to find the actual git root (specpunk/)
         let git_root = workspace.parent().unwrap_or(workspace);
         let arch = run_git_archaeology(git_root);
@@ -1267,7 +1294,9 @@ mod tests {
         assert!(arch.contributor_count >= 0); // always true, checks it runs
         assert!(arch.conventional_commit_ratio >= 0.0 && arch.conventional_commit_ratio <= 1.0);
         assert!(
-            arch.commit_style == "conventional" || arch.commit_style == "freeform" || arch.commit_style.is_empty()
+            arch.commit_style == "conventional"
+                || arch.commit_style == "freeform"
+                || arch.commit_style.is_empty()
         );
     }
 
@@ -1287,7 +1316,10 @@ mod tests {
 
         let result = run_scan(dir).unwrap();
         assert_eq!(result.primary_language.as_deref(), Some("javascript"));
-        assert!(result.dependencies.contains_key("javascript"), "JS deps not detected");
+        assert!(
+            result.dependencies.contains_key("javascript"),
+            "JS deps not detected"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::complexity::{DiffMetadata, complexity_score};
+use super::complexity::{complexity_score, DiffMetadata};
 
 /// Ceremony level controls how much overhead the plan command applies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,10 +95,7 @@ mod tests {
             ..Default::default()
         };
         let (score, level, tier) = detect_ceremony(&light_meta);
-        assert!(
-            (3..=5).contains(&score),
-            "expected score 3-5, got {score}"
-        );
+        assert!((3..=5).contains(&score), "expected score 3-5, got {score}");
         assert_eq!(level, CeremonyLevel::Lightweight);
         assert_eq!(tier, ModelTier::Sonnet);
 

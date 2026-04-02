@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +19,8 @@ pub struct Goal {
     #[serde(default)]
     pub spent_usd: f64,
     pub status: GoalStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<Plan>,
     pub created_at: DateTime<Utc>,
@@ -62,13 +65,15 @@ pub struct Step {
     pub sub_tasks: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
     Pending,
+    Queued,
     Running,
     Done,
     Blocked,
+    Failed,
     Skipped,
 }
 
@@ -109,6 +114,67 @@ pub fn list_goals(bus: &Path) -> Vec<Goal> {
     goals
 }
 
+/// Format a concise one-line summary of goal counts for status output.
+pub fn format_goal_summary_line(bus: &Path) -> String {
+    format_goal_summary_line_for_project(bus, None)
+}
+
+/// Format a concise one-line summary of goal counts scoped to an optional project.
+pub fn format_goal_summary_line_for_project(bus: &Path, project_filter: Option<&str>) -> String {
+    let mut active = 0usize;
+    let mut paused = 0usize;
+    let mut awaiting_approval = 0usize;
+    let mut done = 0usize;
+    let mut failed = 0usize;
+    let mut replan_needed = 0usize;
+
+    for goal in list_goals(bus)
+        .into_iter()
+        .filter(|goal| project_filter.map_or(true, |project| goal.project == project))
+    {
+        match goal.status {
+            GoalStatus::Active => active += 1,
+            GoalStatus::Paused => paused += 1,
+            GoalStatus::AwaitingApproval => awaiting_approval += 1,
+            GoalStatus::Done => done += 1,
+            GoalStatus::Failed => {
+                failed += 1;
+                if goal.status_reason.as_deref() == Some("replan_needed_dead_end") {
+                    replan_needed += 1;
+                }
+            }
+            GoalStatus::Planning => {}
+        }
+    }
+
+    format!(
+        "Goals: active {}, paused {}, awaiting approval {}, done {}, failed {}, replan-needed {}",
+        active, paused, awaiting_approval, done, failed, replan_needed
+    )
+}
+
+/// Return an operator attention line when any failed goals need replan.
+pub fn format_goal_attention_line(bus: &Path) -> Option<String> {
+    format_goal_attention_line_for_project(bus, None)
+}
+
+/// Return an operator attention line when any failed goals in an optional project need replan.
+pub fn format_goal_attention_line_for_project(
+    bus: &Path,
+    project_filter: Option<&str>,
+) -> Option<String> {
+    let count = list_goals(bus)
+        .into_iter()
+        .filter(|goal| project_filter.map_or(true, |project| goal.project == project))
+        .filter(|goal| goal.status_reason.as_deref() == Some("replan_needed_dead_end"))
+        .count();
+    if count > 0 {
+        Some(format!("Goal attention: replan dead-end goals ({count})"))
+    } else {
+        None
+    }
+}
+
 /// Load a specific goal.
 pub fn load_goal(bus: &Path, goal_id: &str) -> Option<Goal> {
     let safe = sanitize::safe_id(goal_id).ok()?;
@@ -125,8 +191,7 @@ pub fn save_goal(bus: &Path, goal: &Goal) -> std::io::Result<()> {
     let dir = goals_dir(bus);
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", goal.id));
-    let json = serde_json::to_string_pretty(goal)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(goal).map_err(std::io::Error::other)?;
     fs::write(path, json)
 }
 
@@ -140,11 +205,7 @@ pub fn create_goal(
 ) -> std::io::Result<Goal> {
     sanitize::safe_id(project)
         .map_err(|e| std::io::Error::other(format!("unsafe project name: {e}")))?;
-    let id = format!(
-        "{}-{}",
-        project,
-        Utc::now().format("%Y%m%d-%H%M%S")
-    );
+    let id = format!("{}-{}", project, Utc::now().format("%Y%m%d-%H%M%S"));
 
     let goal = Goal {
         id: id.clone(),
@@ -154,6 +215,7 @@ pub fn create_goal(
         budget_usd,
         spent_usd: 0.0,
         status: GoalStatus::Planning,
+        status_reason: None,
         plan: None,
         created_at: Utc::now(),
         completed_at: None,
@@ -184,7 +246,8 @@ pub fn build_planner_prompt(goal: &Goal, project_path: &Path) -> String {
         }
     }
 
-    prompt.push_str(r#"## Output Format
+    prompt.push_str(
+        r#"## Output Format
 
 Respond with ONLY a JSON array of steps. Each step:
 ```json
@@ -207,7 +270,8 @@ Rules:
 - Total estimated cost should not exceed the budget
 - Use research steps before codegen for complex tasks
 - End with a review/verification step
-"#);
+"#,
+    );
 
     prompt
 }
@@ -222,10 +286,25 @@ pub fn parse_plan(planner_output: &str, planner_model: &str) -> Option<Plan> {
         .into_iter()
         .map(|v| Step {
             step: v.get("step").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-            category: v.get("category").and_then(|v| v.as_str()).unwrap_or("codegen").to_string(),
-            prompt: v.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            agent: v.get("agent").and_then(|v| v.as_str()).unwrap_or("claude-sonnet").to_string(),
-            est_cost_usd: v.get("est_cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.5),
+            category: v
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("codegen")
+                .to_string(),
+            prompt: v
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            agent: v
+                .get("agent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("claude-sonnet")
+                .to_string(),
+            est_cost_usd: v
+                .get("est_cost_usd")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.5),
             depends_on: v
                 .get("depends_on")
                 .and_then(|v| v.as_array())
@@ -287,19 +366,18 @@ pub fn queue_ready_steps(bus: &Path, goal: &mut Goal) -> Result<Vec<String>, Que
     let config_dir = crate::config::config_dir();
     let cfg = crate::config::load_or_default(&config_dir)?;
 
-    let done_steps: Vec<u32> = plan
+    let step_statuses: HashMap<u32, StepStatus> = plan
         .steps
         .iter()
-        .filter(|s| s.status == StepStatus::Done)
-        .map(|s| s.step)
+        .map(|s| (s.step, s.status.clone()))
         .collect();
 
     for step in &mut plan.steps {
         if step.status != StepStatus::Pending {
             continue;
         }
-        // Check all dependencies are done
-        let deps_met = step.depends_on.iter().all(|dep| done_steps.contains(dep));
+        // Check all dependencies are in a satisfied terminal state.
+        let deps_met = step_dependencies_met(step, &step_statuses);
         if !deps_met {
             continue;
         }
@@ -322,16 +400,104 @@ pub fn queue_ready_steps(bus: &Path, goal: &mut Goal) -> Result<Vec<String>, Que
             "step": step.step
         });
 
+        if let Some(existing_status) = task_step_status(bus, &task_id) {
+            step.status = existing_status;
+            step.task_id = Some(task_id);
+            continue;
+        }
+
         let queue_path = bus.join("new/p1").join(format!("{task_id}.json"));
-        let data = serde_json::to_string_pretty(&task_json)
-            .map_err(std::io::Error::other)?;
-        fs::write(&queue_path, data)?;
-        step.status = StepStatus::Running;
-        step.task_id = Some(task_id.clone());
-        queued.push(task_id);
+        if let Some(parent) = queue_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_string_pretty(&task_json).map_err(std::io::Error::other)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&queue_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(data.as_bytes())?;
+                step.status = StepStatus::Queued;
+                step.task_id = Some(task_id.clone());
+                queued.push(task_id);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                step.status = StepStatus::Queued;
+                step.task_id = Some(task_id);
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
 
     Ok(queued)
+}
+
+pub(crate) fn step_dependencies_met(step: &Step, step_statuses: &HashMap<u32, StepStatus>) -> bool {
+    step.depends_on.iter().all(|dep| {
+        matches!(
+            step_statuses.get(dep),
+            Some(StepStatus::Done | StepStatus::Skipped)
+        )
+    })
+}
+
+pub(crate) fn step_dependencies_blocked(
+    step: &Step,
+    step_statuses: &HashMap<u32, StepStatus>,
+) -> bool {
+    step.depends_on.iter().any(|dep| {
+        matches!(
+            step_statuses.get(dep),
+            None | Some(StepStatus::Blocked | StepStatus::Failed)
+        )
+    })
+}
+
+pub(crate) fn task_step_status(bus: &Path, task_id: &str) -> Option<StepStatus> {
+    if task_queue_exists(bus, task_id) {
+        return Some(StepStatus::Queued);
+    }
+    if bus.join("cur").join(format!("{task_id}.json")).exists() {
+        return Some(StepStatus::Running);
+    }
+
+    let receipt_path = bus.join("done").join(task_id).join("receipt.json");
+    if receipt_path.exists() {
+        let status = fs::read_to_string(&receipt_path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            });
+        return Some(match status.as_deref() {
+            Some("success") => StepStatus::Done,
+            Some(_) | None => StepStatus::Failed,
+        });
+    }
+
+    let failed = bus.join("failed").join(task_id).is_dir();
+    let dead = bus.join("dead").join(task_id).is_dir();
+    if failed || dead {
+        return Some(StepStatus::Failed);
+    }
+
+    None
+}
+
+fn task_queue_exists(bus: &Path, task_id: &str) -> bool {
+    [
+        bus.join("new").join(format!("{task_id}.json")),
+        bus.join("new").join("p0").join(format!("{task_id}.json")),
+        bus.join("new").join("p1").join(format!("{task_id}.json")),
+        bus.join("new").join("p2").join(format!("{task_id}.json")),
+    ]
+    .into_iter()
+    .any(|path| path.exists())
 }
 
 fn provider_from_agent(agent: &str) -> String {
@@ -379,6 +545,132 @@ mod tests {
     }
 
     #[test]
+    fn format_goal_summary_line_counts_goal_statuses() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+
+        for (id, status, status_reason) in [
+            ("goal-active", GoalStatus::Active, None),
+            ("goal-paused", GoalStatus::Paused, None),
+            ("goal-awaiting", GoalStatus::AwaitingApproval, None),
+            ("goal-done", GoalStatus::Done, None),
+            (
+                "goal-failed",
+                GoalStatus::Failed,
+                Some("replan_needed_dead_end"),
+            ),
+            ("goal-planning", GoalStatus::Planning, None),
+        ] {
+            save_goal(
+                &bus,
+                &Goal {
+                    id: id.into(),
+                    project: "specpunk".into(),
+                    objective: "test".into(),
+                    deadline: None,
+                    budget_usd: 1.0,
+                    spent_usd: 0.0,
+                    status,
+                    status_reason: status_reason.map(str::to_string),
+                    plan: None,
+                    created_at: Utc::now(),
+                    completed_at: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let line = format_goal_summary_line(&bus);
+        assert!(line.contains("active 1"));
+        assert!(line.contains("paused 1"));
+        assert!(line.contains("awaiting approval 1"));
+        assert!(line.contains("done 1"));
+        assert!(line.contains("failed 1"));
+        assert!(line.contains("replan-needed 1"));
+    }
+
+    #[test]
+    fn format_goal_summary_line_for_project_filters_goals() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+
+        for (id, project, status, status_reason) in [
+            ("goal-a", "alpha", GoalStatus::Active, None),
+            (
+                "goal-b",
+                "alpha",
+                GoalStatus::Failed,
+                Some("replan_needed_dead_end"),
+            ),
+            ("goal-c", "beta", GoalStatus::Paused, None),
+        ] {
+            save_goal(
+                &bus,
+                &Goal {
+                    id: id.into(),
+                    project: project.into(),
+                    objective: "test".into(),
+                    deadline: None,
+                    budget_usd: 1.0,
+                    spent_usd: 0.0,
+                    status,
+                    status_reason: status_reason.map(str::to_string),
+                    plan: None,
+                    created_at: Utc::now(),
+                    completed_at: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let line = format_goal_summary_line_for_project(&bus, Some("alpha"));
+        assert!(line.contains("active 1"));
+        assert!(line.contains("paused 0"));
+        assert!(line.contains("failed 1"));
+        assert!(line.contains("replan-needed 1"));
+    }
+
+    #[test]
+    fn format_goal_attention_line_for_project_filters_goals() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+
+        for (id, project, status_reason) in [
+            ("goal-a", "alpha", Some("replan_needed_dead_end")),
+            ("goal-b", "beta", Some("replan_needed_dead_end")),
+            ("goal-c", "alpha", None),
+        ] {
+            save_goal(
+                &bus,
+                &Goal {
+                    id: id.into(),
+                    project: project.into(),
+                    objective: "test".into(),
+                    deadline: None,
+                    budget_usd: 1.0,
+                    spent_usd: 0.0,
+                    status: GoalStatus::Failed,
+                    status_reason: status_reason.map(str::to_string),
+                    plan: None,
+                    created_at: Utc::now(),
+                    completed_at: None,
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            format_goal_attention_line_for_project(&bus, Some("alpha")).as_deref(),
+            Some("Goal attention: replan dead-end goals (1)")
+        );
+        assert_eq!(
+            format_goal_attention_line_for_project(&bus, Some("beta")).as_deref(),
+            Some("Goal attention: replan dead-end goals (1)")
+        );
+        assert!(format_goal_attention_line_for_project(&bus, Some("gamma")).is_none());
+    }
+
+    #[test]
     fn goal_serde_roundtrip() {
         let goal = Goal {
             id: "test-001".into(),
@@ -388,6 +680,7 @@ mod tests {
             budget_usd: 5.0,
             spent_usd: 0.0,
             status: GoalStatus::Planning,
+            status_reason: None,
             plan: None,
             created_at: Utc::now(),
             completed_at: None,
@@ -408,13 +701,16 @@ mod tests {
 
         // Empty project string: safe_id("") returns Err → create_goal returns Err
         let result = create_goal(&bus, "", "some objective", None, 1.0);
-        assert!(result.is_err(), "create_goal with empty project should return Err (safe_id rejects empty)");
+        assert!(
+            result.is_err(),
+            "create_goal with empty project should return Err (safe_id rejects empty)"
+        );
     }
 
     #[test]
     fn adversarial_10k_char_objective() {
-        use tempfile::TempDir;
         use std::fs;
+        use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let bus = tmp.path().join("bus");
@@ -435,7 +731,10 @@ mod tests {
     #[test]
     fn adversarial_empty_plan_parse() {
         // Empty string
-        assert!(parse_plan("", "test").is_none(), "empty string should return None");
+        assert!(
+            parse_plan("", "test").is_none(),
+            "empty string should return None"
+        );
 
         // Only whitespace
         assert!(parse_plan("   \n\t  ", "test").is_none());
@@ -456,7 +755,10 @@ mod tests {
         // Steps missing all fields — should use defaults, not panic
         let output = r#"[{}, {}, {}]"#;
         let plan = parse_plan(output, "model");
-        assert!(plan.is_some(), "steps with missing fields should use defaults");
+        assert!(
+            plan.is_some(),
+            "steps with missing fields should use defaults"
+        );
         let plan = plan.unwrap();
         assert_eq!(plan.steps.len(), 3);
         // step defaults to 0
@@ -466,8 +768,8 @@ mod tests {
 
     #[test]
     fn adversarial_negative_budget_goal() {
-        use tempfile::TempDir;
         use std::fs;
+        use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let bus = tmp.path().join("bus");
@@ -487,8 +789,8 @@ mod tests {
 
     #[test]
     fn adversarial_load_goal_path_traversal() {
-        use tempfile::TempDir;
         use std::fs;
+        use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let bus = tmp.path().join("bus");
@@ -515,8 +817,8 @@ mod tests {
 
     #[test]
     fn adversarial_list_goals_corrupt_json() {
-        use tempfile::TempDir;
         use std::fs;
+        use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let bus = tmp.path().join("bus");
@@ -530,7 +832,10 @@ mod tests {
 
         // Should silently skip corrupt files
         let goals = list_goals(&bus);
-        assert!(goals.is_empty(), "corrupt json files should be silently skipped");
+        assert!(
+            goals.is_empty(),
+            "corrupt json files should be silently skipped"
+        );
     }
 
     #[test]
@@ -543,6 +848,7 @@ mod tests {
             budget_usd: 5.0,
             spent_usd: 0.0,
             status: GoalStatus::Planning,
+            status_reason: None,
             plan: None,
             created_at: Utc::now(),
             completed_at: None,
@@ -616,6 +922,7 @@ mod tests {
                 budget_usd: 5.0,
                 spent_usd: 0.0,
                 status: GoalStatus::Active,
+                status_reason: None,
                 plan: Some(plan),
                 created_at: Utc::now(),
                 completed_at: None,
@@ -669,6 +976,139 @@ mod tests {
                 "duplicate queue filenames detected"
             );
         }
+    }
+
+    #[test]
+    fn queue_ready_steps_marks_step_queued() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(bus.join("new/p1")).unwrap();
+
+        let mut goal = Goal {
+            id: "goal-queued".into(),
+            project: "test".into(),
+            objective: "queue".into(),
+            deadline: None,
+            budget_usd: 5.0,
+            spent_usd: 0.0,
+            status: GoalStatus::Active,
+            status_reason: None,
+            plan: Some(Plan {
+                version: 1,
+                created_by: "test".into(),
+                approved_at: None,
+                steps: vec![Step {
+                    step: 1,
+                    category: "codegen".into(),
+                    prompt: "ship it".into(),
+                    agent: "claude-sonnet".into(),
+                    est_cost_usd: 0.5,
+                    depends_on: vec![],
+                    status: StepStatus::Pending,
+                    task_id: None,
+                    sub_tasks: vec![],
+                }],
+            }),
+            created_at: Utc::now(),
+            completed_at: None,
+        };
+
+        let queued = queue_ready_steps(&bus, &mut goal).unwrap();
+        assert_eq!(queued, vec!["goal-queued-step1"]);
+
+        let step = &goal.plan.as_ref().unwrap().steps[0];
+        assert_eq!(step.status, StepStatus::Queued);
+        assert_eq!(step.task_id.as_deref(), Some("goal-queued-step1"));
+        assert!(bus.join("new/p1/goal-queued-step1.json").exists());
+    }
+
+    #[test]
+    fn queue_ready_steps_bootstraps_missing_new_p1_dir() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        let mut goal = Goal {
+            id: "goal-bootstrap".into(),
+            project: "test".into(),
+            objective: "queue".into(),
+            deadline: None,
+            budget_usd: 5.0,
+            spent_usd: 0.0,
+            status: GoalStatus::Active,
+            status_reason: None,
+            plan: Some(Plan {
+                version: 1,
+                created_by: "test".into(),
+                approved_at: None,
+                steps: vec![Step {
+                    step: 1,
+                    category: "codegen".into(),
+                    prompt: "ship it".into(),
+                    agent: "claude-sonnet".into(),
+                    est_cost_usd: 0.5,
+                    depends_on: vec![],
+                    status: StepStatus::Pending,
+                    task_id: None,
+                    sub_tasks: vec![],
+                }],
+            }),
+            created_at: Utc::now(),
+            completed_at: None,
+        };
+
+        let queued = queue_ready_steps(&bus, &mut goal).unwrap();
+        assert_eq!(queued, vec!["goal-bootstrap-step1"]);
+        assert!(bus.join("new/p1/goal-bootstrap-step1.json").exists());
+    }
+
+    #[test]
+    fn queue_ready_steps_reuses_existing_queue_file_without_duplicate_write() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+        fs::create_dir_all(bus.join("new/p1")).unwrap();
+        let existing_path = bus.join("new/p1/goal-existing-step1.json");
+        fs::write(&existing_path, "{\"already\":\"queued\"}").unwrap();
+
+        let mut goal = Goal {
+            id: "goal-existing".into(),
+            project: "test".into(),
+            objective: "queue".into(),
+            deadline: None,
+            budget_usd: 5.0,
+            spent_usd: 0.0,
+            status: GoalStatus::Active,
+            status_reason: None,
+            plan: Some(Plan {
+                version: 1,
+                created_by: "test".into(),
+                approved_at: None,
+                steps: vec![Step {
+                    step: 1,
+                    category: "codegen".into(),
+                    prompt: "ship it".into(),
+                    agent: "claude-sonnet".into(),
+                    est_cost_usd: 0.5,
+                    depends_on: vec![],
+                    status: StepStatus::Pending,
+                    task_id: None,
+                    sub_tasks: vec![],
+                }],
+            }),
+            created_at: Utc::now(),
+            completed_at: None,
+        };
+
+        let queued = queue_ready_steps(&bus, &mut goal).unwrap();
+        assert!(queued.is_empty());
+
+        let step = &goal.plan.as_ref().unwrap().steps[0];
+        assert_eq!(step.status, StepStatus::Queued);
+        assert_eq!(step.task_id.as_deref(), Some("goal-existing-step1"));
+        assert_eq!(
+            fs::read_to_string(existing_path).unwrap(),
+            "{\"already\":\"queued\"}"
+        );
     }
 
     #[test]
@@ -727,9 +1167,8 @@ mod tests {
             }
             // If canonicalize fails, the file doesn't exist at that path (likely escaped).
             // Try to find it outside the tmp dir.
-            let escaped_path = std::path::Path::new("/tmp").join(
-                format!("{}.json", goal.id.replace("../../../tmp", "tmp"))
-            );
+            let escaped_path = std::path::Path::new("/tmp")
+                .join(format!("{}.json", goal.id.replace("../../../tmp", "tmp")));
             assert!(
                 !escaped_path.exists(),
                 "SECURITY BYPASS: file may have escaped to {}",
@@ -758,7 +1197,10 @@ mod tests {
         );
 
         let result = load_goal(&bus, "../secret");
-        assert!(result.is_none(), "load_goal with '../secret' must return None");
+        assert!(
+            result.is_none(),
+            "load_goal with '../secret' must return None"
+        );
     }
 
     #[test]
@@ -778,6 +1220,7 @@ mod tests {
             budget_usd: 0.0,
             spent_usd: 0.0,
             status: GoalStatus::Planning,
+            status_reason: None,
             plan: None,
             created_at: Utc::now(),
             completed_at: None,

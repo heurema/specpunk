@@ -72,7 +72,11 @@ pub fn write_artifacts(
     let punk_dir = root.join(".punk");
 
     // Security: reject if .punk is a symlink (path-traversal defense)
-    if punk_dir.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+    if punk_dir
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
         return Err(InitError::Scan(
             ".punk is a symlink — refusing to write artifacts (possible path traversal)".into(),
         ));
@@ -210,7 +214,11 @@ mod tests {
         write_artifacts(dir, &artifacts, true).unwrap();
 
         // Simulate user editing intent.md
-        fs::write(dir.join(".punk/intent.md"), "# My custom intent\nUser edited\n").unwrap();
+        fs::write(
+            dir.join(".punk/intent.md"),
+            "# My custom intent\nUser edited\n",
+        )
+        .unwrap();
 
         // Second run
         write_artifacts(dir, &artifacts, true).unwrap();

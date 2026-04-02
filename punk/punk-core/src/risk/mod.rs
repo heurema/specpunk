@@ -24,11 +24,40 @@ pub enum RouteFamily {
 }
 
 /// Keywords that signal each route family.
-const DELETION_KEYWORDS: &[&str] = &["remove", "delete", "drop", "deprecate", "cleanup", "dead code"];
-const MIGRATION_KEYWORDS: &[&str] = &["migrate", "migration", "schema", "alter table", "rename column"];
-const DEPENDENCY_KEYWORDS: &[&str] = &["upgrade", "dependency", "bump", "update crate", "npm update"];
-const INFRA_KEYWORDS: &[&str] = &["deploy", "kubernetes", "docker", "ci/cd", "pipeline", "terraform", "ansible"];
-const API_KEYWORDS: &[&str] = &["endpoint", "api", "route", "handler", "graphql", "rest", "grpc"];
+const DELETION_KEYWORDS: &[&str] = &[
+    "remove",
+    "delete",
+    "drop",
+    "deprecate",
+    "cleanup",
+    "dead code",
+];
+const MIGRATION_KEYWORDS: &[&str] = &[
+    "migrate",
+    "migration",
+    "schema",
+    "alter table",
+    "rename column",
+];
+const DEPENDENCY_KEYWORDS: &[&str] = &[
+    "upgrade",
+    "dependency",
+    "bump",
+    "update crate",
+    "npm update",
+];
+const INFRA_KEYWORDS: &[&str] = &[
+    "deploy",
+    "kubernetes",
+    "docker",
+    "ci/cd",
+    "pipeline",
+    "terraform",
+    "ansible",
+];
+const API_KEYWORDS: &[&str] = &[
+    "endpoint", "api", "route", "handler", "graphql", "rest", "grpc",
+];
 
 // ---------------------------------------------------------------------------
 // Assurance tier — how much ceremony is required?
@@ -155,7 +184,11 @@ pub fn determine_tier(risk: &RiskLevel, family: &RouteFamily) -> AssuranceTier {
     };
 
     // Take the higher of family and risk
-    if family_min >= risk_tier { family_min } else { risk_tier }
+    if family_min >= risk_tier {
+        family_min
+    } else {
+        risk_tier
+    }
 }
 
 /// Full risk assessment: risk level + family + tier + ceremony.
@@ -174,7 +207,12 @@ pub fn assess(goal: &str, scope: &Scope) -> RiskAssessment {
     let tier = determine_tier(&risk_level, &family);
     let ceremony = ceremony_for_tier(&tier);
 
-    RiskAssessment { risk_level, family, tier, ceremony }
+    RiskAssessment {
+        risk_level,
+        family,
+        tier,
+        ceremony,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -188,11 +226,27 @@ pub fn render_assessment(a: &RiskAssessment) -> String {
     );
     out.push_str(&format!(
         "  baseline: {} | holdouts: {}+ | review: {} | multi-model: {} | repair: {}\n",
-        if a.ceremony.baseline_required { "required" } else { "optional" },
+        if a.ceremony.baseline_required {
+            "required"
+        } else {
+            "optional"
+        },
         a.ceremony.min_holdouts,
-        if a.ceremony.single_review { "required" } else { "optional" },
-        if a.ceremony.multi_model_audit { "required" } else { "no" },
-        if a.ceremony.repair_loop { "required" } else { "no" },
+        if a.ceremony.single_review {
+            "required"
+        } else {
+            "optional"
+        },
+        if a.ceremony.multi_model_audit {
+            "required"
+        } else {
+            "no"
+        },
+        if a.ceremony.repair_loop {
+            "required"
+        } else {
+            "no"
+        },
     ));
     out
 }
@@ -214,35 +268,80 @@ mod tests {
 
     #[test]
     fn family_detection() {
-        assert_eq!(detect_family("fix JWT token validation"), RouteFamily::Security);
-        assert_eq!(detect_family("remove old auth module"), RouteFamily::Deletion);
-        assert_eq!(detect_family("migrate users table to v2 schema"), RouteFamily::Migration);
-        assert_eq!(detect_family("deploy to production kubernetes"), RouteFamily::Infra);
-        assert_eq!(detect_family("add REST endpoint for users"), RouteFamily::Api);
-        assert_eq!(detect_family("upgrade dependency versions"), RouteFamily::Dependency);
-        assert_eq!(detect_family("add logging to service"), RouteFamily::Standard);
+        assert_eq!(
+            detect_family("fix JWT token validation"),
+            RouteFamily::Security
+        );
+        assert_eq!(
+            detect_family("remove old auth module"),
+            RouteFamily::Deletion
+        );
+        assert_eq!(
+            detect_family("migrate users table to v2 schema"),
+            RouteFamily::Migration
+        );
+        assert_eq!(
+            detect_family("deploy to production kubernetes"),
+            RouteFamily::Infra
+        );
+        assert_eq!(
+            detect_family("add REST endpoint for users"),
+            RouteFamily::Api
+        );
+        assert_eq!(
+            detect_family("upgrade dependency versions"),
+            RouteFamily::Dependency
+        );
+        assert_eq!(
+            detect_family("add logging to service"),
+            RouteFamily::Standard
+        );
     }
 
     #[test]
     fn tier_from_family() {
-        assert_eq!(determine_tier(&RiskLevel::Low, &RouteFamily::Security), AssuranceTier::T3);
-        assert_eq!(determine_tier(&RiskLevel::Low, &RouteFamily::Migration), AssuranceTier::T2);
-        assert_eq!(determine_tier(&RiskLevel::Low, &RouteFamily::Standard), AssuranceTier::T0);
+        assert_eq!(
+            determine_tier(&RiskLevel::Low, &RouteFamily::Security),
+            AssuranceTier::T3
+        );
+        assert_eq!(
+            determine_tier(&RiskLevel::Low, &RouteFamily::Migration),
+            AssuranceTier::T2
+        );
+        assert_eq!(
+            determine_tier(&RiskLevel::Low, &RouteFamily::Standard),
+            AssuranceTier::T0
+        );
     }
 
     #[test]
     fn tier_from_risk() {
-        assert_eq!(determine_tier(&RiskLevel::High, &RouteFamily::Standard), AssuranceTier::T2);
-        assert_eq!(determine_tier(&RiskLevel::Medium, &RouteFamily::Standard), AssuranceTier::T1);
-        assert_eq!(determine_tier(&RiskLevel::Low, &RouteFamily::Standard), AssuranceTier::T0);
+        assert_eq!(
+            determine_tier(&RiskLevel::High, &RouteFamily::Standard),
+            AssuranceTier::T2
+        );
+        assert_eq!(
+            determine_tier(&RiskLevel::Medium, &RouteFamily::Standard),
+            AssuranceTier::T1
+        );
+        assert_eq!(
+            determine_tier(&RiskLevel::Low, &RouteFamily::Standard),
+            AssuranceTier::T0
+        );
     }
 
     #[test]
     fn tier_takes_max() {
         // High risk + Security family → T3 (family wins)
-        assert_eq!(determine_tier(&RiskLevel::High, &RouteFamily::Security), AssuranceTier::T3);
+        assert_eq!(
+            determine_tier(&RiskLevel::High, &RouteFamily::Security),
+            AssuranceTier::T3
+        );
         // Low risk + Migration → T2 (family escalates)
-        assert_eq!(determine_tier(&RiskLevel::Low, &RouteFamily::Migration), AssuranceTier::T2);
+        assert_eq!(
+            determine_tier(&RiskLevel::Low, &RouteFamily::Migration),
+            AssuranceTier::T2
+        );
     }
 
     #[test]

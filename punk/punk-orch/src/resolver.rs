@@ -16,7 +16,7 @@ pub struct ResolvedProject {
     pub stack: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ResolveSource {
     CliPath,
     Pinned,
@@ -53,6 +53,12 @@ pub struct CachedProject {
     pub discovered_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousProjectCandidate {
+    pub path: PathBuf,
+    pub sources: Vec<ResolveSource>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
     #[error("project '{name}' not found{}", format_suggestions(suggestions))]
@@ -64,6 +70,11 @@ pub enum ResolveError {
     PathNotFound(PathBuf),
     #[error("configured path for project '{name}' does not exist: {path}")]
     ConfiguredPathNotFound { name: String, path: PathBuf },
+    #[error("project '{name}' is ambiguous{}", format_ambiguity(candidates))]
+    Ambiguous {
+        name: String,
+        candidates: Vec<AmbiguousProjectCandidate>,
+    },
     #[error("cache error: {0}")]
     CacheError(#[from] std::io::Error),
 }
@@ -76,14 +87,28 @@ fn format_suggestions(suggestions: &[String]) -> String {
     }
 }
 
+fn format_ambiguity(candidates: &[AmbiguousProjectCandidate]) -> String {
+    if candidates.is_empty() {
+        return String::new();
+    }
+    let details = candidates
+        .iter()
+        .map(|candidate| {
+            let sources = candidate
+                .sources
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("\n  - {} ({sources})", candidate.path.display())
+        })
+        .collect::<String>();
+    format!(":{details}")
+}
+
 // --- Scan roots ---
 
-const SCAN_ROOTS: &[&str] = &[
-    "~/personal/heurema",
-    "~/works",
-    "~/contrib",
-    "~/personal",
-];
+const SCAN_ROOTS: &[&str] = &["~/personal/heurema", "~/works", "~/contrib", "~/personal"];
 
 fn expand_tilde(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
@@ -99,7 +124,11 @@ fn expand_tilde(p: &str) -> PathBuf {
 
 pub fn cache_path() -> PathBuf {
     dirs::cache_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".cache"))
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".cache")
+        })
         .join("punk/projects.json")
 }
 
@@ -116,8 +145,7 @@ pub fn save_cache(cache: &ProjectCache) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_string_pretty(cache)
-        .map_err(std::io::Error::other)?;
+    let data = serde_json::to_string_pretty(cache).map_err(std::io::Error::other)?;
     fs::write(&path, data)
 }
 
@@ -178,61 +206,13 @@ pub fn resolve(
         });
     }
 
-    // 2. Pinned alias in cache
     let cache = load_cache();
-    if let Some(entry) = cache.projects.iter().find(|p| p.id == name && p.pinned) {
-        let path = PathBuf::from(&entry.path);
-        if path.is_dir() {
-            return Ok(ResolvedProject {
-                id: name.to_string(),
-                path,
-                source: ResolveSource::Pinned,
-                stack: entry.stack.clone(),
-            });
-        }
-    }
-
-    // 3. TOML projects
-    if let Some(cfg) = config {
-        if let Some(proj) = cfg.projects.projects.iter().find(|p| p.id == name) {
-            let path = expand_tilde(&proj.path);
-            if !path.is_dir() {
-                return Err(ResolveError::ConfiguredPathNotFound {
-                    name: name.to_string(),
-                    path,
-                });
-            }
-            return Ok(ResolvedProject {
-                id: name.to_string(),
-                path,
-                source: ResolveSource::Toml,
-                stack: if proj.stack.is_empty() {
-                    detect_stack(&expand_tilde(&proj.path))
-                } else {
-                    Some(proj.stack.clone())
-                },
-            });
-        }
-    }
-
-    // 4. Cached scan (non-pinned)
-    if let Some(entry) = cache.projects.iter().find(|p| p.id == name && !p.pinned) {
-        let path = PathBuf::from(&entry.path);
-        if path.is_dir() {
-            return Ok(ResolvedProject {
-                id: name.to_string(),
-                path,
-                source: ResolveSource::CachedScan,
-                stack: entry.stack.clone(),
-            });
-        }
-    }
-
-    // 5. Lazy scan
-    if let Some(resolved) = scan_for_project(name) {
-        // Auto-cache the discovery
-        let mut cache = load_cache();
-        if !cache.projects.iter().any(|p| p.id == name) {
+    let scanned = scan_for_project_candidates(name);
+    if let Some(resolved) = resolve_from_sources(name, config, &cache, &scanned)? {
+        if matches!(resolved.source, ResolveSource::LazyScan)
+            && !cache.projects.iter().any(|p| p.id == name)
+        {
+            let mut cache = cache;
             cache.projects.push(CachedProject {
                 id: resolved.id.clone(),
                 path: resolved.path.to_string_lossy().to_string(),
@@ -255,14 +235,109 @@ pub fn resolve(
     })
 }
 
+fn resolve_from_sources(
+    name: &str,
+    config: Option<&Config>,
+    cache: &ProjectCache,
+    scanned: &[ResolvedProject],
+) -> Result<Option<ResolvedProject>, ResolveError> {
+    let mut candidates = Vec::new();
+
+    for entry in cache.projects.iter().filter(|p| p.id == name && p.pinned) {
+        let path = PathBuf::from(&entry.path);
+        if path.is_dir() {
+            candidates.push(ResolvedProject {
+                id: name.to_string(),
+                path,
+                source: ResolveSource::Pinned,
+                stack: entry.stack.clone(),
+            });
+        }
+    }
+
+    if let Some(cfg) = config {
+        for proj in cfg.projects.projects.iter().filter(|p| p.id == name) {
+            let path = expand_tilde(&proj.path);
+            if !path.is_dir() {
+                return Err(ResolveError::ConfiguredPathNotFound {
+                    name: name.to_string(),
+                    path,
+                });
+            }
+            candidates.push(ResolvedProject {
+                id: name.to_string(),
+                path: path.clone(),
+                source: ResolveSource::Toml,
+                stack: if proj.stack.is_empty() {
+                    detect_stack(&path)
+                } else {
+                    Some(proj.stack.clone())
+                },
+            });
+        }
+    }
+
+    for entry in cache.projects.iter().filter(|p| p.id == name && !p.pinned) {
+        let path = PathBuf::from(&entry.path);
+        if path.is_dir() {
+            candidates.push(ResolvedProject {
+                id: name.to_string(),
+                path,
+                source: ResolveSource::CachedScan,
+                stack: entry.stack.clone(),
+            });
+        }
+    }
+
+    candidates.extend(scanned.iter().filter(|p| p.id == name).cloned());
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let ambiguities = collapse_ambiguous_candidates(&candidates);
+    if ambiguities.len() > 1 {
+        return Err(ResolveError::Ambiguous {
+            name: name.to_string(),
+            candidates: ambiguities,
+        });
+    }
+
+    Ok(candidates.into_iter().next())
+}
+
+fn collapse_ambiguous_candidates(candidates: &[ResolvedProject]) -> Vec<AmbiguousProjectCandidate> {
+    let mut by_path: HashMap<PathBuf, AmbiguousProjectCandidate> = HashMap::new();
+    for candidate in candidates {
+        let key = if candidate.path.is_dir() {
+            fs::canonicalize(&candidate.path).unwrap_or_else(|_| candidate.path.clone())
+        } else {
+            candidate.path.clone()
+        };
+        let entry = by_path
+            .entry(key.clone())
+            .or_insert_with(|| AmbiguousProjectCandidate {
+                path: candidate.path.clone(),
+                sources: Vec::new(),
+            });
+        if !entry.sources.contains(&candidate.source) {
+            entry.sources.push(candidate.source.clone());
+        }
+    }
+    let mut values: Vec<_> = by_path.into_values().collect();
+    values.sort_by(|a, b| a.path.cmp(&b.path));
+    values
+}
+
 // --- Scan ---
 
-fn scan_for_project(name: &str) -> Option<ResolvedProject> {
+fn scan_for_project_candidates(name: &str) -> Vec<ResolvedProject> {
+    let mut results = Vec::new();
     for root in SCAN_ROOTS {
         let root_path = expand_tilde(root);
         let candidate = root_path.join(name);
         if candidate.is_dir() && candidate.join(".git").exists() {
-            return Some(ResolvedProject {
+            results.push(ResolvedProject {
                 id: name.to_string(),
                 path: candidate.clone(),
                 source: ResolveSource::LazyScan,
@@ -270,7 +345,7 @@ fn scan_for_project(name: &str) -> Option<ResolvedProject> {
             });
         }
     }
-    None
+    results
 }
 
 pub fn scan_all_roots() -> Vec<ResolvedProject> {
@@ -465,7 +540,10 @@ mod tests {
 
     #[test]
     fn stale_toml_path_is_an_explicit_error() {
-        let missing = format!("/tmp/specpunk-missing-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default());
+        let missing = format!(
+            "/tmp/specpunk-missing-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
         let cfg = crate::config::Config {
             projects: crate::config::ProjectsFile {
                 projects: vec![crate::config::Project {
@@ -492,6 +570,84 @@ mod tests {
             }
             other => panic!("expected configured path error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_reports_ambiguity_for_conflicting_sources() {
+        let tmp = TempDir::new().unwrap();
+        let toml = make_project_dir(tmp.path(), "toml-proj");
+        let cached = make_project_dir(tmp.path(), "cached-proj");
+
+        let cache = ProjectCache {
+            version: 1,
+            updated_at: String::new(),
+            projects: vec![CachedProject {
+                id: "same-proj".to_string(),
+                path: cached.to_string_lossy().to_string(),
+                pinned: false,
+                stack: Some("rust".to_string()),
+                discovered_at: String::new(),
+            }],
+        };
+
+        let cfg = crate::config::Config {
+            projects: crate::config::ProjectsFile {
+                projects: vec![crate::config::Project {
+                    id: "same-proj".to_string(),
+                    path: toml.to_string_lossy().to_string(),
+                    stack: "rust".to_string(),
+                    active: true,
+                    budget_usd: 0.0,
+                    checkpoint: String::new(),
+                }],
+            },
+            agents: crate::config::AgentsFile {
+                agents: HashMap::new(),
+            },
+            policy: crate::config::default_policy(),
+            dir: PathBuf::new(),
+        };
+
+        let result = resolve_from_sources("same-proj", Some(&cfg), &cache, &[]);
+        match result {
+            Err(ResolveError::Ambiguous { name, candidates }) => {
+                assert_eq!(name, "same-proj");
+                assert_eq!(candidates.len(), 2);
+                assert!(candidates.iter().any(|c| c.path == toml));
+                assert!(candidates.iter().any(|c| c.path == cached));
+            }
+            other => panic!("expected ambiguity error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_prefers_single_unique_path_even_when_sources_overlap() {
+        let tmp = TempDir::new().unwrap();
+        let shared = make_project_dir(tmp.path(), "shared-proj");
+
+        let cache = ProjectCache {
+            version: 1,
+            updated_at: String::new(),
+            projects: vec![CachedProject {
+                id: "shared-proj".to_string(),
+                path: shared.to_string_lossy().to_string(),
+                pinned: false,
+                stack: Some("rust".to_string()),
+                discovered_at: String::new(),
+            }],
+        };
+        let scanned = vec![ResolvedProject {
+            id: "shared-proj".to_string(),
+            path: shared.clone(),
+            source: ResolveSource::LazyScan,
+            stack: Some("rust".to_string()),
+        }];
+
+        let resolved = resolve_from_sources("shared-proj", None, &cache, &scanned)
+            .unwrap()
+            .expect("unique path should resolve");
+        assert_eq!(resolved.source, ResolveSource::CachedScan);
+        assert_eq!(resolved.path, shared);
     }
 
     #[test]
@@ -563,7 +719,8 @@ mod tests {
         fs::write(&cache_file, data).unwrap();
 
         // Verify cache round-trip
-        let loaded: ProjectCache = serde_json::from_str(&fs::read_to_string(&cache_file).unwrap()).unwrap();
+        let loaded: ProjectCache =
+            serde_json::from_str(&fs::read_to_string(&cache_file).unwrap()).unwrap();
         assert_eq!(loaded.projects.len(), 1);
         assert_eq!(loaded.projects[0].id, "testproj");
         assert!(loaded.projects[0].pinned);

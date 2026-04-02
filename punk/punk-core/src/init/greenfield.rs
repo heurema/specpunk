@@ -152,7 +152,10 @@ mod tests {
         assert!(!artifacts.config_toml.is_empty());
         assert!(!artifacts.intent_md.is_empty());
         assert!(!artifacts.conventions_json.is_empty());
-        assert!(artifacts.scan_json.is_none(), "greenfield must not have scan.json");
+        assert!(
+            artifacts.scan_json.is_none(),
+            "greenfield must not have scan.json"
+        );
 
         // Write and verify no scan.json is created
         super::super::artifacts::write_artifacts(dir, &artifacts, false).unwrap();
@@ -160,7 +163,10 @@ mod tests {
         assert!(dir.join(".punk/config.toml").exists());
         assert!(dir.join(".punk/intent.md").exists());
         assert!(dir.join(".punk/conventions.json").exists());
-        assert!(!dir.join(".punk/scan.json").exists(), "scan.json must not exist in greenfield");
+        assert!(
+            !dir.join(".punk/scan.json").exists(),
+            "scan.json must not exist in greenfield"
+        );
 
         // Verify content
         let intent = fs::read_to_string(dir.join(".punk/intent.md")).unwrap();

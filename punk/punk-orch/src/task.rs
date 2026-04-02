@@ -101,13 +101,10 @@ impl TaskState {
                 pid,
                 started_at: Utc::now(),
             }),
-            (Self::Running { .. }, TaskEvent::Completed { receipt }) => Ok(Self::Done {
-                receipt,
-            }),
-            (Self::Running { .. }, TaskEvent::Failed { error }) => Ok(Self::Failed {
-                error,
-                attempts: 1,
-            }),
+            (Self::Running { .. }, TaskEvent::Completed { receipt }) => Ok(Self::Done { receipt }),
+            (Self::Running { .. }, TaskEvent::Failed { error }) => {
+                Ok(Self::Failed { error, attempts: 1 })
+            }
             (state, event) => Err(InvalidTransition {
                 from: format!("{state:?}"),
                 event: format!("{event:?}"),

@@ -82,7 +82,11 @@ pub fn check_quality(
     }
 
     let score = (100i32 - deductions).max(0) as u8;
-    QualityReport { score, warnings, errors }
+    QualityReport {
+        score,
+        warnings,
+        errors,
+    }
 }
 
 #[cfg(test)]
@@ -103,16 +107,17 @@ mod tests {
         // Good spec
         let good_acs = vec![ac("AC-01", "cargo test passes", Some("cargo test"))];
         let report = check_quality(&good_acs, &["src/lib.rs".to_string()], &[]);
-        assert!(report.is_acceptable(), "good spec should pass: {:?}", report.errors);
+        assert!(
+            report.is_acceptable(),
+            "good spec should pass: {:?}",
+            report.errors
+        );
         assert!(report.score > 50);
 
         // Weasel word
         let weasel_acs = vec![ac("AC-01", "improve performance", Some("cargo bench"))];
         let report = check_quality(&weasel_acs, &["src/lib.rs".to_string()], &[]);
-        assert!(
-            !report.is_acceptable(),
-            "weasel word should cause error"
-        );
+        assert!(!report.is_acceptable(), "weasel word should cause error");
         assert!(
             report.errors.iter().any(|e| e.contains("improve")),
             "error should mention 'improve'"
@@ -130,7 +135,11 @@ mod tests {
         // Multiple weasel words
         let multi = vec![
             ac("AC-01", "better error messages", Some("cargo test")),
-            ac("AC-02", "optimize the database queries", Some("cargo bench")),
+            ac(
+                "AC-02",
+                "optimize the database queries",
+                Some("cargo bench"),
+            ),
         ];
         let report = check_quality(&multi, &["src/db.rs".to_string()], &[]);
         assert!(!report.is_acceptable());

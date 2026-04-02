@@ -36,8 +36,8 @@
       "punk_core",
       "chrono",
       "self",
-      "sha2",
-      "clap"
+      "clap",
+      "sha2"
     ],
     "layering": []
   },

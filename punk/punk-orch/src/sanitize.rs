@@ -70,10 +70,7 @@ mod tests {
         // Null bytes can truncate filenames on some OS/lib implementations.
         // Must be rejected — not alphanumeric.
         let input = "foo\x00bar";
-        assert!(
-            safe_id(input).is_err(),
-            "null byte must be rejected"
-        );
+        assert!(safe_id(input).is_err(), "null byte must be rejected");
     }
 
     #[test]
@@ -92,10 +89,19 @@ mod tests {
         // "..." doesn't contain ".." as a substring — wait, it does: chars 0-1 are "..".
         // The current check uses contains(".."), so "..." has ".." at position 0.
         // This test documents the expected behavior.
-        assert!(safe_id("...").is_err(), "'...' contains '..' and must be rejected");
-        assert!(safe_id("....").is_err(), "'....' contains '..' and must be rejected");
+        assert!(
+            safe_id("...").is_err(),
+            "'...' contains '..' and must be rejected"
+        );
+        assert!(
+            safe_id("....").is_err(),
+            "'....' contains '..' and must be rejected"
+        );
         // ". ." has a space — rejected by alphanumeric filter.
-        assert!(safe_id(". .").is_err(), "'. .' has a space, must be rejected");
+        assert!(
+            safe_id(". .").is_err(),
+            "'. .' has a space, must be rejected"
+        );
     }
 
     #[test]
@@ -120,7 +126,10 @@ mod tests {
         // Expected by design: safe_id does NOT block leading dots.
         // A caller creating ".hidden" would produce a hidden file on Unix.
         // Leaving as a known-accepted gap with documentation.
-        assert!(result.is_ok(), ".hidden is currently accepted (known gap: creates hidden file)");
+        assert!(
+            result.is_ok(),
+            ".hidden is currently accepted (known gap: creates hidden file)"
+        );
     }
 
     #[test]
@@ -162,17 +171,26 @@ mod tests {
         assert!(safe_id("..").is_err(), "double dot is path traversal");
 
         // "..." contains ".." at position 0 → rejected
-        assert!(safe_id("...").is_err(), "triple dot contains '..' substring");
+        assert!(
+            safe_id("...").is_err(),
+            "triple dot contains '..' substring"
+        );
 
         // ".a.": no ".." present, chars are . a . → accepted
-        assert!(safe_id(".a.").is_ok(), "dot-letter-dot has no '..' and valid chars");
+        assert!(
+            safe_id(".a.").is_ok(),
+            "dot-letter-dot has no '..' and valid chars"
+        );
     }
 
     #[test]
     fn adversarial_names_with_only_hyphens() {
         assert!(safe_id("-").is_ok(), "single hyphen is allowed");
         assert!(safe_id("---").is_ok(), "multiple hyphens are allowed");
-        assert!(safe_id("-a-b-c-").is_ok(), "hyphens around letters are allowed");
+        assert!(
+            safe_id("-a-b-c-").is_ok(),
+            "hyphens around letters are allowed"
+        );
     }
 
     #[test]
@@ -188,7 +206,10 @@ mod tests {
         let long = "a".repeat(10_000);
         let result = safe_id(&long);
         // Documents current behavior: no length cap, accepted without panic
-        assert!(result.is_ok(), "10K char valid id accepted (no length limit enforced)");
+        assert!(
+            result.is_ok(),
+            "10K char valid id accepted (no length limit enforced)"
+        );
     }
 
     #[test]
@@ -196,7 +217,10 @@ mod tests {
         assert!(safe_id("foo\nbar").is_err(), "newline must be rejected");
         assert!(safe_id("foo\rbar").is_err(), "CR must be rejected");
         assert!(safe_id("foo\tbar").is_err(), "tab must be rejected");
-        assert!(safe_id("\x01\x02\x03").is_err(), "SOH/STX/ETX must be rejected");
+        assert!(
+            safe_id("\x01\x02\x03").is_err(),
+            "SOH/STX/ETX must be rejected"
+        );
     }
 
     #[test]
@@ -204,7 +228,13 @@ mod tests {
         // "~" check is only starts_with — embedded tilde not caught by that check
         // but '~' is not in the allowed charset (not alphanumeric, -, _, .)
         // so it gets caught by the char filter
-        assert!(safe_id("foo~bar").is_err(), "embedded tilde must be rejected by char filter");
-        assert!(safe_id("~").is_err(), "bare tilde rejected by starts_with check");
+        assert!(
+            safe_id("foo~bar").is_err(),
+            "embedded tilde must be rejected by char filter"
+        );
+        assert!(
+            safe_id("~").is_err(),
+            "bare tilde rejected by starts_with check"
+        );
     }
 }

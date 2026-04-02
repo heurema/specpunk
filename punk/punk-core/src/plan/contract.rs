@@ -25,9 +25,23 @@ pub enum RiskLevel {
 
 /// Security keywords that auto-escalate to High risk.
 pub const RISK_KEYWORDS: &[&str] = &[
-    "auth", "token", "secret", "payment", "crypto", "permission", "password",
-    "jwt", "oauth", "migration", "schema", "deploy", "credential", "session",
-    "certificate", "ssl", "tls",
+    "auth",
+    "token",
+    "secret",
+    "payment",
+    "crypto",
+    "permission",
+    "password",
+    "jwt",
+    "oauth",
+    "migration",
+    "schema",
+    "deploy",
+    "credential",
+    "session",
+    "certificate",
+    "ssl",
+    "tls",
 ];
 
 // ---------------------------------------------------------------------------
@@ -169,7 +183,6 @@ pub struct Contract {
     pub attempt_number: u32,
 
     // --- v2 fields (all default, backward-compatible with v1) ---
-
     /// Risk level: low/medium/high. Default: low.
     #[serde(default)]
     pub risk_level: RiskLevel,
@@ -368,15 +381,33 @@ mod tests {
 
     #[test]
     fn risk_classification() {
-        let scope_small = Scope { touch: vec!["a.rs".into()], dont_touch: vec![] };
-        let scope_medium = Scope { touch: (0..8).map(|i| format!("f{i}.rs")).collect(), dont_touch: vec![] };
-        let scope_large = Scope { touch: (0..20).map(|i| format!("f{i}.rs")).collect(), dont_touch: vec![] };
+        let scope_small = Scope {
+            touch: vec!["a.rs".into()],
+            dont_touch: vec![],
+        };
+        let scope_medium = Scope {
+            touch: (0..8).map(|i| format!("f{i}.rs")).collect(),
+            dont_touch: vec![],
+        };
+        let scope_large = Scope {
+            touch: (0..20).map(|i| format!("f{i}.rs")).collect(),
+            dont_touch: vec![],
+        };
 
         assert_eq!(classify_risk("add logging", &scope_small), RiskLevel::Low);
-        assert_eq!(classify_risk("add logging", &scope_medium), RiskLevel::Medium);
+        assert_eq!(
+            classify_risk("add logging", &scope_medium),
+            RiskLevel::Medium
+        );
         assert_eq!(classify_risk("add logging", &scope_large), RiskLevel::High);
-        assert_eq!(classify_risk("fix auth token validation", &scope_small), RiskLevel::High);
-        assert_eq!(classify_risk("add JWT middleware", &scope_small), RiskLevel::High);
+        assert_eq!(
+            classify_risk("fix auth token validation", &scope_small),
+            RiskLevel::High
+        );
+        assert_eq!(
+            classify_risk("add JWT middleware", &scope_small),
+            RiskLevel::High
+        );
     }
 
     #[test]
