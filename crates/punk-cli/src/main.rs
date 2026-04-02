@@ -531,10 +531,14 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
     let approved = orch.approve_contract(&contract.id)?;
     let executor = CodexCliExecutor::default();
     let (run, receipt) = orch.cut_run(&executor, &approved.id)?;
+    let gate = GateService::new(repo_root, global_root);
+    let decision = gate.gate_run(&run.id)?;
+    let proof_service = ProofService::new(repo_root, global_root);
+    let proof = proof_service.write_proofpack(&decision.id)?;
     let status = orch.status(Some(&run.id))?;
     let project_root = resolve_project_root(repo_root);
     let project = infer_project_id(&project_root).unwrap_or_else(|| status.project_id.clone());
-    let follow_up = format!("punk status {}", run.id);
+    let follow_up = format!("punk inspect {} --json", proof.id);
 
     if json {
         println!(
@@ -546,6 +550,8 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
                 "contract": approved,
                 "run": run,
                 "receipt": receipt,
+                "decision": decision,
+                "proof": proof,
                 "follow_up": follow_up,
             }))?
         );
@@ -559,6 +565,8 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
                 &run.id,
                 &receipt.status,
                 &receipt.summary,
+                decision_label(&decision.decision),
+                &proof.id,
                 &follow_up,
             )
         );
@@ -584,11 +592,21 @@ fn format_go_summary(
     run_id: &str,
     receipt_status: &str,
     receipt_summary: &str,
+    decision: &str,
+    proof_id: &str,
     follow_up: &str,
 ) -> String {
     format!(
-        "Goal: {goal}\nProject: {project}\nApproved contract: {contract_id}\nRun: {run_id} ({receipt_status})\nSummary: {receipt_summary}\nFollow-up: {follow_up}"
+        "Goal: {goal}\nProject: {project}\nApproved contract: {contract_id}\nRun: {run_id} ({receipt_status})\nSummary: {receipt_summary}\nGate: {decision}\nProof: {proof_id}\nFollow-up: {follow_up}"
     )
+}
+
+fn decision_label(decision: &punk_domain::Decision) -> &'static str {
+    match decision {
+        punk_domain::Decision::Accept => "accept",
+        punk_domain::Decision::Block => "block",
+        punk_domain::Decision::Escalate => "escalate",
+    }
 }
 
 fn resolve_init_project_id(project_root: &Path, explicit_project: Option<&str>) -> Result<String> {
@@ -961,14 +979,18 @@ mod tests {
             "run_456",
             "success",
             "implemented bounded change",
-            "punk status run_456",
+            "accept",
+            "proof_789",
+            "punk inspect proof_789 --json",
         );
         assert!(rendered.contains("Goal: add interview feedback summary endpoint"));
         assert!(rendered.contains("Project: interviewcoach"));
         assert!(rendered.contains("Approved contract: ct_123"));
         assert!(rendered.contains("Run: run_456 (success)"));
         assert!(rendered.contains("Summary: implemented bounded change"));
-        assert!(rendered.contains("Follow-up: punk status run_456"));
+        assert!(rendered.contains("Gate: accept"));
+        assert!(rendered.contains("Proof: proof_789"));
+        assert!(rendered.contains("Follow-up: punk inspect proof_789 --json"));
     }
 
     #[test]
