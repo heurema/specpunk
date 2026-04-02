@@ -26,12 +26,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Start(StartCommand),
     Plot(PlotCommand),
     Cut(CutCommand),
     Gate(GateCommand),
     Status(StatusCommand),
     Inspect(InspectCommand),
     Vcs(VcsCommand),
+}
+
+#[derive(Args)]
+struct StartCommand {
+    goal: String,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -138,6 +146,7 @@ fn run() -> Result<()> {
     }
 
     match cli.command {
+        Command::Start(start) => cmd_start(&repo_root, &global_root, &start.goal, start.json),
         Command::Plot(plot) => match plot.action {
             PlotAction::Contract { prompt, json } => {
                 let orch = OrchService::new(&repo_root, &global_root)?;
@@ -281,13 +290,8 @@ fn default_global_root() -> Result<PathBuf> {
 }
 
 fn maybe_auto_bootstrap_project(repo_root: &Path, command: &Command) -> Result<bool> {
-    let json = match command {
-        Command::Plot(PlotCommand {
-            action: PlotAction::Contract { json, .. },
-        }) => *json,
-        _ => {
-            return Ok(false);
-        }
+    let Some(json) = bootstrap_json_mode(command) else {
+        return Ok(false);
     };
 
     let project_root = resolve_project_root(repo_root);
@@ -308,6 +312,16 @@ fn maybe_auto_bootstrap_project(repo_root: &Path, command: &Command) -> Result<b
         }
     }
     Ok(true)
+}
+
+fn bootstrap_json_mode(command: &Command) -> Option<bool> {
+    match command {
+        Command::Plot(PlotCommand {
+            action: PlotAction::Contract { json, .. },
+        }) => Some(*json),
+        Command::Start(StartCommand { json, .. }) => Some(*json),
+        _ => None,
+    }
 }
 
 fn resolve_project_root(repo_root: &Path) -> PathBuf {
@@ -412,6 +426,51 @@ fn format_bootstrap_error(project_id: &str, reason: &str) -> String {
 fn format_bootstrap_skip_note(project_id: &str, reason: &str) -> String {
     format!(
         "Bootstrap note: skipping optional project bootstrap for `{project_id}` because {reason}. If you need full onboarding, run `punk-run init --project {project_id} --enable-jj --verify` manually."
+    )
+}
+
+fn cmd_start(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Result<()> {
+    let trimmed_goal = goal.trim();
+    if trimmed_goal.is_empty() {
+        return Err(anyhow!("goal must not be empty"));
+    }
+
+    let orch = OrchService::new(repo_root, global_root)?;
+    let drafter = CodexCliContractDrafter::default();
+    let contract = orch.draft_contract(&drafter, trimmed_goal)?;
+    let status = orch.status(None)?;
+    let project_root = resolve_project_root(repo_root);
+    let project = infer_project_id(&project_root).unwrap_or_else(|| status.project_id.clone());
+    let next_command = format!("punk plot approve {}", contract.id);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "goal": trimmed_goal,
+                "project": project,
+                "project_id": status.project_id,
+                "contract": contract,
+                "next_command": next_command,
+            }))?
+        );
+    } else {
+        println!(
+            "{}",
+            format_start_summary(&project, trimmed_goal, &contract.id, &next_command)
+        );
+    }
+    Ok(())
+}
+
+fn format_start_summary(
+    project: &str,
+    goal: &str,
+    contract_id: &str,
+    next_command: &str,
+) -> String {
+    format!(
+        "Goal: {goal}\nProject: {project}\nDrafted contract: {contract_id}\nNext: {next_command}"
     )
 }
 
@@ -682,5 +741,41 @@ mod tests {
         let message = format_bootstrap_error("interviewcoach", "failed to execute punk-run");
         assert!(message.contains("project bootstrap failed"));
         assert!(message.contains("punk-run init --project interviewcoach --enable-jj --verify"));
+    }
+
+    #[test]
+    fn bootstrap_json_mode_supports_start_and_plot_contract() {
+        let start = Command::Start(StartCommand {
+            goal: "ship interview summary".into(),
+            json: true,
+        });
+        let plot = Command::Plot(PlotCommand {
+            action: PlotAction::Contract {
+                prompt: "ship interview summary".into(),
+                json: false,
+            },
+        });
+        let status = Command::Status(StatusCommand {
+            id: None,
+            json: false,
+        });
+
+        assert_eq!(bootstrap_json_mode(&start), Some(true));
+        assert_eq!(bootstrap_json_mode(&plot), Some(false));
+        assert_eq!(bootstrap_json_mode(&status), None);
+    }
+
+    #[test]
+    fn start_summary_mentions_goal_project_and_next_step() {
+        let rendered = format_start_summary(
+            "interviewcoach",
+            "add interview feedback summary endpoint",
+            "ct_123",
+            "punk plot approve ct_123",
+        );
+        assert!(rendered.contains("Goal: add interview feedback summary endpoint"));
+        assert!(rendered.contains("Project: interviewcoach"));
+        assert!(rendered.contains("Drafted contract: ct_123"));
+        assert!(rendered.contains("Next: punk plot approve ct_123"));
     }
 }
