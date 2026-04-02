@@ -1290,6 +1290,7 @@ fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {
         fail_count,
         total_cost
     );
+    println!("{}", goal::format_goal_summary_line(&bus_path));
     if let Ok(skill_eval_summary) =
         eval::summarize_skill_evals(Path::new("."), Some(recent_limit), project_filter, None)
     {

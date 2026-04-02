@@ -112,6 +112,31 @@ pub fn list_goals(bus: &Path) -> Vec<Goal> {
     goals
 }
 
+/// Format a concise one-line summary of goal counts for status output.
+pub fn format_goal_summary_line(bus: &Path) -> String {
+    let mut active = 0usize;
+    let mut paused = 0usize;
+    let mut awaiting_approval = 0usize;
+    let mut done = 0usize;
+    let mut failed = 0usize;
+
+    for goal in list_goals(bus) {
+        match goal.status {
+            GoalStatus::Active => active += 1,
+            GoalStatus::Paused => paused += 1,
+            GoalStatus::AwaitingApproval => awaiting_approval += 1,
+            GoalStatus::Done => done += 1,
+            GoalStatus::Failed => failed += 1,
+            GoalStatus::Planning => {}
+        }
+    }
+
+    format!(
+        "Goals: active {}, paused {}, awaiting approval {}, done {}, failed {}",
+        active, paused, awaiting_approval, done, failed
+    )
+}
+
 /// Load a specific goal.
 pub fn load_goal(bus: &Path, goal_id: &str) -> Option<Goal> {
     let safe = sanitize::safe_id(goal_id).ok()?;
@@ -478,6 +503,45 @@ mod tests {
     fn parse_plan_invalid() {
         assert!(parse_plan("not json at all", "test").is_none());
         assert!(parse_plan("[]", "test").is_none()); // empty
+    }
+
+    #[test]
+    fn format_goal_summary_line_counts_goal_statuses() {
+        let tmp = TempDir::new().unwrap();
+        let bus = tmp.path().join("bus");
+
+        for (id, status) in [
+            ("goal-active", GoalStatus::Active),
+            ("goal-paused", GoalStatus::Paused),
+            ("goal-awaiting", GoalStatus::AwaitingApproval),
+            ("goal-done", GoalStatus::Done),
+            ("goal-failed", GoalStatus::Failed),
+            ("goal-planning", GoalStatus::Planning),
+        ] {
+            save_goal(
+                &bus,
+                &Goal {
+                    id: id.into(),
+                    project: "specpunk".into(),
+                    objective: "test".into(),
+                    deadline: None,
+                    budget_usd: 1.0,
+                    spent_usd: 0.0,
+                    status,
+                    plan: None,
+                    created_at: Utc::now(),
+                    completed_at: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let line = format_goal_summary_line(&bus);
+        assert!(line.contains("active 1"));
+        assert!(line.contains("paused 1"));
+        assert!(line.contains("awaiting approval 1"));
+        assert!(line.contains("done 1"));
+        assert!(line.contains("failed 1"));
     }
 
     #[test]
