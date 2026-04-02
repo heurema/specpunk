@@ -1292,6 +1292,9 @@ fn cmd_status(recent_limit: usize, project_filter: Option<&str>) {
         total_cost
     );
     println!("{}", goal::format_goal_summary_line(&bus_path));
+    if let Some(attention) = goal::format_goal_attention_line(&bus_path) {
+        println!("{attention}");
+    }
     if let Ok(skill_eval_summary) =
         eval::summarize_skill_evals(Path::new("."), Some(recent_limit), project_filter, None)
     {
@@ -4570,6 +4573,7 @@ mod guard_tests {
 mod cli_goal_tests {
     use super::*;
     use punk_orch::chrono::Utc;
+    use std::fs;
 
     fn sample_goal(status: goal::GoalStatus, step_statuses: &[goal::StepStatus]) -> goal::Goal {
         goal::Goal {
@@ -4707,6 +4711,39 @@ mod cli_goal_tests {
         assert!(rendered.contains("reason:    replan_needed_dead_end"));
         assert!(rendered.contains("replan needed: blocked or failed steps left no runnable work"));
         assert!(rendered.contains("punk-run goal replan goal-1"));
+    }
+
+    #[test]
+    fn format_goal_attention_line_reports_dead_end_goal_count() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-run-goal-attention-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let bus = root.join("bus");
+        fs::create_dir_all(&bus).unwrap();
+
+        goal::save_goal(
+            &bus,
+            &goal::Goal {
+                id: "goal-dead-end".into(),
+                project: "specpunk".into(),
+                objective: "recover".into(),
+                deadline: None,
+                budget_usd: 5.0,
+                spent_usd: 1.0,
+                status: goal::GoalStatus::Failed,
+                status_reason: Some("replan_needed_dead_end".into()),
+                plan: None,
+                created_at: Utc::now(),
+                completed_at: None,
+            },
+        )
+        .unwrap();
+
+        let rendered = goal::format_goal_attention_line(&bus).unwrap();
+        assert_eq!(rendered, "Goal attention: replan dead-end goals (1)");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

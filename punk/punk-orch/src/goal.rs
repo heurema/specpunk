@@ -121,6 +121,7 @@ pub fn format_goal_summary_line(bus: &Path) -> String {
     let mut awaiting_approval = 0usize;
     let mut done = 0usize;
     let mut failed = 0usize;
+    let mut replan_needed = 0usize;
 
     for goal in list_goals(bus) {
         match goal.status {
@@ -128,15 +129,33 @@ pub fn format_goal_summary_line(bus: &Path) -> String {
             GoalStatus::Paused => paused += 1,
             GoalStatus::AwaitingApproval => awaiting_approval += 1,
             GoalStatus::Done => done += 1,
-            GoalStatus::Failed => failed += 1,
+            GoalStatus::Failed => {
+                failed += 1;
+                if goal.status_reason.as_deref() == Some("replan_needed_dead_end") {
+                    replan_needed += 1;
+                }
+            }
             GoalStatus::Planning => {}
         }
     }
 
     format!(
-        "Goals: active {}, paused {}, awaiting approval {}, done {}, failed {}",
-        active, paused, awaiting_approval, done, failed
+        "Goals: active {}, paused {}, awaiting approval {}, done {}, failed {}, replan-needed {}",
+        active, paused, awaiting_approval, done, failed, replan_needed
     )
+}
+
+/// Return an operator attention line when any failed goals need replan.
+pub fn format_goal_attention_line(bus: &Path) -> Option<String> {
+    let count = list_goals(bus)
+        .into_iter()
+        .filter(|goal| goal.status_reason.as_deref() == Some("replan_needed_dead_end"))
+        .count();
+    if count > 0 {
+        Some(format!("Goal attention: replan dead-end goals ({count})"))
+    } else {
+        None
+    }
 }
 
 /// Load a specific goal.
@@ -513,13 +532,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bus = tmp.path().join("bus");
 
-        for (id, status) in [
-            ("goal-active", GoalStatus::Active),
-            ("goal-paused", GoalStatus::Paused),
-            ("goal-awaiting", GoalStatus::AwaitingApproval),
-            ("goal-done", GoalStatus::Done),
-            ("goal-failed", GoalStatus::Failed),
-            ("goal-planning", GoalStatus::Planning),
+        for (id, status, status_reason) in [
+            ("goal-active", GoalStatus::Active, None),
+            ("goal-paused", GoalStatus::Paused, None),
+            ("goal-awaiting", GoalStatus::AwaitingApproval, None),
+            ("goal-done", GoalStatus::Done, None),
+            (
+                "goal-failed",
+                GoalStatus::Failed,
+                Some("replan_needed_dead_end"),
+            ),
+            ("goal-planning", GoalStatus::Planning, None),
         ] {
             save_goal(
                 &bus,
@@ -531,7 +554,7 @@ mod tests {
                     budget_usd: 1.0,
                     spent_usd: 0.0,
                     status,
-                    status_reason: None,
+                    status_reason: status_reason.map(str::to_string),
                     plan: None,
                     created_at: Utc::now(),
                     completed_at: None,
@@ -546,6 +569,7 @@ mod tests {
         assert!(line.contains("awaiting approval 1"));
         assert!(line.contains("done 1"));
         assert!(line.contains("failed 1"));
+        assert!(line.contains("replan-needed 1"));
     }
 
     #[test]
