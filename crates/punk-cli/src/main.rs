@@ -539,6 +539,9 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
     let project_root = resolve_project_root(repo_root);
     let project = infer_project_id(&project_root).unwrap_or_else(|| status.project_id.clone());
     let follow_up = format!("punk inspect {} --json", proof.id);
+    let outcome = go_outcome_label(&decision.decision);
+    let success = go_decision_succeeds(&decision.decision);
+    let basis_summary = summarize_decision_basis(&decision.decision_basis);
 
     if json {
         println!(
@@ -552,6 +555,9 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
                 "receipt": receipt,
                 "decision": decision,
                 "proof": proof,
+                "outcome": outcome,
+                "success": success,
+                "decision_basis_summary": basis_summary,
                 "follow_up": follow_up,
             }))?
         );
@@ -565,13 +571,15 @@ fn cmd_go(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Resul
                 &run.id,
                 &receipt.status,
                 &receipt.summary,
+                outcome,
                 decision_label(&decision.decision),
+                &basis_summary,
                 &proof.id,
                 &follow_up,
             )
         );
     }
-    if go_decision_succeeds(&decision.decision) {
+    if success {
         Ok(())
     } else {
         Err(anyhow!(format_go_error(
@@ -600,12 +608,14 @@ fn format_go_summary(
     run_id: &str,
     receipt_status: &str,
     receipt_summary: &str,
+    outcome: &str,
     decision: &str,
+    basis_summary: &str,
     proof_id: &str,
     follow_up: &str,
 ) -> String {
     format!(
-        "Goal: {goal}\nProject: {project}\nApproved contract: {contract_id}\nRun: {run_id} ({receipt_status})\nSummary: {receipt_summary}\nGate: {decision}\nProof: {proof_id}\nFollow-up: {follow_up}"
+        "Goal: {goal}\nProject: {project}\nApproved contract: {contract_id}\nRun: {run_id} ({receipt_status})\nSummary: {receipt_summary}\nOutcome: {outcome}\nGate: {decision}\nBasis: {basis_summary}\nProof: {proof_id}\nFollow-up: {follow_up}"
     )
 }
 
@@ -619,6 +629,28 @@ fn decision_label(decision: &punk_domain::Decision) -> &'static str {
 
 fn go_decision_succeeds(decision: &punk_domain::Decision) -> bool {
     matches!(decision, punk_domain::Decision::Accept)
+}
+
+fn go_outcome_label(decision: &punk_domain::Decision) -> &'static str {
+    match decision {
+        punk_domain::Decision::Accept => "success",
+        punk_domain::Decision::Block => "blocked",
+        punk_domain::Decision::Escalate => "escalated",
+    }
+}
+
+fn summarize_decision_basis(basis: &[String]) -> String {
+    let trimmed: Vec<_> = basis
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .take(2)
+        .collect();
+    if trimmed.is_empty() {
+        "no explicit decision basis recorded".to_string()
+    } else {
+        trimmed.join("; ")
+    }
 }
 
 fn format_go_error(decision: &punk_domain::Decision, proof_id: &str, follow_up: &str) -> String {
@@ -1000,7 +1032,9 @@ mod tests {
             "run_456",
             "success",
             "implemented bounded change",
+            "success",
             "accept",
+            "target checks passed; integrity checks passed",
             "proof_789",
             "punk inspect proof_789 --json",
         );
@@ -1009,7 +1043,9 @@ mod tests {
         assert!(rendered.contains("Approved contract: ct_123"));
         assert!(rendered.contains("Run: run_456 (success)"));
         assert!(rendered.contains("Summary: implemented bounded change"));
+        assert!(rendered.contains("Outcome: success"));
         assert!(rendered.contains("Gate: accept"));
+        assert!(rendered.contains("Basis: target checks passed; integrity checks passed"));
         assert!(rendered.contains("Proof: proof_789"));
         assert!(rendered.contains("Follow-up: punk inspect proof_789 --json"));
     }
@@ -1031,6 +1067,32 @@ mod tests {
         assert!(go_decision_succeeds(&punk_domain::Decision::Accept));
         assert!(!go_decision_succeeds(&punk_domain::Decision::Block));
         assert!(!go_decision_succeeds(&punk_domain::Decision::Escalate));
+    }
+
+    #[test]
+    fn go_outcome_labels_follow_decision() {
+        assert_eq!(go_outcome_label(&punk_domain::Decision::Accept), "success");
+        assert_eq!(go_outcome_label(&punk_domain::Decision::Block), "blocked");
+        assert_eq!(
+            go_outcome_label(&punk_domain::Decision::Escalate),
+            "escalated"
+        );
+    }
+
+    #[test]
+    fn summarize_decision_basis_is_concise_and_stable() {
+        assert_eq!(
+            summarize_decision_basis(&[
+                " first reason ".into(),
+                "second reason".into(),
+                "third reason".into(),
+            ]),
+            "first reason; second reason"
+        );
+        assert_eq!(
+            summarize_decision_basis(&[]),
+            "no explicit decision basis recorded"
+        );
     }
 
     #[test]
