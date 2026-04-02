@@ -5,7 +5,7 @@ use chrono::{Duration, Utc};
 use serde_json::Value;
 
 use crate::benchmark::BenchmarkSummary;
-use crate::eval::EvalSummary;
+use crate::eval::{EvalSummary, SkillEvalSummary};
 
 /// Weekly performance metrics computed from receipts.
 #[derive(Debug, Clone)]
@@ -344,6 +344,95 @@ pub fn benchmark_directives(summary: &BenchmarkSummary) -> Vec<RatchetDirective>
     }
 
     directives
+}
+
+pub fn skill_eval_directives(summary: &SkillEvalSummary) -> Vec<RatchetDirective> {
+    let mut directives = Vec::new();
+
+    if summary.avg_candidate_primary_score < 0.7 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Warn,
+            metric: "skill_eval_score",
+            message: format!(
+                "avg skill eval candidate score is low at {:.2}",
+                summary.avg_candidate_primary_score
+            ),
+        });
+    } else if summary.avg_candidate_primary_score >= 0.9 && summary.avg_score_delta >= 0.05 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Ok,
+            metric: "skill_eval_score",
+            message: format!(
+                "avg skill eval candidate score is strong at {:.2}",
+                summary.avg_candidate_primary_score
+            ),
+        });
+    }
+
+    if summary.avg_score_delta <= -0.03 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Warn,
+            metric: "skill_eval_delta",
+            message: format!(
+                "skill eval candidate score regressed by {:.2}",
+                summary.avg_score_delta
+            ),
+        });
+    } else if summary.avg_score_delta >= 0.05 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Ok,
+            metric: "skill_eval_delta",
+            message: format!(
+                "skill eval candidate score improved by +{:.2}",
+                summary.avg_score_delta
+            ),
+        });
+    }
+
+    if summary.rollback_count > 0 {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Warn,
+            metric: "skill_eval_rollbacks",
+            message: format!("{} skill evals recommend rollback", summary.rollback_count),
+        });
+    }
+
+    if summary.reject_count + summary.rollback_count > summary.promote_count {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Warn,
+            metric: "skill_eval_decisions",
+            message: format!(
+                "skill eval decisions skew negative (promote/reject/rollback = {}/{}/{})",
+                summary.promote_count, summary.reject_count, summary.rollback_count
+            ),
+        });
+    } else if summary.promote_count > 0
+        && summary.reject_count == 0
+        && summary.rollback_count == 0
+    {
+        directives.push(RatchetDirective {
+            level: DirectiveLevel::Ok,
+            metric: "skill_eval_decisions",
+            message: format!(
+                "all {} recent skill evals recommend promote",
+                summary.promote_count
+            ),
+        });
+    }
+
+    directives
+}
+
+pub fn format_skill_eval_window(summary: &SkillEvalSummary) -> String {
+    format!(
+        "last {} stored skill evals, avg candidate {:.2}, delta {:+.2}, promote/reject/rollback = {}/{}/{}",
+        summary.total,
+        summary.avg_candidate_primary_score,
+        summary.avg_score_delta,
+        summary.promote_count,
+        summary.reject_count,
+        summary.rollback_count
+    )
 }
 
 pub fn format_directive(directive: &RatchetDirective) -> String {

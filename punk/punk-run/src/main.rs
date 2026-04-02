@@ -1766,6 +1766,10 @@ fn cmd_ratchet() {
     if let Some(summary) = &eval_summary {
         directives.extend(ratchet::eval_directives(summary));
     }
+    let skill_eval_summary = eval::summarize_skill_evals(&cwd, Some(20), None, None).ok();
+    if let Some(summary) = &skill_eval_summary {
+        directives.extend(ratchet::skill_eval_directives(summary));
+    }
     let benchmark_summary = benchmark::summarize_benchmarks(&cwd, Some(20), None, None).ok();
     if let Some(summary) = &benchmark_summary {
         directives.extend(ratchet::benchmark_directives(summary));
@@ -1786,6 +1790,12 @@ fn cmd_ratchet() {
         println!(
             "  Eval window: last {} stored evals, avg score {:.2}, drift {:.2}",
             summary.total, summary.avg_score, summary.avg_drift_penalty
+        );
+    }
+    if let Some(summary) = skill_eval_summary {
+        println!(
+            "  Skill eval window: {}",
+            ratchet::format_skill_eval_window(&summary)
         );
     }
     if let Some(summary) = benchmark_summary {
