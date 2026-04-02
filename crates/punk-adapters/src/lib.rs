@@ -420,29 +420,34 @@ impl CodexCliContractDrafter {
         let _ = fs::remove_file(&output_path);
         fs::write(&schema_path, serde_json::to_vec_pretty(&draft_schema())?)?;
 
-        let result = match self.run_json_prompt_once(prompt, repo_root, &schema_path, &output_path)
-        {
+        let total_timeout = codex_drafter_timeout();
+        let (primary_timeout, retry_timeout) =
+            drafter_attempt_timeouts(total_timeout, retry_prompt.is_some());
+        let result = match self.run_json_prompt_once(
+            prompt,
+            repo_root,
+            &schema_path,
+            &output_path,
+            primary_timeout,
+        ) {
             Ok(proposal) => Ok(proposal),
             Err(DrafterAttemptError::TimedOut { stdout, stderr }) => {
-                if let Some(retry_prompt) = retry_prompt {
+                if let (Some(retry_prompt), Some(retry_timeout)) = (retry_prompt, retry_timeout) {
                     match self.run_json_prompt_once(
                         &retry_prompt,
                         repo_root,
                         &schema_path,
                         &output_path,
+                        retry_timeout,
                     ) {
                         Ok(proposal) => Ok(proposal),
-                        Err(DrafterAttemptError::TimedOut { stdout, stderr }) => Err(anyhow!(
-                            timeout_summary(codex_drafter_timeout(), &stdout, &stderr)
-                        )),
+                        Err(DrafterAttemptError::TimedOut { stdout, stderr }) => {
+                            Err(anyhow!(timeout_summary(total_timeout, &stdout, &stderr)))
+                        }
                         Err(DrafterAttemptError::Failed(err)) => Err(err),
                     }
                 } else {
-                    Err(anyhow!(timeout_summary(
-                        codex_drafter_timeout(),
-                        &stdout,
-                        &stderr
-                    )))
+                    Err(anyhow!(timeout_summary(total_timeout, &stdout, &stderr)))
                 }
             }
             Err(DrafterAttemptError::Failed(err)) => Err(err),
@@ -459,6 +464,7 @@ impl CodexCliContractDrafter {
         repo_root: &str,
         schema_path: &std::path::Path,
         output_path: &std::path::Path,
+        timeout: Duration,
     ) -> std::result::Result<DraftProposal, DrafterAttemptError> {
         let _ = fs::remove_file(output_path);
         let mut command = Command::new("codex");
@@ -481,12 +487,9 @@ impl CodexCliContractDrafter {
         }
         command.arg(prompt);
 
-        let output =
-            run_command_with_timeout(&mut command, codex_drafter_timeout()).map_err(|err| {
-                DrafterAttemptError::Failed(
-                    err.context(format!("spawn codex drafter in {repo_root}")),
-                )
-            })?;
+        let output = run_command_with_timeout(&mut command, timeout).map_err(|err| {
+            DrafterAttemptError::Failed(err.context(format!("spawn codex drafter in {repo_root}")))
+        })?;
         let stdout = String::from_utf8_lossy(&output.output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.output.stderr).to_string();
         if output.timed_out {
@@ -1304,8 +1307,34 @@ fn codex_drafter_timeout() -> Duration {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(90);
+        .unwrap_or(30);
     Duration::from_secs(seconds)
+}
+
+fn drafter_attempt_timeouts(
+    total_timeout: Duration,
+    retry_enabled: bool,
+) -> (Duration, Option<Duration>) {
+    if !retry_enabled {
+        return (total_timeout, None);
+    }
+
+    let total_millis = total_timeout.as_millis() as u64;
+    if total_millis < 1_500 {
+        return (total_timeout, None);
+    }
+
+    let retry_millis = (total_millis / 3)
+        .max(5_000)
+        .min(total_millis.saturating_sub(1_000));
+    if retry_millis == 0 || retry_millis >= total_millis {
+        return (total_timeout, None);
+    }
+
+    (
+        Duration::from_millis(total_millis - retry_millis),
+        Some(Duration::from_millis(retry_millis)),
+    )
 }
 
 fn codex_executor_reasoning_effort(contract: &Contract) -> Option<&'static str> {
@@ -3053,6 +3082,10 @@ mod tests {
     use super::*;
     use punk_domain::RepoScanSummary;
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn build_exec_prompt_mentions_scope_when_present() {
@@ -3079,6 +3112,101 @@ mod tests {
         assert!(prompt.contains("Do not perform broad repo-wide search."));
         assert!(prompt.contains(blocked_execution_template()));
         assert!(prompt.contains(successful_execution_template()));
+    }
+
+    #[test]
+    fn drafter_attempt_timeouts_reserve_retry_budget() {
+        let (primary, retry) = drafter_attempt_timeouts(Duration::from_secs(30), true);
+        assert_eq!(primary, Duration::from_secs(20));
+        assert_eq!(retry, Some(Duration::from_secs(10)));
+
+        let (primary, retry) = drafter_attempt_timeouts(Duration::from_secs(1), true);
+        assert_eq!(primary, Duration::from_secs(1));
+        assert_eq!(retry, None);
+    }
+
+    #[test]
+    fn codex_drafter_timeout_is_total_budget_across_retry_attempts() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-drafter-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let fake_bin = root.join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let fake_codex = fake_bin.join("codex");
+        fs::write(
+            &fake_codex,
+            "#!/usr/bin/env python3\nimport time\ntime.sleep(5)\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&fake_codex).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_codex, perms).unwrap();
+        }
+
+        let old_path = std::env::var_os("PATH");
+        let old_timeout = std::env::var_os("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
+        std::env::set_var(
+            "PATH",
+            std::env::join_paths(
+                [fake_bin.clone()]
+                    .into_iter()
+                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
+            )
+            .unwrap(),
+        );
+        std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", "3");
+
+        let drafter = CodexCliContractDrafter::default();
+        let input = DraftInput {
+            repo_root: root.display().to_string(),
+            prompt: "bounded prompt".into(),
+            scan: RepoScanSummary {
+                project_kind: "generic".into(),
+                manifests: vec![],
+                package_manager: None,
+                available_scripts: BTreeMap::new(),
+                candidate_entry_points: vec![],
+                candidate_scope_paths: vec![],
+                candidate_file_scope_paths: vec![],
+                candidate_directory_scope_paths: vec![],
+                candidate_target_checks: vec!["true".into()],
+                candidate_integrity_checks: vec!["true".into()],
+                notes: vec![],
+            },
+        };
+
+        let start = Instant::now();
+        let err = drafter.draft(input).unwrap_err().to_string();
+        let elapsed = start.elapsed();
+
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        if let Some(timeout) = old_timeout {
+            std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", timeout);
+        } else {
+            std::env::remove_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
+        }
+
+        assert!(err.contains("timed out after 3s"), "{err}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drafter elapsed too long: {elapsed:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

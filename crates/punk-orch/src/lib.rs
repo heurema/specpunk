@@ -56,6 +56,10 @@ pub struct OrchService {
     events: EventStore,
 }
 
+fn phase_error<T>(phase: &str, result: Result<T>) -> Result<T> {
+    result.map_err(|err| anyhow!("phase {phase}: {err}"))
+}
+
 impl OrchService {
     pub fn new(repo_root: impl AsRef<Path>, global_root: impl AsRef<Path>) -> Result<Self> {
         let repo_root = repo_root.as_ref().to_path_buf();
@@ -136,25 +140,30 @@ impl OrchService {
         if prompt.trim().is_empty() {
             return Err(anyhow!("prompt must not be empty"));
         }
-        let project = self.bootstrap_project()?;
-        let scan = scan_repo(&self.paths.repo_root, prompt)?;
+        let trimmed_prompt = prompt.trim();
+        let project = phase_error("bootstrap", self.bootstrap_project())?;
+        let scan = phase_error(
+            "repo scan",
+            scan_repo(&self.paths.repo_root, trimmed_prompt),
+        )?;
         if scan.candidate_integrity_checks.is_empty() {
             return Err(anyhow!(
+                "phase repo scan: {}",
                 "unable to infer trustworthy integrity checks from repo scan"
             ));
         }
         let input = DraftInput {
             repo_root: self.paths.repo_root.display().to_string(),
-            prompt: prompt.trim().to_string(),
+            prompt: trimmed_prompt.to_string(),
             scan: scan.clone(),
         };
-        let mut proposal = drafter.draft(input)?;
-        canonicalize_draft_proposal(&self.paths.repo_root, prompt.trim(), &mut proposal);
+        let mut proposal = phase_error("drafter request", drafter.draft(input))?;
+        canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
         let mut errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
         if errors.is_empty() {
             if let Some(fallback) = build_bounded_fallback_proposal(
                 &self.paths.repo_root,
-                prompt.trim(),
+                trimmed_prompt,
                 &proposal,
                 &scan,
                 &errors,
@@ -164,19 +173,22 @@ impl OrchService {
             }
         }
         if !errors.is_empty() {
-            proposal = drafter.refine(RefineInput {
-                repo_root: self.paths.repo_root.display().to_string(),
-                prompt: prompt.trim().to_string(),
-                guidance: format_validation_guidance(&errors),
-                current: proposal,
-                scan: scan.clone(),
-            })?;
-            canonicalize_draft_proposal(&self.paths.repo_root, prompt.trim(), &mut proposal);
+            proposal = phase_error(
+                "drafter repair",
+                drafter.refine(RefineInput {
+                    repo_root: self.paths.repo_root.display().to_string(),
+                    prompt: trimmed_prompt.to_string(),
+                    guidance: format_validation_guidance(&errors),
+                    current: proposal,
+                    scan: scan.clone(),
+                }),
+            )?;
+            canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
             errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             if errors.is_empty() {
                 if let Some(fallback) = build_bounded_fallback_proposal(
                     &self.paths.repo_root,
-                    prompt.trim(),
+                    trimmed_prompt,
                     &proposal,
                     &scan,
                     &errors,
@@ -189,7 +201,7 @@ impl OrchService {
         if !errors.is_empty() {
             if let Some(fallback) = build_bounded_fallback_proposal(
                 &self.paths.repo_root,
-                prompt.trim(),
+                trimmed_prompt,
                 &proposal,
                 &scan,
                 &errors,
@@ -200,22 +212,42 @@ impl OrchService {
         }
         if !errors.is_empty() {
             return Err(anyhow!(
-                "draft proposal invalid after repair: {}",
+                "phase validate: draft proposal invalid after repair: {}",
                 format_validation_guidance(&errors)
             ));
         }
-        let (feature, contract) = self.persist_draft_contract(&project, prompt, &proposal)?;
+        let (feature, contract) = phase_error(
+            "persist",
+            self.persist_draft_contract(&project, prompt, &proposal),
+        )?;
         let contract_dir = self.paths.contracts_dir.join(&feature.id);
-        fs::create_dir_all(&contract_dir)?;
+        phase_error(
+            "persist",
+            fs::create_dir_all(&contract_dir).map_err(Into::into),
+        )?;
         let contract_path = contract_dir.join("v1.json");
-        self.append_event(
-            &project.id,
-            Some(&feature.id),
-            None,
-            None,
-            ModeId::Plot,
-            "contract.drafted",
-            Some(&contract_path),
+        if !self
+            .paths
+            .features_dir
+            .join(format!("{}.json", feature.id))
+            .exists()
+            || !contract_path.exists()
+        {
+            return Err(anyhow!(
+                "phase persist: draft artifacts missing after write"
+            ));
+        }
+        phase_error(
+            "persist",
+            self.append_event(
+                &project.id,
+                Some(&feature.id),
+                None,
+                None,
+                ModeId::Plot,
+                "contract.drafted",
+                Some(&contract_path),
+            ),
         )?;
         Ok(contract)
     }
@@ -1369,6 +1401,22 @@ mod tests {
         }
     }
 
+    struct FailingDrafter;
+
+    impl ContractDrafter for FailingDrafter {
+        fn name(&self) -> &'static str {
+            "failing-drafter"
+        }
+
+        fn draft(&self, _input: DraftInput) -> Result<DraftProposal> {
+            Err(anyhow!("simulated drafter failure"))
+        }
+
+        fn refine(&self, _input: RefineInput) -> Result<DraftProposal> {
+            Err(anyhow!("simulated refine failure"))
+        }
+    }
+
     #[test]
     fn draft_and_approve_contract() {
         let root = std::env::temp_dir().join(format!("punk-orch-{}", std::process::id()));
@@ -1687,6 +1735,37 @@ mod tests {
             .unwrap();
         assert_eq!(refined.id, contract.id);
         assert_eq!(refined.version, contract.version);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_reports_phase_for_drafter_failures() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-draft-phase-error-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let err = service
+            .draft_contract(&FailingDrafter, "add file")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("phase drafter request"));
+        assert!(err.contains("simulated drafter failure"));
+
         let _ = fs::remove_dir_all(&root);
     }
 
