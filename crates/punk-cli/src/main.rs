@@ -26,6 +26,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Init(InitCommand),
     Start(StartCommand),
     Plot(PlotCommand),
     Cut(CutCommand),
@@ -33,6 +34,16 @@ enum Command {
     Status(StatusCommand),
     Inspect(InspectCommand),
     Vcs(VcsCommand),
+}
+
+#[derive(Args)]
+struct InitCommand {
+    #[arg(long)]
+    project: Option<String>,
+    #[arg(long)]
+    enable_jj: bool,
+    #[arg(long)]
+    verify: bool,
 }
 
 #[derive(Args)]
@@ -146,6 +157,12 @@ fn run() -> Result<()> {
     }
 
     match cli.command {
+        Command::Init(init) => cmd_init(
+            &repo_root,
+            init.project.as_deref(),
+            init.enable_jj,
+            init.verify,
+        ),
         Command::Start(start) => cmd_start(&repo_root, &global_root, &start.goal, start.json),
         Command::Plot(plot) => match plot.action {
             PlotAction::Contract { prompt, json } => {
@@ -429,6 +446,35 @@ fn format_bootstrap_skip_note(project_id: &str, reason: &str) -> String {
     )
 }
 
+fn cmd_init(
+    repo_root: &Path,
+    explicit_project: Option<&str>,
+    enable_jj: bool,
+    verify: bool,
+) -> Result<()> {
+    let project_root = resolve_project_root(repo_root);
+    let project_id = resolve_init_project_id(&project_root, explicit_project)?;
+    let output = run_explicit_project_init(&project_root, &project_id, enable_jj, verify)?;
+
+    if !output.stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let reason = output
+        .status
+        .code()
+        .map(|code| format!("punk-run init exited with code {code}"))
+        .unwrap_or_else(|| "punk-run init terminated by signal".to_string());
+    Err(anyhow!(format_init_error(&project_id, &reason)))
+}
+
 fn cmd_start(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Result<()> {
     let trimmed_goal = goal.trim();
     if trimmed_goal.is_empty() {
@@ -474,8 +520,59 @@ fn format_start_summary(
     )
 }
 
+fn resolve_init_project_id(project_root: &Path, explicit_project: Option<&str>) -> Result<String> {
+    if let Some(project) = explicit_project
+        .map(str::trim)
+        .filter(|project| !project.is_empty())
+    {
+        return Ok(project.to_string());
+    }
+    infer_project_id(project_root).ok_or_else(|| {
+        anyhow!("unable to infer project id from repo root; rerun with `punk init --project <id>`")
+    })
+}
+
+fn run_explicit_project_init(
+    project_root: &Path,
+    project_id: &str,
+    enable_jj: bool,
+    verify: bool,
+) -> Result<std::process::Output> {
+    match detect_punk_run_bootstrap_support(project_root) {
+        BootstrapSupport::Supported => {
+            let mut command = ProcessCommand::new("punk-run");
+            command
+                .current_dir(project_root)
+                .arg("init")
+                .arg("--project")
+                .arg(project_id);
+            if enable_jj {
+                command.arg("--enable-jj");
+            }
+            if verify {
+                command.arg("--verify");
+            }
+            command.output().map_err(|err| {
+                anyhow!(format_init_error(
+                    project_id,
+                    &format!("failed to execute punk-run: {err}")
+                ))
+            })
+        }
+        BootstrapSupport::Unavailable(reason) | BootstrapSupport::Incompatible(reason) => {
+            Err(anyhow!(format_init_error(project_id, &reason)))
+        }
+    }
+}
+
+fn format_init_error(project_id: &str, reason: &str) -> String {
+    format!(
+        "project init failed for `{project_id}`: {reason}. Ensure a compatible `punk-run init --project ...` is available and retry."
+    )
+}
+
 fn maybe_warn_jj_degraded_mode(repo_root: &PathBuf, command: &Command) {
-    if matches!(command, Command::Vcs(_)) {
+    if matches!(command, Command::Vcs(_) | Command::Init(_)) {
         return;
     }
     if should_warn_about_disabled_jj(detect_vcs_mode(repo_root)) {
@@ -777,5 +874,29 @@ mod tests {
         assert!(rendered.contains("Project: interviewcoach"));
         assert!(rendered.contains("Drafted contract: ct_123"));
         assert!(rendered.contains("Next: punk plot approve ct_123"));
+    }
+
+    #[test]
+    fn resolve_init_project_id_prefers_explicit_then_repo_basename() {
+        let root = PathBuf::from("/tmp/interviewcoach");
+        assert_eq!(
+            resolve_init_project_id(&root, Some("custom-project")).unwrap(),
+            "custom-project"
+        );
+        assert_eq!(
+            resolve_init_project_id(&root, None).unwrap(),
+            "interviewcoach"
+        );
+    }
+
+    #[test]
+    fn init_error_mentions_punk_run_requirement() {
+        let rendered = format_init_error(
+            "interviewcoach",
+            "compatible `punk-run init --project ...` support not detected",
+        );
+        assert!(rendered.contains("project init failed"));
+        assert!(rendered.contains("compatible `punk-run init --project ...` support not detected"));
+        assert!(rendered.contains("Ensure a compatible `punk-run init --project ...` is available"));
     }
 }
