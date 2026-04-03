@@ -58,6 +58,11 @@ Update docs in the same diff when behavior changes:
 - `docs/product/NORTH-ROADMAP.md` when strategic status changes
 - relevant `docs/research/*.md` note when a strategic track gains new evidence
 
+When proposing a bounded slice, name:
+
+- which primitive it touches
+- whether it changes a primitive or only a derived mechanism
+
 ## Reliability rules
 
 - If a bug came from external dogfood, add a regression or fixture note if possible

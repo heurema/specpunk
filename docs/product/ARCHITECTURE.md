@@ -126,6 +126,30 @@ Derived mechanisms are compositions over those primitives:
 - eval
 - research protocols
 
+### Derived mechanism map
+
+The first practical mapping should stay explicit:
+
+| Mechanism | Type | Primary primitives touched |
+|---|---|---|
+| `init` | shell bootstrap | `Project`, `Ledger` |
+| `start` | staged shell intake | `Goal`, `Contract`, `Scope` |
+| `go` | autonomous shell intake | `Goal`, `Contract`, `Run`, `DecisionObject`, `Proofpack`, `Ledger` |
+| staged fallback | shell recovery | `Contract`, `DecisionObject`, `Ledger` |
+| `plot` | substrate permission boundary | `Contract`, `Scope` |
+| `cut` | substrate permission boundary | `Workspace`, `Run` |
+| `gate` | substrate permission boundary | `DecisionObject`, `Proofpack` |
+| `status` | shell read surface | `Ledger` projections |
+| `inspect` | shell read surface | canonical artifacts + `Ledger` projections |
+| project overlays | derived project-intelligence mechanism | `Project`, `Ledger` |
+| `council` | derived advisory subsystem | packets + artifacts |
+| `eval` | derived ratchet subsystem | artifacts + baselines |
+| `research` | derived bounded inquiry subsystem | packets + artifacts + synthesis |
+
+Contributor rule:
+
+> every roadmap item, proposal, or implementation slice should be able to answer: which primitive does this touch, and is this a primitive change or a derived mechanism change?
+
 ---
 
 ## 3. First vertical slice

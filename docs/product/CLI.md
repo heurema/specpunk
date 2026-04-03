@@ -48,6 +48,27 @@ Prompt examples:
 
 These are the preferred user-facing commands in the current v0/v0.1 surface.
 
+### Primitive vs mechanism rule
+
+The commands below are not all ontology-level primitives.
+
+- `Project`, `Goal`, `Contract`, `Scope`, `Workspace`, `Run`, `DecisionObject`, `Proofpack`, and `Ledger` are the deeper primitives.
+- shell commands such as `init`, `start`, `go`, `status`, and `inspect` are mechanisms built over those primitives.
+- `plot`, `cut`, and `gate` are best understood as permission boundaries over primitive operations.
+
+### Command-to-primitive map
+
+| Command/mechanism | Type | Primary primitives touched |
+|---|---|---|
+| `punk init` | shell bootstrap | `Project`, `Ledger` |
+| `punk start` | staged shell intake | `Goal`, `Contract`, `Scope` |
+| `punk go --fallback-staged` | autonomous shell intake | `Goal`, `Contract`, `Run`, `DecisionObject`, `Proofpack`, `Ledger` |
+| `punk plot ...` | substrate permission boundary | `Contract`, `Scope` |
+| `punk cut run ...` | substrate permission boundary | `Workspace`, `Run`, `Receipt` |
+| `punk gate ...` | substrate permission boundary | `DecisionObject`, `Proofpack` |
+| `punk status` | shell read surface | `Ledger` projections |
+| `punk inspect` | shell read surface | canonical artifacts + `Ledger` projections |
+
 ### Project bootstrap
 
 ```bash
@@ -288,6 +309,7 @@ Writes:
 4. All inspectable commands should support structured output.
 5. Plain user goals should route through `punk go --fallback-staged "<goal>"` by default.
 6. `punk start "<goal>"` remains the staged/manual escape hatch.
+7. New command proposals should state whether they introduce a new primitive or only a new derived mechanism; the default expectation is derived mechanism.
 
 ---
 
