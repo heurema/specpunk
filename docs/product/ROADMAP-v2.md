@@ -4,6 +4,14 @@ Last updated: 2026-03-27
 Owner: Vitaly
 Status: active
 
+## Related strategic roadmap
+
+For the durable strategic backlog and research-linked long-horizon tracks, read:
+
+- `docs/product/NORTH-ROADMAP.md`
+
+`ROADMAP-v2.md` remains the implementation roadmap. `NORTH-ROADMAP.md` is the strategic map for work that must survive across sessions and contributors.
+
 ## Mission
 
 Build a CLI-first agent orchestration platform that lets a solo founder set goals
