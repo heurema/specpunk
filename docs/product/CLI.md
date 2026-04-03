@@ -115,6 +115,11 @@ Current work-ledger inspect surface:
 - `punk inspect work <id>`
 - `punk inspect work <id> --json`
 
+Current status behavior:
+
+- `punk status` now prefers `WorkLedgerView` for current work continuity fields
+- latest work/lifecycle/next-action data should come from the derived work view, not direct raw-event scanning
+
 Longer-term shell expectation:
 
 - project bootstrap and shell status should keep converging on this same inspectable project-intelligence packet

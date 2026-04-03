@@ -247,22 +247,7 @@ fn run() -> Result<()> {
         Command::Status(status) => {
             let orch = OrchService::new(&repo_root, &global_root)?;
             let snapshot = orch.status(status.id.as_deref())?;
-            render(
-                status.json,
-                &snapshot,
-                &format!(
-                    "project={} events={} contract={:?} run={:?} decision={:?} vcs={:?} ref={:?} dirty={} workspace_root={:?}",
-                    snapshot.project_id,
-                    snapshot.events_count,
-                    snapshot.last_contract_id,
-                    snapshot.last_run_id,
-                    snapshot.last_decision_id,
-                    snapshot.vcs_backend,
-                    snapshot.vcs_ref,
-                    snapshot.vcs_dirty,
-                    snapshot.workspace_root
-                ),
-            )
+            render(status.json, &snapshot, &format_status_summary(&snapshot))
         }
         Command::Inspect(inspect) => {
             let orch = OrchService::new(&repo_root, &global_root)?;
@@ -328,6 +313,26 @@ fn format_gate_run_summary(
         status.vcs_ref,
         status.vcs_dirty,
         status.workspace_root
+    )
+}
+
+fn format_status_summary(snapshot: &punk_orch::StatusSnapshot) -> String {
+    format!(
+        "project={} events={} work={:?} lifecycle={:?} contract={:?} run={:?} decision={:?} next_action={:?} next_action_ref={:?} blocked_reason={:?} vcs={:?} ref={:?} dirty={} workspace_root={:?}",
+        snapshot.project_id,
+        snapshot.events_count,
+        snapshot.work_id,
+        snapshot.lifecycle_state,
+        snapshot.last_contract_id,
+        snapshot.last_run_id,
+        snapshot.last_decision_id,
+        snapshot.next_action,
+        snapshot.next_action_ref,
+        snapshot.blocked_reason,
+        snapshot.vcs_backend,
+        snapshot.vcs_ref,
+        snapshot.vcs_dirty,
+        snapshot.workspace_root
     )
 }
 
@@ -1110,6 +1115,11 @@ mod tests {
         let status = punk_orch::StatusSnapshot {
             project_id: "proj".into(),
             events_count: 1,
+            work_id: Some("feat_1".into()),
+            lifecycle_state: Some("accepted".into()),
+            blocked_reason: None,
+            next_action: Some("inspect_proof".into()),
+            next_action_ref: Some("proof_1".into()),
             last_contract_id: Some("ct_1".into()),
             last_run_id: Some("run_1".into()),
             last_decision_id: Some("dec_1".into()),
@@ -1123,6 +1133,31 @@ mod tests {
         assert!(rendered.contains("vcs=Some(Jj)"));
         assert!(rendered.contains("ref=Some(\"abc123\")"));
         assert!(rendered.contains("dirty=true"));
+    }
+
+    #[test]
+    fn status_summary_mentions_work_lifecycle_and_next_action() {
+        let snapshot = punk_orch::StatusSnapshot {
+            project_id: "proj".into(),
+            events_count: 3,
+            work_id: Some("feat_1".into()),
+            lifecycle_state: Some("accepted".into()),
+            blocked_reason: None,
+            next_action: Some("inspect_proof".into()),
+            next_action_ref: Some("proof_1".into()),
+            last_contract_id: Some("ct_1".into()),
+            last_run_id: Some("run_1".into()),
+            last_decision_id: Some("dec_1".into()),
+            vcs_backend: Some(VcsKind::Jj),
+            vcs_ref: Some("abc123".into()),
+            vcs_dirty: false,
+            workspace_root: Some("/repo".into()),
+        };
+        let rendered = format_status_summary(&snapshot);
+        assert!(rendered.contains("work=Some(\"feat_1\")"));
+        assert!(rendered.contains("lifecycle=Some(\"accepted\")"));
+        assert!(rendered.contains("next_action=Some(\"inspect_proof\")"));
+        assert!(rendered.contains("next_action_ref=Some(\"proof_1\")"));
     }
 
     #[test]

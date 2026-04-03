@@ -42,6 +42,11 @@ pub struct RepoPaths {
 pub struct StatusSnapshot {
     pub project_id: String,
     pub events_count: usize,
+    pub work_id: Option<String>,
+    pub lifecycle_state: Option<String>,
+    pub blocked_reason: Option<String>,
+    pub next_action: Option<String>,
+    pub next_action_ref: Option<String>,
     pub last_contract_id: Option<String>,
     pub last_run_id: Option<String>,
     pub last_decision_id: Option<String>,
@@ -738,110 +743,47 @@ impl OrchService {
             .ok()
             .and_then(|backend| backend.workspace_root().ok())
             .map(|path| path.display().to_string());
-        if let Some(id) = id {
-            let value = self.inspect(id)?;
-            let last_run_id = value
-                .get("run_id")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned)
-                .or_else(|| {
-                    value
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .filter(|v| v.starts_with("run_"))
-                        .map(ToOwned::to_owned)
-                });
-            let last_contract_id = value
-                .get("contract_id")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned)
-                .or_else(|| {
-                    value
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .filter(|v| v.starts_with("ct_"))
-                        .map(ToOwned::to_owned)
-                });
-            let last_decision_id = value
-                .get("decision_id")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned)
-                .or_else(|| {
-                    value
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .filter(|v| v.starts_with("dec_"))
-                        .map(ToOwned::to_owned)
-                });
-            return Ok(StatusSnapshot {
-                project_id: project.id,
-                events_count: events.len(),
-                last_contract_id,
-                last_run_id,
-                last_decision_id,
-                vcs_backend: vcs_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.vcs.clone()),
-                vcs_ref: vcs_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.head_ref.clone()),
-                vcs_dirty: vcs_snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.dirty)
-                    .unwrap_or(false),
-                workspace_root,
-            });
-        }
-        let mut last_contract_id = None;
-        let mut last_run_id = None;
-        let mut last_decision_id = None;
-        for event in events.iter().filter(|event| event.project_id == project.id) {
-            match event.kind.as_str() {
-                "contract.drafted" | "contract.refined" | "contract.approved" => {
-                    if let Some(path) = &event.payload_ref {
-                        if let Ok(value) =
-                            read_json::<serde_json::Value>(&self.paths.repo_root.join(path))
-                        {
-                            last_contract_id = value
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .map(ToOwned::to_owned);
-                        }
-                    }
-                }
-                "run.started" | "run.finished" => {
-                    if let Some(path) = &event.payload_ref {
-                        if let Ok(value) =
-                            read_json::<serde_json::Value>(&self.paths.repo_root.join(path))
-                        {
-                            last_run_id = value
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .map(ToOwned::to_owned);
-                        }
-                    }
-                }
-                "decision.written" => {
-                    if let Some(path) = &event.payload_ref {
-                        if let Ok(value) =
-                            read_json::<serde_json::Value>(&self.paths.repo_root.join(path))
-                        {
-                            last_decision_id = value
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .map(ToOwned::to_owned);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        let ledger = match id {
+            Some(id) if id == project.id => self.inspect_work_ledger(None).ok(),
+            Some(id) => self.inspect_work_ledger(Some(id)).ok(),
+            None => self.inspect_work_ledger(None).ok(),
+        };
+
         Ok(StatusSnapshot {
             project_id: project.id,
             events_count: events.len(),
-            last_contract_id,
-            last_run_id,
-            last_decision_id,
+            work_id: ledger.as_ref().map(|ledger| ledger.work_id.clone()),
+            lifecycle_state: ledger.as_ref().map(|ledger| ledger.lifecycle_state.clone()),
+            blocked_reason: ledger
+                .as_ref()
+                .and_then(|ledger| ledger.blocked_reason.clone()),
+            next_action: ledger
+                .as_ref()
+                .and_then(|ledger| ledger.next_action.clone()),
+            next_action_ref: ledger
+                .as_ref()
+                .and_then(|ledger| ledger.next_action_ref.clone()),
+            last_contract_id: ledger.as_ref().and_then(|ledger| {
+                work_object_id_from_ref(
+                    &self.paths.repo_root,
+                    ledger.active_contract_ref.as_deref(),
+                    "ct_",
+                )
+            }),
+            last_run_id: ledger.as_ref().and_then(|ledger| {
+                work_object_id_from_ref(
+                    &self.paths.repo_root,
+                    ledger.latest_run_ref.as_deref(),
+                    "run_",
+                )
+            }),
+            last_decision_id: ledger.as_ref().and_then(|ledger| {
+                work_object_id_from_ref(
+                    &self.paths.repo_root,
+                    ledger.latest_decision_ref.as_deref(),
+                    "dec_",
+                )
+            }),
             vcs_backend: vcs_snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.vcs.clone()),
@@ -1555,6 +1497,21 @@ fn work_updated_at(
         timestamps.push(proof.created_at.clone());
     }
     timestamps.into_iter().max().unwrap_or_else(now_rfc3339)
+}
+
+fn work_object_id_from_ref(
+    repo_root: &Path,
+    reference: Option<&str>,
+    prefix: &str,
+) -> Option<String> {
+    let path = repo_root.join(reference?);
+    let value: serde_json::Value = read_json(&path).ok()?;
+    let id = value.get("id")?.as_str()?;
+    if id.starts_with(prefix) {
+        Some(id.to_string())
+    } else {
+        None
+    }
 }
 
 fn summarize_prompt(prompt: &str) -> String {
@@ -3052,6 +3009,34 @@ mod tests {
         assert_eq!(via_decision.work_id, ledger.work_id);
         let via_proof = service.inspect_work_ledger(Some(&proof.id)).unwrap();
         assert_eq!(via_proof.work_id, ledger.work_id);
+
+        let status = service.status(None).unwrap();
+        assert_eq!(status.work_id.as_deref(), Some(ledger.work_id.as_str()));
+        assert_eq!(status.lifecycle_state.as_deref(), Some("accepted"));
+        assert_eq!(status.next_action.as_deref(), Some("inspect_proof"));
+        assert_eq!(status.next_action_ref.as_deref(), Some(proof.id.as_str()));
+        assert_eq!(
+            status.last_contract_id.as_deref(),
+            Some(contract.id.as_str())
+        );
+        assert_eq!(status.last_run_id.as_deref(), Some(run.id.as_str()));
+        assert_eq!(
+            status.last_decision_id.as_deref(),
+            Some(decision.id.as_str())
+        );
+
+        let status_for_run = service.status(Some(&run.id)).unwrap();
+        assert_eq!(
+            status_for_run.work_id.as_deref(),
+            Some(ledger.work_id.as_str())
+        );
+        let status_for_project = service
+            .status(Some(&service.bootstrap_project().unwrap().id))
+            .unwrap();
+        assert_eq!(
+            status_for_project.work_id.as_deref(),
+            Some(ledger.work_id.as_str())
+        );
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);

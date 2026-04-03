@@ -524,6 +524,8 @@ The current bounded implementation surface is:
 - `punk inspect work <id>`
 - `punk inspect work <id> --json`
 
+`punk status` should now prefer this derived view for current work continuity fields instead of reconstructing latest state directly from raw events.
+
 This is still a derived repo-local view over existing artifacts, not a new persistence layer.
 
 ### Important rules
