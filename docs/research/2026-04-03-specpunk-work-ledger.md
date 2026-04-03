@@ -131,12 +131,31 @@ Once introduced, these commands or surfaces should read from it first:
 - do not redesign every existing event schema in one shot
 - do not replace append-only events before the object model is explicit
 
+## Current implementation status
+
+The first bounded implementation slice now exists:
+
+- `punk inspect work`
+- `punk inspect work <id>`
+- `punk inspect work <id> --json`
+
+The current v1 derives `WorkLedgerView` from existing repo-local artifacts:
+
+- `Feature`
+- `Contract`
+- `Run`
+- `Receipt`
+- `DecisionObject`
+- `Proofpack`
+
+without introducing a new persistence layer yet.
+
 ## Recommended next slices
 
-1. Define a `WorkLedgerView` projection over existing objects
-2. Materialize one view record per active work item from the existing event stream
-3. Add `punk inspect work <id>` style query surface
-4. Backfill latest contract/run/decision/proof linkage into one materialized view
+1. Make `status` prefer `WorkLedgerView` over ad hoc latest-artifact inference
+2. Materialize one durable view record per active work item from the existing event stream
+3. Backfill stronger latest contract/run/decision/proof linkage into one materialized view
+4. Feed blocked/autonomous recovery state into the same work-ledger projection
 
 ## Acceptance evidence
 

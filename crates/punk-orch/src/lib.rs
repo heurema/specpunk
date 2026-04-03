@@ -76,6 +76,24 @@ pub struct ProjectOverlay {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkLedgerView {
+    pub project_id: String,
+    pub work_id: String,
+    pub goal_ref: Option<String>,
+    pub feature_ref: String,
+    pub active_contract_ref: Option<String>,
+    pub latest_run_ref: Option<String>,
+    pub latest_receipt_ref: Option<String>,
+    pub latest_decision_ref: Option<String>,
+    pub latest_proof_ref: Option<String>,
+    pub lifecycle_state: String,
+    pub blocked_reason: Option<String>,
+    pub next_action: Option<String>,
+    pub next_action_ref: Option<String>,
+    pub updated_at: String,
+}
+
 pub struct OrchService {
     paths: RepoPaths,
     events: EventStore,
@@ -868,6 +886,15 @@ impl OrchService {
         Err(anyhow!("unknown id: {id}"))
     }
 
+    pub fn inspect_work_ledger(&self, id: Option<&str>) -> Result<WorkLedgerView> {
+        let project = self.bootstrap_project()?;
+        let feature_id = match id {
+            Some(id) => self.resolve_feature_id_for_work(id)?,
+            None => self.latest_feature_id_for_project(&project.id)?,
+        };
+        self.build_work_ledger_view(&project, &feature_id)
+    }
+
     pub fn inspect_project_overlay(&self) -> Result<ProjectOverlay> {
         let project = self.bootstrap_project()?;
         let project_label = project_label(&self.paths.repo_root);
@@ -945,6 +972,183 @@ impl OrchService {
             status_scope_mode: format!("project:{}", project.id),
             updated_at: project.updated_at,
         })
+    }
+
+    fn build_work_ledger_view(
+        &self,
+        project: &Project,
+        feature_id: &str,
+    ) -> Result<WorkLedgerView> {
+        let feature_path = self.paths.features_dir.join(format!("{feature_id}.json"));
+        let feature: Feature = read_json(&feature_path)?;
+        let feature_ref = relative_ref(&self.paths.repo_root, &feature_path)?;
+
+        let contracts = work_contract_records(&self.paths.contracts_dir, feature_id)?;
+        let active_contract = contracts.into_iter().max_by(|left, right| {
+            left.contract
+                .version
+                .cmp(&right.contract.version)
+                .then_with(|| left.contract.created_at.cmp(&right.contract.created_at))
+        });
+
+        let runs = work_run_records(&self.paths.runs_dir, feature_id)?;
+        let latest_run = runs.into_iter().max_by(|left, right| {
+            left.run
+                .started_at
+                .cmp(&right.run.started_at)
+                .then_with(|| left.run.id.cmp(&right.run.id))
+        });
+
+        let latest_decision = match latest_run.as_ref() {
+            Some(run_record) => {
+                latest_decision_record(&self.paths.decisions_dir, &run_record.run.id)?
+            }
+            None => None,
+        };
+        let latest_proof = match latest_decision.as_ref() {
+            Some(decision_record) => {
+                latest_proof_record(&self.paths.proofs_dir, &decision_record.decision.id)?
+            }
+            None => None,
+        };
+
+        let active_contract_ref = active_contract
+            .as_ref()
+            .map(|record| relative_ref(&self.paths.repo_root, &record.path))
+            .transpose()?;
+        let latest_run_ref = latest_run
+            .as_ref()
+            .map(|record| relative_ref(&self.paths.repo_root, &record.run_path))
+            .transpose()?;
+        let latest_receipt_ref = latest_run
+            .as_ref()
+            .and_then(|record| {
+                record
+                    .receipt
+                    .as_ref()
+                    .map(|_| relative_ref(&self.paths.repo_root, &record.receipt_path))
+            })
+            .transpose()?;
+        let latest_decision_ref = latest_decision
+            .as_ref()
+            .map(|record| relative_ref(&self.paths.repo_root, &record.path))
+            .transpose()?;
+        let latest_proof_ref = latest_proof
+            .as_ref()
+            .map(|record| relative_ref(&self.paths.repo_root, &record.path))
+            .transpose()?;
+
+        let lifecycle_state = work_lifecycle_state(
+            active_contract.as_ref().map(|record| &record.contract),
+            latest_run.as_ref().map(|record| &record.run),
+            latest_decision.as_ref().map(|record| &record.decision),
+        );
+        let blocked_reason = work_blocked_reason(
+            latest_run
+                .as_ref()
+                .and_then(|record| record.receipt.as_ref()),
+            latest_decision.as_ref().map(|record| &record.decision),
+        );
+        let (next_action, next_action_ref) = work_next_action(
+            active_contract.as_ref().map(|record| &record.contract),
+            latest_run.as_ref().map(|record| &record.run),
+            latest_decision.as_ref().map(|record| &record.decision),
+            latest_proof.as_ref().map(|record| &record.proof),
+        );
+
+        Ok(WorkLedgerView {
+            project_id: project.id.clone(),
+            work_id: feature.id.clone(),
+            goal_ref: active_contract
+                .as_ref()
+                .map(|record| record.contract.prompt_source.clone()),
+            feature_ref,
+            active_contract_ref,
+            latest_run_ref,
+            latest_receipt_ref,
+            latest_decision_ref,
+            latest_proof_ref,
+            lifecycle_state: lifecycle_state.to_string(),
+            blocked_reason,
+            next_action: next_action.map(str::to_string),
+            next_action_ref,
+            updated_at: work_updated_at(
+                &feature,
+                active_contract.as_ref().map(|record| &record.contract),
+                latest_run.as_ref().map(|record| &record.run),
+                latest_run
+                    .as_ref()
+                    .and_then(|record| record.receipt.as_ref()),
+                latest_decision.as_ref().map(|record| &record.decision),
+                latest_proof.as_ref().map(|record| &record.proof),
+            ),
+        })
+    }
+
+    fn resolve_feature_id_for_work(&self, id: &str) -> Result<String> {
+        let feature_path = self.paths.features_dir.join(format!("{id}.json"));
+        if feature_path.exists() {
+            let feature: Feature = read_json(&feature_path)?;
+            return Ok(feature.id);
+        }
+
+        if let Ok(path) = self.find_object_path(&self.paths.contracts_dir, id) {
+            let contract: Contract = read_json(&path)?;
+            return Ok(contract.feature_id);
+        }
+        if let Ok(path) = self.find_object_path(&self.paths.runs_dir, id) {
+            let run: Run = read_json(&path)?;
+            return Ok(run.feature_id);
+        }
+        if let Ok(path) = self.find_object_path(&self.paths.tasks_dir, id) {
+            let task: Task = read_json(&path)?;
+            return Ok(task.feature_id);
+        }
+        if let Ok(path) = self.find_object_path(&self.paths.decisions_dir, id) {
+            let decision: punk_domain::DecisionObject = read_json(&path)?;
+            let run_path = self.find_object_path(&self.paths.runs_dir, &decision.run_id)?;
+            let run: Run = read_json(&run_path)?;
+            return Ok(run.feature_id);
+        }
+        if let Ok(path) = self.find_object_path(&self.paths.proofs_dir, id) {
+            let proof: punk_domain::Proofpack = read_json(&path)?;
+            let run_path = self.find_object_path(&self.paths.runs_dir, &proof.run_id)?;
+            let run: Run = read_json(&run_path)?;
+            return Ok(run.feature_id);
+        }
+
+        Err(anyhow!("unknown work id: {id}"))
+    }
+
+    fn latest_feature_id_for_project(&self, project_id: &str) -> Result<String> {
+        let mut latest: Option<Feature> = None;
+        for entry in fs::read_dir(&self.paths.features_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let feature: Feature = read_json(&path)?;
+            if feature.project_id != project_id {
+                continue;
+            }
+            let replace = latest
+                .as_ref()
+                .map(|current| {
+                    feature
+                        .updated_at
+                        .cmp(&current.updated_at)
+                        .then_with(|| feature.created_at.cmp(&current.created_at))
+                        .is_gt()
+                })
+                .unwrap_or(true);
+            if replace {
+                latest = Some(feature);
+            }
+        }
+
+        latest
+            .map(|feature| feature.id)
+            .ok_or_else(|| anyhow!("no work items found for project"))
     }
 
     fn live_vcs_value(&self) -> serde_json::Value {
@@ -1099,6 +1303,258 @@ fn skill_projects(content: &str) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+#[derive(Debug)]
+struct ContractRecord {
+    path: PathBuf,
+    contract: Contract,
+}
+
+#[derive(Debug)]
+struct RunRecord {
+    run_path: PathBuf,
+    receipt_path: PathBuf,
+    run: Run,
+    receipt: Option<Receipt>,
+}
+
+#[derive(Debug)]
+struct DecisionRecord {
+    path: PathBuf,
+    decision: punk_domain::DecisionObject,
+}
+
+#[derive(Debug)]
+struct ProofRecord {
+    path: PathBuf,
+    proof: punk_domain::Proofpack,
+}
+
+fn work_contract_records(contracts_dir: &Path, feature_id: &str) -> Result<Vec<ContractRecord>> {
+    let feature_dir = contracts_dir.join(feature_id);
+    if !feature_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    for entry in fs::read_dir(feature_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let contract: Contract = read_json(&path)?;
+        records.push(ContractRecord { path, contract });
+    }
+    Ok(records)
+}
+
+fn work_run_records(runs_dir: &Path, feature_id: &str) -> Result<Vec<RunRecord>> {
+    let mut records = Vec::new();
+    if !runs_dir.exists() {
+        return Ok(records);
+    }
+    for entry in fs::read_dir(runs_dir)? {
+        let run_dir = entry?.path();
+        if !run_dir.is_dir() {
+            continue;
+        }
+        let run_path = run_dir.join("run.json");
+        if !run_path.exists() {
+            continue;
+        }
+        let run: Run = read_json(&run_path)?;
+        if run.feature_id != feature_id {
+            continue;
+        }
+        let receipt_path = run_dir.join("receipt.json");
+        let receipt = if receipt_path.exists() {
+            Some(read_json(&receipt_path)?)
+        } else {
+            None
+        };
+        records.push(RunRecord {
+            run_path,
+            receipt_path,
+            run,
+            receipt,
+        });
+    }
+    Ok(records)
+}
+
+fn latest_decision_record(decisions_dir: &Path, run_id: &str) -> Result<Option<DecisionRecord>> {
+    if !decisions_dir.exists() {
+        return Ok(None);
+    }
+    let mut latest: Option<DecisionRecord> = None;
+    for entry in fs::read_dir(decisions_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let decision: punk_domain::DecisionObject = read_json(&path)?;
+        if decision.run_id != run_id {
+            continue;
+        }
+        let replace = latest
+            .as_ref()
+            .map(|current| decision.created_at > current.decision.created_at)
+            .unwrap_or(true);
+        if replace {
+            latest = Some(DecisionRecord { path, decision });
+        }
+    }
+    Ok(latest)
+}
+
+fn latest_proof_record(proofs_dir: &Path, decision_id: &str) -> Result<Option<ProofRecord>> {
+    if !proofs_dir.exists() {
+        return Ok(None);
+    }
+    let mut latest: Option<ProofRecord> = None;
+    let decision_dir = proofs_dir.join(decision_id);
+    if !decision_dir.exists() {
+        return Ok(None);
+    }
+    for entry in fs::read_dir(decision_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let proof: punk_domain::Proofpack = read_json(&path)?;
+        let replace = latest
+            .as_ref()
+            .map(|current| proof.created_at > current.proof.created_at)
+            .unwrap_or(true);
+        if replace {
+            latest = Some(ProofRecord { path, proof });
+        }
+    }
+    Ok(latest)
+}
+
+fn work_lifecycle_state(
+    contract: Option<&Contract>,
+    run: Option<&Run>,
+    decision: Option<&punk_domain::DecisionObject>,
+) -> &'static str {
+    if let Some(decision) = decision {
+        return match decision.decision {
+            punk_domain::Decision::Accept => "accepted",
+            punk_domain::Decision::Block => "blocked",
+            punk_domain::Decision::Escalate => "escalated",
+        };
+    }
+    if let Some(run) = run {
+        return match run.status {
+            RunStatus::Running => "running",
+            RunStatus::Finished | RunStatus::Failed => "awaiting_gate",
+            RunStatus::Cancelled => "cancelled",
+        };
+    }
+    if let Some(contract) = contract {
+        return match contract.status {
+            ContractStatus::Draft => "awaiting_approval",
+            ContractStatus::Approved => "ready_to_run",
+            ContractStatus::Superseded => "superseded",
+            ContractStatus::Cancelled => "cancelled",
+        };
+    }
+    "drafting"
+}
+
+fn work_blocked_reason(
+    receipt: Option<&Receipt>,
+    decision: Option<&punk_domain::DecisionObject>,
+) -> Option<String> {
+    if let Some(decision) = decision {
+        if matches!(
+            decision.decision,
+            punk_domain::Decision::Block | punk_domain::Decision::Escalate
+        ) {
+            let summary = decision
+                .decision_basis
+                .iter()
+                .map(|item| item.trim())
+                .filter(|item| !item.is_empty())
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("; ");
+            if !summary.is_empty() {
+                return Some(summary);
+            }
+            return None;
+        }
+        return None;
+    }
+    receipt
+        .filter(|receipt| receipt.status == "failure")
+        .map(|receipt| receipt.summary.clone())
+}
+
+fn work_next_action(
+    contract: Option<&Contract>,
+    run: Option<&Run>,
+    decision: Option<&punk_domain::DecisionObject>,
+    proof: Option<&punk_domain::Proofpack>,
+) -> (Option<&'static str>, Option<String>) {
+    if let Some(decision) = decision {
+        if let Some(proof) = proof {
+            return (Some("inspect_proof"), Some(proof.id.clone()));
+        }
+        return (Some("write_proofpack"), Some(decision.id.clone()));
+    }
+    if let Some(run) = run {
+        return match run.status {
+            RunStatus::Running => (Some("wait_for_run"), Some(run.id.clone())),
+            RunStatus::Finished | RunStatus::Failed => (Some("gate_run"), Some(run.id.clone())),
+            RunStatus::Cancelled => (None, None),
+        };
+    }
+    if let Some(contract) = contract {
+        return match contract.status {
+            ContractStatus::Draft => (Some("approve_contract"), Some(contract.id.clone())),
+            ContractStatus::Approved => (Some("cut_run"), Some(contract.id.clone())),
+            ContractStatus::Superseded | ContractStatus::Cancelled => (None, None),
+        };
+    }
+    (None, None)
+}
+
+fn work_updated_at(
+    feature: &Feature,
+    contract: Option<&Contract>,
+    run: Option<&Run>,
+    receipt: Option<&Receipt>,
+    decision: Option<&punk_domain::DecisionObject>,
+    proof: Option<&punk_domain::Proofpack>,
+) -> String {
+    let mut timestamps = vec![feature.updated_at.clone()];
+    if let Some(contract) = contract {
+        timestamps.push(
+            contract
+                .approved_at
+                .clone()
+                .unwrap_or_else(|| contract.created_at.clone()),
+        );
+    }
+    if let Some(run) = run {
+        timestamps.push(
+            run.ended_at
+                .clone()
+                .unwrap_or_else(|| run.started_at.clone()),
+        );
+    }
+    if let Some(receipt) = receipt {
+        timestamps.push(receipt.created_at.clone());
+    }
+    if let Some(decision) = decision {
+        timestamps.push(decision.created_at.clone());
+    }
+    if let Some(proof) = proof {
+        timestamps.push(proof.created_at.clone());
+    }
+    timestamps.into_iter().max().unwrap_or_else(now_rfc3339)
 }
 
 fn summarize_prompt(prompt: &str) -> String {
@@ -2456,6 +2912,149 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         let _ = fs::remove_dir_all(&global);
         let _ = fs::remove_dir_all(&bus);
+    }
+
+    #[test]
+    fn inspect_work_ledger_projects_current_artifact_chain() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-work-ledger-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-work-ledger-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&FakeDrafter, "add demo work")
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+        let (run, _receipt) = service.cut_run(&FakeExecutor, &contract.id).unwrap();
+
+        let decision = punk_domain::DecisionObject {
+            id: format!("dec_{}", run.id.trim_start_matches("run_")),
+            run_id: run.id.clone(),
+            contract_id: contract.id.clone(),
+            decision: punk_domain::Decision::Accept,
+            deterministic_status: punk_domain::DeterministicStatus::Pass,
+            target_status: punk_domain::CheckStatus::Pass,
+            integrity_status: punk_domain::CheckStatus::Pass,
+            confidence_estimate: 1.0,
+            decision_basis: vec![
+                "target checks passed".into(),
+                "integrity checks passed".into(),
+            ],
+            contract_ref: format!(".punk/contracts/{}/v1.json", run.feature_id),
+            receipt_ref: format!(".punk/runs/{}/receipt.json", run.id),
+            check_refs: Vec::new(),
+            created_at: now_rfc3339(),
+        };
+        let decision_path = root
+            .join(".punk/decisions")
+            .join(format!("{}.json", decision.id));
+        write_json(&decision_path, &decision).unwrap();
+        let proof = punk_domain::Proofpack {
+            id: format!("proof_{}", decision.id.trim_start_matches("dec_")),
+            decision_id: decision.id.clone(),
+            run_id: run.id.clone(),
+            contract_ref: decision.contract_ref.clone(),
+            receipt_ref: decision.receipt_ref.clone(),
+            decision_ref: format!(".punk/decisions/{}.json", decision.id),
+            check_refs: Vec::new(),
+            hashes: Default::default(),
+            summary: format!("proof for {}", decision.id),
+            created_at: now_rfc3339(),
+        };
+        let proof_dir = root.join(".punk/proofs").join(&decision.id);
+        fs::create_dir_all(&proof_dir).unwrap();
+        let proof_path = proof_dir.join("proofpack.json");
+        write_json(&proof_path, &proof).unwrap();
+
+        let contract_ref = format!(".punk/contracts/{}/v1.json", run.feature_id);
+        let run_ref = format!(".punk/runs/{}/run.json", run.id);
+        let receipt_ref = format!(".punk/runs/{}/receipt.json", run.id);
+        let decision_ref = format!(".punk/decisions/{}.json", decision.id);
+        let proof_ref = format!(".punk/proofs/{}/proofpack.json", decision.id);
+
+        let ledger = service.inspect_work_ledger(Some(&run.feature_id)).unwrap();
+        assert_eq!(ledger.work_id, run.feature_id);
+        assert_eq!(ledger.goal_ref.as_deref(), Some("add demo work"));
+        assert_eq!(
+            ledger.active_contract_ref.as_deref(),
+            Some(contract_ref.as_str())
+        );
+        assert_eq!(ledger.latest_run_ref.as_deref(), Some(run_ref.as_str()));
+        assert_eq!(
+            ledger.latest_receipt_ref.as_deref(),
+            Some(receipt_ref.as_str())
+        );
+        assert_eq!(
+            ledger.latest_decision_ref.as_deref(),
+            Some(decision_ref.as_str())
+        );
+        assert_eq!(ledger.latest_proof_ref.as_deref(), Some(proof_ref.as_str()));
+        assert_eq!(ledger.lifecycle_state, "accepted");
+        assert_eq!(ledger.next_action.as_deref(), Some("inspect_proof"));
+        assert_eq!(ledger.next_action_ref.as_deref(), Some(proof.id.as_str()));
+        assert_eq!(ledger.blocked_reason, None);
+
+        let latest = service.inspect_work_ledger(None).unwrap();
+        assert_eq!(latest.work_id, ledger.work_id);
+        assert_eq!(
+            latest.latest_receipt_ref.as_deref(),
+            ledger.latest_receipt_ref.as_deref()
+        );
+        let via_run = service.inspect_work_ledger(Some(&run.id)).unwrap();
+        assert_eq!(via_run.work_id, ledger.work_id);
+        let via_decision = service.inspect_work_ledger(Some(&decision.id)).unwrap();
+        assert_eq!(via_decision.work_id, ledger.work_id);
+        let via_proof = service.inspect_work_ledger(Some(&proof.id)).unwrap();
+        assert_eq!(via_proof.work_id, ledger.work_id);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
     }
 
     #[test]

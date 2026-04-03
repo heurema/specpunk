@@ -516,6 +516,16 @@ It answers the three operator questions that raw artifacts answer poorly:
 2. what artifact is currently authoritative?
 3. what should happen next?
 
+### Current inspect surface
+
+The current bounded implementation surface is:
+
+- `punk inspect work`
+- `punk inspect work <id>`
+- `punk inspect work <id> --json`
+
+This is still a derived repo-local view over existing artifacts, not a new persistence layer.
+
 ### Important rules
 
 - `WorkLedgerView` is a **derived projection**, not a second mutable truth object

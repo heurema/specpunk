@@ -72,7 +72,8 @@ struct StatusCommand {
 
 #[derive(Args)]
 struct InspectCommand {
-    id: String,
+    target: String,
+    id: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -265,7 +266,7 @@ fn run() -> Result<()> {
         }
         Command::Inspect(inspect) => {
             let orch = OrchService::new(&repo_root, &global_root)?;
-            if inspect.id == "project" {
+            if inspect.target == "project" && inspect.id.is_none() {
                 let overlay = orch.inspect_project_overlay()?;
                 return render(
                     inspect.json,
@@ -273,12 +274,16 @@ fn run() -> Result<()> {
                     &format_project_overlay_summary(&overlay),
                 );
             }
-            if !inspect.json {
+            if inspect.target == "work" {
+                let ledger = orch.inspect_work_ledger(inspect.id.as_deref())?;
+                return render(inspect.json, &ledger, &format_work_ledger_summary(&ledger));
+            }
+            if !inspect.json || inspect.id.is_some() {
                 return Err(anyhow!(
-                    "inspect for object ids currently requires --json; use `punk inspect project` for the human project overlay view"
+                    "inspect for object ids currently requires `punk inspect <id> --json`; use `punk inspect project` or `punk inspect work [id]` for human inspect views"
                 ));
             }
-            let value = orch.inspect(&inspect.id)?;
+            let value = orch.inspect(&inspect.target)?;
             println!("{}", serde_json::to_string_pretty(&value)?);
             Ok(())
         }
@@ -798,6 +803,36 @@ fn format_project_overlay_summary(overlay: &punk_orch::ProjectOverlay) -> String
     )
 }
 
+fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
+    let goal = ledger.goal_ref.as_deref().unwrap_or("missing");
+    let contract = ledger.active_contract_ref.as_deref().unwrap_or("none");
+    let run = ledger.latest_run_ref.as_deref().unwrap_or("none");
+    let receipt = ledger.latest_receipt_ref.as_deref().unwrap_or("none");
+    let decision = ledger.latest_decision_ref.as_deref().unwrap_or("none");
+    let proof = ledger.latest_proof_ref.as_deref().unwrap_or("none");
+    let blocked_reason = ledger.blocked_reason.as_deref().unwrap_or("none");
+    let next_action = ledger.next_action.as_deref().unwrap_or("none");
+    let next_action_ref = ledger.next_action_ref.as_deref().unwrap_or("none");
+
+    format!(
+        "Work: {work_id}\nProject: {project_id}\nLifecycle: {lifecycle_state}\nGoal: {goal}\nFeature: {feature_ref}\nContract: {contract}\nRun: {run}\nReceipt: {receipt}\nDecision: {decision}\nProof: {proof}\nBlocked reason: {blocked_reason}\nNext action: {next_action}\nNext action ref: {next_action_ref}\nUpdated at: {updated_at}",
+        work_id = ledger.work_id,
+        project_id = ledger.project_id,
+        lifecycle_state = ledger.lifecycle_state,
+        goal = goal,
+        feature_ref = ledger.feature_ref,
+        contract = contract,
+        run = run,
+        receipt = receipt,
+        decision = decision,
+        proof = proof,
+        blocked_reason = blocked_reason,
+        next_action = next_action,
+        next_action_ref = next_action_ref,
+        updated_at = ledger.updated_at,
+    )
+}
+
 fn resolve_init_project_id(project_root: &Path, explicit_project: Option<&str>) -> Result<String> {
     if let Some(project) = explicit_project
         .map(str::trim)
@@ -1233,6 +1268,34 @@ mod tests {
         assert!(rendered.contains("Project skills: /tmp/skills/interviewcoach-core.md"));
         assert!(rendered.contains("Safe default checks: make test"));
         assert!(rendered.contains("autonomous_ready=true"));
+    }
+
+    #[test]
+    fn work_ledger_summary_mentions_state_goal_and_next_action() {
+        let ledger = punk_orch::WorkLedgerView {
+            project_id: "interviewcoach-e5b92bb854".into(),
+            work_id: "feat_123".into(),
+            goal_ref: Some("add trace export".into()),
+            feature_ref: ".punk/features/feat_123.json".into(),
+            active_contract_ref: Some(".punk/contracts/feat_123/v1.json".into()),
+            latest_run_ref: Some(".punk/runs/run_456/run.json".into()),
+            latest_receipt_ref: Some(".punk/runs/run_456/receipt.json".into()),
+            latest_decision_ref: Some(".punk/decisions/dec_456.json".into()),
+            latest_proof_ref: Some(".punk/proofs/dec_456/proofpack.json".into()),
+            lifecycle_state: "accepted".into(),
+            blocked_reason: None,
+            next_action: Some("inspect_proof".into()),
+            next_action_ref: Some("proof_456".into()),
+            updated_at: "2026-04-03T00:00:00Z".into(),
+        };
+        let rendered = format_work_ledger_summary(&ledger);
+        assert!(rendered.contains("Work: feat_123"));
+        assert!(rendered.contains("Lifecycle: accepted"));
+        assert!(rendered.contains("Goal: add trace export"));
+        assert!(rendered.contains("Contract: .punk/contracts/feat_123/v1.json"));
+        assert!(rendered.contains("Proof: .punk/proofs/dec_456/proofpack.json"));
+        assert!(rendered.contains("Next action: inspect_proof"));
+        assert!(rendered.contains("Next action ref: proof_456"));
     }
 
     #[test]
