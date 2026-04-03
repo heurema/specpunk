@@ -156,6 +156,7 @@ What is explicitly out of scope for v0:
 - `docs/product/RESEARCH.md` — bounded deep-research protocols
 - `docs/product/DOGFOODING.md` — bounded self-hosting and trust-separation rules
 - `docs/product/CLI.md` — command surface and shell UX
+- `docs/product/NORTH-ROADMAP.md` — durable strategic backlog and linked research tracks
 - `docs/product/MASTER-PLAN.md` — staged build plan
 - `docs/product/CONTINUE-PROMPT.md` — handoff prompt for the next build session
 
