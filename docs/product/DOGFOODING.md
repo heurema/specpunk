@@ -223,9 +223,28 @@ Dogfooding creates realistic high-value research prompts:
 2. Keep dogfood tasks bounded and contract-first.
 3. Record receipts, decisions, and proof artifacts for dogfood runs.
 4. Treat dogfood failures as learning input, not embarrassment.
-5. Never let the system silently self-promote from anecdotal success.
-6. Separate ordinary feature trust from meta-level trust.
-7. When in doubt, require stronger review for self-referential changes.
+5. Map reliability failures to the repo fixture matrix in `docs/research/2026-04-03-specpunk-repo-fixture-matrix.md` whenever possible.
+6. Never let the system silently self-promote from anecdotal success.
+7. Separate ordinary feature trust from meta-level trust.
+8. When in doubt, require stronger review for self-referential changes.
+
+## Dogfood -> fixture rule
+
+If a failure discovered through dogfood affects:
+
+- bootstrap
+- intake
+- project identity
+- scope inference
+- generated artifact filtering
+- blocked/recovery behavior
+- event-log compatibility or corruption handling
+
+then the fix should normally add or update a corresponding fixture-class regression.
+
+The default expectation is:
+
+> external dogfood should shrink the unknown space by becoming repeatable fixture coverage.
 
 ---
 
