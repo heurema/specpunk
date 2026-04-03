@@ -123,6 +123,8 @@ The intended operator experience is:
 - one concise progress or blocker summary out
 - one obvious next step out
 
+Longer-term, blocked or escalated autonomy should also be durable and inspectable through runtime state, not only visible in one shell invocation.
+
 `plot / cut / gate` remain available, but they are expert/control surfaces rather than the default path a normal operator must learn first.
 
 ### Staged/manual path

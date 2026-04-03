@@ -227,6 +227,12 @@ When `--fallback-staged` is set and autonomy blocks:
 - a staged recovery contract is drafted automatically
 - recovery metadata and next command are returned
 
+The intended durable behavior is stronger than shell text:
+
+- blocked or escalated autonomy should remain inspectable later
+- the shell summary should point to durable refs
+- later `status` / `inspect work` should be able to answer what happened and what comes next without relying on old terminal output
+
 ### `punk start "<goal>"`
 
 Creates:

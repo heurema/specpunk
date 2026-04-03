@@ -540,6 +540,57 @@ The first useful `lifecycle_state` set is:
 
 These are projection states for operators and shells, not replacements for lower-level object status enums.
 
+### Durable autonomous outcomes
+
+`go --fallback-staged` should eventually rest on durable state, not shell text alone.
+
+The intended durable shape is an autonomy-linked record such as:
+
+```text
+AutonomyRecord
+  work_id
+  goal_ref
+  contract_ref
+  run_ref
+  decision_ref
+  proof_ref
+  autonomy_outcome
+  basis_summary
+  recovery_contract_ref
+  next_action
+  next_action_ref
+  recorded_at
+```
+
+### Why this matters
+
+Without a durable autonomy-linked record, the shell may report:
+
+- `blocked`
+- `escalated`
+- prepared staged recovery
+
+but later inspection still depends on remembering shell output instead of inspecting durable state.
+
+### Projection rule
+
+`AutonomyRecord` should feed `WorkLedgerView`, not compete with it.
+
+In practice that means:
+
+- `autonomy_outcome` helps determine `lifecycle_state`
+- `basis_summary` helps explain `blocked_reason`
+- `recovery_contract_ref` and `next_action_ref` feed durable recovery surfaces
+
+### Recovery distinction
+
+The architecture should distinguish:
+
+- blocked with no durable recovery prepared
+- blocked with a staged recovery contract already prepared
+
+That distinction is important for both shell UX and later inspection.
+
 ---
 
 ## 9. Storage layout
