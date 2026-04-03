@@ -104,9 +104,14 @@ Generated guidance:
 - `AGENTS.md`
 - `.punk/AGENT_START.md`
 
+Current project inspect surface:
+
+- `punk inspect project`
+- `punk inspect project --json`
+
 Longer-term shell expectation:
 
-- `punk inspect project` or equivalent should explain project identity, guidance, capabilities, and active project overlays in one place
+- project bootstrap and shell status should keep converging on this same inspectable project-intelligence packet
 
 ### Default autonomous intake
 

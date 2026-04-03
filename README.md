@@ -101,7 +101,14 @@ Bootstrap creates repo-local agent guidance:
 - `AGENTS.md`
 - `.punk/AGENT_START.md`
 
-Longer-term, project bootstrap should converge on one inspectable project-intelligence packet instead of a growing set of adjacent bootstrap artifacts.
+Inspect the current derived project-intelligence view with:
+
+```bash
+punk inspect project
+punk inspect project --json
+```
+
+Longer-term, project bootstrap should converge on one richer project-intelligence packet instead of a growing set of adjacent bootstrap artifacts.
 
 ### Default autonomous path
 
