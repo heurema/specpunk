@@ -501,6 +501,9 @@ WorkLedgerView
   latest_receipt_ref
   latest_decision_ref
   latest_proof_ref
+  latest_autonomy_ref
+  autonomy_outcome
+  recovery_contract_ref
   lifecycle_state
   blocked_reason
   next_action
@@ -593,6 +596,15 @@ In practice that means:
 - `autonomy_outcome` helps determine `lifecycle_state`
 - `basis_summary` helps explain `blocked_reason`
 - `recovery_contract_ref` and `next_action_ref` feed durable recovery surfaces
+
+The current bounded implementation now writes a repo-local autonomy-linked record during
+`punk go`, and `WorkLedgerView` projects that record back into:
+
+- `latest_autonomy_ref`
+- `autonomy_outcome`
+- `recovery_contract_ref`
+- recovery-aware `lifecycle_state`
+- durable `next_action` / `next_action_ref`
 
 ### Recovery distinction
 

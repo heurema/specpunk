@@ -569,10 +569,6 @@ fn cmd_go(
     let decision = gate.gate_run(&run.id)?;
     let proof_service = ProofService::new(repo_root, global_root);
     let proof = proof_service.write_proofpack(&decision.id)?;
-    let status = orch.status(Some(&run.id))?;
-    let project_root = resolve_project_root(repo_root);
-    let project = infer_project_id(&project_root).unwrap_or_else(|| status.project_id.clone());
-    let next_command = format!("punk inspect {} --json", proof.id);
     let outcome = go_outcome_label(&decision.decision);
     let success = go_decision_succeeds(&decision.decision);
     let basis_summary = summarize_decision_basis(&decision.decision_basis);
@@ -586,6 +582,16 @@ fn cmd_go(
     let recovery_next_command = staged_recovery
         .as_ref()
         .map(|contract| format!("punk plot approve {}", contract.id));
+    let autonomy = orch.record_autonomy_outcome(
+        &proof.id,
+        staged_recovery
+            .as_ref()
+            .map(|contract| contract.id.as_str()),
+    )?;
+    let status = orch.status(Some(&run.id))?;
+    let project_root = resolve_project_root(repo_root);
+    let project = infer_project_id(&project_root).unwrap_or_else(|| status.project_id.clone());
+    let next_command = format!("punk inspect {} --json", proof.id);
 
     if json {
         println!(
@@ -599,6 +605,7 @@ fn cmd_go(
                 "receipt": receipt,
                 "decision": decision,
                 "proof": proof,
+                "autonomy_record": autonomy,
                 "outcome": outcome,
                 "success": success,
                 "decision_basis_summary": basis_summary,
@@ -815,12 +822,15 @@ fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
     let receipt = ledger.latest_receipt_ref.as_deref().unwrap_or("none");
     let decision = ledger.latest_decision_ref.as_deref().unwrap_or("none");
     let proof = ledger.latest_proof_ref.as_deref().unwrap_or("none");
+    let autonomy = ledger.latest_autonomy_ref.as_deref().unwrap_or("none");
+    let autonomy_outcome = ledger.autonomy_outcome.as_deref().unwrap_or("none");
+    let recovery_contract = ledger.recovery_contract_ref.as_deref().unwrap_or("none");
     let blocked_reason = ledger.blocked_reason.as_deref().unwrap_or("none");
     let next_action = ledger.next_action.as_deref().unwrap_or("none");
     let next_action_ref = ledger.next_action_ref.as_deref().unwrap_or("none");
 
     format!(
-        "Work: {work_id}\nProject: {project_id}\nLifecycle: {lifecycle_state}\nGoal: {goal}\nFeature: {feature_ref}\nContract: {contract}\nRun: {run}\nReceipt: {receipt}\nDecision: {decision}\nProof: {proof}\nBlocked reason: {blocked_reason}\nNext action: {next_action}\nNext action ref: {next_action_ref}\nUpdated at: {updated_at}",
+        "Work: {work_id}\nProject: {project_id}\nLifecycle: {lifecycle_state}\nGoal: {goal}\nFeature: {feature_ref}\nContract: {contract}\nRun: {run}\nReceipt: {receipt}\nDecision: {decision}\nProof: {proof}\nAutonomy: {autonomy}\nAutonomy outcome: {autonomy_outcome}\nRecovery contract: {recovery_contract}\nBlocked reason: {blocked_reason}\nNext action: {next_action}\nNext action ref: {next_action_ref}\nUpdated at: {updated_at}",
         work_id = ledger.work_id,
         project_id = ledger.project_id,
         lifecycle_state = ledger.lifecycle_state,
@@ -831,6 +841,9 @@ fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
         receipt = receipt,
         decision = decision,
         proof = proof,
+        autonomy = autonomy,
+        autonomy_outcome = autonomy_outcome,
+        recovery_contract = recovery_contract,
         blocked_reason = blocked_reason,
         next_action = next_action,
         next_action_ref = next_action_ref,
@@ -1317,6 +1330,9 @@ mod tests {
             latest_receipt_ref: Some(".punk/runs/run_456/receipt.json".into()),
             latest_decision_ref: Some(".punk/decisions/dec_456.json".into()),
             latest_proof_ref: Some(".punk/proofs/dec_456/proofpack.json".into()),
+            latest_autonomy_ref: Some(".punk/autonomy/feat_123/auto_456.json".into()),
+            autonomy_outcome: Some("blocked".into()),
+            recovery_contract_ref: Some(".punk/contracts/feat_789/v1.json".into()),
             lifecycle_state: "accepted".into(),
             blocked_reason: None,
             next_action: Some("inspect_proof".into()),
@@ -1329,6 +1345,9 @@ mod tests {
         assert!(rendered.contains("Goal: add trace export"));
         assert!(rendered.contains("Contract: .punk/contracts/feat_123/v1.json"));
         assert!(rendered.contains("Proof: .punk/proofs/dec_456/proofpack.json"));
+        assert!(rendered.contains("Autonomy: .punk/autonomy/feat_123/auto_456.json"));
+        assert!(rendered.contains("Autonomy outcome: blocked"));
+        assert!(rendered.contains("Recovery contract: .punk/contracts/feat_789/v1.json"));
         assert!(rendered.contains("Next action: inspect_proof"));
         assert!(rendered.contains("Next action ref: proof_456"));
     }

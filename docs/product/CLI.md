@@ -248,6 +248,7 @@ When `--fallback-staged` is set and autonomy blocks:
 
 - a staged recovery contract is drafted automatically
 - recovery metadata and next command are returned
+- an autonomy-linked durable record is written so later inspection does not depend on old shell output
 
 The intended durable behavior is stronger than shell text:
 

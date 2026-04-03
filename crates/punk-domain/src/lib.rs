@@ -78,6 +78,14 @@ pub enum Decision {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum AutonomyOutcome {
+    Succeeded,
+    Blocked,
+    Escalated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum DeterministicStatus {
     Pass,
     Fail,
@@ -270,6 +278,23 @@ pub struct Proofpack {
     pub hashes: std::collections::BTreeMap<String, String>,
     pub summary: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutonomyRecord {
+    pub id: String,
+    pub work_id: String,
+    pub goal_ref: Option<String>,
+    pub contract_ref: String,
+    pub run_ref: String,
+    pub decision_ref: String,
+    pub proof_ref: String,
+    pub autonomy_outcome: AutonomyOutcome,
+    pub basis_summary: String,
+    pub recovery_contract_ref: Option<String>,
+    pub next_action: String,
+    pub next_action_ref: String,
+    pub recorded_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -16,9 +16,9 @@ use punk_core::{
 };
 pub use punk_core::{find_object_path, read_json, relative_ref, write_json};
 use punk_domain::{
-    now_rfc3339, Contract, ContractStatus, DraftInput, DraftProposal, EventEnvelope, Feature,
-    FeatureStatus, ModeId, Project, Receipt, ReceiptArtifacts, RefineInput, Run, RunStatus, Task,
-    TaskKind, TaskStatus, VcsKind,
+    now_rfc3339, AutonomyOutcome, AutonomyRecord, Contract, ContractStatus, DraftInput,
+    DraftProposal, EventEnvelope, Feature, FeatureStatus, ModeId, Project, Receipt,
+    ReceiptArtifacts, RefineInput, Run, RunStatus, Task, TaskKind, TaskStatus, VcsKind,
 };
 use punk_events::EventStore;
 use punk_vcs::{current_snapshot_ref, detect_backend};
@@ -36,6 +36,7 @@ pub struct RepoPaths {
     pub runs_dir: PathBuf,
     pub decisions_dir: PathBuf,
     pub proofs_dir: PathBuf,
+    pub autonomy_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +93,9 @@ pub struct WorkLedgerView {
     pub latest_receipt_ref: Option<String>,
     pub latest_decision_ref: Option<String>,
     pub latest_proof_ref: Option<String>,
+    pub latest_autonomy_ref: Option<String>,
+    pub autonomy_outcome: Option<String>,
+    pub recovery_contract_ref: Option<String>,
     pub lifecycle_state: String,
     pub blocked_reason: Option<String>,
     pub next_action: Option<String>,
@@ -122,6 +126,7 @@ impl OrchService {
             runs_dir: dot_punk.join("runs"),
             decisions_dir: dot_punk.join("decisions"),
             proofs_dir: dot_punk.join("proofs"),
+            autonomy_dir: dot_punk.join("autonomy"),
         };
         let events = EventStore::new(paths.global_root.clone());
         let service = Self { paths, events };
@@ -144,6 +149,7 @@ impl OrchService {
         fs::create_dir_all(&self.paths.runs_dir)?;
         fs::create_dir_all(&self.paths.decisions_dir)?;
         fs::create_dir_all(&self.paths.proofs_dir)?;
+        fs::create_dir_all(&self.paths.autonomy_dir)?;
         self.events.ensure_dirs()?;
 
         let project_id = project_id(&self.paths.repo_root)?;
@@ -816,6 +822,7 @@ impl OrchService {
             &self.paths.runs_dir,
             &self.paths.decisions_dir,
             &self.paths.proofs_dir,
+            &self.paths.autonomy_dir,
         ] {
             if let Ok(path) = self.find_object_path(dir, id) {
                 let mut value = read_json(&path)?;
@@ -916,6 +923,69 @@ impl OrchService {
         })
     }
 
+    pub fn record_autonomy_outcome(
+        &self,
+        proof_id: &str,
+        recovery_contract_id: Option<&str>,
+    ) -> Result<AutonomyRecord> {
+        let project = self.bootstrap_project()?;
+        let proof_path = self.find_object_path(&self.paths.proofs_dir, proof_id)?;
+        let proof: punk_domain::Proofpack = read_json(&proof_path)?;
+        let decision_path = self.find_object_path(&self.paths.decisions_dir, &proof.decision_id)?;
+        let decision: punk_domain::DecisionObject = read_json(&decision_path)?;
+        let run_path = self.find_object_path(&self.paths.runs_dir, &proof.run_id)?;
+        let run: Run = read_json(&run_path)?;
+        let contract_path =
+            self.find_object_path(&self.paths.contracts_dir, &decision.contract_id)?;
+        let contract: Contract = read_json(&contract_path)?;
+        let contract_ref = relative_ref(&self.paths.repo_root, &contract_path)?;
+        let run_ref = relative_ref(&self.paths.repo_root, &run_path)?;
+        let decision_ref = relative_ref(&self.paths.repo_root, &decision_path)?;
+        let proof_ref = relative_ref(&self.paths.repo_root, &proof_path)?;
+        let recovery_contract_ref = recovery_contract_id
+            .map(|id| self.find_object_path(&self.paths.contracts_dir, id))
+            .transpose()?
+            .map(|path| relative_ref(&self.paths.repo_root, &path))
+            .transpose()?;
+        let autonomy_outcome = match decision.decision {
+            punk_domain::Decision::Accept => AutonomyOutcome::Succeeded,
+            punk_domain::Decision::Block => AutonomyOutcome::Blocked,
+            punk_domain::Decision::Escalate => AutonomyOutcome::Escalated,
+        };
+        let basis_summary = summarize_decision_basis(&decision.decision_basis);
+        let (next_action, next_action_ref) =
+            autonomy_next_action(&decision, recovery_contract_id, &proof.id);
+        let record = AutonomyRecord {
+            id: format!("auto_{}", run.id.trim_start_matches("run_")),
+            work_id: run.feature_id.clone(),
+            goal_ref: Some(contract.prompt_source.clone()),
+            contract_ref,
+            run_ref,
+            decision_ref,
+            proof_ref,
+            autonomy_outcome,
+            basis_summary,
+            recovery_contract_ref,
+            next_action: next_action.to_string(),
+            next_action_ref,
+            recorded_at: now_rfc3339(),
+        };
+        let record_dir = self.paths.autonomy_dir.join(&run.feature_id);
+        fs::create_dir_all(&record_dir)?;
+        let record_path = record_dir.join(format!("{}.json", record.id));
+        write_json(&record_path, &record)?;
+        self.append_event(
+            &project.id,
+            Some(&run.feature_id),
+            None,
+            Some(&run.id),
+            ModeId::Gate,
+            "autonomy.recorded",
+            Some(&record_path),
+        )?;
+        Ok(record)
+    }
+
     fn build_work_ledger_view(
         &self,
         project: &Project,
@@ -953,6 +1023,12 @@ impl OrchService {
             }
             None => None,
         };
+        let latest_autonomy = latest_autonomy_record(
+            &self.paths.repo_root,
+            &self.paths.autonomy_dir,
+            feature_id,
+            latest_run.as_ref().map(|record| record.run.id.as_str()),
+        )?;
 
         let active_contract_ref = active_contract
             .as_ref()
@@ -979,24 +1055,37 @@ impl OrchService {
             .as_ref()
             .map(|record| relative_ref(&self.paths.repo_root, &record.path))
             .transpose()?;
+        let latest_autonomy_ref = latest_autonomy
+            .as_ref()
+            .map(|record| relative_ref(&self.paths.repo_root, &record.path))
+            .transpose()?;
 
         let lifecycle_state = work_lifecycle_state(
             active_contract.as_ref().map(|record| &record.contract),
             latest_run.as_ref().map(|record| &record.run),
             latest_decision.as_ref().map(|record| &record.decision),
+            latest_autonomy.as_ref().map(|record| &record.record),
         );
         let blocked_reason = work_blocked_reason(
             latest_run
                 .as_ref()
                 .and_then(|record| record.receipt.as_ref()),
             latest_decision.as_ref().map(|record| &record.decision),
+            latest_autonomy.as_ref().map(|record| &record.record),
         );
         let (next_action, next_action_ref) = work_next_action(
             active_contract.as_ref().map(|record| &record.contract),
             latest_run.as_ref().map(|record| &record.run),
             latest_decision.as_ref().map(|record| &record.decision),
             latest_proof.as_ref().map(|record| &record.proof),
+            latest_autonomy.as_ref().map(|record| &record.record),
         );
+        let autonomy_outcome = latest_autonomy
+            .as_ref()
+            .map(|record| autonomy_outcome_label(&record.record.autonomy_outcome).to_string());
+        let recovery_contract_ref = latest_autonomy
+            .as_ref()
+            .and_then(|record| record.record.recovery_contract_ref.clone());
 
         Ok(WorkLedgerView {
             project_id: project.id.clone(),
@@ -1010,9 +1099,12 @@ impl OrchService {
             latest_receipt_ref,
             latest_decision_ref,
             latest_proof_ref,
+            latest_autonomy_ref,
+            autonomy_outcome,
+            recovery_contract_ref,
             lifecycle_state: lifecycle_state.to_string(),
             blocked_reason,
-            next_action: next_action.map(str::to_string),
+            next_action,
             next_action_ref,
             updated_at: work_updated_at(
                 &feature,
@@ -1023,6 +1115,7 @@ impl OrchService {
                     .and_then(|record| record.receipt.as_ref()),
                 latest_decision.as_ref().map(|record| &record.decision),
                 latest_proof.as_ref().map(|record| &record.proof),
+                latest_autonomy.as_ref().map(|record| &record.record),
             ),
         })
     }
@@ -1057,6 +1150,10 @@ impl OrchService {
             let run_path = self.find_object_path(&self.paths.runs_dir, &proof.run_id)?;
             let run: Run = read_json(&run_path)?;
             return Ok(run.feature_id);
+        }
+        if let Ok(path) = self.find_object_path(&self.paths.autonomy_dir, id) {
+            let record: AutonomyRecord = read_json(&path)?;
+            return Ok(record.work_id);
         }
 
         Err(anyhow!("unknown work id: {id}"))
@@ -1273,6 +1370,11 @@ struct ProofRecord {
     proof: punk_domain::Proofpack,
 }
 
+struct AutonomyRecordFile {
+    path: PathBuf,
+    record: AutonomyRecord,
+}
+
 fn work_contract_records(contracts_dir: &Path, feature_id: &str) -> Result<Vec<ContractRecord>> {
     let feature_dir = contracts_dir.join(feature_id);
     if !feature_dir.exists() {
@@ -1375,11 +1477,69 @@ fn latest_proof_record(proofs_dir: &Path, decision_id: &str) -> Result<Option<Pr
     Ok(latest)
 }
 
+fn latest_autonomy_record(
+    repo_root: &Path,
+    autonomy_dir: &Path,
+    feature_id: &str,
+    latest_run_id: Option<&str>,
+) -> Result<Option<AutonomyRecordFile>> {
+    if !autonomy_dir.exists() {
+        return Ok(None);
+    }
+    let feature_dir = autonomy_dir.join(feature_id);
+    if !feature_dir.exists() {
+        return Ok(None);
+    }
+    let mut latest: Option<AutonomyRecordFile> = None;
+    for entry in fs::read_dir(feature_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let record: AutonomyRecord = read_json(&path)?;
+        if let Some(run_id) = latest_run_id {
+            let record_run_id =
+                work_object_id_from_ref(repo_root, Some(record.run_ref.as_str()), "run_");
+            if record_run_id.as_deref() != Some(run_id) {
+                continue;
+            }
+        }
+        let replace = latest
+            .as_ref()
+            .map(|current| record.recorded_at > current.record.recorded_at)
+            .unwrap_or(true);
+        if replace {
+            latest = Some(AutonomyRecordFile { path, record });
+        }
+    }
+    Ok(latest)
+}
+
 fn work_lifecycle_state(
     contract: Option<&Contract>,
     run: Option<&Run>,
     decision: Option<&punk_domain::DecisionObject>,
+    autonomy: Option<&AutonomyRecord>,
 ) -> &'static str {
+    if let Some(record) = autonomy {
+        return match record.autonomy_outcome {
+            AutonomyOutcome::Succeeded => "accepted",
+            AutonomyOutcome::Blocked => {
+                if record.recovery_contract_ref.is_some() {
+                    "blocked_ready_for_recovery"
+                } else {
+                    "blocked"
+                }
+            }
+            AutonomyOutcome::Escalated => {
+                if record.recovery_contract_ref.is_some() {
+                    "escalated_ready_for_recovery"
+                } else {
+                    "escalated"
+                }
+            }
+        };
+    }
     if let Some(decision) = decision {
         return match decision.decision {
             punk_domain::Decision::Accept => "accepted",
@@ -1408,7 +1568,17 @@ fn work_lifecycle_state(
 fn work_blocked_reason(
     receipt: Option<&Receipt>,
     decision: Option<&punk_domain::DecisionObject>,
+    autonomy: Option<&AutonomyRecord>,
 ) -> Option<String> {
+    if let Some(record) = autonomy {
+        if matches!(
+            record.autonomy_outcome,
+            AutonomyOutcome::Blocked | AutonomyOutcome::Escalated
+        ) && !record.basis_summary.trim().is_empty()
+        {
+            return Some(record.basis_summary.clone());
+        }
+    }
     if let Some(decision) = decision {
         if matches!(
             decision.decision,
@@ -1439,24 +1609,39 @@ fn work_next_action(
     run: Option<&Run>,
     decision: Option<&punk_domain::DecisionObject>,
     proof: Option<&punk_domain::Proofpack>,
-) -> (Option<&'static str>, Option<String>) {
+    autonomy: Option<&AutonomyRecord>,
+) -> (Option<String>, Option<String>) {
+    if let Some(record) = autonomy {
+        return (
+            Some(record.next_action.clone()),
+            Some(record.next_action_ref.clone()),
+        );
+    }
     if let Some(decision) = decision {
         if let Some(proof) = proof {
-            return (Some("inspect_proof"), Some(proof.id.clone()));
+            return (Some("inspect_proof".to_string()), Some(proof.id.clone()));
         }
-        return (Some("write_proofpack"), Some(decision.id.clone()));
+        return (
+            Some("write_proofpack".to_string()),
+            Some(decision.id.clone()),
+        );
     }
     if let Some(run) = run {
         return match run.status {
-            RunStatus::Running => (Some("wait_for_run"), Some(run.id.clone())),
-            RunStatus::Finished | RunStatus::Failed => (Some("gate_run"), Some(run.id.clone())),
+            RunStatus::Running => (Some("wait_for_run".to_string()), Some(run.id.clone())),
+            RunStatus::Finished | RunStatus::Failed => {
+                (Some("gate_run".to_string()), Some(run.id.clone()))
+            }
             RunStatus::Cancelled => (None, None),
         };
     }
     if let Some(contract) = contract {
         return match contract.status {
-            ContractStatus::Draft => (Some("approve_contract"), Some(contract.id.clone())),
-            ContractStatus::Approved => (Some("cut_run"), Some(contract.id.clone())),
+            ContractStatus::Draft => (
+                Some("approve_contract".to_string()),
+                Some(contract.id.clone()),
+            ),
+            ContractStatus::Approved => (Some("cut_run".to_string()), Some(contract.id.clone())),
             ContractStatus::Superseded | ContractStatus::Cancelled => (None, None),
         };
     }
@@ -1470,6 +1655,7 @@ fn work_updated_at(
     receipt: Option<&Receipt>,
     decision: Option<&punk_domain::DecisionObject>,
     proof: Option<&punk_domain::Proofpack>,
+    autonomy: Option<&AutonomyRecord>,
 ) -> String {
     let mut timestamps = vec![feature.updated_at.clone()];
     if let Some(contract) = contract {
@@ -1496,6 +1682,9 @@ fn work_updated_at(
     if let Some(proof) = proof {
         timestamps.push(proof.created_at.clone());
     }
+    if let Some(autonomy) = autonomy {
+        timestamps.push(autonomy.recorded_at.clone());
+    }
     timestamps.into_iter().max().unwrap_or_else(now_rfc3339)
 }
 
@@ -1511,6 +1700,37 @@ fn work_object_id_from_ref(
         Some(id.to_string())
     } else {
         None
+    }
+}
+
+fn summarize_decision_basis(basis: &[String]) -> String {
+    basis
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn autonomy_outcome_label(outcome: &AutonomyOutcome) -> &'static str {
+    match outcome {
+        AutonomyOutcome::Succeeded => "succeeded",
+        AutonomyOutcome::Blocked => "blocked",
+        AutonomyOutcome::Escalated => "escalated",
+    }
+}
+
+fn autonomy_next_action(
+    decision: &punk_domain::DecisionObject,
+    recovery_contract_id: Option<&str>,
+    proof_id: &str,
+) -> (&'static str, String) {
+    match (decision.decision.clone(), recovery_contract_id) {
+        (punk_domain::Decision::Block | punk_domain::Decision::Escalate, Some(contract_id)) => {
+            ("approve_contract", contract_id.to_string())
+        }
+        _ => ("inspect_proof", proof_id.to_string()),
     }
 }
 
@@ -3036,6 +3256,156 @@ mod tests {
         assert_eq!(
             status_for_project.work_id.as_deref(),
             Some(ledger.work_id.as_str())
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn autonomy_record_makes_recovery_durable_in_work_ledger() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-autonomy-ledger-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-autonomy-ledger-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&FakeDrafter, "recover blocked autonomy")
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+        let (run, _receipt) = service.cut_run(&FakeExecutor, &contract.id).unwrap();
+
+        let decision = punk_domain::DecisionObject {
+            id: format!("dec_{}", run.id.trim_start_matches("run_")),
+            run_id: run.id.clone(),
+            contract_id: contract.id.clone(),
+            decision: punk_domain::Decision::Block,
+            deterministic_status: punk_domain::DeterministicStatus::Fail,
+            target_status: punk_domain::CheckStatus::Fail,
+            integrity_status: punk_domain::CheckStatus::Pass,
+            confidence_estimate: 0.82,
+            decision_basis: vec![
+                "trace export still missing".into(),
+                "manual recovery should stay bounded".into(),
+            ],
+            contract_ref: format!(".punk/contracts/{}/v1.json", run.feature_id),
+            receipt_ref: format!(".punk/runs/{}/receipt.json", run.id),
+            check_refs: Vec::new(),
+            created_at: now_rfc3339(),
+        };
+        let decision_path = root
+            .join(".punk/decisions")
+            .join(format!("{}.json", decision.id));
+        write_json(&decision_path, &decision).unwrap();
+        let proof = punk_domain::Proofpack {
+            id: format!("proof_{}", decision.id.trim_start_matches("dec_")),
+            decision_id: decision.id.clone(),
+            run_id: run.id.clone(),
+            contract_ref: decision.contract_ref.clone(),
+            receipt_ref: decision.receipt_ref.clone(),
+            decision_ref: format!(".punk/decisions/{}.json", decision.id),
+            check_refs: Vec::new(),
+            hashes: Default::default(),
+            summary: format!("proof for {}", decision.id),
+            created_at: now_rfc3339(),
+        };
+        let proof_dir = root.join(".punk/proofs").join(&decision.id);
+        fs::create_dir_all(&proof_dir).unwrap();
+        let proof_path = proof_dir.join("proofpack.json");
+        write_json(&proof_path, &proof).unwrap();
+
+        let recovery_contract = service
+            .draft_contract(&FakeDrafter, "recover blocked autonomy")
+            .unwrap();
+        let autonomy = service
+            .record_autonomy_outcome(&proof.id, Some(&recovery_contract.id))
+            .unwrap();
+        let autonomy_ref = format!(".punk/autonomy/{}/{}.json", run.feature_id, autonomy.id);
+        let recovery_ref = format!(".punk/contracts/{}/v1.json", recovery_contract.feature_id);
+
+        let ledger = service.inspect_work_ledger(Some(&run.id)).unwrap();
+        assert_eq!(
+            ledger.latest_autonomy_ref.as_deref(),
+            Some(autonomy_ref.as_str())
+        );
+        assert_eq!(ledger.autonomy_outcome.as_deref(), Some("blocked"));
+        assert_eq!(
+            ledger.recovery_contract_ref.as_deref(),
+            Some(recovery_ref.as_str())
+        );
+        assert_eq!(ledger.lifecycle_state, "blocked_ready_for_recovery");
+        assert_eq!(
+            ledger.blocked_reason.as_deref(),
+            Some("trace export still missing; manual recovery should stay bounded")
+        );
+        assert_eq!(ledger.next_action.as_deref(), Some("approve_contract"));
+        assert_eq!(
+            ledger.next_action_ref.as_deref(),
+            Some(recovery_contract.id.as_str())
+        );
+
+        let status = service.status(Some(&run.id)).unwrap();
+        assert_eq!(
+            status.lifecycle_state.as_deref(),
+            Some("blocked_ready_for_recovery")
+        );
+        assert_eq!(status.next_action.as_deref(), Some("approve_contract"));
+        assert_eq!(
+            status.next_action_ref.as_deref(),
+            Some(recovery_contract.id.as_str())
+        );
+
+        let autonomy_inspect = service.inspect(&autonomy.id).unwrap();
+        assert_eq!(autonomy_inspect["id"].as_str(), Some(autonomy.id.as_str()));
+        assert_eq!(
+            autonomy_inspect["recovery_contract_ref"].as_str(),
+            Some(recovery_ref.as_str())
         );
 
         let _ = fs::remove_dir_all(&root);

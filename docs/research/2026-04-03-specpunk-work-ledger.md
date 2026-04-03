@@ -147,17 +147,20 @@ The current v1 derives `WorkLedgerView` from existing repo-local artifacts:
 - `Receipt`
 - `DecisionObject`
 - `Proofpack`
+- `AutonomyRecord`
 
 without introducing a new persistence layer yet.
 
 `punk status` now prefers this derived view for current work continuity fields (`work_id`, `lifecycle_state`, `next_action`, and latest contract/run/decision refs) instead of reconstructing them ad hoc from raw events.
 
+`punk go` now writes a durable autonomy-linked record so blocked or escalated outcomes with staged recovery prepared become inspectable later through `punk inspect work` / `punk status`.
+
 ## Recommended next slices
 
 1. Materialize one durable view record per active work item from the existing event stream
 2. Backfill stronger latest contract/run/decision/proof linkage into one materialized view
-3. Feed blocked/autonomous recovery state into the same work-ledger projection
-4. Add dedicated `inspect work <id>` recovery-oriented summaries for blocked/escalated autonomy
+3. Add dedicated `inspect work <id>` recovery-oriented summaries for blocked/escalated autonomy
+4. Decide whether a materialized on-disk work-ledger record is still needed beyond the current derived view
 
 ## Acceptance evidence
 
