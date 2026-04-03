@@ -36,6 +36,96 @@ The critical rule is:
 
 > Keep the kernel stable. Let model integrations, skills, councils, and research protocols evolve at the edges.
 
+See also:
+
+- `docs/product/NORTH-ROADMAP.md`
+- `docs/research/2026-04-03-specpunk-identity-and-layering.md`
+- `docs/research/2026-04-03-specpunk-primitives-and-derived-mechanisms.md`
+
+### Core vs shell split
+
+`punk` is intentionally split into two layers:
+
+#### Layer A — correctness substrate
+
+The substrate owns durable truth and safety invariants:
+
+- `Project` identity
+- normalized `Goal` intake record
+- `Contract`
+- `Scope`
+- isolated `Workspace`
+- `Run`
+- `DecisionObject`
+- `Proofpack`
+- evented `Ledger`
+- VCS isolation
+- artifact guarantees
+- failure semantics
+
+This layer must stay:
+
+- deterministic where possible
+- explicit about invariants
+- inspectable through structured artifacts
+- resistant to prompt drift
+
+#### Layer B — operator shell
+
+The shell owns operator ergonomics and default paths:
+
+- `punk init`
+- `punk start`
+- `punk go --fallback-staged`
+- summary formatting
+- blocked / recovery UX
+- generated `AGENTS.md`
+- repo-local bootstrap guidance
+- shell-facing status output
+
+The shell may simplify interaction, but it must not become a second source of truth.
+
+### Boundary rules
+
+Hard rules:
+
+1. The shell may compose substrate operations, but must not bypass substrate invariants.
+2. Safety-critical semantics live in code and persisted artifacts, not only in prompts.
+3. `gate` truth must not be downgraded into shell-only chatter.
+4. If shell behavior changes operator expectations, update `README.md`, `docs/product/CLI.md`, and `docs/product/NORTH-ROADMAP.md` together.
+5. If substrate invariants change, update this file and the linked research notes in the same diff.
+
+### Primitive vs derived rule
+
+If something can be recomposed from deeper objects without changing truth, it is not a primitive.
+
+Current candidate primitives are:
+
+| Primitive | Why it is primitive |
+|---|---|
+| `Project` | identity and repo boundary |
+| `Goal` | normalized user intent anchor |
+| `Contract` | executable bounded spec |
+| `Scope` | safety boundary for execution |
+| `Workspace` | isolated mutation context |
+| `Run` | one execution attempt |
+| `DecisionObject` | final verification verdict |
+| `Proofpack` | immutable verification artifact |
+| `Ledger` | durable evented truth and projections |
+
+Derived mechanisms are compositions over those primitives:
+
+- `init`
+- `start`
+- `go`
+- staged fallback
+- `status`
+- `inspect`
+- project overlays
+- council
+- eval
+- research protocols
+
 ---
 
 ## 3. First vertical slice
@@ -160,6 +250,22 @@ Project
             -> DecisionObject
             -> Proofpack
 ```
+
+### Primitive ownership inside the chain
+
+Not every object in the chain is equally primitive.
+
+| Object | Role |
+|---|---|
+| `Project` | primitive |
+| `Goal` | primitive |
+| `Feature` | durable workstream grouping; important, but can evolve as ledger design sharpens |
+| `Contract` | primitive |
+| `Task` | orchestration unit derived from approved work planning |
+| `Run` | primitive |
+| `Receipt` | execution truth artifact attached to a run |
+| `DecisionObject` | primitive |
+| `Proofpack` | primitive |
 
 ### Important meanings
 
