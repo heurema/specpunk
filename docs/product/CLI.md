@@ -48,6 +48,20 @@ Prompt examples:
 
 These are the preferred user-facing commands in the current v0/v0.1 surface.
 
+### One-face operator shell contract
+
+For initialized repos, the shell should behave as one obvious top-level interface:
+
+- plain user goal in
+- one concise progress or blocker summary out
+- one obvious next step out
+
+That means:
+
+- the default happy path is goal-first and shell-first
+- `plot`, `cut`, and `gate` remain available, but are not the first thing a normal operator should need to think about
+- blocked autonomy should degrade to one explicit recovery path, not to pipeline archaeology
+
 ### Primitive vs mechanism rule
 
 The commands below are not all ontology-level primitives.
@@ -105,6 +119,12 @@ Behavior:
 - exits non-zero when verification blocks or escalates
 - prepares a staged recovery contract when `--fallback-staged` is enabled
 
+Default shell expectation:
+
+- this is the normal initialized-repo path
+- the operator should receive one concise shell summary
+- lower-level commands should only be needed for debugging, review, or explicit control
+
 ### Staged/manual intake
 
 ```bash
@@ -116,6 +136,12 @@ Behavior:
 - accepts a plain goal
 - drafts a contract
 - prints the next explicit operator step
+
+Use this when:
+
+- autonomy is blocked
+- exact human review is needed between stages
+- an expert operator wants tighter manual control
 
 ### Mode-level commands
 
@@ -310,6 +336,7 @@ Writes:
 5. Plain user goals should route through `punk go --fallback-staged "<goal>"` by default.
 6. `punk start "<goal>"` remains the staged/manual escape hatch.
 7. New command proposals should state whether they introduce a new primitive or only a new derived mechanism; the default expectation is derived mechanism.
+8. Shell-facing commands should minimize reading burden by returning one concise progress or blocker summary plus one obvious next step.
 
 ---
 
