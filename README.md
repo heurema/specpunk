@@ -101,6 +101,8 @@ Bootstrap creates repo-local agent guidance:
 - `AGENTS.md`
 - `.punk/AGENT_START.md`
 
+Longer-term, project bootstrap should converge on one inspectable project-intelligence packet instead of a growing set of adjacent bootstrap artifacts.
+
 ### Default autonomous path
 
 The default autonomous intake is goal-only:
