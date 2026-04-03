@@ -61,6 +61,7 @@ Update docs in the same diff when behavior changes:
 ## Reliability rules
 
 - If a bug came from external dogfood, add a regression or fixture note if possible
+- Check `docs/research/2026-04-03-specpunk-repo-fixture-matrix.md` before calling a reliability fix complete
 - If autonomy is blocked, downgrade to staged/manual flow and report the blocker explicitly
 - Do not hide failed verification behind shell success
 - No destructive cleanup without explicit confirmation
