@@ -460,6 +460,62 @@ Later subsystems may add:
 
 but they should extend, not replace, the evented core.
 
+### `WorkLedgerView`
+
+The event log is the source of truth, but operators and agents should not have to reconstruct work continuity manually from raw events and multiple artifact types.
+
+The intended answer is a materialized projection:
+
+```text
+WorkLedgerView
+  project_id
+  work_id
+  goal_ref
+  feature_ref
+  active_contract_ref
+  latest_run_ref
+  latest_receipt_ref
+  latest_decision_ref
+  latest_proof_ref
+  lifecycle_state
+  blocked_reason
+  next_action
+  next_action_ref
+  updated_at
+```
+
+### Why this view exists
+
+It answers the three operator questions that raw artifacts answer poorly:
+
+1. what is the current state of this work item?
+2. what artifact is currently authoritative?
+3. what should happen next?
+
+### Important rules
+
+- `WorkLedgerView` is a **derived projection**, not a second mutable truth object
+- append-only events remain canonical truth
+- contracts, runs, decisions, and proofs remain canonical artifacts
+- shell surfaces should prefer this projection over ad hoc status inference
+
+### Initial lifecycle projection
+
+The first useful `lifecycle_state` set is:
+
+- `drafting`
+- `awaiting_approval`
+- `ready_to_run`
+- `running`
+- `awaiting_gate`
+- `accepted`
+- `blocked`
+- `escalated`
+- `superseded`
+- `cancelled`
+
+These are projection states for operators and shells, not replacements for lower-level object status enums.
+
 ---
 
 ## 9. Storage layout

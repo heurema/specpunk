@@ -41,6 +41,84 @@ A first-class `WorkItem` or equivalent ledger entry should exist above the curre
 
 This does **not** require a new storage engine first. The model should be fixed before storage migration is discussed.
 
+## Proposed shape: `WorkLedgerView`
+
+The next bounded design step should standardize one canonical projection:
+
+```text
+WorkLedgerView
+  project_id
+  work_id
+  goal_ref
+  feature_ref
+  active_contract_ref
+  latest_run_ref
+  latest_receipt_ref
+  latest_decision_ref
+  latest_proof_ref
+  lifecycle_state
+  blocked_reason
+  next_action
+  next_action_ref
+  updated_at
+```
+
+### Required semantics
+
+- `work_id` must be stable across contract versions and retries
+- `active_contract_ref` must point to the contract currently expected to drive execution
+- `latest_*` refs must reflect the newest durable artifacts, not shell guesses
+- `lifecycle_state` must answer the operator question:
+  - what state is this work item in right now?
+- `next_action` must answer:
+  - what should happen next if I continue this work item?
+
+## Proposed `lifecycle_state`
+
+The first version does not need a huge state machine. It needs a useful one.
+
+Recommended v1 states:
+
+- `drafting`
+- `awaiting_approval`
+- `ready_to_run`
+- `running`
+- `awaiting_gate`
+- `accepted`
+- `blocked`
+- `escalated`
+- `superseded`
+- `cancelled`
+
+These states are not replacements for lower-level object statuses. They are the operator-facing projection over them.
+
+## Source-of-truth rule
+
+`WorkLedgerView` is a **projection**, not a new mutable truth object.
+
+That means:
+
+- append-only events remain canonical truth
+- contracts, runs, decisions, and proofs remain canonical artifacts
+- `WorkLedgerView` is materialized from them
+- shell output must prefer `WorkLedgerView` over ad hoc inference
+
+## Query surfaces that should use it
+
+Once introduced, these commands or surfaces should read from it first:
+
+- `punk status`
+- `punk inspect work <id>`
+- blocked/recovery summaries in `punk go`
+- future morning/briefing surfaces
+
+## Anti-goals
+
+- do not invent a second write path for work state
+- do not put review prose into the ledger view
+- do not choose a storage engine before the view shape is accepted
+- do not collapse `Feature` and `WorkLedgerView` into one object without proving they are the same concept
+
 ## Evidence from reference systems
 
 - **Beads** treats work graph and continuity as a primary operational plane.
@@ -56,8 +134,9 @@ This does **not** require a new storage engine first. The model should be fixed 
 ## Recommended next slices
 
 1. Define a `WorkLedgerView` projection over existing objects
-2. Add `punk inspect work <id>` style query surface
-3. Backfill latest contract/run/decision/proof linkage into one materialized view
+2. Materialize one view record per active work item from the existing event stream
+3. Add `punk inspect work <id>` style query surface
+4. Backfill latest contract/run/decision/proof linkage into one materialized view
 
 ## Acceptance evidence
 
@@ -65,3 +144,4 @@ This track is done when:
 - one canonical work view exists
 - status and inspect can answer current/blocked/next questions from it
 - contributor agents no longer need to infer work continuity from multiple file types
+- blocked/autonomous recovery state is inspectable without reading shell logs
