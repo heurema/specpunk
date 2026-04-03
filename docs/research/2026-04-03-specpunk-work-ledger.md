@@ -155,6 +155,12 @@ without introducing a new persistence layer yet.
 
 `punk go` now writes a durable autonomy-linked record so blocked or escalated outcomes with staged recovery prepared become inspectable later through `punk inspect work` / `punk status`.
 
+The next shell-oriented refinement is recovery-aware summaries that expose:
+
+- `autonomy_outcome`
+- `recovery_contract_ref`
+- one obvious `suggested_command`
+
 ## Recommended next slices
 
 1. Materialize one durable view record per active work item from the existing event stream

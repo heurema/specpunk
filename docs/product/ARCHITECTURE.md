@@ -606,6 +606,8 @@ The current bounded implementation now writes a repo-local autonomy-linked recor
 - recovery-aware `lifecycle_state`
 - durable `next_action` / `next_action_ref`
 
+Shell status/read surfaces may additionally derive a `suggested_command`, but that remains a shell convenience layered on top of the durable refs above.
+
 ### Recovery distinction
 
 The architecture should distinguish:
