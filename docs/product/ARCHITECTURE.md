@@ -631,6 +631,56 @@ Use this for:
 - proof bundles
 - project overlays when they are repo-specific
 
+### `ProjectOverlay`
+
+Project intelligence should converge on one inspectable repo-local packet rather than a growing set of adjacent special cases.
+
+The intended packet shape is:
+
+```text
+ProjectOverlay
+  project_id
+  repo_root
+  vcs_mode
+  bootstrap_ref
+  agent_guidance_ref
+  capability_summary
+  project_skill_refs
+  local_constraints
+  safe_default_checks
+  status_scope_mode
+  updated_at
+```
+
+### Why this packet exists
+
+It should unify:
+
+- resolver/pin state
+- bootstrap guidance
+- repo-root `AGENTS.md`
+- `.punk/AGENT_START.md`
+- project-scoped skills
+- repo-specific safe defaults
+
+so that operators and agents can inspect one source instead of reconstructing project intelligence from scattered files.
+
+### Projection rule
+
+`ProjectOverlay` should be inspectable and explicit.
+
+It must not become:
+
+- opaque hidden heuristics
+- silent auto-mutation
+- a second uncontrolled source of truth for runtime artifacts
+
+The likely correct model is:
+
+- canonical project facts and refs are persisted
+- shell commands read them through one project-intelligence packet
+- project-specific skill composition remains explicit and inspectable
+
 ---
 
 ## 10. VCS substrate
@@ -757,6 +807,8 @@ Skills should be composed from layers:
 4. task packet
 
 A live agent should receive a composed skill packet, not a single monolithic markdown blob.
+
+The long-term project layer should therefore line up with `ProjectOverlay`, not with ad hoc bootstrap files alone.
 
 ### Skill lifecycle
 

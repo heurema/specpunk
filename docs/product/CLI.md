@@ -97,11 +97,16 @@ Bootstrap should:
 - pin the current repo as a known project
 - create repo-local agent guidance
 - verify status scope and VCS mode
+- converge project-local intelligence toward one inspectable project packet over time
 
 Generated guidance:
 
 - `AGENTS.md`
 - `.punk/AGENT_START.md`
+
+Longer-term shell expectation:
+
+- `punk inspect project` or equivalent should explain project identity, guidance, capabilities, and active project overlays in one place
 
 ### Default autonomous intake
 
