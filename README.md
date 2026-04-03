@@ -117,6 +117,14 @@ goal -> draft -> approve -> cut -> gate -> proof
 
 If autonomy blocks or escalates, `punk` prepares a staged recovery contract and returns a non-zero exit.
 
+The intended operator experience is:
+
+- plain goal in
+- one concise progress or blocker summary out
+- one obvious next step out
+
+`plot / cut / gate` remain available, but they are expert/control surfaces rather than the default path a normal operator must learn first.
+
 ### Staged/manual path
 
 When you want explicit review between stages:

@@ -41,6 +41,14 @@ punk plot approve <contract-id>
 punk cut run <contract-id>
 ```
 
+For normal work, do not force the user to choose `plot` / `cut` / `gate`.
+Treat those as expert/control surfaces.
+The default shell contract should be:
+
+- plain goal in
+- one concise progress or blocker summary out
+- one obvious next step out
+
 ## Scope and trust rules
 
 - Do not trust drafted or refined `allowed_scope` blindly on a new repo class
