@@ -111,6 +111,9 @@ The most likely good design is:
 
 That keeps shell UX and durable state aligned.
 
+The current bounded implementation now writes an autonomy-linked repo-local record during
+`punk go`, including staged recovery linkage when `--fallback-staged` prepares a recovery contract.
+
 ## Proposed v1 state progression
 
 The first useful autonomous progression can stay compact:
