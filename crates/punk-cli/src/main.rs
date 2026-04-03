@@ -317,17 +317,21 @@ fn format_gate_run_summary(
 }
 
 fn format_status_summary(snapshot: &punk_orch::StatusSnapshot) -> String {
+    let suggested_command = snapshot.suggested_command.as_deref().unwrap_or("none");
     format!(
-        "project={} events={} work={:?} lifecycle={:?} contract={:?} run={:?} decision={:?} next_action={:?} next_action_ref={:?} blocked_reason={:?} vcs={:?} ref={:?} dirty={} workspace_root={:?}",
+        "project={} events={} work={:?} lifecycle={:?} autonomy_outcome={:?} recovery_contract_ref={:?} contract={:?} run={:?} decision={:?} next_action={:?} next_action_ref={:?} suggested_command={} blocked_reason={:?} vcs={:?} ref={:?} dirty={} workspace_root={:?}",
         snapshot.project_id,
         snapshot.events_count,
         snapshot.work_id,
         snapshot.lifecycle_state,
+        snapshot.autonomy_outcome,
+        snapshot.recovery_contract_ref,
         snapshot.last_contract_id,
         snapshot.last_run_id,
         snapshot.last_decision_id,
         snapshot.next_action,
         snapshot.next_action_ref,
+        suggested_command,
         snapshot.blocked_reason,
         snapshot.vcs_backend,
         snapshot.vcs_ref,
@@ -828,9 +832,19 @@ fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
     let blocked_reason = ledger.blocked_reason.as_deref().unwrap_or("none");
     let next_action = ledger.next_action.as_deref().unwrap_or("none");
     let next_action_ref = ledger.next_action_ref.as_deref().unwrap_or("none");
+    let suggested_command = suggested_command_from_action(
+        ledger.next_action.as_deref(),
+        ledger.next_action_ref.as_deref(),
+    )
+    .unwrap_or_else(|| "none".to_string());
+    let recovery_status = if ledger.recovery_contract_ref.is_some() {
+        "prepared"
+    } else {
+        "none"
+    };
 
     format!(
-        "Work: {work_id}\nProject: {project_id}\nLifecycle: {lifecycle_state}\nGoal: {goal}\nFeature: {feature_ref}\nContract: {contract}\nRun: {run}\nReceipt: {receipt}\nDecision: {decision}\nProof: {proof}\nAutonomy: {autonomy}\nAutonomy outcome: {autonomy_outcome}\nRecovery contract: {recovery_contract}\nBlocked reason: {blocked_reason}\nNext action: {next_action}\nNext action ref: {next_action_ref}\nUpdated at: {updated_at}",
+        "Work: {work_id}\nProject: {project_id}\nLifecycle: {lifecycle_state}\nGoal: {goal}\nFeature: {feature_ref}\nContract: {contract}\nRun: {run}\nReceipt: {receipt}\nDecision: {decision}\nProof: {proof}\nAutonomy: {autonomy}\nAutonomy outcome: {autonomy_outcome}\nRecovery status: {recovery_status}\nRecovery contract: {recovery_contract}\nBlocked reason: {blocked_reason}\nNext action: {next_action}\nNext action ref: {next_action_ref}\nSuggested command: {suggested_command}\nUpdated at: {updated_at}",
         work_id = ledger.work_id,
         project_id = ledger.project_id,
         lifecycle_state = ledger.lifecycle_state,
@@ -843,12 +857,31 @@ fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
         proof = proof,
         autonomy = autonomy,
         autonomy_outcome = autonomy_outcome,
+        recovery_status = recovery_status,
         recovery_contract = recovery_contract,
         blocked_reason = blocked_reason,
         next_action = next_action,
         next_action_ref = next_action_ref,
+        suggested_command = suggested_command,
         updated_at = ledger.updated_at,
     )
+}
+
+fn suggested_command_from_action(
+    next_action: Option<&str>,
+    next_action_ref: Option<&str>,
+) -> Option<String> {
+    let action = next_action?;
+    let reference = next_action_ref?;
+    match action {
+        "approve_contract" => Some(format!("punk plot approve {reference}")),
+        "cut_run" => Some(format!("punk cut run {reference}")),
+        "gate_run" => Some(format!("punk gate run {reference}")),
+        "write_proofpack" => Some(format!("punk gate proof {reference}")),
+        "inspect_proof" => Some(format!("punk inspect {reference} --json")),
+        "wait_for_run" => Some(format!("punk status {reference} --json")),
+        _ => None,
+    }
 }
 
 fn resolve_init_project_id(project_root: &Path, explicit_project: Option<&str>) -> Result<String> {
@@ -1130,9 +1163,12 @@ mod tests {
             events_count: 1,
             work_id: Some("feat_1".into()),
             lifecycle_state: Some("accepted".into()),
+            autonomy_outcome: None,
+            recovery_contract_ref: None,
             blocked_reason: None,
             next_action: Some("inspect_proof".into()),
             next_action_ref: Some("proof_1".into()),
+            suggested_command: Some("punk inspect proof_1 --json".into()),
             last_contract_id: Some("ct_1".into()),
             last_run_id: Some("run_1".into()),
             last_decision_id: Some("dec_1".into()),
@@ -1155,9 +1191,12 @@ mod tests {
             events_count: 3,
             work_id: Some("feat_1".into()),
             lifecycle_state: Some("accepted".into()),
-            blocked_reason: None,
-            next_action: Some("inspect_proof".into()),
-            next_action_ref: Some("proof_1".into()),
+            autonomy_outcome: Some("blocked".into()),
+            recovery_contract_ref: Some(".punk/contracts/feat_1/v2.json".into()),
+            blocked_reason: Some("missing trace export".into()),
+            next_action: Some("approve_contract".into()),
+            next_action_ref: Some("ct_2".into()),
+            suggested_command: Some("punk plot approve ct_2".into()),
             last_contract_id: Some("ct_1".into()),
             last_run_id: Some("run_1".into()),
             last_decision_id: Some("dec_1".into()),
@@ -1169,8 +1208,11 @@ mod tests {
         let rendered = format_status_summary(&snapshot);
         assert!(rendered.contains("work=Some(\"feat_1\")"));
         assert!(rendered.contains("lifecycle=Some(\"accepted\")"));
-        assert!(rendered.contains("next_action=Some(\"inspect_proof\")"));
-        assert!(rendered.contains("next_action_ref=Some(\"proof_1\")"));
+        assert!(rendered.contains("autonomy_outcome=Some(\"blocked\")"));
+        assert!(rendered.contains("recovery_contract_ref=Some(\".punk/contracts/feat_1/v2.json\")"));
+        assert!(rendered.contains("next_action=Some(\"approve_contract\")"));
+        assert!(rendered.contains("next_action_ref=Some(\"ct_2\")"));
+        assert!(rendered.contains("suggested_command=punk plot approve ct_2"));
     }
 
     #[test]
@@ -1347,9 +1389,11 @@ mod tests {
         assert!(rendered.contains("Proof: .punk/proofs/dec_456/proofpack.json"));
         assert!(rendered.contains("Autonomy: .punk/autonomy/feat_123/auto_456.json"));
         assert!(rendered.contains("Autonomy outcome: blocked"));
+        assert!(rendered.contains("Recovery status: prepared"));
         assert!(rendered.contains("Recovery contract: .punk/contracts/feat_789/v1.json"));
         assert!(rendered.contains("Next action: inspect_proof"));
         assert!(rendered.contains("Next action ref: proof_456"));
+        assert!(rendered.contains("Suggested command: punk inspect proof_456 --json"));
     }
 
     #[test]

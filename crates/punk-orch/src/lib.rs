@@ -45,9 +45,12 @@ pub struct StatusSnapshot {
     pub events_count: usize,
     pub work_id: Option<String>,
     pub lifecycle_state: Option<String>,
+    pub autonomy_outcome: Option<String>,
+    pub recovery_contract_ref: Option<String>,
     pub blocked_reason: Option<String>,
     pub next_action: Option<String>,
     pub next_action_ref: Option<String>,
+    pub suggested_command: Option<String>,
     pub last_contract_id: Option<String>,
     pub last_run_id: Option<String>,
     pub last_decision_id: Option<String>,
@@ -760,6 +763,12 @@ impl OrchService {
             events_count: events.len(),
             work_id: ledger.as_ref().map(|ledger| ledger.work_id.clone()),
             lifecycle_state: ledger.as_ref().map(|ledger| ledger.lifecycle_state.clone()),
+            autonomy_outcome: ledger
+                .as_ref()
+                .and_then(|ledger| ledger.autonomy_outcome.clone()),
+            recovery_contract_ref: ledger
+                .as_ref()
+                .and_then(|ledger| ledger.recovery_contract_ref.clone()),
             blocked_reason: ledger
                 .as_ref()
                 .and_then(|ledger| ledger.blocked_reason.clone()),
@@ -769,6 +778,12 @@ impl OrchService {
             next_action_ref: ledger
                 .as_ref()
                 .and_then(|ledger| ledger.next_action_ref.clone()),
+            suggested_command: ledger.as_ref().and_then(|ledger| {
+                work_suggested_command(
+                    ledger.next_action.as_deref(),
+                    ledger.next_action_ref.as_deref(),
+                )
+            }),
             last_contract_id: ledger.as_ref().and_then(|ledger| {
                 work_object_id_from_ref(
                     &self.paths.repo_root,
@@ -1731,6 +1746,23 @@ fn autonomy_next_action(
             ("approve_contract", contract_id.to_string())
         }
         _ => ("inspect_proof", proof_id.to_string()),
+    }
+}
+
+fn work_suggested_command(
+    next_action: Option<&str>,
+    next_action_ref: Option<&str>,
+) -> Option<String> {
+    let action = next_action?;
+    let reference = next_action_ref?;
+    match action {
+        "approve_contract" => Some(format!("punk plot approve {reference}")),
+        "cut_run" => Some(format!("punk cut run {reference}")),
+        "gate_run" => Some(format!("punk gate run {reference}")),
+        "write_proofpack" => Some(format!("punk gate proof {reference}")),
+        "inspect_proof" => Some(format!("punk inspect {reference} --json")),
+        "wait_for_run" => Some(format!("punk status {reference} --json")),
+        _ => None,
     }
 }
 
@@ -3233,8 +3265,15 @@ mod tests {
         let status = service.status(None).unwrap();
         assert_eq!(status.work_id.as_deref(), Some(ledger.work_id.as_str()));
         assert_eq!(status.lifecycle_state.as_deref(), Some("accepted"));
+        assert_eq!(status.autonomy_outcome, None);
+        assert_eq!(status.recovery_contract_ref, None);
         assert_eq!(status.next_action.as_deref(), Some("inspect_proof"));
         assert_eq!(status.next_action_ref.as_deref(), Some(proof.id.as_str()));
+        let inspect_command = format!("punk inspect {} --json", proof.id);
+        assert_eq!(
+            status.suggested_command.as_deref(),
+            Some(inspect_command.as_str())
+        );
         assert_eq!(
             status.last_contract_id.as_deref(),
             Some(contract.id.as_str())
@@ -3395,10 +3434,20 @@ mod tests {
             status.lifecycle_state.as_deref(),
             Some("blocked_ready_for_recovery")
         );
+        assert_eq!(status.autonomy_outcome.as_deref(), Some("blocked"));
+        assert_eq!(
+            status.recovery_contract_ref.as_deref(),
+            Some(recovery_ref.as_str())
+        );
         assert_eq!(status.next_action.as_deref(), Some("approve_contract"));
         assert_eq!(
             status.next_action_ref.as_deref(),
             Some(recovery_contract.id.as_str())
+        );
+        let approve_command = format!("punk plot approve {}", recovery_contract.id);
+        assert_eq!(
+            status.suggested_command.as_deref(),
+            Some(approve_command.as_str())
         );
 
         let autonomy_inspect = service.inspect(&autonomy.id).unwrap();

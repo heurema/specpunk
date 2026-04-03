@@ -118,6 +118,7 @@ Current work-ledger inspect surface:
 Current status behavior:
 
 - `punk status` now prefers `WorkLedgerView` for current work continuity fields
+- recovery-oriented status should surface durable autonomy-linked fields such as `autonomy_outcome`, `recovery_contract_ref`, and a shell-level `suggested_command`
 - latest work/lifecycle/next-action data should come from the derived work view, not direct raw-event scanning
 
 Longer-term shell expectation:
