@@ -51,6 +51,31 @@ pub struct StatusSnapshot {
     pub workspace_root: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectCapabilitySummary {
+    pub bootstrap_ready: bool,
+    pub autonomous_ready: bool,
+    pub staged_ready: bool,
+    pub jj_ready: bool,
+    pub proof_ready: bool,
+    pub project_guidance_ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectOverlay {
+    pub project_id: String,
+    pub repo_root: String,
+    pub vcs_mode: String,
+    pub bootstrap_ref: Option<String>,
+    pub agent_guidance_ref: Vec<String>,
+    pub capability_summary: ProjectCapabilitySummary,
+    pub project_skill_refs: Vec<String>,
+    pub local_constraints: Vec<String>,
+    pub safe_default_checks: Vec<String>,
+    pub status_scope_mode: String,
+    pub updated_at: String,
+}
+
 pub struct OrchService {
     paths: RepoPaths,
     events: EventStore,
@@ -815,6 +840,9 @@ impl OrchService {
 
     pub fn inspect(&self, id: &str) -> Result<serde_json::Value> {
         let project = self.bootstrap_project()?;
+        if id == "project" {
+            return Ok(serde_json::to_value(self.inspect_project_overlay()?)?);
+        }
         if id == project.id {
             let mut value = serde_json::to_value(project)?;
             attach_live_vcs(&mut value, self.live_vcs_value());
@@ -838,6 +866,85 @@ impl OrchService {
             }
         }
         Err(anyhow!("unknown id: {id}"))
+    }
+
+    pub fn inspect_project_overlay(&self) -> Result<ProjectOverlay> {
+        let project = self.bootstrap_project()?;
+        let project_label = project_label(&self.paths.repo_root);
+        let bootstrap_path = self
+            .paths
+            .dot_punk
+            .join("bootstrap")
+            .join(format!("{project_label}-core.md"));
+        let repo_agents_path = self.paths.repo_root.join("AGENTS.md");
+        let agent_start_path = self.paths.dot_punk.join("AGENT_START.md");
+
+        let bootstrap_ref = bootstrap_path
+            .exists()
+            .then(|| relative_ref(&self.paths.repo_root, &bootstrap_path))
+            .transpose()?;
+
+        let mut agent_guidance_ref = Vec::new();
+        if repo_agents_path.exists() {
+            agent_guidance_ref.push(relative_ref(&self.paths.repo_root, &repo_agents_path)?);
+        }
+        if agent_start_path.exists() {
+            agent_guidance_ref.push(relative_ref(&self.paths.repo_root, &agent_start_path)?);
+        }
+
+        let mut local_constraints = Vec::new();
+        let safe_default_checks =
+            match scan_repo(&self.paths.repo_root, "project overlay safe default checks") {
+                Ok(scan) => scan.candidate_integrity_checks,
+                Err(error) => {
+                    local_constraints.push(format!("unable to infer safe default checks: {error}"));
+                    Vec::new()
+                }
+            };
+
+        let project_skill_refs = active_project_skill_refs(&project_label);
+        if bootstrap_ref.is_none() {
+            local_constraints.push("repo-local bootstrap guidance missing".to_string());
+        }
+        if !repo_agents_path.exists() {
+            local_constraints.push("repo-root AGENTS.md missing".to_string());
+        }
+        if !agent_start_path.exists() {
+            local_constraints.push(".punk/AGENT_START.md missing".to_string());
+        }
+        if project_skill_refs.is_empty() {
+            local_constraints.push("no active project-scoped skill detected".to_string());
+        }
+
+        let vcs_mode = project_overlay_vcs_mode(&self.paths.repo_root);
+        if vcs_mode != "jj" {
+            local_constraints.push("jj is not enabled for this repo".to_string());
+        }
+
+        let project_guidance_ready = repo_agents_path.exists() && agent_start_path.exists();
+        let staged_ready = !safe_default_checks.is_empty();
+        let capability_summary = ProjectCapabilitySummary {
+            bootstrap_ready: bootstrap_ref.is_some(),
+            autonomous_ready: project_guidance_ready && staged_ready,
+            staged_ready,
+            jj_ready: vcs_mode == "jj",
+            proof_ready: staged_ready,
+            project_guidance_ready,
+        };
+
+        Ok(ProjectOverlay {
+            project_id: project.id.clone(),
+            repo_root: project.path,
+            vcs_mode,
+            bootstrap_ref,
+            agent_guidance_ref,
+            capability_summary,
+            project_skill_refs,
+            local_constraints,
+            safe_default_checks,
+            status_scope_mode: format!("project:{}", project.id),
+            updated_at: project.updated_at,
+        })
     }
 
     fn live_vcs_value(&self) -> serde_json::Value {
@@ -907,6 +1014,91 @@ pub fn project_id(root: &Path) -> Result<String> {
     hasher.update(canonical_root.to_string_lossy().as_bytes());
     let digest = hex::encode(hasher.finalize());
     Ok(format!("{basename}-{}", &digest[..10]))
+}
+
+fn project_label(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project")
+        .to_string()
+}
+
+fn project_overlay_vcs_mode(repo_root: &Path) -> String {
+    use punk_vcs::VcsMode;
+
+    match punk_vcs::detect_mode(repo_root) {
+        VcsMode::Jj => "jj".to_string(),
+        VcsMode::GitWithJjAvailableButDisabled => "git_degraded".to_string(),
+        VcsMode::GitOnly => "git".to_string(),
+        VcsMode::NoVcs => "none".to_string(),
+    }
+}
+
+fn active_project_skill_refs(project_label: &str) -> Vec<String> {
+    let bus_dir = std::env::var("PUNK_BUS_DIR")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            std::env::var("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join("vicc/state/bus"))
+        })
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let skills_dir = bus_dir.parent().unwrap_or(&bus_dir).join("skills");
+    let Ok(entries) = fs::read_dir(&skills_dir) else {
+        return Vec::new();
+    };
+
+    let mut refs = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+        .filter(|path| path_matches_project_skill(path, project_label))
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn path_matches_project_skill(path: &Path, project_label: &str) -> bool {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    if stem == format!("{project_label}-core") {
+        return true;
+    }
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    skill_projects(&content)
+        .iter()
+        .any(|project| project == project_label)
+}
+
+fn skill_projects(content: &str) -> Vec<String> {
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return Vec::new();
+    };
+    let Some((frontmatter, _)) = rest.split_once("\n---") else {
+        return Vec::new();
+    };
+    for line in frontmatter.lines() {
+        let Some(raw) = line.strip_prefix("project:") else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            return trimmed[1..trimmed.len() - 1]
+                .split(',')
+                .map(|item| item.trim().trim_matches('"').to_string())
+                .filter(|item| !item.is_empty())
+                .collect();
+        }
+        if !trimmed.is_empty() {
+            return vec![trimmed.trim_matches('"').to_string()];
+        }
+    }
+    Vec::new()
 }
 
 fn summarize_prompt(prompt: &str) -> String {
@@ -1123,6 +1315,29 @@ mod tests {
     use super::*;
     use punk_adapters::{ContractDrafter, ExecuteInput, ExecuteOutput};
     use punk_domain::{DraftInput, RefineInput};
+    use std::ffi::OsString;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     struct FakeExecutor;
 
@@ -2119,6 +2334,128 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn inspect_project_overlay_reports_guidance_capabilities_and_skill_refs() {
+        let base = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = base.join("interviewcoach");
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bus = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-bus-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _bus_guard = EnvVarGuard::set("PUNK_BUS_DIR", &bus);
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        let _ = fs::remove_dir_all(&bus);
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='interviewcoach'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        fs::write(root.join("Makefile"), "test:\n\tcargo test\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/interviewcoach-core.md"),
+            "Use existing architecture.\n",
+        )
+        .unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::create_dir_all(root.join(".punk")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+
+        let skills_dir = bus.parent().unwrap().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        fs::write(
+            skills_dir.join("interviewcoach-core.md"),
+            "---\nname: interviewcoach-core\ndescription: Core rules\nproject: [\"interviewcoach\"]\n---\n\nUse existing architecture.\n",
+        )
+        .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let overlay = service.inspect_project_overlay().unwrap();
+
+        assert_eq!(
+            overlay.bootstrap_ref.as_deref(),
+            Some(".punk/bootstrap/interviewcoach-core.md")
+        );
+        assert_eq!(
+            overlay.agent_guidance_ref,
+            vec!["AGENTS.md", ".punk/AGENT_START.md"]
+        );
+        assert!(overlay
+            .safe_default_checks
+            .iter()
+            .any(|check| check == "make test"));
+        assert!(overlay
+            .safe_default_checks
+            .iter()
+            .any(|check| check == "cargo test"));
+        assert!(overlay
+            .project_skill_refs
+            .iter()
+            .any(|path| path.ends_with("interviewcoach-core.md")));
+        assert!(overlay.capability_summary.bootstrap_ready);
+        assert!(overlay.capability_summary.project_guidance_ready);
+        assert!(overlay.capability_summary.staged_ready);
+        assert!(overlay.capability_summary.autonomous_ready);
+        assert_eq!(
+            overlay.status_scope_mode,
+            format!("project:{}", overlay.project_id)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&global);
+        let _ = fs::remove_dir_all(&bus);
     }
 
     #[test]

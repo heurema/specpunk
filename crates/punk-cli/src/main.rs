@@ -265,8 +265,18 @@ fn run() -> Result<()> {
         }
         Command::Inspect(inspect) => {
             let orch = OrchService::new(&repo_root, &global_root)?;
+            if inspect.id == "project" {
+                let overlay = orch.inspect_project_overlay()?;
+                return render(
+                    inspect.json,
+                    &overlay,
+                    &format_project_overlay_summary(&overlay),
+                );
+            }
             if !inspect.json {
-                return Err(anyhow!("inspect currently requires --json"));
+                return Err(anyhow!(
+                    "inspect for object ids currently requires --json; use `punk inspect project` for the human project overlay view"
+                ));
             }
             let value = orch.inspect(&inspect.id)?;
             println!("{}", serde_json::to_string_pretty(&value)?);
@@ -740,6 +750,54 @@ fn format_go_error(
     rendered
 }
 
+fn format_project_overlay_summary(overlay: &punk_orch::ProjectOverlay) -> String {
+    let bootstrap = overlay.bootstrap_ref.as_deref().unwrap_or("missing");
+    let guidance = if overlay.agent_guidance_ref.is_empty() {
+        "missing".to_string()
+    } else {
+        overlay.agent_guidance_ref.join(", ")
+    };
+    let skills = if overlay.project_skill_refs.is_empty() {
+        "none".to_string()
+    } else {
+        overlay.project_skill_refs.join(", ")
+    };
+    let checks = if overlay.safe_default_checks.is_empty() {
+        "none".to_string()
+    } else {
+        overlay.safe_default_checks.join(", ")
+    };
+    let constraints = if overlay.local_constraints.is_empty() {
+        "none".to_string()
+    } else {
+        overlay
+            .local_constraints
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "Project: {project_id}\nRepo root: {repo_root}\nVCS mode: {vcs_mode}\nStatus scope: {status_scope_mode}\nBootstrap: {bootstrap}\nGuidance: {guidance}\nProject skills: {skills}\nSafe default checks: {checks}\nCapabilities:\n  bootstrap_ready={bootstrap_ready}\n  project_guidance_ready={guidance_ready}\n  staged_ready={staged_ready}\n  autonomous_ready={autonomous_ready}\n  jj_ready={jj_ready}\n  proof_ready={proof_ready}\nLocal constraints:\n{constraints}",
+        project_id = overlay.project_id,
+        repo_root = overlay.repo_root,
+        vcs_mode = overlay.vcs_mode,
+        status_scope_mode = overlay.status_scope_mode,
+        bootstrap = bootstrap,
+        guidance = guidance,
+        skills = skills,
+        checks = checks,
+        bootstrap_ready = overlay.capability_summary.bootstrap_ready,
+        guidance_ready = overlay.capability_summary.project_guidance_ready,
+        staged_ready = overlay.capability_summary.staged_ready,
+        autonomous_ready = overlay.capability_summary.autonomous_ready,
+        jj_ready = overlay.capability_summary.jj_ready,
+        proof_ready = overlay.capability_summary.proof_ready,
+        constraints = constraints,
+    )
+}
+
 fn resolve_init_project_id(project_root: &Path, explicit_project: Option<&str>) -> Result<String> {
     if let Some(project) = explicit_project
         .map(str::trim)
@@ -1144,6 +1202,37 @@ mod tests {
         assert!(rendered.contains("proof: proof_789"));
         assert!(rendered.contains("punk inspect proof_789 --json"));
         assert!(rendered.contains("punk start \"retry goal\""));
+    }
+
+    #[test]
+    fn project_overlay_summary_mentions_capabilities_and_refs() {
+        let overlay = punk_orch::ProjectOverlay {
+            project_id: "interviewcoach-e5b92bb854".into(),
+            repo_root: "/tmp/interviewcoach".into(),
+            vcs_mode: "jj".into(),
+            bootstrap_ref: Some(".punk/bootstrap/interviewcoach-core.md".into()),
+            agent_guidance_ref: vec!["AGENTS.md".into(), ".punk/AGENT_START.md".into()],
+            capability_summary: punk_orch::ProjectCapabilitySummary {
+                bootstrap_ready: true,
+                autonomous_ready: true,
+                staged_ready: true,
+                jj_ready: true,
+                proof_ready: true,
+                project_guidance_ready: true,
+            },
+            project_skill_refs: vec!["/tmp/skills/interviewcoach-core.md".into()],
+            local_constraints: vec!["none".into()],
+            safe_default_checks: vec!["make test".into()],
+            status_scope_mode: "project:interviewcoach-e5b92bb854".into(),
+            updated_at: "2026-04-03T00:00:00Z".into(),
+        };
+        let rendered = format_project_overlay_summary(&overlay);
+        assert!(rendered.contains("Project: interviewcoach-e5b92bb854"));
+        assert!(rendered.contains("Bootstrap: .punk/bootstrap/interviewcoach-core.md"));
+        assert!(rendered.contains("Guidance: AGENTS.md, .punk/AGENT_START.md"));
+        assert!(rendered.contains("Project skills: /tmp/skills/interviewcoach-core.md"));
+        assert!(rendered.contains("Safe default checks: make test"));
+        assert!(rendered.contains("autonomous_ready=true"));
     }
 
     #[test]
