@@ -109,9 +109,16 @@ Current project inspect surface:
 - `punk inspect project`
 - `punk inspect project --json`
 
+Current work-ledger inspect surface:
+
+- `punk inspect work`
+- `punk inspect work <id>`
+- `punk inspect work <id> --json`
+
 Longer-term shell expectation:
 
 - project bootstrap and shell status should keep converging on this same inspectable project-intelligence packet
+- work continuity should keep converging on one inspectable work-ledger view instead of ad hoc latest-artifact inference
 
 ### Default autonomous intake
 

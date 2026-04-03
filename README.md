@@ -108,6 +108,14 @@ punk inspect project
 punk inspect project --json
 ```
 
+Inspect the current derived work-ledger view with:
+
+```bash
+punk inspect work
+punk inspect work <id>
+punk inspect work <id> --json
+```
+
 Longer-term, project bootstrap should converge on one richer project-intelligence packet instead of a growing set of adjacent bootstrap artifacts.
 
 ### Default autonomous path
