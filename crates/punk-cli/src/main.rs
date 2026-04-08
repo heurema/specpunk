@@ -970,9 +970,32 @@ fn format_proofpack_summary(proof: &punk_domain::Proofpack) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let harness_evidence = if proof.harness_evidence.is_empty() {
+        "none".to_string()
+    } else {
+        proof
+            .harness_evidence
+            .iter()
+            .map(|item| {
+                let target = item
+                    .artifact_ref
+                    .as_deref()
+                    .or(item.source_ref.as_deref())
+                    .unwrap_or(item.summary.as_str());
+                format!(
+                    "- {} {} [{}]: {}",
+                    item.evidence_type,
+                    check_status_summary_label(&item.status),
+                    item.profile,
+                    target
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
     format!(
-        "Proof: {proof_id}\nRun: {run_id}\nDecision: {decision_id}\nContract: {contract_ref}\nReceipt: {receipt_ref}\nSummary: {summary}\nCommand evidence:\n{command_evidence}",
+        "Proof: {proof_id}\nRun: {run_id}\nDecision: {decision_id}\nContract: {contract_ref}\nReceipt: {receipt_ref}\nSummary: {summary}\nCommand evidence:\n{command_evidence}\nHarness evidence:\n{harness_evidence}",
         proof_id = proof.id,
         run_id = proof.run_id,
         decision_id = proof.decision_id,
@@ -980,6 +1003,7 @@ fn format_proofpack_summary(proof: &punk_domain::Proofpack) -> String {
         receipt_ref = proof.receipt_ref,
         summary = proof.summary,
         command_evidence = command_evidence,
+        harness_evidence = harness_evidence,
     )
 }
 
@@ -1600,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn proofpack_summary_mentions_command_evidence() {
+    fn proofpack_summary_mentions_command_and_harness_evidence() {
         let proof = punk_domain::Proofpack {
             id: "proof_789".into(),
             decision_id: "dec_789".into(),
@@ -1630,7 +1654,24 @@ mod tests {
                 },
             ],
             declared_harness_evidence: vec![],
-            harness_evidence: vec![],
+            harness_evidence: vec![
+                punk_domain::HarnessEvidence {
+                    evidence_type: "artifact_assertion".into(),
+                    profile: "default".into(),
+                    status: punk_domain::CheckStatus::Pass,
+                    summary: "artifact exists".into(),
+                    source_ref: Some(".punk/project/harness.json".into()),
+                    artifact_ref: Some("AGENTS.md".into()),
+                },
+                punk_domain::HarnessEvidence {
+                    evidence_type: "artifact_assertion".into(),
+                    profile: "default".into(),
+                    status: punk_domain::CheckStatus::Pass,
+                    summary: "artifact exists".into(),
+                    source_ref: Some(".punk/project/harness.json".into()),
+                    artifact_ref: Some(".punk/bootstrap/specpunk-core.md".into()),
+                },
+            ],
             hashes: Default::default(),
             summary: "proof for dec_789".into(),
             created_at: "2026-04-08T00:00:00Z".into(),
@@ -1641,6 +1682,10 @@ mod tests {
         assert!(rendered.contains("Command evidence:"));
         assert!(rendered.contains("- target pass: cargo test -p punk-cli"));
         assert!(rendered.contains("- integrity pass: cargo test --workspace"));
+        assert!(rendered.contains("Harness evidence:"));
+        assert!(rendered.contains("- artifact_assertion pass [default]: AGENTS.md"));
+        assert!(rendered
+            .contains("- artifact_assertion pass [default]: .punk/bootstrap/specpunk-core.md"));
     }
 
     #[test]
