@@ -2289,6 +2289,33 @@ mod tests {
         }
     }
 
+    struct ScanTargetChecksDrafter;
+
+    impl ContractDrafter for ScanTargetChecksDrafter {
+        fn name(&self) -> &'static str {
+            "scan-target-checks"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "scan target checks".into(),
+                summary: input.prompt,
+                entry_points: vec!["crates/punk-orch/src/lib.rs".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["keep target checks bounded".into()],
+                behavior_requirements: vec!["use scan candidate target checks".into()],
+                allowed_scope: vec!["crates/punk-orch/src/lib.rs".into()],
+                target_checks: input.scan.candidate_target_checks,
+                integrity_checks: input.scan.candidate_integrity_checks,
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
     struct PlaceholderScopeDrafter;
 
     impl ContractDrafter for PlaceholderScopeDrafter {
@@ -2660,6 +2687,58 @@ mod tests {
             contract.integrity_checks,
             vec!["cargo test --workspace".to_string()]
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_ignores_nested_non_member_workspace_target_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-workspace-targets-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/Cargo.toml"),
+            "[package]\nname = \"punk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/Cargo.toml"),
+            "[package]\nname = \"punk-orch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("punk/punk-run/Cargo.toml"),
+            "[package]\nname = \"punk-run\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&ScanTargetChecksDrafter, "tighten run reporting in punk-orch")
+            .unwrap();
+
+        assert!(contract
+            .target_checks
+            .contains(&"cargo test -p punk-orch".to_string()));
+        assert!(!contract
+            .target_checks
+            .contains(&"cargo test -p punk-run".to_string()));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -571,10 +571,173 @@ fn matched_rust_packages(repo_root: &Path, prompt_tokens: &[String]) -> Vec<Stri
 }
 
 fn rust_package_names(repo_root: &Path) -> Result<Vec<String>> {
+    if let Some(workspace_member_packages) = workspace_member_package_names(repo_root)? {
+        return Ok(workspace_member_packages);
+    }
     let mut package_names = Vec::new();
     collect_rust_package_names(repo_root, repo_root, &mut package_names)?;
     dedupe(&mut package_names);
     Ok(package_names)
+}
+
+fn workspace_member_package_names(repo_root: &Path) -> Result<Option<Vec<String>>> {
+    let cargo_toml = repo_root.join("Cargo.toml");
+    if !cargo_toml.exists() {
+        return Ok(None);
+    }
+    let contents =
+        fs::read_to_string(&cargo_toml).with_context(|| format!("read {}", cargo_toml.display()))?;
+    if !contents.lines().any(|line| line.trim() == "[workspace]") {
+        return Ok(None);
+    }
+    let member_patterns = workspace_member_patterns(&contents);
+    if member_patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut package_names = Vec::new();
+    for pattern in member_patterns {
+        for member_path in expand_workspace_member_pattern(repo_root, &pattern)? {
+            let cargo_toml = if member_path.is_file() {
+                member_path.clone()
+            } else {
+                member_path.join("Cargo.toml")
+            };
+            if !cargo_toml.exists() {
+                continue;
+            }
+            if let Some(package_name) = cargo_package_name(&cargo_toml)? {
+                package_names.push(package_name);
+            }
+        }
+    }
+    dedupe(&mut package_names);
+    Ok(Some(package_names))
+}
+
+fn workspace_member_patterns(contents: &str) -> Vec<String> {
+    let mut patterns = Vec::new();
+    let mut in_workspace = false;
+    let mut collecting_members = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_workspace = trimmed == "[workspace]";
+            collecting_members = false;
+            continue;
+        }
+        if !in_workspace {
+            continue;
+        }
+        if collecting_members {
+            for pattern in quoted_values(trimmed) {
+                patterns.push(pattern);
+            }
+            if trimmed.contains(']') {
+                collecting_members = false;
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("members") {
+            let Some((_, value)) = rest.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            for pattern in quoted_values(value) {
+                patterns.push(pattern);
+            }
+            if value.starts_with('[') && !value.contains(']') {
+                collecting_members = true;
+            }
+        }
+    }
+
+    patterns
+}
+
+fn quoted_values(input: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut in_quote = false;
+    let mut start = 0;
+    for (idx, ch) in input.char_indices() {
+        if ch != '"' {
+            continue;
+        }
+        if in_quote {
+            values.push(input[start..idx].to_string());
+            in_quote = false;
+        } else {
+            in_quote = true;
+            start = idx + ch.len_utf8();
+        }
+    }
+    values
+}
+
+fn expand_workspace_member_pattern(repo_root: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
+    let mut paths = vec![repo_root.to_path_buf()];
+    for segment in pattern.split('/').filter(|segment| !segment.is_empty()) {
+        let mut next = Vec::new();
+        for base in paths {
+            if segment.contains('*') {
+                for entry in fs::read_dir(&base)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if ignored_name(&name) {
+                        continue;
+                    }
+                    if wildcard_match_segment(segment, &name) {
+                        next.push(path);
+                    }
+                }
+            } else {
+                let candidate = base.join(segment);
+                if candidate.exists() {
+                    next.push(candidate);
+                }
+            }
+        }
+        paths = next;
+        if paths.is_empty() {
+            break;
+        }
+    }
+    Ok(paths)
+}
+
+fn wildcard_match_segment(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+    let parts = pattern.split('*').collect::<Vec<_>>();
+    let mut remainder = value;
+    let mut first = true;
+    for (idx, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if first && !pattern.starts_with('*') {
+            let Some(rest) = remainder.strip_prefix(part) else {
+                return false;
+            };
+            remainder = rest;
+            first = false;
+            continue;
+        }
+        if idx == parts.len() - 1 && !pattern.ends_with('*') {
+            return remainder.ends_with(part);
+        }
+        let Some(found) = remainder.find(part) else {
+            return false;
+        };
+        remainder = &remainder[found + part.len()..];
+        first = false;
+    }
+    true
 }
 
 fn collect_rust_package_names(
@@ -2175,6 +2338,46 @@ mod tests {
             .candidate_target_checks
             .iter()
             .all(|check| !check.starts_with("cargo test extract")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rust_target_checks_ignore_nested_non_member_workspace_packages() {
+        let root =
+            std::env::temp_dir().join(format!("punk-core-workspace-members-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/Cargo.toml"),
+            "[package]\nname = \"punk-orch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/Cargo.toml"),
+            "[package]\nname = \"punk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("punk/punk-run/Cargo.toml"),
+            "[package]\nname = \"punk-run\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let summary = scan_repo(&root, "tighten run reporting in punk-orch").unwrap();
+        assert!(summary
+            .candidate_target_checks
+            .contains(&"cargo test -p punk-orch".to_string()));
+        assert!(!summary
+            .candidate_target_checks
+            .contains(&"cargo test -p punk-run".to_string()));
+
         let _ = fs::remove_dir_all(&root);
     }
 
