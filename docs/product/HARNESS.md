@@ -222,6 +222,7 @@ Current Slice 3 starts smaller:
 - keep existing command checks as the only executed recipe type
 - persist them as typed `command` evidence entries instead of relying only on flat `check_refs`
 - keep `target` / `integrity` lane information, command text, pass/fail status, and stdout/stderr refs together
+- surface the latest typed `command` evidence through normal inspect flows so operators do not need raw JSON for the first proof read
 
 ### `proof`
 
@@ -242,6 +243,7 @@ The ledger should keep harness-related continuity visible:
 - which evidence path was attempted
 - what blocked
 - which recovery contract or next action is authoritative
+- what the latest proof actually verified at a concise human-summary level
 
 This is important because blocked verification should remain inspectable later without relying on old terminal logs.
 

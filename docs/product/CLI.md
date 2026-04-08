@@ -131,6 +131,17 @@ Current work-ledger inspect surface:
 - `punk inspect work <id>`
 - `punk inspect work <id> --json`
 
+Current proof inspect surface:
+
+- `punk inspect proof_<id> --json`
+- `punk inspect proof_<id>`
+
+Current human-facing inspect expectations:
+
+- `punk inspect work` should show a concise latest-proof evidence summary when a latest proof exists
+- `punk inspect proof_<id>` should render a concise human summary for typed `command` evidence without requiring raw JSON reading
+- JSON object inspect remains the source of full structured proof detail
+
 Current status behavior:
 
 - `punk status` now prefers `WorkLedgerView` for current work continuity fields

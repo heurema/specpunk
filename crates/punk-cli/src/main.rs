@@ -263,9 +263,13 @@ fn run() -> Result<()> {
                 let ledger = orch.inspect_work_ledger(inspect.id.as_deref())?;
                 return render(inspect.json, &ledger, &format_work_ledger_summary(&ledger));
             }
+            if !inspect.json && inspect.id.is_none() && inspect.target.starts_with("proof_") {
+                let proof = orch.inspect_proofpack(&inspect.target)?;
+                return render(false, &proof, &format_proofpack_summary(&proof));
+            }
             if !inspect.json || inspect.id.is_some() {
                 return Err(anyhow!(
-                    "inspect for object ids currently requires `punk inspect <id> --json`; use `punk inspect project` or `punk inspect work [id]` for human inspect views"
+                    "inspect for object ids currently requires `punk inspect <id> --json`; only `proof_<id>` currently supports human inspect output. Use `punk inspect project` or `punk inspect work [id]` for human inspect views"
                 ));
             }
             let value = orch.inspect(&inspect.target)?;
@@ -888,6 +892,16 @@ fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
         ledger.next_action_ref.as_deref(),
     )
     .unwrap_or_else(|| "none".to_string());
+    let latest_proof_evidence = if ledger.latest_proof_command_evidence_summary.is_empty() {
+        "none".to_string()
+    } else {
+        ledger
+            .latest_proof_command_evidence_summary
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let recovery_status = if ledger.recovery_contract_ref.is_some() {
         "prepared"
     } else {
@@ -895,7 +909,7 @@ fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
     };
 
     format!(
-        "Work: {work_id}\nProject: {project_id}\nLifecycle: {lifecycle_state}\nGoal: {goal}\nFeature: {feature_ref}\nContract: {contract}\nRun: {run}\nReceipt: {receipt}\nDecision: {decision}\nProof: {proof}\nAutonomy: {autonomy}\nAutonomy outcome: {autonomy_outcome}\nRecovery status: {recovery_status}\nRecovery contract: {recovery_contract}\nBlocked reason: {blocked_reason}\nNext action: {next_action}\nNext action ref: {next_action_ref}\nSuggested command: {suggested_command}\nUpdated at: {updated_at}",
+        "Work: {work_id}\nProject: {project_id}\nLifecycle: {lifecycle_state}\nGoal: {goal}\nFeature: {feature_ref}\nContract: {contract}\nRun: {run}\nReceipt: {receipt}\nDecision: {decision}\nProof: {proof}\nLatest proof evidence:\n{latest_proof_evidence}\nAutonomy: {autonomy}\nAutonomy outcome: {autonomy_outcome}\nRecovery status: {recovery_status}\nRecovery contract: {recovery_contract}\nBlocked reason: {blocked_reason}\nNext action: {next_action}\nNext action ref: {next_action_ref}\nSuggested command: {suggested_command}\nUpdated at: {updated_at}",
         work_id = ledger.work_id,
         project_id = ledger.project_id,
         lifecycle_state = ledger.lifecycle_state,
@@ -906,6 +920,7 @@ fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
         receipt = receipt,
         decision = decision,
         proof = proof,
+        latest_proof_evidence = latest_proof_evidence,
         autonomy = autonomy,
         autonomy_outcome = autonomy_outcome,
         recovery_status = recovery_status,
@@ -916,6 +931,45 @@ fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
         suggested_command = suggested_command,
         updated_at = ledger.updated_at,
     )
+}
+
+fn format_proofpack_summary(proof: &punk_domain::Proofpack) -> String {
+    let command_evidence = if proof.command_evidence.is_empty() {
+        "none".to_string()
+    } else {
+        proof.command_evidence
+            .iter()
+            .map(|item| {
+                format!(
+                    "- {} {}: {}",
+                    item.lane,
+                    check_status_summary_label(&item.status),
+                    item.command
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "Proof: {proof_id}\nRun: {run_id}\nDecision: {decision_id}\nContract: {contract_ref}\nReceipt: {receipt_ref}\nSummary: {summary}\nCommand evidence:\n{command_evidence}",
+        proof_id = proof.id,
+        run_id = proof.run_id,
+        decision_id = proof.decision_id,
+        contract_ref = proof.contract_ref,
+        receipt_ref = proof.receipt_ref,
+        summary = proof.summary,
+        command_evidence = command_evidence,
+    )
+}
+
+fn check_status_summary_label(status: &punk_domain::CheckStatus) -> &'static str {
+    match status {
+        punk_domain::CheckStatus::Pass => "pass",
+        punk_domain::CheckStatus::Fail => "fail",
+        punk_domain::CheckStatus::Partial => "partial",
+        punk_domain::CheckStatus::Unverified => "unverified",
+    }
 }
 
 fn suggested_command_from_action(
@@ -1468,6 +1522,10 @@ mod tests {
             recovery_contract_ref: Some(".punk/contracts/feat_789/v1.json".into()),
             lifecycle_state: "accepted".into(),
             blocked_reason: None,
+            latest_proof_command_evidence_summary: vec![
+                "target pass: cargo test -p punk-cli".into(),
+                "integrity pass: cargo test --workspace".into(),
+            ],
             next_action: Some("inspect_proof".into()),
             next_action_ref: Some("proof_456".into()),
             updated_at: "2026-04-03T00:00:00Z".into(),
@@ -1478,6 +1536,8 @@ mod tests {
         assert!(rendered.contains("Goal: add trace export"));
         assert!(rendered.contains("Contract: .punk/contracts/feat_123/v1.json"));
         assert!(rendered.contains("Proof: .punk/proofs/dec_456/proofpack.json"));
+        assert!(rendered.contains("Latest proof evidence:"));
+        assert!(rendered.contains("- target pass: cargo test -p punk-cli"));
         assert!(rendered.contains("Autonomy: .punk/autonomy/feat_123/auto_456.json"));
         assert!(rendered.contains("Autonomy outcome: blocked"));
         assert!(rendered.contains("Recovery status: prepared"));
@@ -1485,6 +1545,52 @@ mod tests {
         assert!(rendered.contains("Next action: inspect_proof"));
         assert!(rendered.contains("Next action ref: proof_456"));
         assert!(rendered.contains("Suggested command: punk inspect proof_456 --json"));
+    }
+
+    #[test]
+    fn proofpack_summary_mentions_command_evidence() {
+        let proof = punk_domain::Proofpack {
+            id: "proof_789".into(),
+            decision_id: "dec_789".into(),
+            run_id: "run_789".into(),
+            contract_ref: ".punk/contracts/feat_789/v1.json".into(),
+            receipt_ref: ".punk/runs/run_789/receipt.json".into(),
+            decision_ref: ".punk/decisions/dec_789.json".into(),
+            check_refs: vec![],
+            command_evidence: vec![
+                punk_domain::CommandEvidence {
+                    evidence_type: "command".into(),
+                    lane: "target".into(),
+                    command: "cargo test -p punk-cli".into(),
+                    status: punk_domain::CheckStatus::Pass,
+                    summary: "target check passed".into(),
+                    stdout_ref: Some(".punk/runs/run_789/checks/target-01.stdout.log".into()),
+                    stderr_ref: Some(".punk/runs/run_789/checks/target-01.stderr.log".into()),
+                },
+                punk_domain::CommandEvidence {
+                    evidence_type: "command".into(),
+                    lane: "integrity".into(),
+                    command: "cargo test --workspace".into(),
+                    status: punk_domain::CheckStatus::Pass,
+                    summary: "integrity check passed".into(),
+                    stdout_ref: Some(
+                        ".punk/runs/run_789/checks/integrity-01.stdout.log".into(),
+                    ),
+                    stderr_ref: Some(
+                        ".punk/runs/run_789/checks/integrity-01.stderr.log".into(),
+                    ),
+                },
+            ],
+            hashes: Default::default(),
+            summary: "proof for dec_789".into(),
+            created_at: "2026-04-08T00:00:00Z".into(),
+        };
+
+        let rendered = format_proofpack_summary(&proof);
+        assert!(rendered.contains("Proof: proof_789"));
+        assert!(rendered.contains("Command evidence:"));
+        assert!(rendered.contains("- target pass: cargo test -p punk-cli"));
+        assert!(rendered.contains("- integrity pass: cargo test --workspace"));
     }
 
     #[test]

@@ -112,6 +112,7 @@ pub struct WorkLedgerView {
     pub recovery_contract_ref: Option<String>,
     pub lifecycle_state: String,
     pub blocked_reason: Option<String>,
+    pub latest_proof_command_evidence_summary: Vec<String>,
     pub next_action: Option<String>,
     pub next_action_ref: Option<String>,
     pub updated_at: String,
@@ -867,6 +868,11 @@ impl OrchService {
         Err(anyhow!("unknown id: {id}"))
     }
 
+    pub fn inspect_proofpack(&self, proof_id: &str) -> Result<punk_domain::Proofpack> {
+        let proof_path = self.find_object_path(&self.paths.proofs_dir, proof_id)?;
+        read_json(&proof_path)
+    }
+
     pub fn inspect_work_ledger(&self, id: Option<&str>) -> Result<WorkLedgerView> {
         let project = self.bootstrap_project()?;
         let feature_id = match id {
@@ -1172,6 +1178,10 @@ impl OrchService {
         let recovery_contract_ref = latest_autonomy
             .as_ref()
             .and_then(|record| record.record.recovery_contract_ref.clone());
+        let latest_proof_command_evidence_summary = latest_proof
+            .as_ref()
+            .map(|record| summarize_command_evidence(&record.proof.command_evidence))
+            .unwrap_or_default();
 
         Ok(WorkLedgerView {
             project_id: project.id.clone(),
@@ -1190,6 +1200,7 @@ impl OrchService {
             recovery_contract_ref,
             lifecycle_state: lifecycle_state.to_string(),
             blocked_reason,
+            latest_proof_command_evidence_summary,
             next_action,
             next_action_ref,
             updated_at: work_updated_at(
@@ -1798,6 +1809,31 @@ fn summarize_decision_basis(basis: &[String]) -> String {
         .take(2)
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn summarize_command_evidence(
+    command_evidence: &[punk_domain::CommandEvidence],
+) -> Vec<String> {
+    command_evidence
+        .iter()
+        .map(|item| {
+            format!(
+                "{} {}: {}",
+                item.lane,
+                check_status_label(&item.status),
+                item.command
+            )
+        })
+        .collect()
+}
+
+fn check_status_label(status: &punk_domain::CheckStatus) -> &'static str {
+    match status {
+        punk_domain::CheckStatus::Pass => "pass",
+        punk_domain::CheckStatus::Fail => "fail",
+        punk_domain::CheckStatus::Partial => "partial",
+        punk_domain::CheckStatus::Unverified => "unverified",
+    }
 }
 
 fn autonomy_outcome_label(outcome: &AutonomyOutcome) -> &'static str {
@@ -3384,7 +3420,26 @@ mod tests {
             receipt_ref: decision.receipt_ref.clone(),
             decision_ref: format!(".punk/decisions/{}.json", decision.id),
             check_refs: Vec::new(),
-            command_evidence: Vec::new(),
+            command_evidence: vec![
+                punk_domain::CommandEvidence {
+                    evidence_type: "command".into(),
+                    lane: "target".into(),
+                    command: "cargo test -p punk-orch".into(),
+                    status: punk_domain::CheckStatus::Pass,
+                    summary: "target check passed".into(),
+                    stdout_ref: None,
+                    stderr_ref: None,
+                },
+                punk_domain::CommandEvidence {
+                    evidence_type: "command".into(),
+                    lane: "integrity".into(),
+                    command: "cargo test --workspace".into(),
+                    status: punk_domain::CheckStatus::Pass,
+                    summary: "integrity check passed".into(),
+                    stdout_ref: None,
+                    stderr_ref: None,
+                },
+            ],
             hashes: Default::default(),
             summary: format!("proof for {}", decision.id),
             created_at: now_rfc3339(),
@@ -3417,6 +3472,13 @@ mod tests {
             Some(decision_ref.as_str())
         );
         assert_eq!(ledger.latest_proof_ref.as_deref(), Some(proof_ref.as_str()));
+        assert_eq!(
+            ledger.latest_proof_command_evidence_summary,
+            vec![
+                "target pass: cargo test -p punk-orch".to_string(),
+                "integrity pass: cargo test --workspace".to_string()
+            ]
+        );
         assert_eq!(ledger.lifecycle_state, "accepted");
         assert_eq!(ledger.next_action.as_deref(), Some("inspect_proof"));
         assert_eq!(ledger.next_action_ref.as_deref(), Some(proof.id.as_str()));
