@@ -523,11 +523,15 @@ fn cmd_start(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Re
         return Err(anyhow!("goal must not be empty"));
     }
 
+    let project_root = resolve_project_root(repo_root);
+    let project = infer_project_id(&project_root).unwrap_or_else(|| "project".to_string());
+    let retry_command = format!("punk start {}", shell_quote_goal(trimmed_goal));
+    ensure_vcs_ready_for_goal_intake(repo_root, &project, "punk start", &retry_command)?;
+
     let orch = OrchService::new(repo_root, global_root)?;
     let drafter = CodexCliContractDrafter::default();
     let contract = orch.draft_contract(&drafter, trimmed_goal)?;
     let status = orch.status(None)?;
-    let project_root = resolve_project_root(repo_root);
     let project = infer_project_id(&project_root).unwrap_or_else(|| status.project_id.clone());
     let next_command = format!("punk plot approve {}", contract.id);
 
@@ -563,6 +567,15 @@ fn cmd_go(
         return Err(anyhow!("goal must not be empty"));
     }
 
+    let project_root = resolve_project_root(repo_root);
+    let project = infer_project_id(&project_root).unwrap_or_else(|| "project".to_string());
+    let retry_command = if fallback_staged {
+        format!("punk go --fallback-staged {}", shell_quote_goal(trimmed_goal))
+    } else {
+        format!("punk go {}", shell_quote_goal(trimmed_goal))
+    };
+    ensure_vcs_ready_for_goal_intake(repo_root, &project, "punk go", &retry_command)?;
+
     let orch = OrchService::new(repo_root, global_root)?;
     let drafter = CodexCliContractDrafter::default();
     let contract = orch.draft_contract(&drafter, trimmed_goal)?;
@@ -593,7 +606,6 @@ fn cmd_go(
             .map(|contract| contract.id.as_str()),
     )?;
     let status = orch.status(Some(&run.id))?;
-    let project_root = resolve_project_root(repo_root);
     let project = infer_project_id(&project_root).unwrap_or_else(|| status.project_id.clone());
     let next_command = format!("punk inspect {} --json", proof.id);
 
@@ -668,6 +680,36 @@ fn format_start_summary(
     )
 }
 
+fn ensure_vcs_ready_for_goal_intake(
+    repo_root: &Path,
+    project_id: &str,
+    command_name: &str,
+    retry_command: &str,
+) -> Result<()> {
+    if detect_vcs_mode(repo_root) == VcsMode::NoVcs {
+        return Err(anyhow!(format_goal_intake_no_vcs_error(
+            repo_root,
+            project_id,
+            command_name,
+            retry_command
+        )));
+    }
+    Ok(())
+}
+
+fn format_goal_intake_no_vcs_error(
+    repo_root: &Path,
+    project_id: &str,
+    command_name: &str,
+    retry_command: &str,
+) -> String {
+    format!(
+        "{command_name} requires a Git or jj-backed repo before goal intake. No VCS detected at {}. Recovery: run `git init`, then `punk init --project {project_id} --enable-jj --verify`, then retry `{retry_command}`.",
+        repo_root.display()
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn format_go_summary(
     project: &str,
     goal: &str,
@@ -1269,6 +1311,34 @@ mod tests {
         assert_eq!(bootstrap_json_mode(&start), Some(true));
         assert_eq!(bootstrap_json_mode(&plot), Some(false));
         assert_eq!(bootstrap_json_mode(&status), None);
+    }
+
+    #[test]
+    fn no_vcs_goal_intake_error_mentions_recovery_path_for_start() {
+        let root = temp_test_dir("start-no-vcs");
+        let retry = "punk start \"ship demo\"";
+        let err = ensure_vcs_ready_for_goal_intake(&root, "demo", "punk start", retry)
+            .expect_err("no-vcs workspace should fail preflight")
+            .to_string();
+        assert!(err.contains("punk start requires a Git or jj-backed repo"));
+        assert!(err.contains("No VCS detected"));
+        assert!(err.contains("git init"));
+        assert!(err.contains("punk init --project demo --enable-jj --verify"));
+        assert!(err.contains(retry));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_vcs_goal_intake_error_mentions_recovery_path_for_go() {
+        let root = temp_test_dir("go-no-vcs");
+        let retry = "punk go --fallback-staged \"ship demo\"";
+        let err = ensure_vcs_ready_for_goal_intake(&root, "demo", "punk go", retry)
+            .expect_err("no-vcs workspace should fail preflight")
+            .to_string();
+        assert!(err.contains("punk go requires a Git or jj-backed repo"));
+        assert!(err.contains("punk init --project demo --enable-jj --verify"));
+        assert!(err.contains(retry));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

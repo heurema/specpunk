@@ -1411,7 +1411,7 @@ fn validate_scope_path(repo_root: &Path, value: &str) -> std::result::Result<(),
     Err("path does not exist and has no existing parent directory".to_string())
 }
 
-fn validate_check_command(repo_root: &Path, value: &str) -> std::result::Result<(), String> {
+pub fn validate_check_command(repo_root: &Path, value: &str) -> std::result::Result<(), String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err("must be non-empty".to_string());
@@ -1419,7 +1419,29 @@ fn validate_check_command(repo_root: &Path, value: &str) -> std::result::Result<
     if trimmed.contains('\n') || trimmed.contains('\r') {
         return Err("must be a single-line shell command".to_string());
     }
-    for token in trimmed.split_whitespace() {
+
+    let forbidden = [
+        ';', '&', '|', '>', '<', '$', '(', ')', '`', '!', '*', '?', '[', ']', '{', '}',
+    ];
+    if trimmed.chars().any(|c| forbidden.contains(&c)) {
+        return Err(
+            "must not contain shell metacharacters, redirection, or glob patterns".to_string(),
+        );
+    }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if let Some(program) = tokens.first() {
+        let allowed_programs = [
+            "cargo", "npm", "pnpm", "yarn", "bun", "make", "pytest", "go", "swift", "python",
+            "python3", "node", "deno", "rake", "gradle", "mvn", "ant", "true", "false",
+        ];
+        if !allowed_programs.contains(program) {
+            return Err(format!(
+                "program '{program}' is not in the allowlist of trusted check runners"
+            ));
+        }
+    }
+    for token in tokens {
         if token.contains("../") || token.starts_with("..") || token.contains("..\\") {
             return Err("must not reference paths outside repo root".to_string());
         }
@@ -2829,6 +2851,31 @@ mod tests {
                 "crates/punk-council/src/storage.rs".to_string(),
             ]
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_check_command_rejects_shell_fragments_and_untrusted_runners() {
+        let root =
+            std::env::temp_dir().join(format!("punk-core-check-guard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        assert!(validate_check_command(&root, "cargo test -p punk-core").is_ok());
+        assert!(validate_check_command(&root, "true").is_ok());
+
+        let shell_fragment = validate_check_command(&root, "cargo test; touch hacked")
+            .expect_err("shell metacharacters should be rejected");
+        assert!(shell_fragment.contains("must not contain shell metacharacters"));
+
+        let untrusted_runner = validate_check_command(&root, "sh -c true")
+            .expect_err("untrusted shell runner should be rejected");
+        assert!(untrusted_runner.contains("allowlist of trusted check runners"));
+
+        let traversal = validate_check_command(&root, "cargo test ../outside")
+            .expect_err("parent traversal should be rejected");
+        assert!(traversal.contains("outside repo root"));
 
         let _ = fs::remove_dir_all(&root);
     }

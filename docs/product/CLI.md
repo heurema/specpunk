@@ -257,7 +257,21 @@ The intended durable behavior is stronger than shell text:
 - the shell summary should point to durable refs
 - later `status` / `inspect work` should be able to answer what happened and what comes next without relying on old terminal output
 
+Preflight expectation:
+
+- fail early if no Git or jj repo is detected
+- return one explicit recovery path instead of a downstream adapter or scan error
+- recovery should point to `git init`, then `punk init --project <id> --enable-jj --verify`, then retry the original `punk go ...`
+
 ### `punk start "<goal>"`
+
+Runs the staged/manual intake from a plain goal.
+
+Preflight expectation:
+
+- fail early if no Git or jj repo is detected
+- do not defer this to a later drafter or repo-scan failure
+- return one explicit recovery path: `git init`, then `punk init --project <id> --enable-jj --verify`, then retry `punk start "<goal>"`
 
 Creates:
 
@@ -343,6 +357,8 @@ Checks:
 - policy
 - target checks
 - integrity checks
+
+Target and integrity checks must be validated and executed as direct trusted runners, not interpolated through `/bin/sh -lc` or other shell-fragment execution.
 
 ### `punk gate proof <run-id|decision-id>`
 

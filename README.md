@@ -96,6 +96,13 @@ If the repo basename is not a good project id, use:
 punk init --project <id> --enable-jj --verify
 ```
 
+Goal-intake commands assume a VCS-backed repo. If `punk start` or `punk go` reports `no VCS detected`, initialize the repo first:
+
+```bash
+git init
+punk init --project <id> --enable-jj --verify
+```
+
 Bootstrap creates repo-local agent guidance:
 
 - `AGENTS.md`
@@ -154,6 +161,13 @@ punk plot approve <contract-id>
 punk cut run <contract-id>
 punk gate run <run-id>
 punk gate proof <run-id|decision-id>
+```
+
+If the workspace is not a Git or jj repo yet, `punk start` should stop early and point back to:
+
+```bash
+git init
+punk init --project <id> --enable-jj --verify
 ```
 
 Read-only inspection:

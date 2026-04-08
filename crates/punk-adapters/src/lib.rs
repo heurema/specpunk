@@ -150,6 +150,7 @@ impl Default for CodexCliExecutor {
     }
 }
 
+
 impl GitGuardEnv {
     fn install() -> Result<Option<Self>> {
         let Some(real_git) = find_binary_in_path("git") else {
@@ -485,7 +486,7 @@ impl CodexCliContractDrafter {
         if let Some(model) = &self.model {
             command.arg("-m").arg(model);
         }
-        command.arg(prompt);
+        command.arg("--").arg(prompt);
 
         let output = run_command_with_timeout(&mut command, timeout).map_err(|err| {
             DrafterAttemptError::Failed(err.context(format!("spawn codex drafter in {repo_root}")))
@@ -626,7 +627,7 @@ impl CodexCliExecutor {
         }
         let orientation_guard = OrientationGuardEnv::install()?;
         orientation_guard.apply(&mut command);
-        command.arg(prompt);
+        command.arg("--").arg(prompt);
 
         let timed_output = match run_patch_lane_command_with_timeout(
             &mut command,
@@ -818,7 +819,7 @@ impl CodexCliExecutor {
         }
         let orientation_guard = OrientationGuardEnv::install()?;
         orientation_guard.apply(&mut command);
-        command.arg(prompt);
+        command.arg("--").arg(prompt);
 
         let timed_output = run_plan_lane_command_with_timeout(
             &mut command,
@@ -916,7 +917,7 @@ impl CodexCliExecutor {
                 .arg("-c")
                 .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""));
         }
-        command.arg(prompt);
+        command.arg("--").arg(prompt);
         let timed_output = match run_command_with_timeout_and_tee(
             &mut command,
             codex_executor_timeout(),
@@ -3205,6 +3206,81 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "drafter elapsed too long: {elapsed:?}"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_drafter_passes_prompt_after_separator() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-drafter-separator-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let fake_bin = root.join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let fake_codex = fake_bin.join("codex");
+        let args_path = root.join("args.json");
+        fs::write(
+            &fake_codex,
+            format!(
+                "#!/usr/bin/env python3\nimport json, sys\nargs = sys.argv[1:]\nwith open({args_path:?}, 'w') as fh:\n    json.dump(args, fh)\nout_path = None\nfor idx, arg in enumerate(args):\n    if arg == '-o' and idx + 1 < len(args):\n        out_path = args[idx + 1]\n        break\npayload = {{'title': 'draft', 'summary': 'draft', 'entry_points': ['src/lib.rs'], 'import_paths': [], 'expected_interfaces': ['pub fn demo'], 'behavior_requirements': ['do demo'], 'allowed_scope': ['src/lib.rs'], 'target_checks': ['true'], 'integrity_checks': ['true'], 'risk_level': 'low'}}\nif out_path:\n    with open(out_path, 'w') as fh:\n        json.dump(payload, fh)\nelse:\n    print(json.dumps(payload))\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&fake_codex).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_codex, perms).unwrap();
+        }
+
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            std::env::join_paths(
+                [fake_bin.clone()]
+                    .into_iter()
+                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
+            )
+            .unwrap(),
+        );
+
+        let drafter = CodexCliContractDrafter::default();
+        let schema_path = root.join("schema.json");
+        let output_path = root.join("output.json");
+        fs::write(&schema_path, "{}").unwrap();
+        let prompt = "--dangerous prompt";
+        let proposal = match drafter.run_json_prompt_once(
+            prompt,
+            root.to_str().unwrap(),
+            &schema_path,
+            &output_path,
+            Duration::from_secs(5),
+        ) {
+            Ok(proposal) => proposal,
+            Err(_) => panic!("fake codex should succeed"),
+        };
+
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+
+        let args: Vec<String> = serde_json::from_slice(&fs::read(&args_path).unwrap()).unwrap();
+        let separator_index = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("codex args should contain separator");
+        assert_eq!(args.get(separator_index + 1).map(String::as_str), Some(prompt));
+        assert_eq!(proposal.title, "draft");
 
         let _ = fs::remove_dir_all(&root);
     }

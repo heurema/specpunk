@@ -1,6 +1,6 @@
 # Specpunk North Roadmap
 
-Last updated: 2026-04-03
+Last updated: 2026-04-08
 Owner: Vitaly
 Status: active
 
@@ -67,6 +67,10 @@ Recommended order unless a production bug forces reprioritization:
 5. One-face operator shell
 6. Autonomous loop
 7. Project intelligence
+
+## Current operator-shell note
+
+- Goal-intake commands such as `punk start` and `punk go --fallback-staged` should fail early with one explicit recovery path when the workspace is not VCS-backed, instead of surfacing late repo-scan or adapter errors.
 
 ## Rules for future contributors
 

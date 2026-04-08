@@ -1,9 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{anyhow, Result};
-use punk_core::{find_object_path, read_json, relative_ref, write_json};
+use punk_core::{find_object_path, read_json, relative_ref, validate_check_command, write_json};
 use punk_domain::{
     now_rfc3339, CheckStatus, Contract, ContractStatus, Decision, DecisionObject,
     DeterministicStatus, EventEnvelope, ModeId, Receipt,
@@ -136,23 +135,37 @@ fn run_checks(
     fs::create_dir_all(&checks_dir)?;
     let mut failed = false;
     let mut reasons = Vec::new();
-    for (index, command) in commands.iter().enumerate() {
+    for (index, command_str) in commands.iter().enumerate() {
         let stdout_path = checks_dir.join(format!("{}-{:02}.stdout.log", kind, index + 1));
         let stderr_path = checks_dir.join(format!("{}-{:02}.stderr.log", kind, index + 1));
-        let output = Command::new("/bin/sh")
-            .arg("-lc")
-            .arg(command)
+
+        let args = split_command_args(command_str);
+        if args.is_empty() {
+            failed = true;
+            reasons.push(format!("{kind} check failed: empty command"));
+            continue;
+        }
+
+        if let Err(msg) = validate_check_command(repo_root, command_str) {
+            failed = true;
+            reasons.push(format!("{kind} check failed: invalid command: {msg}"));
+            continue;
+        }
+
+        let output = std::process::Command::new(&args[0])
+            .args(&args[1..])
             .current_dir(repo_root)
             .output()?;
+
         fs::write(&stdout_path, &output.stdout)?;
         fs::write(&stderr_path, &output.stderr)?;
         refs.push(relative_ref(repo_root, &stdout_path)?);
         refs.push(relative_ref(repo_root, &stderr_path)?);
         if output.status.success() {
-            reasons.push(format!("{kind} check passed: {command}"));
+            reasons.push(format!("{kind} check passed: {command_str}"));
         } else {
             failed = true;
-            reasons.push(format!("{kind} check failed: {command}"));
+            reasons.push(format!("{kind} check failed: {command_str}"));
         }
     }
     Ok((
@@ -163,6 +176,28 @@ fn run_checks(
         },
         reasons,
     ))
+}
+
+fn split_command_args(s: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for c in s.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ' ' if !in_quotes => {
+                if !current.is_empty() {
+                    args.push(current.clone());
+                    current.clear();
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
 }
 
 #[cfg(test)]
@@ -254,5 +289,93 @@ mod tests {
             &["src/lib.rs.bak".into()]
         ));
         assert!(!validate_scope(&["foo".into()], &["foobar".into()]));
+    }
+
+    #[test]
+    fn gate_blocks_invalid_check_command_without_running_shell_payload() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-invalid-check-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "x".into(),
+            entry_points: vec![],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["allowed.txt".into()],
+            target_checks: vec!["true; touch hacked".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
+        let run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "success".into(),
+            executor_name: "fake".into(),
+            changed_files: vec!["allowed.txt".into()],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec![],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "done".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+
+        let gate = GateService::new(&root, &global);
+        let decision = gate.gate_run("run_1").unwrap();
+
+        assert_eq!(decision.decision, Decision::Block);
+        assert_eq!(decision.target_status, CheckStatus::Fail);
+        assert!(decision
+            .decision_basis
+            .iter()
+            .any(|reason| reason.contains("invalid command")));
+        assert!(!root.join("hacked").exists());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

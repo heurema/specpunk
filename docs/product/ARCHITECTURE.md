@@ -421,7 +421,7 @@ That means:
 |---|---|---|
 | `plot` | repo read, VCS read, deterministic repo scan, contract draft/refine writes, local planning artifact writes under `.punk/` | source mutation, patch apply, broad mutating execution, final decision writing |
 | `cut` | isolated change creation, source mutation within approved scope, executor invocation, test/build/check execution, receipt writing | final decision writing, proof writing |
-| `gate` | artifact read, scope validation, deterministic target/integrity checks, decision writing, proof writing | broad source mutation, unrestricted repair edits |
+| `gate` | artifact read, scope validation, deterministic target/integrity checks via trusted direct process execution, decision writing, proof writing | broad source mutation, unrestricted repair edits |
 
 Mode enforcement must live in runtime behavior, not only in prompts.
 
@@ -949,7 +949,7 @@ Owns:
 
 - scope validation
 - policy validation
-- target/integrity checks
+- target/integrity checks via trusted direct execution of validated runners
 - decision synthesis
 
 ### `punk-proof`
