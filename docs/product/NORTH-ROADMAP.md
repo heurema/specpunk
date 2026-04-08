@@ -72,6 +72,12 @@ Recommended order unless a production bug forces reprioritization:
 
 - Goal-intake commands such as `punk start` and `punk go --fallback-staged` should fail early with one explicit recovery path when the workspace is not VCS-backed, instead of surfacing late repo-scan or adapter errors.
 
+## Cross-cutting harness note
+
+- Harness engineering should be implemented as a derived harness/evidence plane across existing tracks, not as a new primitive layer.
+- Near-term focus: inspectable project harness packets, typed evidence paths for `gate` / `proof`, and stronger harness-linked recovery continuity in the work ledger.
+- Reference note: `docs/research/2026-04-08-specpunk-harness-engineering.md`.
+
 ## Rules for future contributors
 
 - One bounded slice per session

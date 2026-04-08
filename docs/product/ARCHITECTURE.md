@@ -126,6 +126,8 @@ Derived mechanisms are compositions over those primitives:
 - eval
 - research protocols
 
+Harness engineering should be treated the same way: it is a derived harness/evidence plane over existing primitives, not a new primitive truth object.
+
 ### Derived mechanism map
 
 The first practical mapping should stay explicit:
@@ -149,6 +151,23 @@ The first practical mapping should stay explicit:
 Contributor rule:
 
 > every roadmap item, proposal, or implementation slice should be able to answer: which primitive does this touch, and is this a primitive change or a derived mechanism change?
+
+### Harness / evidence plane
+
+`punk` should absorb harness engineering as a derived plane that makes runtime behavior more legible and verifiable without redefining substrate truth.
+
+That means:
+
+- `ProjectOverlay` should grow into the shell-facing map of harness capabilities
+- `Workspace` remains the isolated execution context for harness boot and evidence collection
+- `gate` should gradually move toward typed validation recipes, not only raw command checks
+- `Proofpack` should eventually persist evidence manifests and assertion outcomes
+- `Ledger` should keep blocked harness recovery inspectable after the shell output is gone
+
+See also:
+
+- `docs/product/HARNESS.md`
+- `docs/research/2026-04-08-specpunk-harness-engineering.md`
 
 ---
 
