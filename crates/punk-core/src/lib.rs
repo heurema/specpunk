@@ -1615,7 +1615,63 @@ fn explicit_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
     paths
 }
 
+fn authoritative_exact_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
+    let lowered = prompt.to_ascii_lowercase();
+    let anchors = [
+        "allowed_scope exactly",
+        "allowed scope exactly",
+        "final allowed_scope must contain exactly",
+        "final allowed scope must contain exactly",
+        "restrict allowed_scope exactly",
+        "restrict allowed scope exactly",
+    ];
+    let stop_markers = [
+        "\ndo not ",
+        " do not ",
+        "\ndon't ",
+        " don't ",
+        "\ntarget checks",
+        " target checks",
+        "\nintegrity checks",
+        " integrity checks",
+        "\nthe regression",
+        " the regression",
+        "\nadd a focused regression",
+        " add a focused regression",
+        "\nupdate only ",
+        " update only ",
+        "\nkeep this ",
+        " keep this ",
+    ];
+
+    for anchor in anchors {
+        let Some(anchor_idx) = lowered.find(anchor) else {
+            continue;
+        };
+        let tail = &prompt[anchor_idx..];
+        let Some(colon_rel) = tail.find(':') else {
+            continue;
+        };
+        let start = anchor_idx + colon_rel + 1;
+        let end = stop_markers
+            .iter()
+            .filter_map(|marker| lowered[start..].find(marker).map(|idx| start + idx))
+            .min()
+            .unwrap_or(prompt.len());
+        let explicit = explicit_scope_paths(prompt[start..end].trim(), repo_root);
+        if !explicit.is_empty() {
+            return explicit;
+        }
+    }
+
+    Vec::new()
+}
+
 fn explicit_scope_override(prompt: &str, repo_root: &Path) -> Option<Vec<String>> {
+    let exact_scope = authoritative_exact_scope_paths(prompt, repo_root);
+    if !exact_scope.is_empty() {
+        return Some(exact_scope);
+    }
     let explicit_scope = explicit_scope_paths(prompt, repo_root);
     (!explicit_scope.is_empty()).then_some(explicit_scope)
 }
@@ -2318,6 +2374,34 @@ mod tests {
         assert_eq!(proposal.entry_points, proposal.allowed_scope);
         assert_eq!(proposal.target_checks, vec!["make test".to_string()]);
         assert_eq!(proposal.integrity_checks, vec!["make test".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_scope_override_keeps_exact_list_without_readding_excluded_path_mentions() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-exact-scope-negative-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
+        fs::write(root.join("crates/punk-core/src/lib.rs"), "pub fn core() {}\n").unwrap();
+        fs::write(root.join("crates/punk-orch/src/lib.rs"), "pub fn orch() {}\n").unwrap();
+        fs::write(root.join("punk/punk-run/src/main.rs"), "fn main() {}\n").unwrap();
+
+        let guidance = "Restrict allowed_scope exactly to these two files and nothing else: crates/punk-core/src/lib.rs; crates/punk-orch/src/lib.rs. Do not include punk/punk-run in allowed_scope.";
+        let explicit = explicit_scope_override(guidance, &root).unwrap();
+
+        assert_eq!(
+            explicit,
+            vec![
+                "crates/punk-core/src/lib.rs".to_string(),
+                "crates/punk-orch/src/lib.rs".to_string(),
+            ]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

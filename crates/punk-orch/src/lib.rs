@@ -2662,6 +2662,7 @@ mod tests {
             .unwrap();
         fs::create_dir_all(root.join("Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests"))
             .unwrap();
+        fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
         fs::write(root.join("Makefile"), "test:\n\t@echo ok\n").unwrap();
         fs::write(
             root.join(
@@ -2682,6 +2683,7 @@ mod tests {
             "func testExample() {}\n",
         )
         .unwrap();
+        fs::write(root.join("punk/punk-run/src/main.rs"), "fn main() {}\n").unwrap();
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(&root)
@@ -2695,7 +2697,7 @@ mod tests {
                 "Add the next bounded dev-only slice for interviewcoach.",
             )
             .unwrap();
-        let guidance = "Expand allowed_scope exactly to the files needed for the copy/export trace slice: `Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/DevAppViewModel.swift`; `Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/MainWindowView.swift`; `Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests/DevAppViewModelTests.swift`. Target checks should include make test. Integrity checks should include make test.";
+        let guidance = "Expand allowed_scope exactly to the files needed for the copy/export trace slice: `Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/DevAppViewModel.swift`; `Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/MainWindowView.swift`; `Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests/DevAppViewModelTests.swift`. Do not include `punk/punk-run` in allowed_scope. Target checks should include make test. Integrity checks should include make test.";
         let refined = service
             .refine_contract(&FakeDrafter, &contract.id, guidance)
             .unwrap();
