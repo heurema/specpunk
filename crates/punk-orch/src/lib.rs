@@ -22,7 +22,7 @@ use punk_domain::{
 };
 use punk_events::EventStore;
 use punk_vcs::{current_snapshot_ref, detect_backend};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
@@ -37,6 +37,8 @@ pub struct RepoPaths {
     pub decisions_dir: PathBuf,
     pub proofs_dir: PathBuf,
     pub autonomy_dir: PathBuf,
+    pub project_dir: PathBuf,
+    pub harness_spec_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,6 +82,31 @@ pub struct ProjectHarnessSummary {
     pub traces_legible: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedHarnessCapabilities {
+    pub ui_legible: bool,
+    pub logs_legible: bool,
+    pub metrics_legible: bool,
+    pub traces_legible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedHarnessProfile {
+    pub name: String,
+    pub validation_surfaces: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedHarnessSpec {
+    pub project_id: String,
+    pub inspect_ready: bool,
+    pub bootable_per_workspace: bool,
+    pub capabilities: PersistedHarnessCapabilities,
+    pub profiles: Vec<PersistedHarnessProfile>,
+    pub derivation_source: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectOverlay {
     pub project_id: String,
@@ -89,6 +116,8 @@ pub struct ProjectOverlay {
     pub agent_guidance_ref: Vec<String>,
     pub capability_summary: ProjectCapabilitySummary,
     pub harness_summary: ProjectHarnessSummary,
+    pub harness_spec_ref: String,
+    pub harness_spec: PersistedHarnessSpec,
     pub project_skill_refs: Vec<String>,
     pub local_constraints: Vec<String>,
     pub safe_default_checks: Vec<String>,
@@ -133,10 +162,59 @@ fn repo_has_any(repo_root: &Path, rel_paths: &[&str]) -> bool {
         .any(|rel_path| repo_root.join(rel_path).exists())
 }
 
+impl PersistedHarnessSpec {
+    fn from_summary(
+        project_id: &str,
+        summary: &ProjectHarnessSummary,
+        updated_at: &str,
+    ) -> Self {
+        let capabilities = PersistedHarnessCapabilities {
+            ui_legible: summary.ui_legible,
+            logs_legible: summary.logs_legible,
+            metrics_legible: summary.metrics_legible,
+            traces_legible: summary.traces_legible,
+        };
+        let mut validation_surfaces = Vec::new();
+        if summary.bootable_per_workspace {
+            validation_surfaces.push("command".to_string());
+        }
+        if summary.ui_legible {
+            validation_surfaces.push("ui_snapshot".to_string());
+        }
+        if summary.logs_legible {
+            validation_surfaces.push("log_query".to_string());
+        }
+        if summary.metrics_legible {
+            validation_surfaces.push("metric_assertion".to_string());
+        }
+        if summary.traces_legible {
+            validation_surfaces.push("trace_assertion".to_string());
+        }
+        let profiles = if validation_surfaces.is_empty() {
+            Vec::new()
+        } else {
+            vec![PersistedHarnessProfile {
+                name: "default".to_string(),
+                validation_surfaces,
+            }]
+        };
+        Self {
+            project_id: project_id.to_string(),
+            inspect_ready: summary.inspect_ready,
+            bootable_per_workspace: summary.bootable_per_workspace,
+            capabilities,
+            profiles,
+            derivation_source: "repo_markers_v1".to_string(),
+            updated_at: updated_at.to_string(),
+        }
+    }
+}
+
 impl OrchService {
     pub fn new(repo_root: impl AsRef<Path>, global_root: impl AsRef<Path>) -> Result<Self> {
         let repo_root = repo_root.as_ref().to_path_buf();
         let dot_punk = repo_root.join(".punk");
+        let project_dir = dot_punk.join("project");
         let paths = RepoPaths {
             repo_root: repo_root.clone(),
             global_root: global_root.as_ref().to_path_buf(),
@@ -148,6 +226,8 @@ impl OrchService {
             decisions_dir: dot_punk.join("decisions"),
             proofs_dir: dot_punk.join("proofs"),
             autonomy_dir: dot_punk.join("autonomy"),
+            project_dir: project_dir.clone(),
+            harness_spec_path: project_dir.join("harness.json"),
         };
         let events = EventStore::new(paths.global_root.clone());
         let service = Self { paths, events };
@@ -171,6 +251,7 @@ impl OrchService {
         fs::create_dir_all(&self.paths.decisions_dir)?;
         fs::create_dir_all(&self.paths.proofs_dir)?;
         fs::create_dir_all(&self.paths.autonomy_dir)?;
+        fs::create_dir_all(&self.paths.project_dir)?;
         self.events.ensure_dirs()?;
 
         let project_id = project_id(&self.paths.repo_root)?;
@@ -1017,6 +1098,11 @@ impl OrchService {
             metrics_legible,
             traces_legible,
         };
+        let persisted_harness_spec =
+            PersistedHarnessSpec::from_summary(&project.id, &harness_summary, &project.updated_at);
+        write_json(&self.paths.harness_spec_path, &persisted_harness_spec)?;
+        let harness_spec: PersistedHarnessSpec = read_json(&self.paths.harness_spec_path)?;
+        let harness_spec_ref = relative_ref(&self.paths.repo_root, &self.paths.harness_spec_path)?;
 
         Ok(ProjectOverlay {
             project_id: project.id.clone(),
@@ -1026,6 +1112,8 @@ impl OrchService {
             agent_guidance_ref,
             capability_summary,
             harness_summary,
+            harness_spec_ref,
+            harness_spec,
             project_skill_refs,
             local_constraints,
             safe_default_checks,
@@ -3557,6 +3645,27 @@ mod tests {
         assert!(overlay.harness_summary.logs_legible);
         assert!(overlay.harness_summary.metrics_legible);
         assert!(overlay.harness_summary.traces_legible);
+        assert_eq!(overlay.harness_spec_ref, ".punk/project/harness.json");
+        assert_eq!(overlay.harness_spec.project_id, overlay.project_id);
+        assert_eq!(overlay.harness_spec.derivation_source, "repo_markers_v1");
+        assert!(overlay.harness_spec.inspect_ready);
+        assert!(overlay.harness_spec.bootable_per_workspace);
+        assert_eq!(
+            overlay.harness_spec.profiles,
+            vec![PersistedHarnessProfile {
+                name: "default".into(),
+                validation_surfaces: vec![
+                    "command".into(),
+                    "ui_snapshot".into(),
+                    "log_query".into(),
+                    "metric_assertion".into(),
+                    "trace_assertion".into(),
+                ],
+            }]
+        );
+        let persisted: PersistedHarnessSpec =
+            read_json(&root.join(".punk/project/harness.json")).unwrap();
+        assert_eq!(persisted, overlay.harness_spec);
         assert_eq!(
             overlay.status_scope_mode,
             format!("project:{}", overlay.project_id)
@@ -3566,6 +3675,50 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         let _ = fs::remove_dir_all(&global);
         let _ = fs::remove_dir_all(&bus);
+    }
+
+    #[test]
+    fn inspect_project_overlay_persists_empty_harness_profile_when_markers_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-empty-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let overlay = service.inspect_project_overlay().unwrap();
+
+        assert_eq!(overlay.harness_spec_ref, ".punk/project/harness.json");
+        assert!(!overlay.harness_summary.inspect_ready);
+        assert!(!overlay.harness_summary.bootable_per_workspace);
+        assert!(!overlay.harness_spec.inspect_ready);
+        assert!(overlay.harness_spec.profiles.is_empty());
+        let persisted: PersistedHarnessSpec =
+            read_json(&root.join(".punk/project/harness.json")).unwrap();
+        assert_eq!(persisted, overlay.harness_spec);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
     }
 
     #[test]

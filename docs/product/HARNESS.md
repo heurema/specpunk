@@ -179,6 +179,51 @@ In the current slice:
 - `bootable_per_workspace` is derived from current bootstrap/check/VCS readiness
 - `ui_legible`, `logs_legible`, `metrics_legible`, and `traces_legible` are conservative repo-state signals only
 
+Current slice also persists a minimal derived packet at:
+
+```text
+.punk/project/harness.json
+```
+
+Current v1 packet shape:
+
+```json
+{
+  "project_id": "specpunk",
+  "inspect_ready": true,
+  "bootable_per_workspace": true,
+  "capabilities": {
+    "ui_legible": false,
+    "logs_legible": false,
+    "metrics_legible": false,
+    "traces_legible": false
+  },
+  "profiles": [
+    {
+      "name": "default",
+      "validation_surfaces": ["command"]
+    }
+  ],
+  "derivation_source": "repo_markers_v1",
+  "updated_at": "2026-04-08T00:00:00Z"
+}
+```
+
+Current derivation rules:
+
+- `command` appears only when `bootable_per_workspace=true`
+- `ui_snapshot` appears when `ui_legible=true`
+- `log_query` appears when `logs_legible=true`
+- `metric_assertion` appears when `metrics_legible=true`
+- `trace_assertion` appears when `traces_legible=true`
+- if no validation surfaces are available yet, the packet still persists with an empty `profiles[]`
+
+Current inspect semantics:
+
+- `punk inspect project` shows both `harness_summary` and the persisted harness packet ref/profile summary
+- `punk inspect project --json` includes `harness_spec_ref` and `harness_spec`
+- the packet remains a derived mechanism only; it does not introduce a new primitive or new gate/proof semantics
+
 Future `ProjectOverlay` growth can still add fields like:
 
 ```text

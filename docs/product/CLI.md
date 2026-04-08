@@ -119,11 +119,16 @@ Current `inspect project` overlay should include:
   - `logs_legible`
   - `metrics_legible`
   - `traces_legible`
+- derived persisted harness packet fields:
+  - `harness_spec_ref`
+  - `harness_spec`
 
-This slice is inspect-only:
+Current persisted harness packet behavior:
 
-- do not persist a harness packet yet
-- do not add new runtime execution semantics yet
+- `punk inspect project` writes a derived repo-local packet to `.punk/project/harness.json`
+- `punk inspect project --json` includes both `harness_summary` and the persisted `harness_spec` payload
+- the current packet is still inspect-only and derived from repo markers
+- this slice does not add new runtime execution semantics yet
 
 Current work-ledger inspect surface:
 
