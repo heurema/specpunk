@@ -1350,8 +1350,8 @@ fn render_function_excerpt(
     let local_index = line_number.saturating_sub(file.start_line);
     let start = local_index.saturating_sub(1);
     let mut end = lines.len();
-    for idx in (local_index + 1)..lines.len() {
-        let signature = lines[idx].trim();
+    for (idx, line) in lines.iter().enumerate().skip(local_index + 1) {
+        let signature = line.trim();
         if looks_like_symbol_anchor(signature) {
             end = idx;
             break;
@@ -1364,7 +1364,7 @@ fn render_function_excerpt(
         .map(|(offset, line)| format!("// {:>4} | {}", start + offset + file.start_line, line))
         .collect::<Vec<_>>()
         .join("\n");
-    format!("{excerpt}")
+    excerpt.to_string()
 }
 
 fn render_window_excerpt(file: &ContextFileExcerpt, line_number: usize, radius: usize) -> String {
@@ -1378,7 +1378,7 @@ fn render_window_excerpt(file: &ContextFileExcerpt, line_number: usize, radius: 
         .map(|(offset, line)| format!("// {:>4} | {}", start + offset + file.start_line, line))
         .collect::<Vec<_>>()
         .join("\n");
-    format!("{excerpt}")
+    excerpt.to_string()
 }
 
 fn council_synthesis_recipe_seed() -> ContextRecipeSeed {

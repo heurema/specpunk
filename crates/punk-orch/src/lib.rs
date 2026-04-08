@@ -1219,6 +1219,7 @@ impl OrchService {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_event(
         &self,
         project_id: &str,
@@ -2011,7 +2012,7 @@ mod tests {
             "fake"
         }
         fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
-            fs::write(&input.repo_root.join("demo.txt"), b"ok")?;
+            fs::write(input.repo_root.join("demo.txt"), b"ok")?;
             fs::write(&input.stdout_path, b"done")?;
             fs::write(&input.stderr_path, b"")?;
             Ok(ExecuteOutput {
@@ -2032,8 +2033,8 @@ mod tests {
         }
 
         fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
-            fs::write(&input.repo_root.join("carry.txt"), b"changed during run")?;
-            fs::write(&input.repo_root.join("demo.txt"), b"ok")?;
+            fs::write(input.repo_root.join("carry.txt"), b"changed during run")?;
+            fs::write(input.repo_root.join("demo.txt"), b"ok")?;
             fs::write(&input.stdout_path, b"done")?;
             fs::write(&input.stderr_path, b"")?;
             Ok(ExecuteOutput {
