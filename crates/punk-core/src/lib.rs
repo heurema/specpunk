@@ -1751,6 +1751,14 @@ fn explicit_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
         if !looks_like_repo_path(&candidate) {
             continue;
         }
+        let explicitly_reviewed_generated_path = is_generated_runtime_artifact_path(&candidate)
+            && prompt_explicitly_targets_generated_path(prompt, &candidate);
+        if is_artifact_storage_pattern(&candidate) && !explicitly_reviewed_generated_path {
+            continue;
+        }
+        if is_generated_runtime_artifact_path(&candidate) && !explicitly_reviewed_generated_path {
+            continue;
+        }
         if !candidate.contains('/')
             && !is_repo_root_file(&candidate)
             && !repo_root.join(&candidate).exists()
@@ -1762,6 +1770,90 @@ fn explicit_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
         }
     }
     paths
+}
+
+fn is_generated_runtime_artifact_path(path: &str) -> bool {
+    let normalized = path.trim().trim_matches('`').replace('\\', "/");
+    normalized == ".punk/project/harness.json"
+        || normalized.starts_with(".punk/project/")
+        || normalized.contains("/.punk/project/")
+}
+
+fn prompt_explicitly_targets_generated_path(prompt: &str, path: &str) -> bool {
+    let prompt = prompt.to_ascii_lowercase();
+    let path = path.trim().trim_matches('`').replace('\\', "/").to_ascii_lowercase();
+    [
+        format!("review `{path}`"),
+        format!("review {path}"),
+        format!("code review target `{path}`"),
+        format!("code review target {path}"),
+        format!("code-review target `{path}`"),
+        format!("code-review target {path}"),
+        format!("explicit review target `{path}`"),
+        format!("explicit review target {path}"),
+        format!("explicitly review `{path}`"),
+        format!("explicitly review {path}"),
+    ]
+    .into_iter()
+    .any(|needle| prompt.contains(&needle))
+}
+
+#[cfg(test)]
+mod generated_runtime_artifact_scope_tests {
+    use super::explicit_scope_paths;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn explicit_scope_paths_excludes_generated_runtime_artifacts_from_prompt_scope() {
+        let repo_root = create_temp_repo_root("exclude-generated-runtime-artifacts");
+        seed_scope_fixture(&repo_root, "crates/punk-orch/src/lib.rs");
+        seed_scope_fixture(&repo_root, "crates/punk-cli/src/main.rs");
+        seed_scope_fixture(&repo_root, ".punk/project/harness.json");
+
+        let prompt = "Review crates/punk-orch/src/lib.rs and crates/punk-cli/src/main.rs before writing .punk/project/harness.json as the generated runtime packet destination.";
+        let paths = explicit_scope_paths(prompt, &repo_root);
+
+        assert_eq!(
+            paths,
+            vec![
+                "crates/punk-orch/src/lib.rs".to_string(),
+                "crates/punk-cli/src/main.rs".to_string()
+            ]
+        );
+        assert!(!paths.iter().any(|path| path == ".punk/project/harness.json"));
+    }
+
+    #[test]
+    fn explicit_scope_paths_keeps_generated_runtime_artifacts_when_explicitly_reviewed() {
+        let repo_root = create_temp_repo_root("preserve-explicit-generated-runtime-review");
+        seed_scope_fixture(&repo_root, ".punk/project/harness.json");
+
+        let prompt =
+            "Code-review target .punk/project/harness.json and confirm the generated runtime packet is valid.";
+        let paths = explicit_scope_paths(prompt, &repo_root);
+
+        assert_eq!(paths, vec![".punk/project/harness.json".to_string()]);
+    }
+
+    fn create_temp_repo_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("punk-core-{label}-{nanos}"));
+        fs::create_dir_all(&root).expect("create repo root");
+        root
+    }
+
+    fn seed_scope_fixture(repo_root: &Path, relative_path: &str) {
+        let path = repo_root.join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create fixture parent");
+        }
+        fs::write(path, "fixture\n").expect("write fixture file");
+    }
 }
 
 fn authoritative_exact_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
@@ -1948,12 +2040,17 @@ fn looks_like_repo_path(value: &str) -> bool {
 }
 
 fn trim_token_punctuation(token: &str) -> &str {
-    token.trim_matches(|c: char| {
-        matches!(
-            c,
-            '`' | '"' | '\'' | ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
-        )
-    })
+    token
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '"' | '\'' | ',' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+        })
+        .trim_end_matches('.')
+        .trim_end_matches(|c: char| {
+            matches!(c, '`' | '"' | '\'' | ',' | ':' | ';' | ')' | ']' | '}')
+        })
 }
 
 fn section_until_break(input: &str) -> &str {
@@ -2610,6 +2707,34 @@ mod tests {
             vec![
                 "crates/punk-core/src/lib.rs".to_string(),
                 "crates/punk-orch/src/lib.rs".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_scope_override_ignores_generated_runtime_artifact_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-exact-scope-generated-artifact-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-cli/src")).unwrap();
+        fs::create_dir_all(root.join(".punk/project")).unwrap();
+        fs::write(root.join("crates/punk-orch/src/lib.rs"), "pub fn orch() {}\n").unwrap();
+        fs::write(root.join("crates/punk-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join(".punk/project/harness.json"), "{}\n").unwrap();
+
+        let guidance = "Restrict allowed_scope exactly to these two files and nothing else: crates/punk-orch/src/lib.rs; crates/punk-cli/src/main.rs. Mention the generated packet `.punk/project/harness.json` in docs, but do not include it in allowed_scope or entry_points because it is a runtime artifact destination.";
+        let explicit = explicit_scope_override(guidance, &root).unwrap();
+
+        assert_eq!(
+            explicit,
+            vec![
+                "crates/punk-orch/src/lib.rs".to_string(),
+                "crates/punk-cli/src/main.rs".to_string(),
             ]
         );
 

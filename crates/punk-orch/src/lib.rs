@@ -3233,6 +3233,73 @@ mod tests {
     }
 
     #[test]
+    fn refine_contract_ignores_generated_runtime_artifact_paths_in_exact_scope_guidance() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-refine-generated-artifact-scope-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-cli/src")).unwrap();
+        fs::create_dir_all(root.join(".punk/project")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/Cargo.toml"),
+            "[package]\nname = \"punk-orch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-cli/Cargo.toml"),
+            "[package]\nname = \"punk-cli\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/punk-orch/src/lib.rs"), "pub fn orch() {}\n").unwrap();
+        fs::write(root.join("crates/punk-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join(".punk/project/harness.json"), "{}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &FakeDrafter,
+                "Add the next bounded harness slice for project inspect.",
+            )
+            .unwrap();
+        let guidance = "Restrict allowed_scope exactly to these two files and nothing else: crates/punk-orch/src/lib.rs; crates/punk-cli/src/main.rs. Mention the generated packet `.punk/project/harness.json` in docs, but do not include it in allowed_scope or entry_points because it is a runtime artifact destination. target_checks must contain exactly one command: cargo test -p punk-core -p punk-orch. integrity_checks must contain exactly one command: cargo test --workspace.";
+        let refined = service
+            .refine_contract(&FakeDrafter, &contract.id, guidance)
+            .unwrap();
+
+        assert_eq!(
+            refined.allowed_scope,
+            vec![
+                "crates/punk-orch/src/lib.rs".to_string(),
+                "crates/punk-cli/src/main.rs".to_string(),
+            ]
+        );
+        assert_eq!(refined.entry_points, refined.allowed_scope);
+        assert_eq!(
+            refined.target_checks,
+            vec!["cargo test -p punk-core -p punk-orch".to_string()]
+        );
+        assert_eq!(
+            refined.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn draft_contract_uses_bounded_fallback_after_refine_failure() {
         let root =
             std::env::temp_dir().join(format!("punk-orch-fallback-draft-{}", std::process::id()));
