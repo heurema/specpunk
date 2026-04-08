@@ -886,15 +886,8 @@ fn has_structural_invalidity(
         return true;
     }
 
-    let explicit_target_checks = explicit_checks_from_prompt(
-        repo_root,
-        prompt,
-        &[
-            "target checks should include",
-            "target checks to satisfy",
-            "target checks:",
-        ],
-    );
+    let explicit_target_checks =
+        explicit_target_checks_override(repo_root, prompt).unwrap_or_default();
     if !explicit_target_checks.is_empty()
         && !explicit_target_checks.iter().all(|command| {
             proposal
@@ -906,15 +899,8 @@ fn has_structural_invalidity(
         return true;
     }
 
-    let explicit_integrity_checks = explicit_checks_from_prompt(
-        repo_root,
-        prompt,
-        &[
-            "integrity checks should include",
-            "integrity checks to keep passing",
-            "integrity checks:",
-        ],
-    );
+    let explicit_integrity_checks =
+        explicit_integrity_checks_override(repo_root, prompt).unwrap_or_default();
     if !explicit_integrity_checks.is_empty()
         && !explicit_integrity_checks.iter().all(|command| {
             proposal
@@ -1849,29 +1835,50 @@ fn explicit_entry_points_override(explicit_scope: &[String]) -> Option<Vec<Strin
 }
 
 fn explicit_target_checks_override(repo_root: &Path, prompt: &str) -> Option<Vec<String>> {
-    let explicit_target_checks = explicit_checks_from_prompt(
-        repo_root,
-        prompt,
-        &[
-            "target checks should include",
-            "target checks to satisfy",
-            "target checks:",
-        ],
-    );
+    let explicit_target_checks = explicit_checks_from_prompt(repo_root, prompt, target_check_markers());
     (!explicit_target_checks.is_empty()).then_some(explicit_target_checks)
 }
 
 fn explicit_integrity_checks_override(repo_root: &Path, prompt: &str) -> Option<Vec<String>> {
-    let explicit_integrity_checks = explicit_checks_from_prompt(
-        repo_root,
-        prompt,
-        &[
-            "integrity checks should include",
-            "integrity checks to keep passing",
-            "integrity checks:",
-        ],
-    );
+    let explicit_integrity_checks =
+        explicit_checks_from_prompt(repo_root, prompt, integrity_check_markers());
     (!explicit_integrity_checks.is_empty()).then_some(explicit_integrity_checks)
+}
+
+fn target_check_markers() -> &'static [&'static str] {
+    &[
+        "target_checks must contain exactly one command:",
+        "target checks must contain exactly one command:",
+        "replace target_checks with exactly one command:",
+        "replace target checks with exactly one command:",
+        "target_checks must contain exactly:",
+        "target checks must contain exactly:",
+        "replace target_checks with exactly:",
+        "replace target checks with exactly:",
+        "target_checks should include",
+        "target checks should include",
+        "target checks to satisfy",
+        "target checks:",
+        "target_checks:",
+    ]
+}
+
+fn integrity_check_markers() -> &'static [&'static str] {
+    &[
+        "integrity_checks must contain exactly one command:",
+        "integrity checks must contain exactly one command:",
+        "replace integrity_checks with exactly one command:",
+        "replace integrity checks with exactly one command:",
+        "integrity_checks must contain exactly:",
+        "integrity checks must contain exactly:",
+        "replace integrity_checks with exactly:",
+        "replace integrity checks with exactly:",
+        "integrity_checks should include",
+        "integrity checks should include",
+        "integrity checks to keep passing",
+        "integrity checks:",
+        "integrity_checks:",
+    ]
 }
 
 fn explicit_checks_from_prompt(repo_root: &Path, prompt: &str, markers: &[&str]) -> Vec<String> {
@@ -2604,6 +2611,53 @@ mod tests {
                 "crates/punk-core/src/lib.rs".to_string(),
                 "crates/punk-orch/src/lib.rs".to_string(),
             ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_target_checks_override_preserves_exact_combined_command() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-exact-target-checks-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::write(root.join("crates/punk-core/src/lib.rs"), "pub fn core() {}\n").unwrap();
+        fs::write(root.join("crates/punk-orch/src/lib.rs"), "pub fn orch() {}\n").unwrap();
+
+        let guidance = "Keep allowed_scope exactly as-is. target_checks must contain exactly one command: cargo test -p punk-core -p punk-orch. integrity_checks must contain exactly one command: cargo test --workspace. Remove every other target check.";
+        let mut proposal = DraftProposal {
+            title: "tighten exact target checks".into(),
+            summary: "tighten exact target checks".into(),
+            entry_points: vec!["crates/punk-orch/src/lib.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec![
+                "crates/punk-core/src/lib.rs".into(),
+                "crates/punk-orch/src/lib.rs".into(),
+            ],
+            target_checks: vec![
+                "cargo test -p punk-core".into(),
+                "cargo test -p punk-orch".into(),
+                "cargo test -p punk-domain".into(),
+            ],
+            integrity_checks: vec!["cargo test".into()],
+            risk_level: "low".into(),
+        };
+
+        apply_explicit_prompt_overrides(&root, guidance, &mut proposal);
+
+        assert_eq!(
+            proposal.target_checks,
+            vec!["cargo test -p punk-core -p punk-orch".to_string()]
+        );
+        assert_eq!(
+            proposal.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
         );
 
         let _ = fs::remove_dir_all(&root);

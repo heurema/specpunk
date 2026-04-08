@@ -2907,6 +2907,60 @@ mod tests {
     }
 
     #[test]
+    fn refine_contract_preserves_exact_combined_target_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-refine-exact-target-checks-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/Cargo.toml"),
+            "[package]\nname = \"punk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/Cargo.toml"),
+            "[package]\nname = \"punk-orch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/punk-core/src/lib.rs"), "pub fn core() {}\n").unwrap();
+        fs::write(root.join("crates/punk-orch/src/lib.rs"), "pub fn orch() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&ScanTargetChecksDrafter, "tighten target check guidance")
+            .unwrap();
+        let guidance = "Keep allowed_scope exactly as-is. target_checks must contain exactly one command: cargo test -p punk-core -p punk-orch. integrity_checks must contain exactly one command: cargo test --workspace. Remove every other target check.";
+        let refined = service
+            .refine_contract(&ScanTargetChecksDrafter, &contract.id, guidance)
+            .unwrap();
+
+        assert_eq!(
+            refined.target_checks,
+            vec!["cargo test -p punk-core -p punk-orch".to_string()]
+        );
+        assert_eq!(
+            refined.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn draft_contract_uses_bounded_fallback_after_refine_failure() {
         let root =
             std::env::temp_dir().join(format!("punk-orch-fallback-draft-{}", std::process::id()));
