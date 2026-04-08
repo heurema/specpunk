@@ -576,6 +576,7 @@ impl OrchService {
         )?;
 
         let backend = detect_backend(&self.paths.repo_root)?;
+        let preexisting_changed_files = backend.changed_files().unwrap_or_default();
         let isolated = backend.create_isolated_change(&task.id)?;
         let workspace_root = PathBuf::from(&isolated.workspace_ref);
         let isolated_backend = detect_backend(&workspace_root)?;
@@ -683,14 +684,32 @@ impl OrchService {
 
         let (status, summary, checks_run, cost_usd, duration_ms) = match execution {
             Ok(output) => {
-                run.status = if output.success {
+                let already_satisfied_before_dispatch = !output.success
+                    && should_treat_cut_run_as_already_satisfied(
+                        &contract,
+                        &output.summary,
+                        &preexisting_changed_files,
+                    );
+                run.status = if output.success || already_satisfied_before_dispatch {
                     RunStatus::Finished
                 } else {
                     RunStatus::Failed
                 };
                 (
-                    if output.success { "success" } else { "failure" }.to_string(),
-                    output.summary,
+                    if output.success || already_satisfied_before_dispatch {
+                        "success"
+                    } else {
+                        "failure"
+                    }
+                    .to_string(),
+                    if already_satisfied_before_dispatch {
+                        already_satisfied_before_dispatch_summary(
+                            &contract.entry_points,
+                            &output.summary,
+                        )
+                    } else {
+                        output.summary
+                    },
                     output.checks_run,
                     output.cost_usd,
                     output.duration_ms,
@@ -1874,6 +1893,59 @@ fn work_suggested_command(
     }
 }
 
+fn should_treat_cut_run_as_already_satisfied(
+    contract: &Contract,
+    summary: &str,
+    preexisting_changed_files: &[String],
+) -> bool {
+    is_cut_run_noop_or_blocked_summary(summary)
+        && entry_points_already_changed_before_dispatch(contract, preexisting_changed_files)
+}
+
+fn is_cut_run_noop_or_blocked_summary(summary: &str) -> bool {
+    let trimmed = summary.trim();
+    trimmed.starts_with("no implementation progress after bounded context dispatch")
+        || trimmed.starts_with("PUNK_EXECUTION_BLOCKED:")
+}
+
+fn entry_points_already_changed_before_dispatch(
+    contract: &Contract,
+    preexisting_changed_files: &[String],
+) -> bool {
+    !contract.entry_points.is_empty()
+        && contract.entry_points.iter().all(|entry_point| {
+            preexisting_changed_files
+                .iter()
+                .any(|changed| path_covers_entry_point(changed, entry_point))
+        })
+}
+
+fn path_covers_entry_point(changed_path: &str, entry_point: &str) -> bool {
+    changed_path == entry_point
+        || changed_path
+            .strip_prefix(entry_point)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn already_satisfied_before_dispatch_summary(
+    entry_points: &[String],
+    original_summary: &str,
+) -> String {
+    let original_summary = original_summary.trim();
+    if original_summary.is_empty() {
+        format!(
+            "already satisfied in allowed scope before bounded dispatch: {}",
+            entry_points.join(", ")
+        )
+    } else {
+        format!(
+            "already satisfied in allowed scope before bounded dispatch: {} (original executor summary: {})",
+            entry_points.join(", "),
+            original_summary
+        )
+    }
+}
+
 fn summarize_prompt(prompt: &str) -> String {
     let trimmed = prompt.trim();
     trimmed.chars().take(60).collect()
@@ -2151,6 +2223,57 @@ mod tests {
                 cost_usd: None,
                 duration_ms: 1,
             })
+        }
+    }
+
+    struct AlreadySatisfiedNoOpExecutor;
+
+    impl Executor for AlreadySatisfiedNoOpExecutor {
+        fn name(&self) -> &'static str {
+            "already-satisfied-noop"
+        }
+
+        fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+            fs::write(
+                &input.stdout_path,
+                b"PUNK_EXECUTION_BLOCKED: bounded executor found no additional edits\n",
+            )?;
+            fs::write(&input.stderr_path, b"")?;
+            Ok(ExecuteOutput {
+                success: false,
+                summary: "PUNK_EXECUTION_BLOCKED: bounded executor found no additional edits"
+                    .into(),
+                checks_run: vec![],
+                cost_usd: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    struct AlreadySatisfiedDrafter;
+
+    impl ContractDrafter for AlreadySatisfiedDrafter {
+        fn name(&self) -> &'static str {
+            "already-satisfied-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "already satisfied".into(),
+                summary: input.prompt,
+                entry_points: vec!["src/lib.rs".into()],
+                import_paths: vec!["src/lib.rs".into()],
+                expected_interfaces: vec!["demo".into()],
+                behavior_requirements: vec!["keep demo implemented".into()],
+                allowed_scope: vec!["src/lib.rs".into()],
+                target_checks: vec!["cargo test".into()],
+                integrity_checks: vec!["cargo test".into()],
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
         }
     }
 
@@ -2540,6 +2663,67 @@ mod tests {
             changed_files,
             vec!["carry.txt".to_string(), "demo.txt".to_string()]
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_succeeds_when_bounded_diff_is_already_satisfied_before_dispatch() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-already-satisfied-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() { println!(\"done\"); }\n").unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&AlreadySatisfiedDrafter, "demo already satisfied")
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (run, receipt) = service
+            .cut_run(&AlreadySatisfiedNoOpExecutor, &contract.id)
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Finished);
+        assert_eq!(receipt.status, "success");
+        assert!(receipt.changed_files.is_empty());
+        assert!(receipt
+            .summary
+            .contains("already satisfied in allowed scope before bounded dispatch"));
+        assert!(receipt.summary.contains("src/lib.rs"));
 
         let _ = fs::remove_dir_all(&root);
     }

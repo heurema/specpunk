@@ -367,6 +367,11 @@ Writes:
 - `receipt.written`
 - `run.finished`
 
+Behavior notes:
+
+- if bounded execution makes no additional edits because the approved entry points were already changed in-scope before dispatch, `cut run` may still record a successful run summary explaining that the slice was already satisfied before dispatch
+- `gate` and `proof` remain authoritative; this cut-time success does not replace verification
+
 ### `punk gate run <run-id>`
 
 Reads:
