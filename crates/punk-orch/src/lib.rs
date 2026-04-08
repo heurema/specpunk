@@ -3369,6 +3369,7 @@ mod tests {
             contract_ref: format!(".punk/contracts/{}/v1.json", run.feature_id),
             receipt_ref: format!(".punk/runs/{}/receipt.json", run.id),
             check_refs: Vec::new(),
+            command_evidence: Vec::new(),
             created_at: now_rfc3339(),
         };
         let decision_path = root
@@ -3383,6 +3384,7 @@ mod tests {
             receipt_ref: decision.receipt_ref.clone(),
             decision_ref: format!(".punk/decisions/{}.json", decision.id),
             check_refs: Vec::new(),
+            command_evidence: Vec::new(),
             hashes: Default::default(),
             summary: format!("proof for {}", decision.id),
             created_at: now_rfc3339(),
@@ -3547,6 +3549,7 @@ mod tests {
             contract_ref: format!(".punk/contracts/{}/v1.json", run.feature_id),
             receipt_ref: format!(".punk/runs/{}/receipt.json", run.id),
             check_refs: Vec::new(),
+            command_evidence: Vec::new(),
             created_at: now_rfc3339(),
         };
         let decision_path = root
@@ -3561,6 +3564,7 @@ mod tests {
             receipt_ref: decision.receipt_ref.clone(),
             decision_ref: format!(".punk/decisions/{}.json", decision.id),
             check_refs: Vec::new(),
+            command_evidence: Vec::new(),
             hashes: Default::default(),
             summary: format!("proof for {}", decision.id),
             created_at: now_rfc3339(),

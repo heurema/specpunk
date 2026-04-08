@@ -217,6 +217,12 @@ Harness integration should make `gate` stronger, not softer:
 - record which harness profile was used
 - keep recovery explicit when required evidence is unavailable
 
+Current Slice 3 starts smaller:
+
+- keep existing command checks as the only executed recipe type
+- persist them as typed `command` evidence entries instead of relying only on flat `check_refs`
+- keep `target` / `integrity` lane information, command text, pass/fail status, and stdout/stderr refs together
+
 ### `proof`
 
 `Proofpack` should eventually persist:
@@ -226,6 +232,8 @@ Harness integration should make `gate` stronger, not softer:
 - evidence manifest refs
 - assertion outcomes
 - blocked evidence reasons when verification could not complete cleanly
+
+Current Slice 3 should at least carry forward the same typed command-evidence manifest that `gate` wrote onto `DecisionObject`.
 
 ### `Ledger`
 

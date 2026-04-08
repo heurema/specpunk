@@ -164,6 +164,12 @@ That means:
 - `Proofpack` should eventually persist evidence manifests and assertion outcomes
 - `Ledger` should keep blocked harness recovery inspectable after the shell output is gone
 
+Current bounded progress:
+
+- `ProjectOverlay` now exposes derived `harness_summary`
+- the next harness step persists typed `command` evidence for existing `target` / `integrity` checks in `DecisionObject` and `Proofpack`
+- this still does **not** introduce a repo-local harness packet or non-command evidence execution
+
 See also:
 
 - `docs/product/HARNESS.md`

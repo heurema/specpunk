@@ -101,6 +101,17 @@ pub enum CheckStatus {
     Unverified,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandEvidence {
+    pub evidence_type: String,
+    pub lane: String,
+    pub command: String,
+    pub status: CheckStatus,
+    pub summary: String,
+    pub stdout_ref: Option<String>,
+    pub stderr_ref: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -263,6 +274,7 @@ pub struct DecisionObject {
     pub contract_ref: String,
     pub receipt_ref: String,
     pub check_refs: Vec<String>,
+    pub command_evidence: Vec<CommandEvidence>,
     pub created_at: String,
 }
 
@@ -275,6 +287,7 @@ pub struct Proofpack {
     pub receipt_ref: String,
     pub decision_ref: String,
     pub check_refs: Vec<String>,
+    pub command_evidence: Vec<CommandEvidence>,
     pub hashes: std::collections::BTreeMap<String, String>,
     pub summary: String,
     pub created_at: String,

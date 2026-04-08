@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use punk_core::{find_object_path, read_json, relative_ref, validate_check_command, write_json};
 use punk_domain::{
-    now_rfc3339, CheckStatus, Contract, ContractStatus, Decision, DecisionObject,
-    DeterministicStatus, EventEnvelope, ModeId, Receipt,
+    now_rfc3339, CheckStatus, CommandEvidence, Contract, ContractStatus, Decision,
+    DecisionObject, DeterministicStatus, EventEnvelope, ModeId, Receipt,
 };
 use punk_events::EventStore;
 use punk_orch::project_id;
@@ -13,6 +13,13 @@ use punk_orch::project_id;
 pub struct GateService {
     repo_root: PathBuf,
     events: EventStore,
+}
+
+struct CheckRunSummary {
+    status: CheckStatus,
+    reasons: Vec<String>,
+    refs: Vec<String>,
+    command_evidence: Vec<CommandEvidence>,
 }
 
 impl GateService {
@@ -40,31 +47,32 @@ impl GateService {
 
         let mut decision_basis = Vec::new();
         let mut check_refs = Vec::new();
+        let mut command_evidence = Vec::new();
         let scope_ok = validate_scope(&contract.allowed_scope, &receipt.changed_files);
         if !scope_ok {
             decision_basis.push("scope violation: changed files outside allowed_scope".to_string());
         }
-        let target = run_checks(
-            &self.repo_root,
-            &run.id,
-            "target",
-            &contract.target_checks,
-            &mut check_refs,
-        )?;
+        let target = run_checks(&self.repo_root, &run.id, "target", &contract.target_checks)?;
         let integrity = run_checks(
             &self.repo_root,
             &run.id,
             "integrity",
             &contract.integrity_checks,
-            &mut check_refs,
         )?;
-        decision_basis.extend(target.1.clone());
-        decision_basis.extend(integrity.1.clone());
+        check_refs.extend(target.refs.iter().cloned());
+        check_refs.extend(integrity.refs.iter().cloned());
+        decision_basis.extend(target.reasons.clone());
+        decision_basis.extend(integrity.reasons.clone());
+        command_evidence.extend(target.command_evidence);
+        command_evidence.extend(integrity.command_evidence);
 
         let (decision, deterministic_status, confidence_estimate) =
-            if !scope_ok || target.0 == CheckStatus::Fail || integrity.0 == CheckStatus::Fail {
+            if !scope_ok
+                || target.status == CheckStatus::Fail
+                || integrity.status == CheckStatus::Fail
+            {
                 (Decision::Block, DeterministicStatus::Fail, 0.9)
-            } else if target.0 == CheckStatus::Pass && integrity.0 == CheckStatus::Pass {
+            } else if target.status == CheckStatus::Pass && integrity.status == CheckStatus::Pass {
                 (Decision::Accept, DeterministicStatus::Pass, 1.0)
             } else {
                 (Decision::Escalate, DeterministicStatus::Mixed, 0.5)
@@ -76,13 +84,14 @@ impl GateService {
             contract_id: contract.id.clone(),
             decision,
             deterministic_status,
-            target_status: target.0,
-            integrity_status: integrity.0,
+            target_status: target.status,
+            integrity_status: integrity.status,
             confidence_estimate,
             decision_basis,
             contract_ref: relative_ref(&self.repo_root, &contract_path)?,
             receipt_ref: relative_ref(&self.repo_root, &receipt_path)?,
             check_refs,
+            command_evidence,
             created_at: now_rfc3339(),
         };
         let decisions_dir = self.repo_root.join(".punk/decisions");
@@ -123,18 +132,21 @@ fn run_checks(
     run_id: &str,
     kind: &str,
     commands: &[String],
-    refs: &mut Vec<String>,
-) -> Result<(CheckStatus, Vec<String>)> {
+) -> Result<CheckRunSummary> {
     if commands.is_empty() {
-        return Ok((
-            CheckStatus::Unverified,
-            vec![format!("{kind} checks missing")],
-        ));
+        return Ok(CheckRunSummary {
+            status: CheckStatus::Unverified,
+            reasons: vec![format!("{kind} checks missing")],
+            refs: Vec::new(),
+            command_evidence: Vec::new(),
+        });
     }
     let checks_dir = repo_root.join(".punk/runs").join(run_id).join("checks");
     fs::create_dir_all(&checks_dir)?;
     let mut failed = false;
     let mut reasons = Vec::new();
+    let mut refs = Vec::new();
+    let mut command_evidence = Vec::new();
     for (index, command_str) in commands.iter().enumerate() {
         let stdout_path = checks_dir.join(format!("{}-{:02}.stdout.log", kind, index + 1));
         let stderr_path = checks_dir.join(format!("{}-{:02}.stderr.log", kind, index + 1));
@@ -142,13 +154,33 @@ fn run_checks(
         let args = split_command_args(command_str);
         if args.is_empty() {
             failed = true;
-            reasons.push(format!("{kind} check failed: empty command"));
+            let summary = format!("{kind} check failed: empty command");
+            reasons.push(summary.clone());
+            command_evidence.push(CommandEvidence {
+                evidence_type: "command".to_string(),
+                lane: kind.to_string(),
+                command: command_str.clone(),
+                status: CheckStatus::Fail,
+                summary,
+                stdout_ref: None,
+                stderr_ref: None,
+            });
             continue;
         }
 
         if let Err(msg) = validate_check_command(repo_root, command_str) {
             failed = true;
-            reasons.push(format!("{kind} check failed: invalid command: {msg}"));
+            let summary = format!("{kind} check failed: invalid command: {msg}");
+            reasons.push(summary.clone());
+            command_evidence.push(CommandEvidence {
+                evidence_type: "command".to_string(),
+                lane: kind.to_string(),
+                command: command_str.clone(),
+                status: CheckStatus::Fail,
+                summary,
+                stdout_ref: None,
+                stderr_ref: None,
+            });
             continue;
         }
 
@@ -159,23 +191,37 @@ fn run_checks(
 
         fs::write(&stdout_path, &output.stdout)?;
         fs::write(&stderr_path, &output.stderr)?;
-        refs.push(relative_ref(repo_root, &stdout_path)?);
-        refs.push(relative_ref(repo_root, &stderr_path)?);
-        if output.status.success() {
-            reasons.push(format!("{kind} check passed: {command_str}"));
+        let stdout_ref = relative_ref(repo_root, &stdout_path)?;
+        let stderr_ref = relative_ref(repo_root, &stderr_path)?;
+        refs.push(stdout_ref.clone());
+        refs.push(stderr_ref.clone());
+        let (status, summary) = if output.status.success() {
+            (CheckStatus::Pass, format!("{kind} check passed: {command_str}"))
         } else {
             failed = true;
-            reasons.push(format!("{kind} check failed: {command_str}"));
-        }
+            (CheckStatus::Fail, format!("{kind} check failed: {command_str}"))
+        };
+        reasons.push(summary.clone());
+        command_evidence.push(CommandEvidence {
+            evidence_type: "command".to_string(),
+            lane: kind.to_string(),
+            command: command_str.clone(),
+            status,
+            summary,
+            stdout_ref: Some(stdout_ref),
+            stderr_ref: Some(stderr_ref),
+        });
     }
-    Ok((
-        if failed {
+    Ok(CheckRunSummary {
+        status: if failed {
             CheckStatus::Fail
         } else {
             CheckStatus::Pass
         },
         reasons,
-    ))
+        refs,
+        command_evidence,
+    })
 }
 
 fn split_command_args(s: &str) -> Vec<String> {
@@ -275,6 +321,8 @@ mod tests {
         let gate = GateService::new(&root, &global);
         let decision = gate.gate_run("run_1").unwrap();
         assert_eq!(decision.decision, Decision::Block);
+        assert_eq!(decision.command_evidence.len(), 2);
+        assert!(decision.command_evidence.iter().all(|item| item.evidence_type == "command"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -374,6 +422,15 @@ mod tests {
             .decision_basis
             .iter()
             .any(|reason| reason.contains("invalid command")));
+        let invalid_command = decision
+            .command_evidence
+            .iter()
+            .find(|item| item.command == "true; touch hacked")
+            .expect("invalid target command evidence");
+        assert_eq!(invalid_command.lane, "target");
+        assert_eq!(invalid_command.status, CheckStatus::Fail);
+        assert!(invalid_command.stdout_ref.is_none());
+        assert!(invalid_command.stderr_ref.is_none());
         assert!(!root.join("hacked").exists());
 
         let _ = fs::remove_dir_all(&root);
