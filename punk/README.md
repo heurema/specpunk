@@ -1,37 +1,84 @@
-# punk
+# punk (legacy nested workspace)
 
-Cargo workspace with 4 crates:
+This directory is the older nested Rust workspace kept as source material while `specpunk` converges on the current root-level `punk` CLI.
 
-| Crate | Type | Status | Binary |
-|-------|------|--------|--------|
-| `punk-core` | library | shipped v0.1, frozen | - |
-| `punk-cli` | binary | shipped v0.1, frozen | `punk` |
-| `punk-orch` | library | Phase 0 scaffold | - |
-| `punk-run` | binary | Phase 0 scaffold | `punk-run` |
+If you want the real operator-facing command surface, treat these as the canonical docs:
 
-## Install
+- `../README.md`
+- `../docs/product/CLI.md`
+- `../docs/product/ARCHITECTURE.md`
 
-```sh
-cargo install --path punk-cli    # verification CLI
-cargo install --path punk-run    # orchestration CLI (scaffold)
-```
+## What lives here
 
-## punk (verification)
+Cargo workspace with 4 legacy crates:
 
-```sh
-punk init       # scan project, detect conventions
-punk plan       # generate implementation contract
-punk check      # verify diff against contract
-punk receipt    # cryptographic completion proof
-punk status     # current workspace state
-punk config     # manage configuration
-```
+| Crate | Type | Role |
+|-------|------|------|
+| `punk-core` | library | older implementation source material |
+| `punk-cli` | binary | legacy verification-oriented CLI |
+| `punk-orch` | library | legacy orchestration source material |
+| `punk-run` | binary | legacy orchestration/admin CLI |
 
-## punk-run (orchestration, in progress)
+## Canonical CLI today
+
+Install the current root CLI from the repo root:
 
 ```sh
-punk-run status   # show tasks, slots, receipts (not yet implemented)
-punk-run config   # show loaded configuration (not yet implemented)
+cargo install --path crates/punk-cli
 ```
 
-See [ROADMAP-v2.md](../docs/product/ROADMAP-v2.md) for implementation plan.
+Primary commands:
+
+```sh
+punk init --enable-jj --verify
+punk init --project <id> --enable-jj --verify
+
+punk go --fallback-staged "<goal>"
+
+punk start "<goal>"
+punk plot approve <contract-id>
+punk cut run <contract-id>
+punk gate run <run-id>
+punk gate proof <run-id|decision-id>
+
+punk status [id]
+punk inspect project
+punk inspect work [id]
+punk inspect <id> --json
+punk vcs status
+punk vcs enable-jj
+```
+
+The default happy path is:
+
+```sh
+punk go --fallback-staged "<goal>"
+```
+
+The staged/manual path is:
+
+```sh
+punk start "<goal>"
+punk plot approve <contract-id>
+punk cut run <contract-id>
+punk gate run <run-id>
+punk gate proof <run-id|decision-id>
+```
+
+## Legacy nested binaries
+
+If you intentionally work inside this nested workspace itself:
+
+```sh
+cargo install --path punk-cli
+cargo install --path punk-run
+```
+
+Those nested binaries still expose the older `plan/check/receipt/config`-style surfaces. Treat them as historical implementation material, not as the current product shell described above.
+
+## More context
+
+- `../README.md` — current project overview and operator flow
+- `../docs/product/CLI.md` — current command semantics
+- `../docs/product/NORTH-ROADMAP.md` — strategic backlog
+- `../docs/product/ROADMAP-v2.md` — implementation plan
