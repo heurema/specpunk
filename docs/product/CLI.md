@@ -152,7 +152,10 @@ Current JSON artifact expectations:
 - `DecisionObject` and `Proofpack` keep `command_evidence` as the executed command-check record
 - they may also carry additive `declared_harness_evidence` copied from `.punk/project/harness.json`
 - `declared_harness_evidence` is metadata only for non-command harness surfaces declared by the persisted packet
-- this slice does **not** imply runtime execution of UI, log, metric, or trace recipes yet
+- they may also carry additive `harness_evidence` for executed non-command harness recipes
+- the first supported executed non-command recipe is `artifact_assertion` from profile-local `validation_recipes[]`
+- `artifact_assertion` verifies repo-relative artifact existence and can block `gate` on failure
+- current slices still do **not** imply runtime execution of UI, log, metric, or trace recipes
 
 Current status behavior:
 

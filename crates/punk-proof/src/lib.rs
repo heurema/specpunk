@@ -62,6 +62,20 @@ impl ProofService {
                 self.events.file_sha256(self.repo_root.join(check_ref))?,
             );
         }
+        for evidence in &decision.harness_evidence {
+            if let Some(source_ref) = &evidence.source_ref {
+                hashes.insert(
+                    source_ref.clone(),
+                    self.events.file_sha256(self.repo_root.join(source_ref))?,
+                );
+            }
+            if let Some(artifact_ref) = &evidence.artifact_ref {
+                hashes.insert(
+                    artifact_ref.clone(),
+                    self.events.file_sha256(self.repo_root.join(artifact_ref))?,
+                );
+            }
+        }
         let proofpack = Proofpack {
             id: format!("proof_{}", decision.id.trim_start_matches("dec_")),
             decision_id: decision.id.clone(),
@@ -72,6 +86,7 @@ impl ProofService {
             check_refs: decision.check_refs.clone(),
             command_evidence: decision.command_evidence.clone(),
             declared_harness_evidence: decision.declared_harness_evidence.clone(),
+            harness_evidence: decision.harness_evidence.clone(),
             hashes,
             summary: format!("proof for {}", decision.id),
             created_at: now_rfc3339(),
@@ -103,7 +118,7 @@ mod tests {
     use super::*;
     use punk_domain::{
         CheckStatus, CommandEvidence, Decision, DecisionObject, DeclaredHarnessEvidence,
-        DeterministicStatus,
+        DeterministicStatus, HarnessEvidence,
     };
     use punk_orch::write_json;
 
@@ -113,17 +128,35 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("punk-proof-evidence-{}-{suffix}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "punk-proof-evidence-{}-{suffix}",
+            std::process::id()
+        ));
         let global = root.join("global");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
         fs::create_dir_all(root.join(".punk/runs/run_1/checks")).unwrap();
         fs::create_dir_all(root.join(".punk/decisions")).unwrap();
-        fs::write(root.join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'\n").unwrap();
+        fs::create_dir_all(root.join(".punk/project")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
         fs::write(root.join(".punk/contracts/feat_1/v1.json"), "{}\n").unwrap();
         fs::write(root.join(".punk/runs/run_1/receipt.json"), "{}\n").unwrap();
-        fs::write(root.join(".punk/runs/run_1/checks/target-01.stdout.log"), "ok\n").unwrap();
-        fs::write(root.join(".punk/runs/run_1/checks/target-01.stderr.log"), "").unwrap();
+        fs::write(
+            root.join(".punk/runs/run_1/checks/target-01.stdout.log"),
+            "ok\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".punk/runs/run_1/checks/target-01.stderr.log"),
+            "",
+        )
+        .unwrap();
+        fs::write(root.join(".punk/project/harness.json"), "{ }\n").unwrap();
+        fs::write(root.join("tracked.txt"), "ok\n").unwrap();
 
         let decision = DecisionObject {
             id: "dec_1".into(),
@@ -156,6 +189,14 @@ mod tests {
                 source_ref: Some(".punk/project/harness.json".into()),
                 summary: "declared harness surface log_query from profile default".into(),
             }],
+            harness_evidence: vec![HarnessEvidence {
+                evidence_type: "artifact_assertion".into(),
+                profile: "default".into(),
+                status: CheckStatus::Pass,
+                summary: "artifact_assertion passed for profile default: tracked.txt exists".into(),
+                source_ref: Some(".punk/project/harness.json".into()),
+                artifact_ref: Some("tracked.txt".into()),
+            }],
             created_at: now_rfc3339(),
         };
         write_json(&root.join(".punk/decisions/dec_1.json"), &decision).unwrap();
@@ -168,7 +209,10 @@ mod tests {
             proofpack.declared_harness_evidence,
             decision.declared_harness_evidence
         );
+        assert_eq!(proofpack.harness_evidence, decision.harness_evidence);
         assert_eq!(proofpack.check_refs, decision.check_refs);
+        assert!(proofpack.hashes.contains_key(".punk/project/harness.json"));
+        assert!(proofpack.hashes.contains_key("tracked.txt"));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -956,7 +956,8 @@ fn format_proofpack_summary(proof: &punk_domain::Proofpack) -> String {
     let command_evidence = if proof.command_evidence.is_empty() {
         "none".to_string()
     } else {
-        proof.command_evidence
+        proof
+            .command_evidence
             .iter()
             .map(|item| {
                 format!(
@@ -1282,6 +1283,7 @@ mod tests {
             check_refs: vec![],
             command_evidence: vec![],
             declared_harness_evidence: vec![],
+            harness_evidence: vec![],
             created_at: "now".into(),
         };
         let status = punk_orch::StatusSnapshot {
@@ -1613,15 +1615,12 @@ mod tests {
                     command: "cargo test --workspace".into(),
                     status: punk_domain::CheckStatus::Pass,
                     summary: "integrity check passed".into(),
-                    stdout_ref: Some(
-                        ".punk/runs/run_789/checks/integrity-01.stdout.log".into(),
-                    ),
-                    stderr_ref: Some(
-                        ".punk/runs/run_789/checks/integrity-01.stderr.log".into(),
-                    ),
+                    stdout_ref: Some(".punk/runs/run_789/checks/integrity-01.stdout.log".into()),
+                    stderr_ref: Some(".punk/runs/run_789/checks/integrity-01.stderr.log".into()),
                 },
             ],
             declared_harness_evidence: vec![],
+            harness_evidence: vec![],
             hashes: Default::default(),
             summary: "proof for dec_789".into(),
             created_at: "2026-04-08T00:00:00Z".into(),

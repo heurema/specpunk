@@ -163,11 +163,7 @@ fn repo_has_any(repo_root: &Path, rel_paths: &[&str]) -> bool {
 }
 
 impl PersistedHarnessSpec {
-    fn from_summary(
-        project_id: &str,
-        summary: &ProjectHarnessSummary,
-        updated_at: &str,
-    ) -> Self {
+    fn from_summary(project_id: &str, summary: &ProjectHarnessSummary, updated_at: &str) -> Self {
         let capabilities = PersistedHarnessCapabilities {
             ui_legible: summary.ui_legible,
             logs_legible: summary.logs_legible,
@@ -1918,9 +1914,7 @@ fn summarize_decision_basis(basis: &[String]) -> String {
         .join("; ")
 }
 
-fn summarize_command_evidence(
-    command_evidence: &[punk_domain::CommandEvidence],
-) -> Vec<String> {
+fn summarize_command_evidence(command_evidence: &[punk_domain::CommandEvidence]) -> Vec<String> {
     command_evidence
         .iter()
         .map(|item| {
@@ -2794,7 +2788,11 @@ mod tests {
             .current_dir(&root)
             .output()
             .unwrap();
-        fs::write(root.join("src/lib.rs"), "pub fn demo() { println!(\"done\"); }\n").unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn demo() { println!(\"done\"); }\n",
+        )
+        .unwrap();
 
         let service = OrchService::new(&root, &global).unwrap();
         let contract = service
@@ -3038,7 +3036,10 @@ mod tests {
 
         let service = OrchService::new(&root, &global).unwrap();
         let contract = service
-            .draft_contract(&ScanTargetChecksDrafter, "tighten run reporting in punk-orch")
+            .draft_contract(
+                &ScanTargetChecksDrafter,
+                "tighten run reporting in punk-orch",
+            )
             .unwrap();
 
         assert!(contract
@@ -3203,8 +3204,16 @@ mod tests {
             "[package]\nname = \"punk-orch\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        fs::write(root.join("crates/punk-core/src/lib.rs"), "pub fn core() {}\n").unwrap();
-        fs::write(root.join("crates/punk-orch/src/lib.rs"), "pub fn orch() {}\n").unwrap();
+        fs::write(
+            root.join("crates/punk-core/src/lib.rs"),
+            "pub fn core() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(&root)
@@ -3258,7 +3267,11 @@ mod tests {
             "[package]\nname = \"punk-cli\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        fs::write(root.join("crates/punk-orch/src/lib.rs"), "pub fn orch() {}\n").unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
         fs::write(root.join("crates/punk-cli/src/main.rs"), "fn main() {}\n").unwrap();
         fs::write(root.join(".punk/project/harness.json"), "{}\n").unwrap();
         std::process::Command::new("git")
@@ -3439,7 +3452,11 @@ mod tests {
         let global = root.join("global");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
         std::process::Command::new("git")
@@ -3865,6 +3882,7 @@ mod tests {
             check_refs: Vec::new(),
             command_evidence: Vec::new(),
             declared_harness_evidence: Vec::new(),
+            harness_evidence: Vec::new(),
             created_at: now_rfc3339(),
         };
         let decision_path = root
@@ -3900,6 +3918,7 @@ mod tests {
                 },
             ],
             declared_harness_evidence: Vec::new(),
+            harness_evidence: Vec::new(),
             hashes: Default::default(),
             summary: format!("proof for {}", decision.id),
             created_at: now_rfc3339(),
@@ -4073,6 +4092,7 @@ mod tests {
             check_refs: Vec::new(),
             command_evidence: Vec::new(),
             declared_harness_evidence: Vec::new(),
+            harness_evidence: Vec::new(),
             created_at: now_rfc3339(),
         };
         let decision_path = root
@@ -4089,6 +4109,7 @@ mod tests {
             check_refs: Vec::new(),
             command_evidence: Vec::new(),
             declared_harness_evidence: Vec::new(),
+            harness_evidence: Vec::new(),
             hashes: Default::default(),
             summary: format!("proof for {}", decision.id),
             created_at: now_rfc3339(),

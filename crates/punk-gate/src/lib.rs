@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use punk_core::{find_object_path, read_json, relative_ref, validate_check_command, write_json};
 use punk_domain::{
     now_rfc3339, CheckStatus, CommandEvidence, Contract, ContractStatus, Decision, DecisionObject,
-    DeclaredHarnessEvidence, DeterministicStatus, EventEnvelope, ModeId, Receipt,
+    DeclaredHarnessEvidence, DeterministicStatus, EventEnvelope, HarnessEvidence, ModeId, Receipt,
 };
 use punk_events::EventStore;
 use punk_orch::project_id;
@@ -21,6 +21,12 @@ struct CheckRunSummary {
     reasons: Vec<String>,
     refs: Vec<String>,
     command_evidence: Vec<CommandEvidence>,
+}
+
+struct HarnessRunSummary {
+    status: CheckStatus,
+    reasons: Vec<String>,
+    harness_evidence: Vec<HarnessEvidence>,
 }
 
 impl GateService {
@@ -46,6 +52,7 @@ impl GateService {
             return Err(anyhow!("gate requires an approved contract"));
         }
         let declared_harness_evidence = load_declared_harness_evidence(&self.repo_root);
+        let harness = run_harness_recipes(&self.repo_root)?;
 
         let mut decision_basis = Vec::new();
         let mut check_refs = Vec::new();
@@ -65,12 +72,14 @@ impl GateService {
         check_refs.extend(integrity.refs.iter().cloned());
         decision_basis.extend(target.reasons.clone());
         decision_basis.extend(integrity.reasons.clone());
+        decision_basis.extend(harness.reasons.clone());
         command_evidence.extend(target.command_evidence);
         command_evidence.extend(integrity.command_evidence);
 
         let (decision, deterministic_status, confidence_estimate) = if !scope_ok
             || target.status == CheckStatus::Fail
             || integrity.status == CheckStatus::Fail
+            || harness.status == CheckStatus::Fail
         {
             (Decision::Block, DeterministicStatus::Fail, 0.9)
         } else if target.status == CheckStatus::Pass && integrity.status == CheckStatus::Pass {
@@ -94,6 +103,7 @@ impl GateService {
             check_refs,
             command_evidence,
             declared_harness_evidence,
+            harness_evidence: harness.harness_evidence,
             created_at: now_rfc3339(),
         };
         let decisions_dir = self.repo_root.join(".punk/decisions");
@@ -278,6 +288,128 @@ fn load_declared_harness_evidence(repo_root: &Path) -> Vec<DeclaredHarnessEviden
         .collect()
 }
 
+fn run_harness_recipes(repo_root: &Path) -> Result<HarnessRunSummary> {
+    let harness_spec_path = repo_root.join(".punk/project/harness.json");
+    if !harness_spec_path.exists() {
+        return Ok(HarnessRunSummary {
+            status: CheckStatus::Unverified,
+            reasons: Vec::new(),
+            harness_evidence: Vec::new(),
+        });
+    }
+    let spec: serde_json::Value = read_json(&harness_spec_path)?;
+    let harness_ref = relative_ref(repo_root, &harness_spec_path)
+        .unwrap_or_else(|_| ".punk/project/harness.json".to_string());
+    let Some(profiles) = spec.get("profiles").and_then(|value| value.as_array()) else {
+        return Ok(HarnessRunSummary {
+            status: CheckStatus::Unverified,
+            reasons: Vec::new(),
+            harness_evidence: Vec::new(),
+        });
+    };
+
+    let mut failed = false;
+    let mut executed = false;
+    let mut reasons = Vec::new();
+    let mut harness_evidence = Vec::new();
+
+    for profile in profiles {
+        let Some(profile_name) = profile.get("name").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(validation_recipes) = profile
+            .get("validation_recipes")
+            .and_then(|value| value.as_array())
+        else {
+            continue;
+        };
+        for recipe in validation_recipes {
+            let Some(kind) = recipe.get("kind").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if kind != "artifact_assertion" {
+                continue;
+            }
+            let Some(path) = recipe.get("path").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            executed = true;
+            let (status, summary, artifact_ref) =
+                run_artifact_assertion(repo_root, profile_name, path)?;
+            if status == CheckStatus::Fail {
+                failed = true;
+            }
+            reasons.push(summary.clone());
+            harness_evidence.push(HarnessEvidence {
+                evidence_type: "artifact_assertion".to_string(),
+                profile: profile_name.to_string(),
+                status,
+                summary,
+                source_ref: Some(harness_ref.clone()),
+                artifact_ref,
+            });
+        }
+    }
+
+    Ok(HarnessRunSummary {
+        status: if failed {
+            CheckStatus::Fail
+        } else if executed {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Unverified
+        },
+        reasons,
+        harness_evidence,
+    })
+}
+
+fn run_artifact_assertion(
+    repo_root: &Path,
+    profile_name: &str,
+    path: &str,
+) -> Result<(CheckStatus, String, Option<String>)> {
+    if !is_safe_repo_relative_path(path) {
+        return Ok((
+            CheckStatus::Fail,
+            format!(
+                "artifact_assertion failed for profile {profile_name}: invalid repo-relative path {path}"
+            ),
+            None,
+        ));
+    }
+    let artifact_path = repo_root.join(path);
+    if artifact_path.exists() {
+        let artifact_ref = relative_ref(repo_root, &artifact_path).ok();
+        Ok((
+            CheckStatus::Pass,
+            format!("artifact_assertion passed for profile {profile_name}: {path} exists"),
+            artifact_ref,
+        ))
+    } else {
+        Ok((
+            CheckStatus::Fail,
+            format!("artifact_assertion failed for profile {profile_name}: {path} is missing"),
+            None,
+        ))
+    }
+}
+
+fn is_safe_repo_relative_path(path: &str) -> bool {
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        return false;
+    }
+    candidate.components().all(|component| {
+        !matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    })
+}
+
 fn split_command_args(s: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
@@ -398,11 +530,13 @@ mod tests {
         fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
         fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
         fs::create_dir_all(root.join(".punk/project")).unwrap();
+        fs::create_dir_all(root.join("artifacts")).unwrap();
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(&root)
             .output()
             .unwrap();
+        fs::write(root.join("artifacts/result.txt"), "ok\n").unwrap();
         fs::write(
             root.join(".punk/project/harness.json"),
             r#"{
@@ -418,7 +552,13 @@ mod tests {
   "profiles": [
     {
       "name": "default",
-      "validation_surfaces": ["command", "ui_snapshot", "log_query"]
+      "validation_surfaces": ["command", "ui_snapshot", "log_query"],
+      "validation_recipes": [
+        {
+          "kind": "artifact_assertion",
+          "path": "artifacts/result.txt"
+        }
+      ]
     }
   ],
   "derivation_source": "repo_markers_v1",
@@ -500,6 +640,125 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(
+            decision.harness_evidence,
+            vec![HarnessEvidence {
+                evidence_type: "artifact_assertion".into(),
+                profile: "default".into(),
+                status: CheckStatus::Pass,
+                summary:
+                    "artifact_assertion passed for profile default: artifacts/result.txt exists"
+                        .into(),
+                source_ref: Some(".punk/project/harness.json".into()),
+                artifact_ref: Some("artifacts/result.txt".into()),
+            }]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failing_artifact_assertion_blocks_gate() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-harness-artifact-block-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/project")).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(
+            root.join(".punk/project/harness.json"),
+            r#"{
+  "project_id": "demo",
+  "profiles": [
+    {
+      "name": "default",
+      "validation_surfaces": ["command"],
+      "validation_recipes": [
+        {
+          "kind": "artifact_assertion",
+          "path": "artifacts/missing.txt"
+        }
+      ]
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "x".into(),
+            entry_points: vec![],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["src".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
+        let run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "success".into(),
+            executor_name: "fake".into(),
+            changed_files: vec![],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec![],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "done".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        let gate = GateService::new(&root, &global);
+        let decision = gate.gate_run("run_1").unwrap();
+        assert_eq!(decision.decision, Decision::Block);
+        assert_eq!(decision.harness_evidence.len(), 1);
+        assert_eq!(decision.harness_evidence[0].status, CheckStatus::Fail);
+        assert!(decision.decision_basis.iter().any(|reason| {
+            reason.contains(
+                "artifact_assertion failed for profile default: artifacts/missing.txt is missing",
+            )
+        }));
         let _ = fs::remove_dir_all(&root);
     }
 
