@@ -643,7 +643,7 @@ mod tests {
         );
 
         // Verify the hash is correct
-        let without_hash: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let _without_hash: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let mut canonical_contract = contract.clone();
         canonical_contract.approval_hash = None;
         let canonical = serde_json::to_string_pretty(&canonical_contract).unwrap();
