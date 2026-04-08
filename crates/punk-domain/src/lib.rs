@@ -112,6 +112,14 @@ pub struct CommandEvidence {
     pub stderr_ref: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeclaredHarnessEvidence {
+    pub evidence_type: String,
+    pub profile: String,
+    pub source_ref: Option<String>,
+    pub summary: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
@@ -276,6 +284,8 @@ pub struct DecisionObject {
     pub check_refs: Vec<String>,
     #[serde(default)]
     pub command_evidence: Vec<CommandEvidence>,
+    #[serde(default)]
+    pub declared_harness_evidence: Vec<DeclaredHarnessEvidence>,
     pub created_at: String,
 }
 
@@ -290,6 +300,8 @@ pub struct Proofpack {
     pub check_refs: Vec<String>,
     #[serde(default)]
     pub command_evidence: Vec<CommandEvidence>,
+    #[serde(default)]
+    pub declared_harness_evidence: Vec<DeclaredHarnessEvidence>,
     pub hashes: std::collections::BTreeMap<String, String>,
     pub summary: String,
     pub created_at: String,
@@ -431,6 +443,7 @@ mod tests {
 
         let decision = DecisionObject::deserialize(legacy).unwrap();
         assert!(decision.command_evidence.is_empty());
+        assert!(decision.declared_harness_evidence.is_empty());
     }
 
     #[test]
@@ -464,5 +477,6 @@ mod tests {
 
         let proofpack = Proofpack::deserialize(legacy).unwrap();
         assert!(proofpack.command_evidence.is_empty());
+        assert!(proofpack.declared_harness_evidence.is_empty());
     }
 }

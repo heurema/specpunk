@@ -222,7 +222,9 @@ Current inspect semantics:
 
 - `punk inspect project` shows both `harness_summary` and the persisted harness packet ref/profile summary
 - `punk inspect project --json` includes `harness_spec_ref` and `harness_spec`
-- the packet remains a derived mechanism only; it does not introduce a new primitive or new gate/proof semantics
+- the packet remains a derived mechanism only; it does not introduce a new primitive
+- `gate` / `proof` may copy declared non-command validation surfaces from the persisted packet into decision/proof artifacts as typed metadata only
+- this still does **not** execute new UI, log, metric, or trace runtime checks
 
 Future `ProjectOverlay` growth can still add fields like:
 

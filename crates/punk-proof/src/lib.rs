@@ -71,6 +71,7 @@ impl ProofService {
             decision_ref: decision_rel.clone(),
             check_refs: decision.check_refs.clone(),
             command_evidence: decision.command_evidence.clone(),
+            declared_harness_evidence: decision.declared_harness_evidence.clone(),
             hashes,
             summary: format!("proof for {}", decision.id),
             created_at: now_rfc3339(),
@@ -101,7 +102,8 @@ impl ProofService {
 mod tests {
     use super::*;
     use punk_domain::{
-        CheckStatus, CommandEvidence, Decision, DecisionObject, DeterministicStatus,
+        CheckStatus, CommandEvidence, Decision, DecisionObject, DeclaredHarnessEvidence,
+        DeterministicStatus,
     };
     use punk_orch::write_json;
 
@@ -148,6 +150,12 @@ mod tests {
                 stdout_ref: Some(".punk/runs/run_1/checks/target-01.stdout.log".into()),
                 stderr_ref: Some(".punk/runs/run_1/checks/target-01.stderr.log".into()),
             }],
+            declared_harness_evidence: vec![DeclaredHarnessEvidence {
+                evidence_type: "log_query".into(),
+                profile: "default".into(),
+                source_ref: Some(".punk/project/harness.json".into()),
+                summary: "declared harness surface log_query from profile default".into(),
+            }],
             created_at: now_rfc3339(),
         };
         write_json(&root.join(".punk/decisions/dec_1.json"), &decision).unwrap();
@@ -156,6 +164,10 @@ mod tests {
         let proofpack = service.write_proofpack("dec_1").unwrap();
 
         assert_eq!(proofpack.command_evidence, decision.command_evidence);
+        assert_eq!(
+            proofpack.declared_harness_evidence,
+            decision.declared_harness_evidence
+        );
         assert_eq!(proofpack.check_refs, decision.check_refs);
 
         let _ = fs::remove_dir_all(&root);

@@ -147,6 +147,13 @@ Current human-facing inspect expectations:
 - `punk inspect proof_<id>` should render a concise human summary for typed `command` evidence without requiring raw JSON reading
 - JSON object inspect remains the source of full structured proof detail
 
+Current JSON artifact expectations:
+
+- `DecisionObject` and `Proofpack` keep `command_evidence` as the executed command-check record
+- they may also carry additive `declared_harness_evidence` copied from `.punk/project/harness.json`
+- `declared_harness_evidence` is metadata only for non-command harness surfaces declared by the persisted packet
+- this slice does **not** imply runtime execution of UI, log, metric, or trace recipes yet
+
 Current status behavior:
 
 - `punk status` now prefers `WorkLedgerView` for current work continuity fields

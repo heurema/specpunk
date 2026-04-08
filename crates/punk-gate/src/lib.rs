@@ -1,11 +1,12 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use punk_core::{find_object_path, read_json, relative_ref, validate_check_command, write_json};
 use punk_domain::{
-    now_rfc3339, CheckStatus, CommandEvidence, Contract, ContractStatus, Decision,
-    DecisionObject, DeterministicStatus, EventEnvelope, ModeId, Receipt,
+    now_rfc3339, CheckStatus, CommandEvidence, Contract, ContractStatus, Decision, DecisionObject,
+    DeclaredHarnessEvidence, DeterministicStatus, EventEnvelope, ModeId, Receipt,
 };
 use punk_events::EventStore;
 use punk_orch::project_id;
@@ -44,6 +45,7 @@ impl GateService {
         if contract.status != ContractStatus::Approved {
             return Err(anyhow!("gate requires an approved contract"));
         }
+        let declared_harness_evidence = load_declared_harness_evidence(&self.repo_root);
 
         let mut decision_basis = Vec::new();
         let mut check_refs = Vec::new();
@@ -66,17 +68,16 @@ impl GateService {
         command_evidence.extend(target.command_evidence);
         command_evidence.extend(integrity.command_evidence);
 
-        let (decision, deterministic_status, confidence_estimate) =
-            if !scope_ok
-                || target.status == CheckStatus::Fail
-                || integrity.status == CheckStatus::Fail
-            {
-                (Decision::Block, DeterministicStatus::Fail, 0.9)
-            } else if target.status == CheckStatus::Pass && integrity.status == CheckStatus::Pass {
-                (Decision::Accept, DeterministicStatus::Pass, 1.0)
-            } else {
-                (Decision::Escalate, DeterministicStatus::Mixed, 0.5)
-            };
+        let (decision, deterministic_status, confidence_estimate) = if !scope_ok
+            || target.status == CheckStatus::Fail
+            || integrity.status == CheckStatus::Fail
+        {
+            (Decision::Block, DeterministicStatus::Fail, 0.9)
+        } else if target.status == CheckStatus::Pass && integrity.status == CheckStatus::Pass {
+            (Decision::Accept, DeterministicStatus::Pass, 1.0)
+        } else {
+            (Decision::Escalate, DeterministicStatus::Mixed, 0.5)
+        };
 
         let decision_object = DecisionObject {
             id: format!("dec_{}", run.id.trim_start_matches("run_")),
@@ -92,6 +93,7 @@ impl GateService {
             receipt_ref: relative_ref(&self.repo_root, &receipt_path)?,
             check_refs,
             command_evidence,
+            declared_harness_evidence,
             created_at: now_rfc3339(),
         };
         let decisions_dir = self.repo_root.join(".punk/decisions");
@@ -196,10 +198,16 @@ fn run_checks(
         refs.push(stdout_ref.clone());
         refs.push(stderr_ref.clone());
         let (status, summary) = if output.status.success() {
-            (CheckStatus::Pass, format!("{kind} check passed: {command_str}"))
+            (
+                CheckStatus::Pass,
+                format!("{kind} check passed: {command_str}"),
+            )
         } else {
             failed = true;
-            (CheckStatus::Fail, format!("{kind} check failed: {command_str}"))
+            (
+                CheckStatus::Fail,
+                format!("{kind} check failed: {command_str}"),
+            )
         };
         reasons.push(summary.clone());
         command_evidence.push(CommandEvidence {
@@ -222,6 +230,52 @@ fn run_checks(
         refs,
         command_evidence,
     })
+}
+
+fn load_declared_harness_evidence(repo_root: &Path) -> Vec<DeclaredHarnessEvidence> {
+    let harness_spec_path = repo_root.join(".punk/project/harness.json");
+    if !harness_spec_path.exists() {
+        return Vec::new();
+    }
+    let spec: serde_json::Value = match read_json(&harness_spec_path) {
+        Ok(spec) => spec,
+        Err(_) => return Vec::new(),
+    };
+    let harness_ref = relative_ref(repo_root, &harness_spec_path)
+        .unwrap_or_else(|_| ".punk/project/harness.json".to_string());
+    let mut pairs = BTreeSet::new();
+    let Some(profiles) = spec.get("profiles").and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+    for profile in profiles {
+        let Some(profile_name) = profile.get("name").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(validation_surfaces) = profile
+            .get("validation_surfaces")
+            .and_then(|value| value.as_array())
+        else {
+            continue;
+        };
+        for surface in validation_surfaces {
+            let Some(surface_name) = surface.as_str() else {
+                continue;
+            };
+            if surface_name == "command" {
+                continue;
+            }
+            pairs.insert((profile_name.to_string(), surface_name.to_string()));
+        }
+    }
+    pairs
+        .into_iter()
+        .map(|(profile, evidence_type)| DeclaredHarnessEvidence {
+            summary: format!("declared harness surface {evidence_type} from profile {profile}"),
+            evidence_type,
+            profile,
+            source_ref: Some(harness_ref.clone()),
+        })
+        .collect()
 }
 
 fn split_command_args(s: &str) -> Vec<String> {
@@ -322,7 +376,130 @@ mod tests {
         let decision = gate.gate_run("run_1").unwrap();
         assert_eq!(decision.decision, Decision::Block);
         assert_eq!(decision.command_evidence.len(), 2);
-        assert!(decision.command_evidence.iter().all(|item| item.evidence_type == "command"));
+        assert!(decision
+            .command_evidence
+            .iter()
+            .all(|item| item.evidence_type == "command"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gate_persists_declared_non_command_harness_evidence_from_packet() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-harness-declared-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/project")).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(
+            root.join(".punk/project/harness.json"),
+            r#"{
+  "project_id": "demo",
+  "inspect_ready": true,
+  "bootable_per_workspace": true,
+  "capabilities": {
+    "ui_legible": true,
+    "logs_legible": true,
+    "metrics_legible": false,
+    "traces_legible": false
+  },
+  "profiles": [
+    {
+      "name": "default",
+      "validation_surfaces": ["command", "ui_snapshot", "log_query"]
+    }
+  ],
+  "derivation_source": "repo_markers_v1",
+  "updated_at": "2026-04-08T00:00:00Z"
+}"#,
+        )
+        .unwrap();
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "x".into(),
+            entry_points: vec![],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["src".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
+        let run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "success".into(),
+            executor_name: "fake".into(),
+            changed_files: vec![],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec![],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "done".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        let gate = GateService::new(&root, &global);
+        let decision = gate.gate_run("run_1").unwrap();
+        assert_eq!(decision.decision, Decision::Accept);
+        assert_eq!(
+            decision.declared_harness_evidence,
+            vec![
+                DeclaredHarnessEvidence {
+                    evidence_type: "log_query".into(),
+                    profile: "default".into(),
+                    source_ref: Some(".punk/project/harness.json".into()),
+                    summary: "declared harness surface log_query from profile default".into(),
+                },
+                DeclaredHarnessEvidence {
+                    evidence_type: "ui_snapshot".into(),
+                    profile: "default".into(),
+                    source_ref: Some(".punk/project/harness.json".into()),
+                    summary: "declared harness surface ui_snapshot from profile default".into(),
+                },
+            ]
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

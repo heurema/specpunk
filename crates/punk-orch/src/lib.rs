@@ -3439,11 +3439,7 @@ mod tests {
         let global = root.join("global");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname='demo'\nversion='0.1.0'\n",
-        )
-        .unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'\n").unwrap();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
         std::process::Command::new("git")
@@ -3765,7 +3761,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("Cargo.toml"), "[package]\nname='demo'\nversion='0.1.0'\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(&root)
@@ -3864,6 +3864,7 @@ mod tests {
             receipt_ref: format!(".punk/runs/{}/receipt.json", run.id),
             check_refs: Vec::new(),
             command_evidence: Vec::new(),
+            declared_harness_evidence: Vec::new(),
             created_at: now_rfc3339(),
         };
         let decision_path = root
@@ -3898,6 +3899,7 @@ mod tests {
                     stderr_ref: None,
                 },
             ],
+            declared_harness_evidence: Vec::new(),
             hashes: Default::default(),
             summary: format!("proof for {}", decision.id),
             created_at: now_rfc3339(),
@@ -4070,6 +4072,7 @@ mod tests {
             receipt_ref: format!(".punk/runs/{}/receipt.json", run.id),
             check_refs: Vec::new(),
             command_evidence: Vec::new(),
+            declared_harness_evidence: Vec::new(),
             created_at: now_rfc3339(),
         };
         let decision_path = root
@@ -4085,6 +4088,7 @@ mod tests {
             decision_ref: format!(".punk/decisions/{}.json", decision.id),
             check_refs: Vec::new(),
             command_evidence: Vec::new(),
+            declared_harness_evidence: Vec::new(),
             hashes: Default::default(),
             summary: format!("proof for {}", decision.id),
             created_at: now_rfc3339(),

@@ -1281,6 +1281,7 @@ mod tests {
             receipt_ref: "rcpt.json".into(),
             check_refs: vec![],
             command_evidence: vec![],
+            declared_harness_evidence: vec![],
             created_at: "now".into(),
         };
         let status = punk_orch::StatusSnapshot {
@@ -1620,6 +1621,7 @@ mod tests {
                     ),
                 },
             ],
+            declared_harness_evidence: vec![],
             hashes: Default::default(),
             summary: "proof for dec_789".into(),
             created_at: "2026-04-08T00:00:00Z".into(),
