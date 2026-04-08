@@ -1523,6 +1523,16 @@ mod tests {
                 profiles: vec![punk_orch::PersistedHarnessProfile {
                     name: "default".into(),
                     validation_surfaces: vec!["command".into(), "log_query".into()],
+                    validation_recipes: vec![
+                        punk_orch::PersistedHarnessRecipe {
+                            kind: "artifact_assertion".into(),
+                            path: ".punk/bootstrap/interviewcoach-core.md".into(),
+                        },
+                        punk_orch::PersistedHarnessRecipe {
+                            kind: "artifact_assertion".into(),
+                            path: "AGENTS.md".into(),
+                        },
+                    ],
                 }],
                 derivation_source: "repo_markers_v1".into(),
                 updated_at: "2026-04-03T00:00:00Z".into(),

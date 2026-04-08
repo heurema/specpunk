@@ -128,7 +128,8 @@ Current persisted harness packet behavior:
 - `punk inspect project` writes a derived repo-local packet to `.punk/project/harness.json`
 - `punk inspect project --json` includes both `harness_summary` and the persisted `harness_spec` payload
 - the current packet is still inspect-only and derived from repo markers
-- this slice does not add new runtime execution semantics yet
+- derived `validation_recipes[]` now include repo-local `artifact_assertion` entries for persisted bootstrap/guidance refs when a default profile is emitted
+- this slice does not add new runtime execution semantics beyond the already-supported `artifact_assertion` recipe
 
 Current work-ledger inspect surface:
 

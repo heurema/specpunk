@@ -91,9 +91,17 @@ pub struct PersistedHarnessCapabilities {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedHarnessRecipe {
+    pub kind: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedHarnessProfile {
     pub name: String,
     pub validation_surfaces: Vec<String>,
+    #[serde(default)]
+    pub validation_recipes: Vec<PersistedHarnessRecipe>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,13 +171,20 @@ fn repo_has_any(repo_root: &Path, rel_paths: &[&str]) -> bool {
 }
 
 impl PersistedHarnessSpec {
-    fn from_summary(project_id: &str, summary: &ProjectHarnessSummary, updated_at: &str) -> Self {
+    fn from_summary(
+        project_id: &str,
+        summary: &ProjectHarnessSummary,
+        bootstrap_ref: Option<&str>,
+        agent_guidance_ref: &[String],
+        updated_at: &str,
+    ) -> Self {
         let capabilities = PersistedHarnessCapabilities {
             ui_legible: summary.ui_legible,
             logs_legible: summary.logs_legible,
             metrics_legible: summary.metrics_legible,
             traces_legible: summary.traces_legible,
         };
+        let validation_recipes = derived_validation_recipes(bootstrap_ref, agent_guidance_ref);
         let mut validation_surfaces = Vec::new();
         if summary.bootable_per_workspace {
             validation_surfaces.push("command".to_string());
@@ -192,6 +207,7 @@ impl PersistedHarnessSpec {
             vec![PersistedHarnessProfile {
                 name: "default".to_string(),
                 validation_surfaces,
+                validation_recipes,
             }]
         };
         Self {
@@ -204,6 +220,33 @@ impl PersistedHarnessSpec {
             updated_at: updated_at.to_string(),
         }
     }
+}
+
+fn derived_validation_recipes(
+    bootstrap_ref: Option<&str>,
+    agent_guidance_ref: &[String],
+) -> Vec<PersistedHarnessRecipe> {
+    let mut refs = Vec::new();
+    if let Some(path) = bootstrap_ref {
+        refs.push(path.to_string());
+    }
+    refs.extend(agent_guidance_ref.iter().cloned());
+
+    let mut recipes = Vec::new();
+    for path in refs {
+        if path.is_empty()
+            || recipes
+                .iter()
+                .any(|recipe: &PersistedHarnessRecipe| recipe.path == path)
+        {
+            continue;
+        }
+        recipes.push(PersistedHarnessRecipe {
+            kind: "artifact_assertion".to_string(),
+            path,
+        });
+    }
+    recipes
 }
 
 impl OrchService {
@@ -1094,8 +1137,13 @@ impl OrchService {
             metrics_legible,
             traces_legible,
         };
-        let persisted_harness_spec =
-            PersistedHarnessSpec::from_summary(&project.id, &harness_summary, &project.updated_at);
+        let persisted_harness_spec = PersistedHarnessSpec::from_summary(
+            &project.id,
+            &harness_summary,
+            bootstrap_ref.as_deref(),
+            &agent_guidance_ref,
+            &project.updated_at,
+        );
         write_json(&self.paths.harness_spec_path, &persisted_harness_spec)?;
         let harness_spec: PersistedHarnessSpec = read_json(&self.paths.harness_spec_path)?;
         let harness_spec_ref = relative_ref(&self.paths.repo_root, &self.paths.harness_spec_path)?;
@@ -3740,6 +3788,20 @@ mod tests {
                     "log_query".into(),
                     "metric_assertion".into(),
                     "trace_assertion".into(),
+                ],
+                validation_recipes: vec![
+                    PersistedHarnessRecipe {
+                        kind: "artifact_assertion".into(),
+                        path: ".punk/bootstrap/interviewcoach-core.md".into(),
+                    },
+                    PersistedHarnessRecipe {
+                        kind: "artifact_assertion".into(),
+                        path: "AGENTS.md".into(),
+                    },
+                    PersistedHarnessRecipe {
+                        kind: "artifact_assertion".into(),
+                        path: ".punk/AGENT_START.md".into(),
+                    },
                 ],
             }]
         );
