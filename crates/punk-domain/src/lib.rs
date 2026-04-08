@@ -274,6 +274,7 @@ pub struct DecisionObject {
     pub contract_ref: String,
     pub receipt_ref: String,
     pub check_refs: Vec<String>,
+    #[serde(default)]
     pub command_evidence: Vec<CommandEvidence>,
     pub created_at: String,
 }
@@ -287,6 +288,7 @@ pub struct Proofpack {
     pub receipt_ref: String,
     pub decision_ref: String,
     pub check_refs: Vec<String>,
+    #[serde(default)]
     pub command_evidence: Vec<CommandEvidence>,
     pub hashes: std::collections::BTreeMap<String, String>,
     pub summary: String,
@@ -328,4 +330,139 @@ pub struct EventEnvelope {
 
 fn default_event_actor() -> String {
     "unknown".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::de::{self, IntoDeserializer, Visitor};
+    use serde::forward_to_deserialize_any;
+
+    #[derive(Clone)]
+    enum LegacyValue {
+        String(&'static str),
+        F64(f64),
+        Seq(Vec<LegacyValue>),
+        Map(Vec<(&'static str, LegacyValue)>),
+    }
+
+    impl<'de> IntoDeserializer<'de, de::value::Error> for LegacyValue {
+        type Deserializer = Self;
+
+        fn into_deserializer(self) -> Self::Deserializer {
+            self
+        }
+    }
+
+    impl<'de> de::Deserializer<'de> for LegacyValue {
+        type Error = de::value::Error;
+
+        fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+        where
+            V: Visitor<'de>,
+        {
+            match self {
+                LegacyValue::String(value) => value.into_deserializer().deserialize_any(visitor),
+                LegacyValue::F64(value) => value.into_deserializer().deserialize_any(visitor),
+                LegacyValue::Seq(values) => {
+                    visitor.visit_seq(de::value::SeqDeserializer::new(values.into_iter()))
+                }
+                LegacyValue::Map(values) => visitor.visit_map(de::value::MapDeserializer::new(
+                    values
+                        .into_iter()
+                        .map(|(key, value)| (key.into_deserializer(), value)),
+                )),
+            }
+        }
+
+        fn deserialize_enum<V>(
+            self,
+            _name: &'static str,
+            _variants: &'static [&'static str],
+            visitor: V,
+        ) -> Result<V::Value, Self::Error>
+        where
+            V: Visitor<'de>,
+        {
+            match self {
+                LegacyValue::String(value) => visitor.visit_enum(value.into_deserializer()),
+                other => other.deserialize_any(visitor),
+            }
+        }
+
+        forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf option
+            unit unit_struct newtype_struct seq tuple tuple_struct map struct identifier
+            ignored_any
+        }
+    }
+
+    #[test]
+    fn legacy_decision_object_without_command_evidence_deserializes() {
+        let legacy = LegacyValue::Map(vec![
+            ("id", LegacyValue::String("dec_1")),
+            ("run_id", LegacyValue::String("run_1")),
+            ("contract_id", LegacyValue::String("ct_1")),
+            ("decision", LegacyValue::String("accept")),
+            ("deterministic_status", LegacyValue::String("pass")),
+            ("target_status", LegacyValue::String("pass")),
+            ("integrity_status", LegacyValue::String("pass")),
+            ("confidence_estimate", LegacyValue::F64(1.0)),
+            (
+                "decision_basis",
+                LegacyValue::Seq(vec![LegacyValue::String("checks passed")]),
+            ),
+            (
+                "contract_ref",
+                LegacyValue::String(".punk/contracts/feat_1/v1.json"),
+            ),
+            (
+                "receipt_ref",
+                LegacyValue::String(".punk/runs/run_1/receipt.json"),
+            ),
+            (
+                "check_refs",
+                LegacyValue::Seq(vec![LegacyValue::String(
+                    ".punk/runs/run_1/checks/target-01.stdout.log",
+                )]),
+            ),
+            ("created_at", LegacyValue::String("2026-04-08T00:00:00Z")),
+        ]);
+
+        let decision = DecisionObject::deserialize(legacy).unwrap();
+        assert!(decision.command_evidence.is_empty());
+    }
+
+    #[test]
+    fn legacy_proofpack_without_command_evidence_deserializes() {
+        let legacy = LegacyValue::Map(vec![
+            ("id", LegacyValue::String("proof_1")),
+            ("decision_id", LegacyValue::String("dec_1")),
+            ("run_id", LegacyValue::String("run_1")),
+            (
+                "contract_ref",
+                LegacyValue::String(".punk/contracts/feat_1/v1.json"),
+            ),
+            (
+                "receipt_ref",
+                LegacyValue::String(".punk/runs/run_1/receipt.json"),
+            ),
+            (
+                "decision_ref",
+                LegacyValue::String(".punk/decisions/dec_1.json"),
+            ),
+            (
+                "check_refs",
+                LegacyValue::Seq(vec![LegacyValue::String(
+                    ".punk/runs/run_1/checks/target-01.stdout.log",
+                )]),
+            ),
+            ("hashes", LegacyValue::Map(vec![])),
+            ("summary", LegacyValue::String("proof for dec_1")),
+            ("created_at", LegacyValue::String("2026-04-08T00:00:00Z")),
+        ]);
+
+        let proofpack = Proofpack::deserialize(legacy).unwrap();
+        assert!(proofpack.command_evidence.is_empty());
+    }
 }
