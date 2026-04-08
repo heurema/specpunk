@@ -71,6 +71,16 @@ pub struct ProjectCapabilitySummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ProjectHarnessSummary {
+    pub inspect_ready: bool,
+    pub bootable_per_workspace: bool,
+    pub ui_legible: bool,
+    pub logs_legible: bool,
+    pub metrics_legible: bool,
+    pub traces_legible: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ProjectOverlay {
     pub project_id: String,
     pub repo_root: String,
@@ -78,6 +88,7 @@ pub struct ProjectOverlay {
     pub bootstrap_ref: Option<String>,
     pub agent_guidance_ref: Vec<String>,
     pub capability_summary: ProjectCapabilitySummary,
+    pub harness_summary: ProjectHarnessSummary,
     pub project_skill_refs: Vec<String>,
     pub local_constraints: Vec<String>,
     pub safe_default_checks: Vec<String>,
@@ -113,6 +124,12 @@ pub struct OrchService {
 
 fn phase_error<T>(phase: &str, result: Result<T>) -> Result<T> {
     result.map_err(|err| anyhow!("phase {phase}: {err}"))
+}
+
+fn repo_has_any(repo_root: &Path, rel_paths: &[&str]) -> bool {
+    rel_paths
+        .iter()
+        .any(|rel_path| repo_root.join(rel_path).exists())
 }
 
 impl OrchService {
@@ -922,6 +939,59 @@ impl OrchService {
             proof_ready: staged_ready,
             project_guidance_ready,
         };
+        let ui_legible = repo_has_any(
+            &self.paths.repo_root,
+            &[
+                "playwright.config.ts",
+                "playwright.config.js",
+                "playwright.config.mjs",
+                "playwright.config.cjs",
+                "tests/e2e",
+                "e2e",
+            ],
+        );
+        let logs_legible = repo_has_any(
+            &self.paths.repo_root,
+            &[
+                "logs",
+                "observability/logs",
+                "config/logging.yaml",
+                "config/logging.yml",
+                "vector.toml",
+            ],
+        );
+        let metrics_legible = repo_has_any(
+            &self.paths.repo_root,
+            &[
+                "metrics",
+                "observability/metrics",
+                "prometheus.yml",
+                "prometheus.yaml",
+            ],
+        );
+        let traces_legible = repo_has_any(
+            &self.paths.repo_root,
+            &[
+                "traces",
+                "observability/traces",
+                "otel-collector.yaml",
+                "otel-collector.yml",
+            ],
+        );
+        let bootable_per_workspace =
+            bootstrap_ref.is_some() && staged_ready && vcs_mode != "no_vcs";
+        let harness_summary = ProjectHarnessSummary {
+            inspect_ready: bootable_per_workspace
+                || ui_legible
+                || logs_legible
+                || metrics_legible
+                || traces_legible,
+            bootable_per_workspace,
+            ui_legible,
+            logs_legible,
+            metrics_legible,
+            traces_legible,
+        };
 
         Ok(ProjectOverlay {
             project_id: project.id.clone(),
@@ -930,6 +1000,7 @@ impl OrchService {
             bootstrap_ref,
             agent_guidance_ref,
             capability_summary,
+            harness_summary,
             project_skill_refs,
             local_constraints,
             safe_default_checks,
@@ -3045,6 +3116,18 @@ mod tests {
         .unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
         fs::write(root.join("Makefile"), "test:\n\tcargo test\n").unwrap();
+        fs::write(root.join("playwright.config.ts"), "export default {};\n").unwrap();
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::write(
+            root.join("prometheus.yml"),
+            "global:\n  scrape_interval: 15s\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("otel-collector.yaml"),
+            "receivers: {}\nexporters: {}\nservice: {}\n",
+        )
+        .unwrap();
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(&root)
@@ -3115,6 +3198,12 @@ mod tests {
         assert!(overlay.capability_summary.project_guidance_ready);
         assert!(overlay.capability_summary.staged_ready);
         assert!(overlay.capability_summary.autonomous_ready);
+        assert!(overlay.harness_summary.inspect_ready);
+        assert!(overlay.harness_summary.bootable_per_workspace);
+        assert!(overlay.harness_summary.ui_legible);
+        assert!(overlay.harness_summary.logs_legible);
+        assert!(overlay.harness_summary.metrics_legible);
+        assert!(overlay.harness_summary.traces_legible);
         assert_eq!(
             overlay.status_scope_mode,
             format!("project:{}", overlay.project_id)

@@ -109,6 +109,22 @@ Current project inspect surface:
 - `punk inspect project`
 - `punk inspect project --json`
 
+Current `inspect project` overlay should include:
+
+- existing project capability summary (`bootstrap_ready`, `project_guidance_ready`, `staged_ready`, `autonomous_ready`, `jj_ready`, `proof_ready`)
+- derived `harness_summary` fields from current repo state only:
+  - `inspect_ready`
+  - `bootable_per_workspace`
+  - `ui_legible`
+  - `logs_legible`
+  - `metrics_legible`
+  - `traces_legible`
+
+This slice is inspect-only:
+
+- do not persist a harness packet yet
+- do not add new runtime execution semantics yet
+
 Current work-ledger inspect surface:
 
 - `punk inspect work`

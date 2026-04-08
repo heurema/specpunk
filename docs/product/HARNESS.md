@@ -160,12 +160,31 @@ It means the model should allow them without redefining primitives later.
 
 `ProjectOverlay` is the natural shell-facing map for harness information.
 
-Future `ProjectOverlay` growth should add fields like:
+Current inspectable harness surface is intentionally derived from live repo state only.
+
+`punk inspect project` and `punk inspect project --json` should expose a `harness_summary` with:
+
+```text
+inspect_ready
+bootable_per_workspace
+ui_legible
+logs_legible
+metrics_legible
+traces_legible
+```
+
+In the current slice:
+
+- `inspect_ready` means the repo can already expose at least one derived harness capability
+- `bootable_per_workspace` is derived from current bootstrap/check/VCS readiness
+- `ui_legible`, `logs_legible`, `metrics_legible`, and `traces_legible` are conservative repo-state signals only
+
+Future `ProjectOverlay` growth can still add fields like:
 
 ```text
 harness_ref
 harness_profiles[]
-harness_capabilities
+persisted_harness_capabilities
   bootable_per_workspace
   ui_legible
   logs_legible
@@ -257,12 +276,13 @@ This is the harness-facing part of garbage collection.
 
 ### Phase 2 — inspectable project harness
 
-- add repo-local harness packet
-- expose harness capabilities through `punk inspect project`
+- expose derived harness capabilities through `punk inspect project`
+- keep the first slice packet-free and derived from current repo state
 - keep the model inspectable before adding deep runtime behavior
 
-### Phase 3 — typed evidence in `gate` / `proof`
+### Phase 3 — repo-local harness packet + typed evidence in `gate` / `proof`
 
+- add repo-local harness packet
 - allow typed validation recipes
 - persist evidence manifests and assertion outcomes
 - keep blocked evidence paths explicit and durable

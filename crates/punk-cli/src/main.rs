@@ -570,7 +570,10 @@ fn cmd_go(
     let project_root = resolve_project_root(repo_root);
     let project = infer_project_id(&project_root).unwrap_or_else(|| "project".to_string());
     let retry_command = if fallback_staged {
-        format!("punk go --fallback-staged {}", shell_quote_goal(trimmed_goal))
+        format!(
+            "punk go --fallback-staged {}",
+            shell_quote_goal(trimmed_goal)
+        )
     } else {
         format!("punk go {}", shell_quote_goal(trimmed_goal))
     };
@@ -842,7 +845,7 @@ fn format_project_overlay_summary(overlay: &punk_orch::ProjectOverlay) -> String
     };
 
     format!(
-        "Project: {project_id}\nRepo root: {repo_root}\nVCS mode: {vcs_mode}\nStatus scope: {status_scope_mode}\nBootstrap: {bootstrap}\nGuidance: {guidance}\nProject skills: {skills}\nSafe default checks: {checks}\nCapabilities:\n  bootstrap_ready={bootstrap_ready}\n  project_guidance_ready={guidance_ready}\n  staged_ready={staged_ready}\n  autonomous_ready={autonomous_ready}\n  jj_ready={jj_ready}\n  proof_ready={proof_ready}\nLocal constraints:\n{constraints}",
+        "Project: {project_id}\nRepo root: {repo_root}\nVCS mode: {vcs_mode}\nStatus scope: {status_scope_mode}\nBootstrap: {bootstrap}\nGuidance: {guidance}\nProject skills: {skills}\nSafe default checks: {checks}\nCapabilities:\n  bootstrap_ready={bootstrap_ready}\n  project_guidance_ready={guidance_ready}\n  staged_ready={staged_ready}\n  autonomous_ready={autonomous_ready}\n  jj_ready={jj_ready}\n  proof_ready={proof_ready}\nHarness:\n  inspect_ready={inspect_ready}\n  bootable_per_workspace={bootable_per_workspace}\n  ui_legible={ui_legible}\n  logs_legible={logs_legible}\n  metrics_legible={metrics_legible}\n  traces_legible={traces_legible}\nLocal constraints:\n{constraints}",
         project_id = overlay.project_id,
         repo_root = overlay.repo_root,
         vcs_mode = overlay.vcs_mode,
@@ -857,6 +860,12 @@ fn format_project_overlay_summary(overlay: &punk_orch::ProjectOverlay) -> String
         autonomous_ready = overlay.capability_summary.autonomous_ready,
         jj_ready = overlay.capability_summary.jj_ready,
         proof_ready = overlay.capability_summary.proof_ready,
+        inspect_ready = overlay.harness_summary.inspect_ready,
+        bootable_per_workspace = overlay.harness_summary.bootable_per_workspace,
+        ui_legible = overlay.harness_summary.ui_legible,
+        logs_legible = overlay.harness_summary.logs_legible,
+        metrics_legible = overlay.harness_summary.metrics_legible,
+        traces_legible = overlay.harness_summary.traces_legible,
         constraints = constraints,
     )
 }
@@ -1415,6 +1424,14 @@ mod tests {
                 proof_ready: true,
                 project_guidance_ready: true,
             },
+            harness_summary: punk_orch::ProjectHarnessSummary {
+                inspect_ready: true,
+                bootable_per_workspace: true,
+                ui_legible: false,
+                logs_legible: true,
+                metrics_legible: false,
+                traces_legible: false,
+            },
             project_skill_refs: vec!["/tmp/skills/interviewcoach-core.md".into()],
             local_constraints: vec!["none".into()],
             safe_default_checks: vec!["make test".into()],
@@ -1428,6 +1445,9 @@ mod tests {
         assert!(rendered.contains("Project skills: /tmp/skills/interviewcoach-core.md"));
         assert!(rendered.contains("Safe default checks: make test"));
         assert!(rendered.contains("autonomous_ready=true"));
+        assert!(rendered.contains("Harness:"));
+        assert!(rendered.contains("bootable_per_workspace=true"));
+        assert!(rendered.contains("logs_legible=true"));
     }
 
     #[test]
