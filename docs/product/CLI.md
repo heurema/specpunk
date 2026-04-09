@@ -146,6 +146,7 @@ Current human-facing inspect expectations:
 
 - `punk inspect work` should show a concise latest-proof evidence summary when a latest proof exists
 - `punk inspect work` may also show a concise latest-proof harness summary derived from the latest proof's declared and executed harness evidence
+- declared harness evidence in human summaries should preserve any declared `source_ref` when the proof carries it
 - `punk inspect proof_<id>` should render a concise human summary for typed `command` evidence, `declared_harness_evidence`, and executed `harness_evidence` without requiring raw JSON reading
 - JSON object inspect remains the source of full structured proof detail
 

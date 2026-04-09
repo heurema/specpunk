@@ -252,9 +252,11 @@ Current inspect semantics:
 - the packet remains a derived mechanism only; it does not introduce a new primitive
 - `gate` / `proof` may copy declared non-command validation surfaces from the persisted packet into decision/proof artifacts as typed metadata only
 - `punk inspect proof_<id>` may surface `declared_harness_evidence` in the human summary while JSON remains the source of full structured detail
+- when a declared harness entry includes `source_ref`, the human summary should preserve that ref instead of collapsing to summary text only
 - `gate` / `proof` may also execute `artifact_assertion` recipes when they are explicitly declared in the persisted packet
 - `punk inspect proof_<id>` may surface executed `harness_evidence` in the human summary while JSON remains the source of full structured detail
 - `punk inspect work` may surface a latest-proof harness summary derived from those same proof fields while `WorkLedgerView` JSON stays unchanged
+- the same declared source refs should remain visible there so operators can see which persisted packet entry declared the surface
 - this still does **not** execute UI, log, metric, or trace runtime checks
 
 Future `ProjectOverlay` growth can still add fields like:

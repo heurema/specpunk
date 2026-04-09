@@ -986,8 +986,11 @@ fn summarize_proof_harness_evidence(proof: &punk_domain::Proofpack) -> String {
     let mut lines = Vec::new();
     lines.extend(proof.declared_harness_evidence.iter().map(|item| {
         format!(
-            "declared {} [{}]: {}",
-            item.evidence_type, item.profile, item.summary
+            "declared {} [{}]: {}{}",
+            item.evidence_type,
+            item.profile,
+            item.summary,
+            format_declared_harness_evidence_target(item.source_ref.as_deref())
         )
     }));
     lines.extend(proof.harness_evidence.iter().map(|item| {
@@ -1013,6 +1016,12 @@ fn summarize_proof_harness_evidence(proof: &punk_domain::Proofpack) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+fn format_declared_harness_evidence_target(source_ref: Option<&str>) -> String {
+    source_ref
+        .map(|source_ref| format!(" (source: {source_ref})"))
+        .unwrap_or_default()
 }
 
 fn format_proofpack_summary(proof: &punk_domain::Proofpack) -> String {
@@ -1041,8 +1050,11 @@ fn format_proofpack_summary(proof: &punk_domain::Proofpack) -> String {
             .iter()
             .map(|item| {
                 format!(
-                    "- {} [{}]: {}",
-                    item.evidence_type, item.profile, item.summary
+                    "- {} [{}]: {}{}",
+                    item.evidence_type,
+                    item.profile,
+                    item.summary,
+                    format_declared_harness_evidence_target(item.source_ref.as_deref())
                 )
             })
             .collect::<Vec<_>>()
@@ -1257,7 +1269,6 @@ fn cmd_vcs_enable_jj(repo_root: &PathBuf) -> Result<()> {
         )),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
