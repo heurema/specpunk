@@ -323,18 +323,27 @@ impl Executor for CodexCliExecutor {
         if !attempt.timed_output.no_progress_paths.is_empty()
             && is_fail_closed_scope_task(&input.contract)
         {
-            attempt = self.run_execution_attempt(&input, &created_entry_points, true)?;
-            if !attempt.restored_paths.is_empty() {
-                return Ok(ExecuteOutput {
-                    success: false,
-                    summary: format!(
-                        "materialized entry-point files were deleted during execution: {}",
-                        attempt.restored_paths.join(", ")
-                    ),
-                    checks_run: Vec::new(),
-                    cost_usd: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                });
+            let stdout = String::from_utf8_lossy(&attempt.timed_output.output.stdout);
+            let stderr = String::from_utf8_lossy(&attempt.timed_output.output.stderr);
+            if should_retry_after_no_progress(
+                &input.contract,
+                &attempt.timed_output.no_progress_paths,
+                &stdout,
+                &stderr,
+            ) {
+                attempt = self.run_execution_attempt(&input, &created_entry_points, true)?;
+                if !attempt.restored_paths.is_empty() {
+                    return Ok(ExecuteOutput {
+                        success: false,
+                        summary: format!(
+                            "materialized entry-point files were deleted during execution: {}",
+                            attempt.restored_paths.join(", ")
+                        ),
+                        checks_run: Vec::new(),
+                        cost_usd: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
             }
         }
         let timed_output = attempt.timed_output;
@@ -1560,6 +1569,50 @@ fn is_self_referential_control_plane_path(path: &str) -> bool {
         || path.starts_with("crates/punk-orch/")
 }
 
+fn should_retry_after_no_progress(
+    contract: &Contract,
+    paths: &[String],
+    stdout: &str,
+    stderr: &str,
+) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    if is_greenfield_manifest_no_progress(contract, paths)
+        && logs_indicate_missing_manifest_wiring(stdout, stderr, paths)
+    {
+        return false;
+    }
+    true
+}
+
+fn is_greenfield_manifest_no_progress(contract: &Contract, paths: &[String]) -> bool {
+    !contract.entry_points.is_empty()
+        && contract
+            .entry_points
+            .iter()
+            .all(|path| is_greenfield_manifest_entry_point(path))
+        && paths.iter().all(|path| is_greenfield_manifest_entry_point(path))
+        && paths.iter().all(|path| contract.entry_points.contains(path))
+}
+
+fn is_greenfield_manifest_entry_point(path: &str) -> bool {
+    matches!(path, "Cargo.toml" | "go.mod" | "pyproject.toml" | "package.json")
+}
+
+fn logs_indicate_missing_manifest_wiring(stdout: &str, stderr: &str, paths: &[String]) -> bool {
+    if paths.is_empty() || !paths.iter().all(|path| is_greenfield_manifest_entry_point(path)) {
+        return false;
+    }
+    let haystack = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    paths.iter().all(|path| {
+        let lowered = path.to_ascii_lowercase();
+        haystack.contains(&format!("missing {lowered}"))
+            || haystack.contains(&format!("{lowered} -> missing"))
+            || haystack.contains(&format!("missing manifest wiring for {lowered}"))
+    })
+}
+
 fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<TimedOutput> {
     #[cfg(unix)]
     command.process_group(0);
@@ -2224,6 +2277,15 @@ fn classify_no_progress_after_dispatch_result(
 ) -> (bool, String) {
     if let Some(blocked) = blocked_execution_line(stdout, stderr) {
         return (false, blocked);
+    }
+    if logs_indicate_missing_manifest_wiring(stdout, stderr, paths) {
+        return (
+            false,
+            format!(
+                "PUNK_EXECUTION_BLOCKED: missing manifest wiring for {}",
+                paths.join(", ")
+            ),
+        );
     }
     (
         false,
@@ -5182,6 +5244,45 @@ mod tests {
         assert!(!success);
         assert!(summary.contains("no implementation progress after bounded context dispatch"));
         assert!(summary.contains("crates/punk-council/src/synthesis.rs"));
+    }
+
+    #[test]
+    fn no_progress_classification_blocks_missing_manifest_wiring() {
+        let (success, summary) = classify_no_progress_after_dispatch_result(
+            &[String::from("Cargo.toml")],
+            "Cargo.toml -> MISSING\n",
+            "",
+        );
+        assert!(!success);
+        assert_eq!(summary, "PUNK_EXECUTION_BLOCKED: missing manifest wiring for Cargo.toml");
+    }
+
+    #[test]
+    fn manifest_probe_no_progress_skips_retry() {
+        let contract = Contract {
+            id: "ct_manifest".into(),
+            feature_id: "feat_manifest".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "scaffold Rust workspace".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["workspace scaffold".into()],
+            behavior_requirements: vec!["bootstrap project".into()],
+            allowed_scope: vec!["Cargo.toml".into(), "crates".into(), "tests".into()],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert!(!should_retry_after_no_progress(
+            &contract,
+            &[String::from("Cargo.toml")],
+            "Cargo.toml -> MISSING\n",
+            "",
+        ));
     }
 
     #[test]
