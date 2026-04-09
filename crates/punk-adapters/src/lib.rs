@@ -365,6 +365,10 @@ impl Executor for CodexCliExecutor {
                 &stdout,
                 &stderr,
             )
+        } else if let Some(blocked) =
+            greenfield_manifest_blocked_summary(&input.repo_root, &input.contract)
+        {
+            (false, blocked)
         } else if timed_output.timed_out {
             classify_timeout_result(&stdout, &stderr, codex_executor_timeout())
         } else if timed_output.orphaned {
@@ -1611,6 +1615,47 @@ fn logs_indicate_missing_manifest_wiring(stdout: &str, stderr: &str, paths: &[St
             || haystack.contains(&format!("{lowered} -> missing"))
             || haystack.contains(&format!("missing manifest wiring for {lowered}"))
     })
+}
+
+fn greenfield_manifest_blocked_summary(repo_root: &Path, contract: &Contract) -> Option<String> {
+    if !is_greenfield_manifest_no_progress(contract, &contract.entry_points) {
+        return None;
+    }
+
+    let mut missing_surfaces = Vec::new();
+    for path in &contract.entry_points {
+        if !repo_root.join(path).exists() {
+            missing_surfaces.push(path.clone());
+        }
+    }
+    for scope in &contract.allowed_scope {
+        if contract.entry_points.iter().any(|entry| entry == scope) || is_file_like_scope(scope) {
+            continue;
+        }
+        let scope_path = repo_root.join(scope);
+        let is_missing_or_empty = !scope_path.exists()
+            || fs::read_dir(&scope_path)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true);
+        if is_missing_or_empty {
+            missing_surfaces.push(format!("{scope}/"));
+        }
+    }
+    if missing_surfaces.is_empty() {
+        return None;
+    }
+
+    let check = contract
+        .target_checks
+        .first()
+        .cloned()
+        .or_else(|| contract.integrity_checks.first().cloned())
+        .unwrap_or_else(|| "the required checks".to_string());
+    Some(format!(
+        "PUNK_EXECUTION_BLOCKED: missing manifest wiring in allowed scope; repo root has no {}, so there is no scaffold entry point to implement or verify with {}",
+        missing_surfaces.join(", "),
+        check
+    ))
 }
 
 fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<TimedOutput> {
@@ -5283,6 +5328,47 @@ mod tests {
             "Cargo.toml -> MISSING\n",
             "",
         ));
+    }
+
+    #[test]
+    fn greenfield_manifest_blocked_summary_reports_missing_scope_surfaces() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-greenfield-blocked-summary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let contract = Contract {
+            id: "ct_manifest".into(),
+            feature_id: "feat_manifest".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "scaffold Rust workspace".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["workspace scaffold".into()],
+            behavior_requirements: vec!["bootstrap project".into()],
+            allowed_scope: vec!["Cargo.toml".into(), "crates".into(), "tests".into()],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let summary = greenfield_manifest_blocked_summary(&root, &contract).unwrap();
+        assert!(summary.contains("PUNK_EXECUTION_BLOCKED: missing manifest wiring in allowed scope"));
+        assert!(summary.contains("Cargo.toml"));
+        assert!(summary.contains("crates/"));
+        assert!(summary.contains("tests/"));
+        assert!(summary.contains("cargo test --workspace"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
