@@ -301,6 +301,7 @@ impl Executor for CodexCliExecutor {
             ExecutionLane::Exec => {}
         }
         let start = Instant::now();
+        let executor_timeout = effective_codex_executor_timeout(&input.contract);
         restore_stale_entry_point_masks(&input.repo_root)?;
         let created_entry_points = if is_fail_closed_scope_task(&input.contract) {
             materialize_missing_entry_points(&input.repo_root, &input.contract)?
@@ -370,7 +371,7 @@ impl Executor for CodexCliExecutor {
         {
             (false, blocked)
         } else if timed_output.timed_out {
-            classify_timeout_result(&stdout, &stderr, codex_executor_timeout())
+            classify_timeout_result(&stdout, &stderr, executor_timeout)
         } else if timed_output.orphaned {
             classify_orphan_result(&stdout, &stderr)
         } else if timed_output.stalled {
@@ -958,9 +959,10 @@ impl CodexCliExecutor {
                 .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""));
         }
         command.arg("--").arg(prompt);
+        let executor_timeout = effective_codex_executor_timeout(&input.contract);
         let timed_output = match run_command_with_timeout_and_tee(
             &mut command,
-            codex_executor_timeout(),
+            executor_timeout,
             codex_executor_stall_timeout(),
             codex_executor_no_progress_timeout(),
             codex_executor_scaffold_progress_timeout(),
@@ -1287,6 +1289,14 @@ fn codex_executor_timeout() -> Duration {
         .filter(|value| *value > 0)
         .unwrap_or(300);
     Duration::from_secs(seconds)
+}
+
+fn effective_codex_executor_timeout(contract: &Contract) -> Duration {
+    let base = codex_executor_timeout();
+    if is_greenfield_manifest_no_progress(contract, &contract.entry_points) {
+        return base.min(Duration::from_secs(20));
+    }
+    base
 }
 
 fn codex_patch_lane_timeout() -> Duration {
@@ -2278,8 +2288,8 @@ fn logs_indicate_compile_or_check_reason(
         || combined.contains("/bin/bash -lc 'cargo ")
         || combined.contains("error[")
         || combined.contains("error:")
-        || combined.contains(BLOCKED_EXECUTION_SENTINEL)
-        || combined.contains(SUCCESSFUL_EXECUTION_SENTINEL)
+        || blocked_execution_line(&stdout, &stderr).is_some()
+        || successful_execution_line(&stdout, &stderr).is_some()
 }
 
 fn logs_indicate_post_check_zero_progress_tail(
@@ -3479,7 +3489,7 @@ mod tests {
         };
 
         let start = Instant::now();
-        let _err = drafter.draft(input).unwrap_err().to_string();
+        let err = drafter.draft(input).unwrap_err().to_string();
         let elapsed = start.elapsed();
 
         if let Some(path) = old_path {
@@ -3729,7 +3739,7 @@ mod tests {
             },
         };
 
-        let err = drafter.draft(input).unwrap_err().to_string();
+        let _err = drafter.draft(input).unwrap_err().to_string();
 
         if let Some(path) = old_path {
             std::env::set_var("PATH", path);
@@ -3823,6 +3833,32 @@ mod tests {
         assert_eq!(proposal.title, "draft");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn greenfield_manifest_contracts_use_shorter_executor_timeout() {
+        let contract = Contract {
+            id: "ct_greenfield".into(),
+            feature_id: "feat_greenfield".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "scaffold Rust workspace".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["initial Rust scaffold".into()],
+            behavior_requirements: vec!["scaffold Rust workspace".into()],
+            allowed_scope: vec!["Cargo.toml".into(), "crates".into(), "tests".into()],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert_eq!(
+            effective_codex_executor_timeout(&contract),
+            Duration::from_secs(20)
+        );
     }
 
     #[test]
@@ -5453,6 +5489,36 @@ mod tests {
         fs::write(
             &stderr_path,
             "user\nTarget checks to satisfy: cargo test --workspace\nIntegrity checks to keep passing: cargo test --workspace\n",
+        )
+        .unwrap();
+
+        assert!(!logs_indicate_compile_or_check_reason(
+            &stdout_path,
+            &stderr_path
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compile_or_check_reason_ignores_prompt_declared_sentinels() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-compile-reason-sentinel-prompt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        fs::write(&stdout_path, "").unwrap();
+        fs::write(
+            &stderr_path,
+            "user\nIf you are blocked emit exactly one single-line sentinel in the form `PUNK_EXECUTION_BLOCKED: <reason>` and stop. When implementation is complete emit exactly one single-line sentinel in the form `PUNK_EXECUTION_COMPLETE: <summary>`.\n",
         )
         .unwrap();
 
