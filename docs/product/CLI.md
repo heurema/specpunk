@@ -168,6 +168,8 @@ Current status behavior:
 - when choosing the implicit current work item, `punk status` / `punk inspect work` should prefer the feature with the latest ledger activity (`run` / `receipt` / `decision` / `proof` / autonomy record), not merely the most recently drafted feature timestamp
 - stale/orphaned `running` runs with a dead executor pid, no receipt/decision/proof, and old `heartbeat.last_progress_at` should be ignored by active status/work projections instead of dominating current-work selection
 - non-destructive hygiene should start with `punk gc stale --dry-run`, which reports `safe_to_archive` vs `manual_review` candidates without deleting or moving artifacts yet
+- normal shell flows may autonomously quarantine `safe_to_archive` stale runs into `.punk/archive/runs/<run-id>/` so the user does not have to participate in inner-loop ledger hygiene
+- autonomous stale-run quarantine must remain non-destructive: archive/move is allowed, hard delete is not
 
 Longer-term shell expectation:
 

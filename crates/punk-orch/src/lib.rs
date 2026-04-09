@@ -271,6 +271,7 @@ impl OrchService {
         let events = EventStore::new(paths.global_root.clone());
         let service = Self { paths, events };
         service.bootstrap_project()?;
+        service.quarantine_safe_stale_runs()?;
         Ok(service)
     }
 
@@ -1234,6 +1235,51 @@ impl OrchService {
             safe_to_archive,
             manual_review,
         })
+    }
+
+    fn quarantine_safe_stale_runs(&self) -> Result<Vec<StaleArtifactCandidate>> {
+        let report = self.gc_stale_dry_run()?;
+        let mut archived = Vec::new();
+        let archive_root = self.paths.dot_punk.join("archive").join("runs");
+        fs::create_dir_all(&archive_root)?;
+
+        for candidate in report.safe_to_archive {
+            let source_dir = self
+                .paths
+                .repo_root
+                .join(candidate.artifact_ref.trim_end_matches("/run.json"))
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.paths.runs_dir.join(&candidate.artifact_id));
+            let source_dir = if source_dir.ends_with(&candidate.artifact_id) {
+                source_dir
+            } else {
+                self.paths.runs_dir.join(&candidate.artifact_id)
+            };
+            if !source_dir.exists() {
+                continue;
+            }
+
+            let target_dir = archive_root.join(&candidate.artifact_id);
+            if target_dir.exists() {
+                fs::remove_dir_all(&target_dir)?;
+            }
+            fs::rename(&source_dir, &target_dir)?;
+
+            let archive_record = StaleArchiveRecord {
+                archived_at: now_rfc3339(),
+                run_id: candidate.artifact_id.clone(),
+                work_id: candidate.work_id.clone(),
+                original_ref: candidate.artifact_ref.clone(),
+                reason: candidate.reason.clone(),
+                last_progress_at: candidate.last_progress_at.clone(),
+                executor_pid: candidate.executor_pid,
+            };
+            write_json(&target_dir.join("quarantine.json"), &archive_record)?;
+            archived.push(candidate);
+        }
+
+        Ok(archived)
     }
 
     pub fn record_autonomy_outcome(
@@ -2519,6 +2565,17 @@ pub struct StaleGcReport {
     pub generated_at: String,
     pub safe_to_archive: Vec<StaleArtifactCandidate>,
     pub manual_review: Vec<StaleArtifactCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StaleArchiveRecord {
+    archived_at: String,
+    run_id: String,
+    work_id: String,
+    original_ref: String,
+    reason: String,
+    last_progress_at: Option<String>,
+    executor_pid: Option<u32>,
 }
 
 struct RunHeartbeatGuard {
@@ -5527,6 +5584,127 @@ mod tests {
         assert_eq!(
             candidate.artifact_ref,
             format!(".punk/runs/{}/run.json", stale_run.id)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn orch_new_quarantines_safe_stale_runs_into_archive() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-auto-quarantine-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-auto-quarantine-stale-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("demo.txt"), "seed\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let project = service.bootstrap_project().unwrap();
+        let proposal = DraftProposal {
+            title: "feature".into(),
+            summary: "feature".into(),
+            entry_points: vec!["demo.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["demo".into()],
+            behavior_requirements: vec!["update demo".into()],
+            allowed_scope: vec!["demo.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+        };
+        let (_feature, contract) = service
+            .persist_draft_contract(&project, "feature", &proposal)
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let stale_run = Run {
+            id: "run_auto_quarantine".into(),
+            task_id: "task_auto_quarantine".into(),
+            feature_id: contract.feature_id.clone(),
+            contract_id: contract.id.clone(),
+            attempt: 1,
+            status: RunStatus::Running,
+            mode_origin: ModeId::Cut,
+            vcs: RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: "HEAD".into(),
+                change_ref: "HEAD".into(),
+                base_ref: None,
+            },
+            started_at: now_rfc3339(),
+            ended_at: None,
+        };
+        let stale_dir = service.paths.runs_dir.join(&stale_run.id);
+        fs::create_dir_all(&stale_dir).unwrap();
+        write_json(&stale_dir.join("run.json"), &stale_run).unwrap();
+        write_json(
+            &stale_dir.join("executor.json"),
+            &serde_json::json!({"child_pid": 999999_u32, "process_group_id": 999999_u32}),
+        )
+        .unwrap();
+        write_json(
+            &stale_dir.join("heartbeat.json"),
+            &RunHeartbeat {
+                run_id: stale_run.id.clone(),
+                state: "running".into(),
+                last_progress_at: "2020-01-01T00:00:00Z".into(),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            },
+        )
+        .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        assert!(!service.paths.runs_dir.join(&stale_run.id).exists());
+        let archived_dir = root.join(".punk/archive/runs").join(&stale_run.id);
+        assert!(archived_dir.exists());
+        let quarantine: StaleArchiveRecord =
+            read_json(&archived_dir.join("quarantine.json")).unwrap();
+        assert_eq!(quarantine.run_id, stale_run.id);
+        assert_eq!(quarantine.work_id, contract.feature_id);
+        assert!(
+            quarantine
+                .reason
+                .contains("status=running but child_pid 999999 is dead")
         );
 
         let _ = fs::remove_dir_all(&root);
