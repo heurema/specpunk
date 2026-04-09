@@ -323,6 +323,11 @@ Creates:
 - `Feature`
 - draft `Contract`
 
+Timeout expectation:
+
+- if the contract drafter times out, `punk start` should attempt one deterministic bounded fallback derived from the repo scan and explicit prompt details before returning an error
+- non-timeout drafter failures should still fail closed
+
 Writes:
 
 - `.punk/features/<feature-id>.json`
@@ -348,6 +353,11 @@ Writes:
 Updates:
 
 - existing `Contract` with status `draft`
+
+Timeout expectation:
+
+- if the refine drafter times out, `punk plot refine` should attempt one deterministic fallback by reusing the current draft plus explicit guidance overrides before returning an error
+- non-timeout refine failures should still fail closed
 
 Writes:
 

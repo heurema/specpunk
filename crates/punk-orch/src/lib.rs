@@ -352,7 +352,14 @@ impl OrchService {
             prompt: trimmed_prompt.to_string(),
             scan: scan.clone(),
         };
-        let mut proposal = phase_error("drafter request", drafter.draft(input))?;
+        let mut proposal = match drafter.draft(input) {
+            Ok(proposal) => proposal,
+            Err(err) if is_drafter_timeout_error(&err) => phase_error(
+                "drafter timeout fallback",
+                recover_timeout_draft_proposal(&self.paths.repo_root, trimmed_prompt, &scan),
+            )?,
+            Err(err) => return Err(anyhow!("phase drafter request: {err}")),
+        };
         canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
         let mut errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
         if errors.is_empty() {
@@ -368,16 +375,28 @@ impl OrchService {
             }
         }
         if !errors.is_empty() {
-            proposal = phase_error(
-                "drafter repair",
-                drafter.refine(RefineInput {
-                    repo_root: self.paths.repo_root.display().to_string(),
-                    prompt: trimmed_prompt.to_string(),
-                    guidance: format_validation_guidance(&errors),
-                    current: proposal,
-                    scan: scan.clone(),
-                }),
-            )?;
+            let repair_guidance = format_validation_guidance(&errors);
+            let repair_current = proposal.clone();
+            proposal = match drafter.refine(RefineInput {
+                repo_root: self.paths.repo_root.display().to_string(),
+                prompt: trimmed_prompt.to_string(),
+                guidance: repair_guidance.clone(),
+                current: repair_current.clone(),
+                scan: scan.clone(),
+            }) {
+                Ok(proposal) => proposal,
+                Err(err) if is_drafter_timeout_error(&err) => phase_error(
+                    "drafter timeout fallback",
+                    recover_timeout_refine_proposal(
+                        &self.paths.repo_root,
+                        trimmed_prompt,
+                        &repair_guidance,
+                        repair_current,
+                        &scan,
+                    ),
+                )?,
+                Err(err) => return Err(anyhow!("phase drafter repair: {err}")),
+            };
             canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
             errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             if errors.is_empty() {
@@ -475,13 +494,23 @@ impl OrchService {
             ));
         }
         let current = contract_to_proposal(&feature, &current_contract);
-        let mut proposal = drafter.refine(RefineInput {
+        let mut proposal = match drafter.refine(RefineInput {
             repo_root: self.paths.repo_root.display().to_string(),
             prompt: current_contract.prompt_source.clone(),
             guidance: guidance.to_string(),
             current,
             scan: scan.clone(),
-        })?;
+        }) {
+            Ok(proposal) => proposal,
+            Err(err) if is_drafter_timeout_error(&err) => recover_timeout_refine_proposal(
+                &self.paths.repo_root,
+                &current_contract.prompt_source,
+                guidance,
+                contract_to_proposal(&feature, &current_contract),
+                &scan,
+            )?,
+            Err(err) => return Err(err),
+        };
         canonicalize_draft_proposal(
             &self.paths.repo_root,
             &current_contract.prompt_source,
@@ -2081,6 +2110,117 @@ fn summarize_prompt(prompt: &str) -> String {
     trimmed.chars().take(60).collect()
 }
 
+fn is_drafter_timeout_error(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("timed out after")
+}
+
+fn recover_timeout_draft_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+) -> Result<DraftProposal> {
+    finalize_timeout_fallback_proposal(
+        repo_root,
+        prompt,
+        None,
+        timeout_seed_proposal(prompt, scan),
+        scan,
+    )
+}
+
+fn recover_timeout_refine_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    guidance: &str,
+    current: DraftProposal,
+    scan: &punk_domain::RepoScanSummary,
+) -> Result<DraftProposal> {
+    finalize_timeout_fallback_proposal(repo_root, prompt, Some(guidance), current, scan)
+}
+
+fn finalize_timeout_fallback_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    guidance: Option<&str>,
+    mut proposal: DraftProposal,
+    scan: &punk_domain::RepoScanSummary,
+) -> Result<DraftProposal> {
+    canonicalize_draft_proposal(repo_root, prompt, &mut proposal);
+    if let Some(guidance) = guidance {
+        apply_explicit_prompt_overrides(repo_root, guidance, &mut proposal);
+    }
+    let mut errors = validate_draft_proposal(repo_root, &proposal);
+    if errors.is_empty() {
+        return Ok(proposal);
+    }
+
+    if let Some(mut fallback) =
+        build_bounded_fallback_proposal(repo_root, prompt, &proposal, scan, &errors)
+    {
+        canonicalize_draft_proposal(repo_root, prompt, &mut fallback);
+        if let Some(guidance) = guidance {
+            apply_explicit_prompt_overrides(repo_root, guidance, &mut fallback);
+        }
+        errors = validate_draft_proposal(repo_root, &fallback);
+        if errors.is_empty() {
+            return Ok(fallback);
+        }
+    }
+
+    Err(anyhow!(
+        "timed-out drafter proposal could not be recovered: {}",
+        format_validation_guidance(&errors)
+    ))
+}
+
+fn timeout_seed_proposal(prompt: &str, scan: &punk_domain::RepoScanSummary) -> DraftProposal {
+    let entry_points: Vec<String> = if scan.candidate_entry_points.is_empty() {
+        scan.candidate_file_scope_paths
+            .iter()
+            .take(2)
+            .cloned()
+            .collect()
+    } else {
+        scan.candidate_entry_points
+            .iter()
+            .take(2)
+            .cloned()
+            .collect()
+    };
+    let allowed_scope: Vec<String> = if scan.candidate_file_scope_paths.is_empty() {
+        entry_points.clone()
+    } else {
+        scan.candidate_file_scope_paths
+            .iter()
+            .take(4)
+            .cloned()
+            .collect()
+    };
+    let target_checks = if scan.candidate_target_checks.is_empty() {
+        scan.candidate_integrity_checks.clone()
+    } else {
+        scan.candidate_target_checks.clone()
+    };
+
+    DraftProposal {
+        title: summarize_prompt(prompt),
+        summary: summarize_prompt(prompt),
+        entry_points,
+        import_paths: Vec::new(),
+        expected_interfaces: vec!["approve-ready bounded contract".to_string()],
+        behavior_requirements: vec![
+            "Recover an approve-ready bounded contract from deterministic repo scan after drafter timeout."
+                .to_string(),
+        ],
+        allowed_scope,
+        target_checks,
+        integrity_checks: scan.candidate_integrity_checks.clone(),
+        risk_level: "medium".to_string(),
+    }
+}
+
 fn contract_to_proposal(feature: &Feature, contract: &Contract) -> DraftProposal {
     DraftProposal {
         title: feature.title.clone(),
@@ -2685,6 +2825,22 @@ mod tests {
         }
     }
 
+    struct TimeoutDrafter;
+
+    impl ContractDrafter for TimeoutDrafter {
+        fn name(&self) -> &'static str {
+            "timeout-drafter"
+        }
+
+        fn draft(&self, _input: DraftInput) -> Result<DraftProposal> {
+            Err(anyhow!("codex command timed out after 30s: 58,249"))
+        }
+
+        fn refine(&self, _input: RefineInput) -> Result<DraftProposal> {
+            Err(anyhow!("codex command timed out after 30s: 58,249"))
+        }
+    }
+
     #[test]
     fn draft_and_approve_contract() {
         let root = std::env::temp_dir().join(format!("punk-orch-{}", std::process::id()));
@@ -3158,6 +3314,74 @@ mod tests {
     }
 
     #[test]
+    fn draft_contract_uses_timeout_fallback_when_initial_drafter_times_out() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-draft-fallback-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/Cargo.toml"),
+            "[package]\nname = \"punk-orch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/Cargo.toml"),
+            "[package]\nname = \"punk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/src/lib.rs"),
+            "pub fn core() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/CLI.md"), "# CLI\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let prompt = "Improve drafter timeout resilience for punk start and plot refine. Restrict allowed_scope exactly to crates/punk-orch/src/lib.rs; crates/punk-core/src/lib.rs; docs/product/CLI.md. Target checks should include cargo test -p punk-core -p punk-orch. Integrity checks should include cargo test --workspace.";
+        let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
+
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "crates/punk-orch/src/lib.rs".to_string(),
+                "crates/punk-core/src/lib.rs".to_string(),
+                "docs/product/CLI.md".to_string(),
+            ]
+        );
+        assert_eq!(contract.entry_points, contract.allowed_scope);
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test -p punk-core -p punk-orch".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn refine_contract_applies_explicit_guidance_scope_exactly() {
         let root = std::env::temp_dir().join(format!(
             "punk-orch-refine-explicit-scope-{}",
@@ -3223,6 +3447,79 @@ mod tests {
         assert_eq!(refined.entry_points, refined.allowed_scope);
         assert_eq!(refined.target_checks, vec!["make test".to_string()]);
         assert_eq!(refined.integrity_checks, vec!["make test".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refine_contract_uses_timeout_fallback_with_explicit_guidance() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-refine-fallback-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/Cargo.toml"),
+            "[package]\nname = \"punk-orch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/Cargo.toml"),
+            "[package]\nname = \"punk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/src/lib.rs"),
+            "pub fn core() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/CLI.md"), "# CLI\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&FakeDrafter, "harden drafter timeout fallback")
+            .unwrap();
+        let guidance = "Restrict allowed_scope exactly to crates/punk-orch/src/lib.rs; crates/punk-core/src/lib.rs; docs/product/CLI.md. target_checks must contain exactly one command: cargo test -p punk-core -p punk-orch. integrity_checks must contain exactly one command: cargo test --workspace.";
+        let refined = service
+            .refine_contract(&TimeoutDrafter, &contract.id, guidance)
+            .unwrap();
+
+        assert_eq!(
+            refined.allowed_scope,
+            vec![
+                "crates/punk-orch/src/lib.rs".to_string(),
+                "crates/punk-core/src/lib.rs".to_string(),
+                "docs/product/CLI.md".to_string(),
+            ]
+        );
+        assert_eq!(refined.entry_points, refined.allowed_scope);
+        assert_eq!(
+            refined.target_checks,
+            vec!["cargo test -p punk-core -p punk-orch".to_string()]
+        );
+        assert_eq!(
+            refined.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
