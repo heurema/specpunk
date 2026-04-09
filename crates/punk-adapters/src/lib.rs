@@ -1561,7 +1561,10 @@ fn is_self_referential_control_plane_path(path: &str) -> bool {
 }
 
 fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<TimedOutput> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let start = Instant::now();
     loop {
@@ -1605,7 +1608,10 @@ fn run_patch_lane_command_with_timeout(
 ) -> Result<PatchLaneTimedOutput> {
     #[cfg(unix)]
     command.process_group(0);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let child_pid = child.id();
     write_executor_pid(&executor_pid_path, child_pid)?;
@@ -1622,14 +1628,14 @@ fn run_patch_lane_command_with_timeout(
     let stderr_live = Arc::new(Mutex::new(Vec::new()));
     let stdout_handle = spawn_stream_tee_with_live_capture(
         stdout,
-        stdout_path,
+        stdout_path.clone(),
         progress.clone(),
         true,
         Some(stdout_live.clone()),
     );
     let stderr_handle = spawn_stream_tee_with_live_capture(
         stderr,
-        stderr_path,
+        stderr_path.clone(),
         progress,
         false,
         Some(stderr_live.clone()),
@@ -1659,8 +1665,16 @@ fn run_patch_lane_command_with_timeout(
         thread::sleep(Duration::from_millis(200));
     };
     let status = child.wait()?;
-    let stdout = join_stream_tee(stdout_handle)?;
-    let stderr = join_stream_tee(stderr_handle)?;
+    let stdout = collect_stream_tee_output(
+        stdout_handle,
+        &stdout_path,
+        codex_executor_orphan_grace_timeout(),
+    )?;
+    let stderr = collect_stream_tee_output(
+        stderr_handle,
+        &stderr_path,
+        codex_executor_orphan_grace_timeout(),
+    )?;
     Ok(PatchLaneTimedOutput {
         output: std::process::Output {
             status,
@@ -1682,7 +1696,10 @@ fn run_plan_lane_command_with_timeout(
 ) -> Result<PlanLaneTimedOutput> {
     #[cfg(unix)]
     command.process_group(0);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let child_pid = child.id();
     write_executor_pid(&executor_pid_path, child_pid)?;
@@ -1699,14 +1716,14 @@ fn run_plan_lane_command_with_timeout(
     let stderr_live = Arc::new(Mutex::new(Vec::new()));
     let stdout_handle = spawn_stream_tee_with_live_capture(
         stdout,
-        stdout_path,
+        stdout_path.clone(),
         progress.clone(),
         true,
         Some(stdout_live.clone()),
     );
     let stderr_handle = spawn_stream_tee_with_live_capture(
         stderr,
-        stderr_path,
+        stderr_path.clone(),
         progress,
         false,
         Some(stderr_live.clone()),
@@ -1736,8 +1753,16 @@ fn run_plan_lane_command_with_timeout(
         thread::sleep(Duration::from_millis(200));
     };
     let status = child.wait()?;
-    let stdout = join_stream_tee(stdout_handle)?;
-    let stderr = join_stream_tee(stderr_handle)?;
+    let stdout = collect_stream_tee_output(
+        stdout_handle,
+        &stdout_path,
+        codex_executor_orphan_grace_timeout(),
+    )?;
+    let stderr = collect_stream_tee_output(
+        stderr_handle,
+        &stderr_path,
+        codex_executor_orphan_grace_timeout(),
+    )?;
     Ok(PlanLaneTimedOutput {
         output: std::process::Output {
             status,
@@ -1765,7 +1790,10 @@ fn run_command_with_timeout_and_tee(
 ) -> Result<TimedOutput> {
     #[cfg(unix)]
     command.process_group(0);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let child_pid = child.id();
     write_executor_pid(&executor_pid_path, child_pid)?;
@@ -1857,8 +1885,16 @@ fn run_command_with_timeout_and_tee(
         thread::sleep(Duration::from_millis(200));
     };
     let status = child.wait()?;
-    let stdout = join_stream_tee(stdout_handle)?;
-    let stderr = join_stream_tee(stderr_handle)?;
+    let stdout = collect_stream_tee_output(
+        stdout_handle,
+        &stdout_path,
+        codex_executor_orphan_grace_timeout(),
+    )?;
+    let stderr = collect_stream_tee_output(
+        stderr_handle,
+        &stderr_path,
+        codex_executor_orphan_grace_timeout(),
+    )?;
     Ok(TimedOutput {
         output: std::process::Output {
             status,
@@ -1946,6 +1982,27 @@ fn join_stream_tee(handle: thread::JoinHandle<Result<Vec<u8>>>) -> Result<Vec<u8
     handle
         .join()
         .map_err(|_| anyhow!("stream tee thread panicked"))?
+}
+
+fn collect_stream_tee_output(
+    handle: thread::JoinHandle<Result<Vec<u8>>>,
+    path: &std::path::Path,
+    grace_timeout: Duration,
+) -> Result<Vec<u8>> {
+    let start = Instant::now();
+    loop {
+        if handle.is_finished() {
+            return join_stream_tee(handle);
+        }
+        if start.elapsed() >= grace_timeout {
+            return match fs::read(path) {
+                Ok(bytes) => Ok(bytes),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(err) => Err(err.into()),
+            };
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn last_non_empty_line(text: &str) -> Option<String> {
@@ -4537,6 +4594,54 @@ mod tests {
         assert!(output.no_progress_paths.is_empty());
         assert!(output.scaffold_only_paths.is_empty());
         assert!(output.post_check_zero_progress_paths.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&output.output.stdout),
+            "parent-done"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_command_with_timeout_and_tee_returns_without_waiting_for_detached_pipe_leak() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-tee-detached-orphan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        let mut command = Command::new("/bin/sh");
+        command.arg("-lc").arg(
+            "python3 - <<'PY'\nimport subprocess, sys\nsubprocess.Popen(['/bin/sh', '-lc', 'sleep 5'], stdout=sys.stdout, stderr=sys.stderr, close_fds=False, start_new_session=True)\nsys.stdout.write('parent-done')\nsys.stdout.flush()\nPY",
+        );
+
+        let start = Instant::now();
+        let output = run_command_with_timeout_and_tee(
+            &mut command,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_millis(400),
+            stdout_path.clone(),
+            stderr_path.clone(),
+            root.join("executor.json"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(start.elapsed() < Duration::from_secs(4));
+        assert!(!output.timed_out);
+        assert!(!output.stalled);
+        assert!(output.orphaned);
         assert_eq!(
             String::from_utf8_lossy(&output.output.stdout),
             "parent-done"
