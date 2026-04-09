@@ -336,6 +336,7 @@ Preflight expectation:
 - for a bootstrapped greenfield Python repo with no existing inferred checks yet, an explicit Python scaffold goal may derive `pytest` and scaffoldable Python scope instead of failing at repo scan
 - for a bootstrapped greenfield TypeScript/Node repo with no existing `package.json`, an explicit TS/Node scaffold goal may derive `npm test` and manifest-first scaffold scope instead of failing at repo scan
 - that same greenfield Rust scaffold draft should route scope toward scaffoldable Rust/workspace surfaces instead of existing docs/archive paths
+- if an explicit bootstrap prompt names nested scaffold touch targets under a missing scaffold root (for example `crates/pubpunk-cli` before `crates/` exists), the draft should still preserve those repo-relative paths in `allowed_scope` instead of collapsing back to only the root manifest
 
 Creates:
 

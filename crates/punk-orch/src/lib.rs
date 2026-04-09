@@ -3729,6 +3729,50 @@ mod tests {
     }
 
     #[test]
+    fn draft_contract_expands_multi_surface_bootstrap_scope_without_existing_crates_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-rust-multisurface-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &GreenfieldRustDrafter,
+                "bootstrap initial Rust workspace for pubpunk touching exactly Cargo.toml, crates/pubpunk-cli, crates/pubpunk-core, and tests; create workspace members and make cargo test --workspace pass",
+            )
+            .unwrap();
+
+        assert_eq!(contract.entry_points, vec!["Cargo.toml".to_string()]);
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "Cargo.toml".to_string(),
+                "crates/pubpunk-cli".to_string(),
+                "crates/pubpunk-core".to_string(),
+                "tests".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn draft_contract_allows_bootstrapped_greenfield_go_repo_without_existing_checks() {
         let root = std::env::temp_dir().join(format!(
             "punk-orch-greenfield-go-intake-{}",

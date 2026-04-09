@@ -1852,7 +1852,24 @@ fn validate_scope_path(repo_root: &Path, value: &str) -> std::result::Result<(),
     {
         return Ok(());
     }
+    if allow_missing_greenfield_scaffold_path(&relative) {
+        return Ok(());
+    }
     Err("path does not exist and has no existing parent directory".to_string())
+}
+
+fn allow_missing_greenfield_scaffold_path(relative: &Path) -> bool {
+    let mut components = relative.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return false;
+    };
+    if components.next().is_none() {
+        return false;
+    }
+    matches!(
+        first.to_str(),
+        Some("crates" | "src" | "tests" | "cmd" | "internal" | "pkg" | "packages" | "apps")
+    )
 }
 
 pub fn validate_check_command(repo_root: &Path, value: &str) -> std::result::Result<(), String> {
@@ -2042,6 +2059,7 @@ fn explicit_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
     for candidate in code_spans(prompt)
         .into_iter()
         .chain(path_like_tokens(prompt).into_iter())
+        .chain(explicit_scaffold_dir_tokens(prompt).into_iter())
     {
         if !looks_like_repo_path(&candidate) {
             continue;
@@ -2056,6 +2074,7 @@ fn explicit_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
         }
         if !candidate.contains('/')
             && !is_repo_root_file(&candidate)
+            && !is_top_level_scaffold_dir(&candidate)
             && !repo_root.join(&candidate).exists()
         {
             continue;
@@ -2067,11 +2086,51 @@ fn explicit_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
     paths
 }
 
+fn explicit_scaffold_dir_tokens(prompt: &str) -> Vec<String> {
+    if !prompt_declares_explicit_touch_set(prompt) {
+        return Vec::new();
+    }
+    prompt
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(c, '`' | '"' | '\'' | ',' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
+        })
+        .map(|token| token.trim_end_matches('.'))
+        .filter(|token| {
+            matches!(
+                *token,
+                "crates" | "src" | "tests" | "cmd" | "internal" | "pkg" | "packages" | "apps"
+            )
+        })
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn prompt_declares_explicit_touch_set(prompt: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    [
+        "touching exactly",
+        "touch exactly",
+        "exact touch set",
+        "requested touch set",
+        "scope bounded to",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+}
+
 fn is_generated_runtime_artifact_path(path: &str) -> bool {
     let normalized = path.trim().trim_matches('`').replace('\\', "/");
     normalized == ".punk/project/harness.json"
         || normalized.starts_with(".punk/project/")
         || normalized.contains("/.punk/project/")
+}
+
+fn is_top_level_scaffold_dir(path: &str) -> bool {
+    matches!(
+        path,
+        "crates" | "src" | "tests" | "cmd" | "internal" | "pkg" | "packages" | "apps"
+    )
 }
 
 fn prompt_explicitly_targets_generated_path(prompt: &str, path: &str) -> bool {
@@ -2334,7 +2393,18 @@ fn looks_like_repo_path(value: &str) -> bool {
     value.contains('/')
         || matches!(
             value,
-            "Cargo.toml" | "Cargo.lock" | "README.md" | "rust-toolchain.toml"
+            "Cargo.toml"
+                | "Cargo.lock"
+                | "README.md"
+                | "rust-toolchain.toml"
+                | "crates"
+                | "src"
+                | "tests"
+                | "cmd"
+                | "internal"
+                | "pkg"
+                | "packages"
+                | "apps"
         )
         || [".rs", ".toml", ".json", ".md", ".yaml", ".yml"]
             .iter()
@@ -3144,6 +3214,38 @@ mod tests {
     }
 
     #[test]
+    fn validation_accepts_scaffold_paths_without_existing_scaffold_root() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-scaffold-missing-root-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let proposal = DraftProposal {
+            title: "bootstrap workspace".into(),
+            summary: "bootstrap workspace".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec!["crates/pubpunk-cli".into(), "crates/pubpunk-core".into()],
+            expected_interfaces: vec!["workspace bootstrap".into()],
+            behavior_requirements: vec!["create workspace members".into()],
+            allowed_scope: vec![
+                "Cargo.toml".into(),
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+        };
+
+        let errors = validate_draft_proposal(&root, &proposal);
+        assert!(errors.is_empty(), "{errors:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn canonicalize_preserves_explicit_paths_and_checks() {
         let root =
             std::env::temp_dir().join(format!("punk-core-canonicalize-{}", std::process::id()));
@@ -3185,6 +3287,45 @@ mod tests {
             proposal.integrity_checks,
             vec!["cargo test --workspace".to_string()]
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn canonicalize_preserves_explicit_bootstrap_touch_set_without_existing_crates_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-bootstrap-explicit-scope-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let prompt = "bootstrap initial Rust workspace for pubpunk touching exactly Cargo.toml, crates/pubpunk-cli, crates/pubpunk-core, and tests; create workspace members and make cargo test --workspace pass";
+        let mut proposal = DraftProposal {
+            title: "wrong".into(),
+            summary: "wrong".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec!["crates/pubpunk-cli".into(), "crates/pubpunk-core".into()],
+            expected_interfaces: vec!["initial Rust scaffold".into()],
+            behavior_requirements: vec!["bootstrap workspace".into()],
+            allowed_scope: vec!["Cargo.toml".into()],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+        };
+
+        canonicalize_draft_proposal(&root, prompt, &mut proposal);
+
+        assert_eq!(
+            proposal.allowed_scope,
+            vec![
+                "Cargo.toml".to_string(),
+                "crates/pubpunk-cli".to_string(),
+                "crates/pubpunk-core".to_string(),
+                "tests".to_string(),
+            ]
+        );
+        assert_eq!(proposal.entry_points, vec!["Cargo.toml".to_string()]);
 
         let _ = fs::remove_dir_all(&root);
     }
