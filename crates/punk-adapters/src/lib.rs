@@ -1561,42 +1561,71 @@ fn is_self_referential_control_plane_path(path: &str) -> bool {
 }
 
 fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<TimedOutput> {
+    #[cfg(unix)]
+    command.process_group(0);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn()?;
+    let child_pid = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("child stdout pipe unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("child stderr pipe unavailable"))?;
+    let progress = Arc::new(ProgressTracker::new());
+    let stdout_live = Arc::new(Mutex::new(Vec::new()));
+    let stderr_live = Arc::new(Mutex::new(Vec::new()));
+    let stdout_handle =
+        spawn_stream_capture(stdout, progress.clone(), true, Some(stdout_live.clone()));
+    let stderr_handle = spawn_stream_capture(stderr, progress, false, Some(stderr_live.clone()));
     let start = Instant::now();
-    loop {
+    let (timed_out, orphaned) = loop {
         if child.try_wait()?.is_some() {
-            return child
-                .wait_with_output()
-                .map(|output| TimedOutput {
-                    output,
-                    timed_out: false,
-                    stalled: false,
-                    orphaned: false,
-                    no_progress_paths: Vec::new(),
-                    scaffold_only_paths: Vec::new(),
-                    post_check_zero_progress_paths: Vec::new(),
-                })
-                .map_err(Into::into);
+            if !wait_for_stream_completion(
+                &stdout_handle,
+                &stderr_handle,
+                codex_executor_orphan_grace_timeout(),
+            ) {
+                terminate_process_tree(&mut child, child_pid);
+                break (false, true);
+            }
+            break (false, false);
         }
         if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            return Ok(TimedOutput {
-                output,
-                timed_out: true,
-                stalled: false,
-                orphaned: false,
-                no_progress_paths: Vec::new(),
-                scaffold_only_paths: Vec::new(),
-                post_check_zero_progress_paths: Vec::new(),
-            });
+            terminate_process_tree(&mut child, child_pid);
+            break (true, false);
         }
         thread::sleep(Duration::from_millis(200));
-    }
+    };
+    let status = child.wait()?;
+    let stdout = collect_stream_capture_output(
+        stdout_handle,
+        &stdout_live,
+        codex_executor_orphan_grace_timeout(),
+    )?;
+    let stderr = collect_stream_capture_output(
+        stderr_handle,
+        &stderr_live,
+        codex_executor_orphan_grace_timeout(),
+    )?;
+    Ok(TimedOutput {
+        output: std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+        timed_out,
+        stalled: false,
+        orphaned,
+        no_progress_paths: Vec::new(),
+        scaffold_only_paths: Vec::new(),
+        post_check_zero_progress_paths: Vec::new(),
+    })
 }
 
 fn run_patch_lane_command_with_timeout(
@@ -1978,6 +2007,35 @@ where
     spawn_stream_tee_with_live_capture(reader, path, progress, is_stdout, None)
 }
 
+fn spawn_stream_capture<R>(
+    mut reader: R,
+    progress: Arc<ProgressTracker>,
+    is_stdout: bool,
+    live_capture: Option<Arc<Mutex<Vec<u8>>>>,
+) -> thread::JoinHandle<Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut captured = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            captured.extend_from_slice(&buffer[..read]);
+            if let Some(live_capture) = live_capture.as_ref() {
+                if let Ok(mut live) = live_capture.lock() {
+                    live.extend_from_slice(&buffer[..read]);
+                }
+            }
+            progress.record(read as u64, is_stdout);
+        }
+        Ok(captured)
+    })
+}
+
 fn join_stream_tee(handle: thread::JoinHandle<Result<Vec<u8>>>) -> Result<Vec<u8>> {
     handle
         .join()
@@ -2000,6 +2058,26 @@ fn collect_stream_tee_output(
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
                 Err(err) => Err(err.into()),
             };
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn collect_stream_capture_output(
+    handle: thread::JoinHandle<Result<Vec<u8>>>,
+    live_capture: &Arc<Mutex<Vec<u8>>>,
+    grace_timeout: Duration,
+) -> Result<Vec<u8>> {
+    let start = Instant::now();
+    loop {
+        if handle.is_finished() {
+            return join_stream_tee(handle);
+        }
+        if start.elapsed() >= grace_timeout {
+            return Ok(live_capture
+                .lock()
+                .map(|bytes| bytes.clone())
+                .unwrap_or_default());
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -4382,6 +4460,26 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&output.output.stdout),
             "before-timeout"
+        );
+    }
+
+    #[test]
+    fn run_command_with_timeout_returns_without_waiting_for_detached_pipe_leak() {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-lc").arg(
+            "python3 - <<'PY'\nimport subprocess, sys\nsubprocess.Popen(['/bin/sh', '-lc', 'sleep 5'], stdout=sys.stdout, stderr=sys.stderr, close_fds=False, start_new_session=True)\nsys.stdout.write('parent-done')\nsys.stdout.flush()\nPY",
+        );
+
+        let start = Instant::now();
+        let output = run_command_with_timeout(&mut command, Duration::from_secs(5)).unwrap();
+
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(!output.timed_out);
+        assert!(!output.stalled);
+        assert!(output.orphaned);
+        assert_eq!(
+            String::from_utf8_lossy(&output.output.stdout),
+            "parent-done"
         );
     }
 
