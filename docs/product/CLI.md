@@ -61,6 +61,8 @@ That means:
 - the default happy path is goal-first and shell-first
 - `plot`, `cut`, and `gate` remain available, but are not the first thing a normal operator should need to think about
 - blocked autonomy should degrade to one explicit recovery path, not to pipeline archaeology
+- if the inner loop needs another opinion, the default path should be another model/provider or a bounded council step, not a user interruption
+- the user should only re-enter at a true terminal blocker or at the final result/review boundary
 
 ### Primitive vs mechanism rule
 
@@ -170,6 +172,7 @@ Current status behavior:
 - non-destructive hygiene should start with `punk gc stale --dry-run`, which reports `safe_to_archive` vs `manual_review` candidates without deleting or moving artifacts yet
 - normal shell flows may autonomously quarantine `safe_to_archive` stale runs into `.punk/archive/runs/<run-id>/` so the user does not have to participate in inner-loop ledger hygiene
 - autonomous stale-run quarantine must remain non-destructive: archive/move is allowed, hard delete is not
+- ambiguity that only requires another technical opinion should stay inside the loop and use internal model/provider escalation rather than surfacing as a user question
 
 Longer-term shell expectation:
 

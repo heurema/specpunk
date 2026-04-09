@@ -36,6 +36,34 @@ The critical rule is:
 
 > Keep the kernel stable. Let model integrations, skills, councils, and research protocols evolve at the edges.
 
+### Inner-loop second-opinion rule
+
+When the system needs a second opinion inside the autonomous loop, the default escalation target is:
+
+- another model
+- another provider
+- or a bounded structured council protocol
+
+It is **not** the user by default.
+
+The user should participate:
+
+- at goal intake
+- at final result or final blocker review
+
+but not as the routine tie-breaker for inner-loop uncertainty.
+
+This means:
+
+- model disagreement is an internal execution concern
+- selective cross-model/provider checks are a derived mechanism over the same primitives
+- user interruption should happen only when the system reaches a real terminal blocker, not when it merely wants another opinion
+
+Security exception:
+
+- sensitive decisions should remain single-model only when policy forbids sending the same material to multiple providers
+- in those cases, the system should degrade to a local blocked/escalated outcome rather than silently broadening provider exposure
+
 See also:
 
 - `docs/product/NORTH-ROADMAP.md`

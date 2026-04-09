@@ -78,6 +78,12 @@ Recommended order unless a production bug forces reprioritization:
 - Near-term focus: inspectable project harness packets, typed evidence paths for `gate` / `proof`, and stronger harness-linked recovery continuity in the work ledger.
 - Reference note: `docs/research/2026-04-08-specpunk-harness-engineering.md`.
 
+## Cross-cutting autonomy note
+
+- The intended operator model is: user at the first step, system inside the loop, user again at the last step.
+- If the loop needs a second technical opinion, the default escalation target should be another model/provider or a bounded council protocol, not the user.
+- Sensitive decisions still require single-model handling when multi-provider escalation would broaden data exposure beyond policy.
+
 ## Rules for future contributors
 
 - One bounded slice per session
