@@ -2176,7 +2176,7 @@ fn finalize_timeout_fallback_proposal(
 }
 
 fn timeout_seed_proposal(prompt: &str, scan: &punk_domain::RepoScanSummary) -> DraftProposal {
-    let greenfield_scaffold_scope = timeout_greenfield_rust_scaffold_scope(prompt, scan);
+    let greenfield_scaffold_scope = timeout_greenfield_scaffold_scope(prompt, scan);
     let entry_points: Vec<String> = if let Some((entry_points, _)) = &greenfield_scaffold_scope {
         entry_points.clone()
     } else if scan.candidate_entry_points.is_empty() {
@@ -2226,33 +2226,30 @@ fn timeout_seed_proposal(prompt: &str, scan: &punk_domain::RepoScanSummary) -> D
     }
 }
 
-fn timeout_greenfield_rust_scaffold_scope(
-    prompt: &str,
+fn timeout_greenfield_scaffold_scope(
+    _prompt: &str,
     scan: &punk_domain::RepoScanSummary,
 ) -> Option<(Vec<String>, Vec<String>)> {
-    if !prompt_requests_greenfield_rust_scaffold(prompt) {
-        return None;
-    }
-    if !scan
+    let manifest = scan
         .candidate_file_scope_paths
         .iter()
-        .any(|path| path == "Cargo.toml")
-    {
+        .find(|path| matches!(path.as_str(), "Cargo.toml" | "go.mod" | "pyproject.toml"))?
+        .clone();
+
+    let preferred_directories: &[&str] = match manifest.as_str() {
+        "Cargo.toml" => &["crates", "src", "tests"],
+        "go.mod" => &["cmd", "internal", "pkg"],
+        "pyproject.toml" => &["src", "tests"],
+        _ => &[],
+    };
+    if preferred_directories.is_empty() {
         return None;
     }
 
-    let mut entry_points = vec!["Cargo.toml".to_string()];
-    if scan
-        .candidate_entry_points
-        .iter()
-        .any(|path| path == "Cargo.toml")
-    {
-        entry_points = vec!["Cargo.toml".to_string()];
-    }
-
+    let entry_points = vec![manifest.clone()];
     let mut allowed_scope = entry_points.clone();
     for candidate in &scan.candidate_directory_scope_paths {
-        if matches!(candidate.as_str(), "crates" | "src" | "tests")
+        if preferred_directories.contains(&candidate.as_str())
             && !allowed_scope.iter().any(|existing| existing == candidate)
         {
             allowed_scope.push(candidate.clone());
@@ -2260,27 +2257,6 @@ fn timeout_greenfield_rust_scaffold_scope(
     }
 
     Some((entry_points, allowed_scope))
-}
-
-fn prompt_requests_greenfield_rust_scaffold(prompt: &str) -> bool {
-    let tokens = prompt
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .map(|token| token.trim().to_ascii_lowercase())
-        .filter(|token| token.len() >= 3)
-        .collect::<Vec<_>>();
-    let requests_rust = tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "rust" | "cargo" | "crate" | "crates" | "workspace"
-        )
-    });
-    let requests_scaffold = tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "scaffold" | "bootstrap" | "greenfield" | "init" | "initialize"
-        )
-    });
-    requests_rust && requests_scaffold
 }
 
 fn contract_to_proposal(feature: &Feature, contract: &Contract) -> DraftProposal {
@@ -2823,6 +2799,60 @@ mod tests {
                 expected_interfaces: vec!["initial Rust scaffold".into()],
                 behavior_requirements: vec!["allow first Rust goal after init".into()],
                 allowed_scope: vec!["Cargo.toml".into(), "src/lib.rs".into()],
+                target_checks: input.scan.candidate_target_checks,
+                integrity_checks: input.scan.candidate_integrity_checks,
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct GreenfieldGoDrafter;
+
+    impl ContractDrafter for GreenfieldGoDrafter {
+        fn name(&self) -> &'static str {
+            "greenfield-go-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "greenfield go intake".into(),
+                summary: input.prompt,
+                entry_points: vec!["go.mod".into(), "cmd/pubpunk/main.go".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["initial Go scaffold".into()],
+                behavior_requirements: vec!["allow first Go goal after init".into()],
+                allowed_scope: vec!["go.mod".into(), "cmd".into(), "internal".into()],
+                target_checks: input.scan.candidate_target_checks,
+                integrity_checks: input.scan.candidate_integrity_checks,
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct GreenfieldPythonDrafter;
+
+    impl ContractDrafter for GreenfieldPythonDrafter {
+        fn name(&self) -> &'static str {
+            "greenfield-python-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "greenfield python intake".into(),
+                summary: input.prompt,
+                entry_points: vec!["pyproject.toml".into(), "src/pubpunk/__init__.py".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["initial Python scaffold".into()],
+                behavior_requirements: vec!["allow first Python goal after init".into()],
+                allowed_scope: vec!["pyproject.toml".into(), "src".into(), "tests".into()],
                 target_checks: input.scan.candidate_target_checks,
                 integrity_checks: input.scan.candidate_integrity_checks,
                 risk_level: "low".into(),
@@ -3390,6 +3420,82 @@ mod tests {
     }
 
     #[test]
+    fn draft_contract_allows_bootstrapped_greenfield_go_repo_without_existing_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-go-intake-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &GreenfieldGoDrafter,
+                "scaffold Go module and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(contract.target_checks, vec!["go test ./...".to_string()]);
+        assert_eq!(contract.integrity_checks, vec!["go test ./...".to_string()]);
+        assert!(!contract.allowed_scope.is_empty());
+        assert!(!contract.entry_points.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_allows_bootstrapped_greenfield_python_repo_without_existing_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-python-intake-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &GreenfieldPythonDrafter,
+                "scaffold Python package and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(contract.target_checks, vec!["pytest".to_string()]);
+        assert_eq!(contract.integrity_checks, vec!["pytest".to_string()]);
+        assert!(!contract.allowed_scope.is_empty());
+        assert!(!contract.entry_points.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn draft_contract_timeout_fallback_prefers_greenfield_rust_scaffold_scope_over_docs() {
         let root = std::env::temp_dir().join(format!(
             "punk-orch-greenfield-rust-scope-timeout-{}",
@@ -3453,6 +3559,113 @@ mod tests {
             .allowed_scope
             .iter()
             .all(|path| !path.starts_with("docs/") && !path.starts_with("archive/")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_timeout_fallback_prefers_greenfield_go_scaffold_scope_over_docs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-go-scope-timeout-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/IMPLEMENTATION_PLAN.md"),
+            "scaffold go module and validate pubpunk init\n",
+        )
+        .unwrap();
+        fs::write(root.join("archive/pubpunk-docs.zip"), "zip placeholder\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &TimeoutDrafter,
+                "scaffold Go module and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(contract.entry_points, vec!["go.mod".to_string()]);
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "go.mod".to_string(),
+                "cmd".to_string(),
+                "internal".to_string(),
+                "pkg".to_string()
+            ]
+        );
+        assert_eq!(contract.target_checks, vec!["go test ./...".to_string()]);
+        assert_eq!(contract.integrity_checks, vec!["go test ./...".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_timeout_fallback_prefers_greenfield_python_scaffold_scope_over_docs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-python-scope-timeout-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/SPEC.md"),
+            "scaffold python package and validate pubpunk init\n",
+        )
+        .unwrap();
+        fs::write(root.join("archive/pubpunk-docs.zip"), "zip placeholder\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &TimeoutDrafter,
+                "scaffold Python package and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(contract.entry_points, vec!["pyproject.toml".to_string()]);
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "pyproject.toml".to_string(),
+                "src".to_string(),
+                "tests".to_string()
+            ]
+        );
+        assert_eq!(contract.target_checks, vec!["pytest".to_string()]);
+        assert_eq!(contract.integrity_checks, vec!["pytest".to_string()]);
 
         let _ = fs::remove_dir_all(&root);
     }

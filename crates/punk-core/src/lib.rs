@@ -14,7 +14,13 @@ struct ScopeCandidates {
     directories: Vec<String>,
 }
 
-struct GreenfieldRustScaffoldSeed {
+enum GreenfieldScaffoldKind {
+    Rust,
+    Go,
+    Python,
+}
+
+struct GreenfieldScaffoldSeed {
     entry_points: Vec<String>,
     file_scope_paths: Vec<String>,
     directory_scope_paths: Vec<String>,
@@ -60,6 +66,15 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
             &mut candidate_integrity_checks,
         );
         "node".to_string()
+    } else if repo_root.join("go.mod").exists() {
+        manifests.push("go.mod".to_string());
+        candidate_integrity_checks.extend(go_integrity_checks());
+        candidate_target_checks.extend(go_target_checks());
+        "go".to_string()
+    } else if let Some(python_manifest) = python_manifest(repo_root) {
+        manifests.push(python_manifest);
+        python_checks(&mut candidate_target_checks, &mut candidate_integrity_checks);
+        "python".to_string()
     } else {
         "generic".to_string()
     };
@@ -81,21 +96,17 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
         }
     }
 
-    if candidate_integrity_checks.is_empty()
-        && repo_has_bootstrap_markers(repo_root)
-        && prompt_explicitly_requests_greenfield_rust_scaffold(&tokens)
-    {
-        let bootstrap_check = if tokens.iter().any(|token| token == "workspace") {
-            "cargo test --workspace".to_string()
-        } else {
-            "cargo test".to_string()
-        };
-        candidate_target_checks.push(bootstrap_check.clone());
-        candidate_integrity_checks.push(bootstrap_check);
-        notes.push(
-            "inferred initial Rust bootstrap checks from bootstrapped greenfield prompt"
-                .to_string(),
-        );
+    let greenfield_scaffold_kind = greenfield_scaffold_kind(repo_root, &tokens);
+    if candidate_integrity_checks.is_empty() {
+        if let Some(scaffold_kind) = &greenfield_scaffold_kind {
+            let bootstrap_check = greenfield_bootstrap_check(scaffold_kind, &tokens);
+            candidate_target_checks.push(bootstrap_check.clone());
+            candidate_integrity_checks.push(bootstrap_check);
+            notes.push(format!(
+                "inferred initial {} bootstrap checks from bootstrapped greenfield prompt",
+                greenfield_scaffold_kind_label(scaffold_kind)
+            ));
+        }
     }
 
     dedupe(&mut candidate_integrity_checks);
@@ -105,7 +116,9 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
         notes.push("no trustworthy integrity checks inferred".to_string());
     }
 
-    let greenfield_scaffold_seed = greenfield_rust_scaffold_seed(repo_root, &tokens);
+    let greenfield_scaffold_seed = greenfield_scaffold_kind
+        .as_ref()
+        .map(|kind| greenfield_scaffold_seed(kind, &tokens));
 
     let mut scope_candidates = collect_scope_candidates(repo_root, prompt)?;
     if let Some(seed) = &greenfield_scaffold_seed {
@@ -115,10 +128,12 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
             &seed.directory_scope_paths,
             20,
         );
-        notes.push(
-            "preferring scaffoldable Rust/workspace scope candidates from bootstrapped greenfield prompt"
-                .to_string(),
-        );
+        if let Some(scaffold_kind) = &greenfield_scaffold_kind {
+            notes.push(format!(
+                "preferring scaffoldable {} scope candidates from bootstrapped greenfield prompt",
+                greenfield_scaffold_kind_label(scaffold_kind)
+            ));
+        }
     }
 
     let mut candidate_entry_points = infer_entry_points(repo_root, prompt, &scope_candidates.files);
@@ -542,6 +557,28 @@ fn repo_has_bootstrap_markers(repo_root: &Path) -> bool {
     repo_root.join(".punk/AGENT_START.md").exists() && has_bootstrap_doc
 }
 
+fn python_manifest(repo_root: &Path) -> Option<String> {
+    for candidate in ["pyproject.toml", "pytest.ini", "requirements.txt"] {
+        if repo_root.join(candidate).exists() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn go_target_checks() -> Vec<String> {
+    vec!["go test ./...".to_string()]
+}
+
+fn go_integrity_checks() -> Vec<String> {
+    vec!["go test ./...".to_string()]
+}
+
+fn python_checks(target: &mut Vec<String>, integrity: &mut Vec<String>) {
+    target.push("pytest".to_string());
+    integrity.push("pytest".to_string());
+}
+
 fn prompt_explicitly_requests_greenfield_rust_scaffold(tokens: &[String]) -> bool {
     let requests_rust = tokens.iter().any(|token| {
         matches!(
@@ -558,37 +595,122 @@ fn prompt_explicitly_requests_greenfield_rust_scaffold(tokens: &[String]) -> boo
     requests_rust && requests_scaffold
 }
 
-fn greenfield_rust_scaffold_seed(
+fn prompt_explicitly_requests_greenfield_go_scaffold(tokens: &[String]) -> bool {
+    let requests_go = tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "go" | "golang" | "module"));
+    let requests_scaffold = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "scaffold" | "bootstrap" | "greenfield" | "init" | "initialize"
+        )
+    });
+    requests_go && requests_scaffold
+}
+
+fn prompt_explicitly_requests_greenfield_python_scaffold(tokens: &[String]) -> bool {
+    let requests_python = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "python" | "pytest" | "pyproject" | "package"
+        )
+    });
+    let requests_scaffold = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "scaffold" | "bootstrap" | "greenfield" | "init" | "initialize"
+        )
+    });
+    requests_python && requests_scaffold
+}
+
+fn greenfield_scaffold_kind(
     repo_root: &Path,
     tokens: &[String],
-) -> Option<GreenfieldRustScaffoldSeed> {
-    if repo_root.join("Cargo.toml").exists()
-        || !repo_has_bootstrap_markers(repo_root)
-        || !prompt_explicitly_requests_greenfield_rust_scaffold(tokens)
-    {
+) -> Option<GreenfieldScaffoldKind> {
+    if !repo_has_bootstrap_markers(repo_root) {
         return None;
     }
-
-    let prefers_workspace_layout = tokens
-        .iter()
-        .any(|token| matches!(token.as_str(), "workspace" | "crates"));
-    let mut directory_scope_paths = if prefers_workspace_layout {
-        vec!["crates".to_string()]
-    } else {
-        vec!["src".to_string()]
-    };
-    if tokens
-        .iter()
-        .any(|token| matches!(token.as_str(), "validate" | "validation" | "test" | "tests"))
+    if !repo_root.join("Cargo.toml").exists()
+        && prompt_explicitly_requests_greenfield_rust_scaffold(tokens)
     {
-        directory_scope_paths.push("tests".to_string());
+        return Some(GreenfieldScaffoldKind::Rust);
     }
+    if !repo_root.join("go.mod").exists() && prompt_explicitly_requests_greenfield_go_scaffold(tokens)
+    {
+        return Some(GreenfieldScaffoldKind::Go);
+    }
+    if python_manifest(repo_root).is_none()
+        && prompt_explicitly_requests_greenfield_python_scaffold(tokens)
+    {
+        return Some(GreenfieldScaffoldKind::Python);
+    }
+    None
+}
 
-    Some(GreenfieldRustScaffoldSeed {
-        entry_points: vec!["Cargo.toml".to_string()],
-        file_scope_paths: vec!["Cargo.toml".to_string()],
-        directory_scope_paths,
-    })
+fn greenfield_bootstrap_check(kind: &GreenfieldScaffoldKind, tokens: &[String]) -> String {
+    match kind {
+        GreenfieldScaffoldKind::Rust => {
+            if tokens.iter().any(|token| token == "workspace") {
+                "cargo test --workspace".to_string()
+            } else {
+                "cargo test".to_string()
+            }
+        }
+        GreenfieldScaffoldKind::Go => "go test ./...".to_string(),
+        GreenfieldScaffoldKind::Python => "pytest".to_string(),
+    }
+}
+
+fn greenfield_scaffold_kind_label(kind: &GreenfieldScaffoldKind) -> &'static str {
+    match kind {
+        GreenfieldScaffoldKind::Rust => "Rust",
+        GreenfieldScaffoldKind::Go => "Go",
+        GreenfieldScaffoldKind::Python => "Python",
+    }
+}
+
+fn greenfield_scaffold_seed(
+    kind: &GreenfieldScaffoldKind,
+    tokens: &[String],
+) -> GreenfieldScaffoldSeed {
+    match kind {
+        GreenfieldScaffoldKind::Rust => {
+            let prefers_workspace_layout = tokens
+                .iter()
+                .any(|token| matches!(token.as_str(), "workspace" | "crates"));
+            let mut directory_scope_paths = if prefers_workspace_layout {
+                vec!["crates".to_string()]
+            } else {
+                vec!["src".to_string()]
+            };
+            if tokens
+                .iter()
+                .any(|token| matches!(token.as_str(), "validate" | "validation" | "test" | "tests"))
+            {
+                directory_scope_paths.push("tests".to_string());
+            }
+            GreenfieldScaffoldSeed {
+                entry_points: vec!["Cargo.toml".to_string()],
+                file_scope_paths: vec!["Cargo.toml".to_string()],
+                directory_scope_paths,
+            }
+        }
+        GreenfieldScaffoldKind::Go => GreenfieldScaffoldSeed {
+            entry_points: vec!["go.mod".to_string()],
+            file_scope_paths: vec!["go.mod".to_string()],
+            directory_scope_paths: vec![
+                "cmd".to_string(),
+                "internal".to_string(),
+                "pkg".to_string(),
+            ],
+        },
+        GreenfieldScaffoldKind::Python => GreenfieldScaffoldSeed {
+            entry_points: vec!["pyproject.toml".to_string()],
+            file_scope_paths: vec!["pyproject.toml".to_string()],
+            directory_scope_paths: vec!["src".to_string(), "tests".to_string()],
+        },
+    }
 }
 
 fn prepend_preferred_candidates(existing: &mut Vec<String>, preferred: &[String], limit: usize) {
@@ -2693,7 +2815,7 @@ mod tests {
             .iter()
             .any(|path| path == "tests"));
         assert!(summary.notes.iter().any(|note| {
-            note.contains("preferring scaffoldable Rust/workspace scope candidates")
+            note.contains("preferring scaffoldable Rust scope candidates")
         }));
 
         let _ = fs::remove_dir_all(&root);
@@ -2717,6 +2839,104 @@ mod tests {
         let summary = scan_repo(&root, "write launch copy for landing page").unwrap();
         assert!(summary.candidate_target_checks.is_empty());
         assert!(summary.candidate_integrity_checks.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_greenfield_go_prompt_infers_initial_checks_and_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-go-bootstrap-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(
+            root.join("docs/IMPLEMENTATION_PLAN.md"),
+            "scaffold go module and validate pubpunk init\n",
+        )
+        .unwrap();
+
+        let summary = scan_repo(&root, "scaffold Go module and implement pubpunk init + validate")
+            .unwrap();
+        assert_eq!(summary.candidate_target_checks, vec!["go test ./...".to_string()]);
+        assert_eq!(
+            summary.candidate_integrity_checks,
+            vec!["go test ./...".to_string()]
+        );
+        assert_eq!(
+            summary.candidate_entry_points.first().map(String::as_str),
+            Some("go.mod")
+        );
+        assert_eq!(
+            summary.candidate_file_scope_paths.first().map(String::as_str),
+            Some("go.mod")
+        );
+        assert_eq!(
+            summary
+                .candidate_directory_scope_paths
+                .first()
+                .map(String::as_str),
+            Some("cmd")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_greenfield_python_prompt_infers_initial_checks_and_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-python-bootstrap-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(
+            root.join("docs/SPEC.md"),
+            "scaffold python package and validate pubpunk init\n",
+        )
+        .unwrap();
+
+        let summary = scan_repo(
+            &root,
+            "scaffold Python package and implement pubpunk init + validate",
+        )
+        .unwrap();
+        assert_eq!(summary.candidate_target_checks, vec!["pytest".to_string()]);
+        assert_eq!(summary.candidate_integrity_checks, vec!["pytest".to_string()]);
+        assert_eq!(
+            summary.candidate_entry_points.first().map(String::as_str),
+            Some("pyproject.toml")
+        );
+        assert_eq!(
+            summary.candidate_file_scope_paths.first().map(String::as_str),
+            Some("pyproject.toml")
+        );
+        assert_eq!(
+            summary
+                .candidate_directory_scope_paths
+                .first()
+                .map(String::as_str),
+            Some("src")
+        );
+        assert!(summary
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "tests"));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -308,6 +308,8 @@ Preflight expectation:
 - return one explicit recovery path instead of a downstream adapter or scan error
 - recovery should point to `git init`, then `punk init --project <id> --enable-jj --verify`, then retry the original `punk go ...`
 - for a bootstrapped greenfield Rust repo with no existing inferred checks yet, a goal that explicitly asks to scaffold Rust (`rust`, `cargo`, `crate`, or `workspace` + `scaffold`/`init`/`bootstrap`) may derive an initial `cargo test` or `cargo test --workspace` intake check instead of failing at repo scan
+- for a bootstrapped greenfield Go repo with no existing inferred checks yet, an explicit Go scaffold goal may derive `go test ./...` plus scaffoldable scope around `go.mod`, `cmd`, `internal`, and `pkg`
+- for a bootstrapped greenfield Python repo with no existing inferred checks yet, an explicit Python scaffold goal may derive `pytest` plus scaffoldable scope around `pyproject.toml`, `src`, and `tests`
 - that same greenfield Rust scaffold intake should prefer scaffoldable Rust/workspace surfaces like `Cargo.toml`, `crates`, and `tests` over existing docs/archive files when synthesizing initial scope candidates
 
 ### `punk start "<goal>"`
@@ -320,6 +322,8 @@ Preflight expectation:
 - do not defer this to a later drafter or repo-scan failure
 - return one explicit recovery path: `git init`, then `punk init --project <id> --enable-jj --verify`, then retry `punk start "<goal>"`
 - for a bootstrapped greenfield Rust repo with no existing inferred checks yet, an explicit Rust scaffold goal may derive an initial `cargo test` or `cargo test --workspace` intake check instead of failing at repo scan
+- for a bootstrapped greenfield Go repo with no existing inferred checks yet, an explicit Go scaffold goal may derive `go test ./...` and scaffoldable Go scope instead of failing at repo scan
+- for a bootstrapped greenfield Python repo with no existing inferred checks yet, an explicit Python scaffold goal may derive `pytest` and scaffoldable Python scope instead of failing at repo scan
 - that same greenfield Rust scaffold draft should route scope toward scaffoldable Rust/workspace surfaces instead of existing docs/archive paths
 
 Creates:
@@ -331,6 +335,7 @@ Timeout expectation:
 
 - if the contract drafter times out, `punk start` should attempt one deterministic bounded fallback derived from the repo scan and explicit prompt details before returning an error
 - for a bootstrapped greenfield Rust scaffold goal, timeout fallback should preserve scaffoldable Rust/workspace scope (`Cargo.toml`, `crates`, optional `tests`) instead of collapsing into docs/archive candidates
+- for bootstrapped greenfield Go and Python scaffold goals, timeout fallback should preserve their manifest-first scaffold scope (`go.mod`/`pyproject.toml` plus ecosystem directories) instead of collapsing into docs/archive candidates
 - non-timeout drafter failures should still fail closed
 
 Writes:
