@@ -2233,13 +2233,23 @@ fn timeout_greenfield_scaffold_scope(
     let manifest = scan
         .candidate_file_scope_paths
         .iter()
-        .find(|path| matches!(path.as_str(), "Cargo.toml" | "go.mod" | "pyproject.toml"))?
+        .find(|path| {
+            matches!(
+                path.as_str(),
+                "Cargo.toml" | "go.mod" | "pyproject.toml" | "package.json"
+            )
+        })?
         .clone();
 
     let preferred_directories: &[&str] = match manifest.as_str() {
         "Cargo.toml" => &["crates", "src", "tests"],
         "go.mod" => &["cmd", "internal", "pkg"],
         "pyproject.toml" => &["src", "tests"],
+        "package.json" => &["packages", "apps", "src", "tests"],
+        _ => &[],
+    };
+    let preferred_files: &[&str] = match manifest.as_str() {
+        "package.json" => &["tsconfig.json"],
         _ => &[],
     };
     if preferred_directories.is_empty() {
@@ -2248,6 +2258,13 @@ fn timeout_greenfield_scaffold_scope(
 
     let entry_points = vec![manifest.clone()];
     let mut allowed_scope = entry_points.clone();
+    for candidate in &scan.candidate_file_scope_paths {
+        if preferred_files.contains(&candidate.as_str())
+            && !allowed_scope.iter().any(|existing| existing == candidate)
+        {
+            allowed_scope.push(candidate.clone());
+        }
+    }
     for candidate in &scan.candidate_directory_scope_paths {
         if preferred_directories.contains(&candidate.as_str())
             && !allowed_scope.iter().any(|existing| existing == candidate)
@@ -2853,6 +2870,38 @@ mod tests {
                 expected_interfaces: vec!["initial Python scaffold".into()],
                 behavior_requirements: vec!["allow first Python goal after init".into()],
                 allowed_scope: vec!["pyproject.toml".into(), "src".into(), "tests".into()],
+                target_checks: input.scan.candidate_target_checks,
+                integrity_checks: input.scan.candidate_integrity_checks,
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct GreenfieldNodeDrafter;
+
+    impl ContractDrafter for GreenfieldNodeDrafter {
+        fn name(&self) -> &'static str {
+            "greenfield-node-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "greenfield node intake".into(),
+                summary: input.prompt,
+                entry_points: vec!["package.json".into(), "src/index.ts".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["initial TypeScript/Node scaffold".into()],
+                behavior_requirements: vec!["allow first TypeScript/Node goal after init".into()],
+                allowed_scope: vec![
+                    "package.json".into(),
+                    "tsconfig.json".into(),
+                    "src".into(),
+                    "tests".into(),
+                ],
                 target_checks: input.scan.candidate_target_checks,
                 integrity_checks: input.scan.candidate_integrity_checks,
                 risk_level: "low".into(),
@@ -3496,6 +3545,44 @@ mod tests {
     }
 
     #[test]
+    fn draft_contract_allows_bootstrapped_greenfield_node_repo_without_existing_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-node-intake-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &GreenfieldNodeDrafter,
+                "scaffold TypeScript package and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(contract.target_checks, vec!["npm test".to_string()]);
+        assert_eq!(contract.integrity_checks, vec!["npm test".to_string()]);
+        assert!(!contract.allowed_scope.is_empty());
+        assert!(!contract.entry_points.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn draft_contract_timeout_fallback_prefers_greenfield_rust_scaffold_scope_over_docs() {
         let root = std::env::temp_dir().join(format!(
             "punk-orch-greenfield-rust-scope-timeout-{}",
@@ -3666,6 +3753,64 @@ mod tests {
         );
         assert_eq!(contract.target_checks, vec!["pytest".to_string()]);
         assert_eq!(contract.integrity_checks, vec!["pytest".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_timeout_fallback_prefers_greenfield_node_scaffold_scope_over_docs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-node-scope-timeout-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/SPEC.md"),
+            "scaffold TypeScript package and validate pubpunk init\n",
+        )
+        .unwrap();
+        fs::write(root.join("archive/pubpunk-docs.zip"), "zip placeholder\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &TimeoutDrafter,
+                "scaffold TypeScript package and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(contract.entry_points, vec!["package.json".to_string()]);
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "package.json".to_string(),
+                "tsconfig.json".to_string(),
+                "src".to_string(),
+                "tests".to_string()
+            ]
+        );
+        assert_eq!(contract.target_checks, vec!["npm test".to_string()]);
+        assert_eq!(contract.integrity_checks, vec!["npm test".to_string()]);
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .all(|path| !path.starts_with("docs/") && !path.starts_with("archive/")));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -18,6 +18,7 @@ enum GreenfieldScaffoldKind {
     Rust,
     Go,
     Python,
+    Node,
 }
 
 struct GreenfieldScaffoldSeed {
@@ -73,7 +74,10 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
         "go".to_string()
     } else if let Some(python_manifest) = python_manifest(repo_root) {
         manifests.push(python_manifest);
-        python_checks(&mut candidate_target_checks, &mut candidate_integrity_checks);
+        python_checks(
+            &mut candidate_target_checks,
+            &mut candidate_integrity_checks,
+        );
         "python".to_string()
     } else {
         "generic".to_string()
@@ -609,12 +613,9 @@ fn prompt_explicitly_requests_greenfield_go_scaffold(tokens: &[String]) -> bool 
 }
 
 fn prompt_explicitly_requests_greenfield_python_scaffold(tokens: &[String]) -> bool {
-    let requests_python = tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "python" | "pytest" | "pyproject" | "package"
-        )
-    });
+    let requests_python = tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "python" | "pytest" | "pyproject" | "poetry"));
     let requests_scaffold = tokens.iter().any(|token| {
         matches!(
             token.as_str(),
@@ -624,10 +625,31 @@ fn prompt_explicitly_requests_greenfield_python_scaffold(tokens: &[String]) -> b
     requests_python && requests_scaffold
 }
 
-fn greenfield_scaffold_kind(
-    repo_root: &Path,
-    tokens: &[String],
-) -> Option<GreenfieldScaffoldKind> {
+fn prompt_explicitly_requests_greenfield_node_scaffold(tokens: &[String]) -> bool {
+    let requests_node = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "typescript"
+                | "javascript"
+                | "node"
+                | "npm"
+                | "pnpm"
+                | "yarn"
+                | "tsconfig"
+                | "tsx"
+                | "vite"
+        )
+    });
+    let requests_scaffold = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "scaffold" | "bootstrap" | "greenfield" | "init" | "initialize"
+        )
+    });
+    requests_node && requests_scaffold
+}
+
+fn greenfield_scaffold_kind(repo_root: &Path, tokens: &[String]) -> Option<GreenfieldScaffoldKind> {
     if !repo_has_bootstrap_markers(repo_root) {
         return None;
     }
@@ -636,7 +658,8 @@ fn greenfield_scaffold_kind(
     {
         return Some(GreenfieldScaffoldKind::Rust);
     }
-    if !repo_root.join("go.mod").exists() && prompt_explicitly_requests_greenfield_go_scaffold(tokens)
+    if !repo_root.join("go.mod").exists()
+        && prompt_explicitly_requests_greenfield_go_scaffold(tokens)
     {
         return Some(GreenfieldScaffoldKind::Go);
     }
@@ -644,6 +667,11 @@ fn greenfield_scaffold_kind(
         && prompt_explicitly_requests_greenfield_python_scaffold(tokens)
     {
         return Some(GreenfieldScaffoldKind::Python);
+    }
+    if !repo_root.join("package.json").exists()
+        && prompt_explicitly_requests_greenfield_node_scaffold(tokens)
+    {
+        return Some(GreenfieldScaffoldKind::Node);
     }
     None
 }
@@ -659,6 +687,7 @@ fn greenfield_bootstrap_check(kind: &GreenfieldScaffoldKind, tokens: &[String]) 
         }
         GreenfieldScaffoldKind::Go => "go test ./...".to_string(),
         GreenfieldScaffoldKind::Python => "pytest".to_string(),
+        GreenfieldScaffoldKind::Node => "npm test".to_string(),
     }
 }
 
@@ -667,6 +696,7 @@ fn greenfield_scaffold_kind_label(kind: &GreenfieldScaffoldKind) -> &'static str
         GreenfieldScaffoldKind::Rust => "Rust",
         GreenfieldScaffoldKind::Go => "Go",
         GreenfieldScaffoldKind::Python => "Python",
+        GreenfieldScaffoldKind::Node => "TypeScript/Node",
     }
 }
 
@@ -710,6 +740,39 @@ fn greenfield_scaffold_seed(
             file_scope_paths: vec!["pyproject.toml".to_string()],
             directory_scope_paths: vec!["src".to_string(), "tests".to_string()],
         },
+        GreenfieldScaffoldKind::Node => {
+            let prefers_workspace_layout = tokens.iter().any(|token| {
+                matches!(
+                    token.as_str(),
+                    "workspace" | "workspaces" | "monorepo" | "packages" | "apps"
+                )
+            });
+            let prefers_typescript = tokens
+                .iter()
+                .any(|token| matches!(token.as_str(), "typescript" | "tsconfig" | "tsx" | "vite"));
+            let mut file_scope_paths = vec!["package.json".to_string()];
+            if prefers_typescript {
+                file_scope_paths.push("tsconfig.json".to_string());
+            }
+            let mut directory_scope_paths = if prefers_workspace_layout {
+                vec!["packages".to_string(), "apps".to_string()]
+            } else {
+                vec!["src".to_string()]
+            };
+            if tokens.iter().any(|token| {
+                matches!(
+                    token.as_str(),
+                    "validate" | "validation" | "test" | "tests" | "check"
+                )
+            }) {
+                directory_scope_paths.push("tests".to_string());
+            }
+            GreenfieldScaffoldSeed {
+                entry_points: vec!["package.json".to_string()],
+                file_scope_paths,
+                directory_scope_paths,
+            }
+        }
     }
 }
 
@@ -2800,7 +2863,10 @@ mod tests {
             Some("Cargo.toml")
         );
         assert_eq!(
-            summary.candidate_file_scope_paths.first().map(String::as_str),
+            summary
+                .candidate_file_scope_paths
+                .first()
+                .map(String::as_str),
             Some("Cargo.toml")
         );
         assert_eq!(
@@ -2814,9 +2880,10 @@ mod tests {
             .candidate_directory_scope_paths
             .iter()
             .any(|path| path == "tests"));
-        assert!(summary.notes.iter().any(|note| {
-            note.contains("preferring scaffoldable Rust scope candidates")
-        }));
+        assert!(summary
+            .notes
+            .iter()
+            .any(|note| { note.contains("preferring scaffoldable Rust scope candidates") }));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2864,9 +2931,15 @@ mod tests {
         )
         .unwrap();
 
-        let summary = scan_repo(&root, "scaffold Go module and implement pubpunk init + validate")
-            .unwrap();
-        assert_eq!(summary.candidate_target_checks, vec!["go test ./...".to_string()]);
+        let summary = scan_repo(
+            &root,
+            "scaffold Go module and implement pubpunk init + validate",
+        )
+        .unwrap();
+        assert_eq!(
+            summary.candidate_target_checks,
+            vec!["go test ./...".to_string()]
+        );
         assert_eq!(
             summary.candidate_integrity_checks,
             vec!["go test ./...".to_string()]
@@ -2876,7 +2949,10 @@ mod tests {
             Some("go.mod")
         );
         assert_eq!(
-            summary.candidate_file_scope_paths.first().map(String::as_str),
+            summary
+                .candidate_file_scope_paths
+                .first()
+                .map(String::as_str),
             Some("go.mod")
         );
         assert_eq!(
@@ -2917,15 +2993,85 @@ mod tests {
         )
         .unwrap();
         assert_eq!(summary.candidate_target_checks, vec!["pytest".to_string()]);
-        assert_eq!(summary.candidate_integrity_checks, vec!["pytest".to_string()]);
+        assert_eq!(
+            summary.candidate_integrity_checks,
+            vec!["pytest".to_string()]
+        );
         assert_eq!(
             summary.candidate_entry_points.first().map(String::as_str),
             Some("pyproject.toml")
         );
         assert_eq!(
-            summary.candidate_file_scope_paths.first().map(String::as_str),
+            summary
+                .candidate_file_scope_paths
+                .first()
+                .map(String::as_str),
             Some("pyproject.toml")
         );
+        assert_eq!(
+            summary
+                .candidate_directory_scope_paths
+                .first()
+                .map(String::as_str),
+            Some("src")
+        );
+        assert!(summary
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "tests"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_greenfield_node_prompt_infers_initial_checks_and_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-node-bootstrap-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(
+            root.join("docs/SPEC.md"),
+            "scaffold TypeScript package and validate pubpunk init\n",
+        )
+        .unwrap();
+
+        let summary = scan_repo(
+            &root,
+            "scaffold TypeScript package and implement pubpunk init + validate",
+        )
+        .unwrap();
+        assert_eq!(
+            summary.candidate_target_checks,
+            vec!["npm test".to_string()]
+        );
+        assert_eq!(
+            summary.candidate_integrity_checks,
+            vec!["npm test".to_string()]
+        );
+        assert_eq!(
+            summary.candidate_entry_points.first().map(String::as_str),
+            Some("package.json")
+        );
+        assert_eq!(
+            summary
+                .candidate_file_scope_paths
+                .first()
+                .map(String::as_str),
+            Some("package.json")
+        );
+        assert!(summary
+            .candidate_file_scope_paths
+            .iter()
+            .any(|path| path == "tsconfig.json"));
         assert_eq!(
             summary
                 .candidate_directory_scope_paths
