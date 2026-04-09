@@ -2176,7 +2176,10 @@ fn finalize_timeout_fallback_proposal(
 }
 
 fn timeout_seed_proposal(prompt: &str, scan: &punk_domain::RepoScanSummary) -> DraftProposal {
-    let entry_points: Vec<String> = if scan.candidate_entry_points.is_empty() {
+    let greenfield_scaffold_scope = timeout_greenfield_rust_scaffold_scope(prompt, scan);
+    let entry_points: Vec<String> = if let Some((entry_points, _)) = &greenfield_scaffold_scope {
+        entry_points.clone()
+    } else if scan.candidate_entry_points.is_empty() {
         scan.candidate_file_scope_paths
             .iter()
             .take(2)
@@ -2189,7 +2192,9 @@ fn timeout_seed_proposal(prompt: &str, scan: &punk_domain::RepoScanSummary) -> D
             .cloned()
             .collect()
     };
-    let allowed_scope: Vec<String> = if scan.candidate_file_scope_paths.is_empty() {
+    let allowed_scope: Vec<String> = if let Some((_, allowed_scope)) = greenfield_scaffold_scope {
+        allowed_scope
+    } else if scan.candidate_file_scope_paths.is_empty() {
         entry_points.clone()
     } else {
         scan.candidate_file_scope_paths
@@ -2219,6 +2224,63 @@ fn timeout_seed_proposal(prompt: &str, scan: &punk_domain::RepoScanSummary) -> D
         integrity_checks: scan.candidate_integrity_checks.clone(),
         risk_level: "medium".to_string(),
     }
+}
+
+fn timeout_greenfield_rust_scaffold_scope(
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+) -> Option<(Vec<String>, Vec<String>)> {
+    if !prompt_requests_greenfield_rust_scaffold(prompt) {
+        return None;
+    }
+    if !scan
+        .candidate_file_scope_paths
+        .iter()
+        .any(|path| path == "Cargo.toml")
+    {
+        return None;
+    }
+
+    let mut entry_points = vec!["Cargo.toml".to_string()];
+    if scan
+        .candidate_entry_points
+        .iter()
+        .any(|path| path == "Cargo.toml")
+    {
+        entry_points = vec!["Cargo.toml".to_string()];
+    }
+
+    let mut allowed_scope = entry_points.clone();
+    for candidate in &scan.candidate_directory_scope_paths {
+        if matches!(candidate.as_str(), "crates" | "src" | "tests")
+            && !allowed_scope.iter().any(|existing| existing == candidate)
+        {
+            allowed_scope.push(candidate.clone());
+        }
+    }
+
+    Some((entry_points, allowed_scope))
+}
+
+fn prompt_requests_greenfield_rust_scaffold(prompt: &str) -> bool {
+    let tokens = prompt
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| token.len() >= 3)
+        .collect::<Vec<_>>();
+    let requests_rust = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "rust" | "cargo" | "crate" | "crates" | "workspace"
+        )
+    });
+    let requests_scaffold = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "scaffold" | "bootstrap" | "greenfield" | "init" | "initialize"
+        )
+    });
+    requests_rust && requests_scaffold
 }
 
 fn contract_to_proposal(feature: &Feature, contract: &Contract) -> DraftProposal {
@@ -3323,6 +3385,74 @@ mod tests {
         );
         assert!(!contract.allowed_scope.is_empty());
         assert!(!contract.entry_points.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_timeout_fallback_prefers_greenfield_rust_scaffold_scope_over_docs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-rust-scope-timeout-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/PUBPUNK_DEVELOPMENT_HANDOFF.md"),
+            "scaffold Rust workspace and implement pubpunk init + validate\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/IMPLEMENTATION_PLAN.md"),
+            "workspace scaffold validate init plan\n",
+        )
+        .unwrap();
+        fs::write(root.join("archive/pubpunk-docs.zip"), "zip placeholder\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &TimeoutDrafter,
+                "scaffold Rust workspace and implement pubpunk init + validate via go",
+            )
+            .unwrap();
+
+        assert_eq!(contract.entry_points, vec!["Cargo.toml".to_string()]);
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "Cargo.toml".to_string(),
+                "crates".to_string(),
+                "tests".to_string()
+            ]
+        );
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .all(|path| !path.starts_with("docs/") && !path.starts_with("archive/")));
 
         let _ = fs::remove_dir_all(&root);
     }

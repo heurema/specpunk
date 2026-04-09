@@ -14,6 +14,12 @@ struct ScopeCandidates {
     directories: Vec<String>,
 }
 
+struct GreenfieldRustScaffoldSeed {
+    entry_points: Vec<String>,
+    file_scope_paths: Vec<String>,
+    directory_scope_paths: Vec<String>,
+}
+
 fn is_swiftpm_build_path(path: &Path) -> bool {
     path.components()
         .any(|component| matches!(component, Component::Normal(name) if name == ".build"))
@@ -99,8 +105,26 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
         notes.push("no trustworthy integrity checks inferred".to_string());
     }
 
-    let scope_candidates = collect_scope_candidates(repo_root, prompt)?;
-    let candidate_entry_points = infer_entry_points(repo_root, prompt, &scope_candidates.files);
+    let greenfield_scaffold_seed = greenfield_rust_scaffold_seed(repo_root, &tokens);
+
+    let mut scope_candidates = collect_scope_candidates(repo_root, prompt)?;
+    if let Some(seed) = &greenfield_scaffold_seed {
+        prepend_preferred_candidates(&mut scope_candidates.files, &seed.file_scope_paths, 20);
+        prepend_preferred_candidates(
+            &mut scope_candidates.directories,
+            &seed.directory_scope_paths,
+            20,
+        );
+        notes.push(
+            "preferring scaffoldable Rust/workspace scope candidates from bootstrapped greenfield prompt"
+                .to_string(),
+        );
+    }
+
+    let mut candidate_entry_points = infer_entry_points(repo_root, prompt, &scope_candidates.files);
+    if let Some(seed) = &greenfield_scaffold_seed {
+        prepend_preferred_candidates(&mut candidate_entry_points, &seed.entry_points, 10);
+    }
     let candidate_scope_paths = combined_scope_candidates(&scope_candidates);
 
     Ok(RepoScanSummary {
@@ -532,6 +556,49 @@ fn prompt_explicitly_requests_greenfield_rust_scaffold(tokens: &[String]) -> boo
         )
     });
     requests_rust && requests_scaffold
+}
+
+fn greenfield_rust_scaffold_seed(
+    repo_root: &Path,
+    tokens: &[String],
+) -> Option<GreenfieldRustScaffoldSeed> {
+    if repo_root.join("Cargo.toml").exists()
+        || !repo_has_bootstrap_markers(repo_root)
+        || !prompt_explicitly_requests_greenfield_rust_scaffold(tokens)
+    {
+        return None;
+    }
+
+    let prefers_workspace_layout = tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "workspace" | "crates"));
+    let mut directory_scope_paths = if prefers_workspace_layout {
+        vec!["crates".to_string()]
+    } else {
+        vec!["src".to_string()]
+    };
+    if tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "validate" | "validation" | "test" | "tests"))
+    {
+        directory_scope_paths.push("tests".to_string());
+    }
+
+    Some(GreenfieldRustScaffoldSeed {
+        entry_points: vec!["Cargo.toml".to_string()],
+        file_scope_paths: vec!["Cargo.toml".to_string()],
+        directory_scope_paths,
+    })
+}
+
+fn prepend_preferred_candidates(existing: &mut Vec<String>, preferred: &[String], limit: usize) {
+    let mut merged = preferred.to_vec();
+    for candidate in existing.drain(..) {
+        if !merged.iter().any(|existing| existing == &candidate) {
+            merged.push(candidate);
+        }
+    }
+    *existing = merged.into_iter().take(limit).collect();
 }
 
 fn infer_entry_points(repo_root: &Path, prompt: &str, candidates: &[String]) -> Vec<String> {
@@ -2569,6 +2636,65 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("inferred initial Rust bootstrap checks")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_greenfield_rust_prompt_prefers_scaffoldable_scope_candidates_over_docs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-rust-scope-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/PUBPUNK_DEVELOPMENT_HANDOFF.md"),
+            "scaffold Rust workspace and implement pubpunk init + validate\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/IMPLEMENTATION_PLAN.md"),
+            "workspace scaffold validate init plan\n",
+        )
+        .unwrap();
+        fs::write(root.join("archive/pubpunk-docs.zip"), "zip placeholder\n").unwrap();
+
+        let summary = scan_repo(
+            &root,
+            "scaffold Rust workspace and implement pubpunk init + validate",
+        )
+        .unwrap();
+        assert_eq!(
+            summary.candidate_entry_points.first().map(String::as_str),
+            Some("Cargo.toml")
+        );
+        assert_eq!(
+            summary.candidate_file_scope_paths.first().map(String::as_str),
+            Some("Cargo.toml")
+        );
+        assert_eq!(
+            summary
+                .candidate_directory_scope_paths
+                .first()
+                .map(String::as_str),
+            Some("crates")
+        );
+        assert!(summary
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "tests"));
+        assert!(summary.notes.iter().any(|note| {
+            note.contains("preferring scaffoldable Rust/workspace scope candidates")
+        }));
 
         let _ = fs::remove_dir_all(&root);
     }
