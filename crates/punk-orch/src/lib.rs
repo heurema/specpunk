@@ -1045,7 +1045,7 @@ impl OrchService {
         let project = self.bootstrap_project()?;
         let feature_id = match id {
             Some(id) => self.resolve_feature_id_for_work(id)?,
-            None => self.latest_feature_id_for_project(&project.id)?,
+            None => self.latest_feature_id_for_project(&project)?,
         };
         self.build_work_ledger_view(&project, &feature_id)
     }
@@ -1436,34 +1436,37 @@ impl OrchService {
         Err(anyhow!("unknown work id: {id}"))
     }
 
-    fn latest_feature_id_for_project(&self, project_id: &str) -> Result<String> {
-        let mut latest: Option<Feature> = None;
+    fn latest_feature_id_for_project(&self, project: &Project) -> Result<String> {
+        let mut latest: Option<(String, String, String)> = None;
         for entry in fs::read_dir(&self.paths.features_dir)? {
             let path = entry?.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
             let feature: Feature = read_json(&path)?;
-            if feature.project_id != project_id {
+            if feature.project_id != project.id {
                 continue;
             }
+            let activity_updated_at = self
+                .build_work_ledger_view(project, &feature.id)
+                .map(|ledger| ledger.updated_at)
+                .unwrap_or_else(|_| feature.updated_at.clone());
             let replace = latest
                 .as_ref()
                 .map(|current| {
-                    feature
-                        .updated_at
-                        .cmp(&current.updated_at)
-                        .then_with(|| feature.created_at.cmp(&current.created_at))
+                    activity_updated_at
+                        .cmp(&current.1)
+                        .then_with(|| feature.created_at.cmp(&current.2))
                         .is_gt()
                 })
                 .unwrap_or(true);
             if replace {
-                latest = Some(feature);
+                latest = Some((feature.id, activity_updated_at, feature.created_at));
             }
         }
 
         latest
-            .map(|feature| feature.id)
+            .map(|feature| feature.0)
             .ok_or_else(|| anyhow!("no work items found for project"))
     }
 
@@ -2484,7 +2487,7 @@ fn file_len(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use punk_adapters::{ContractDrafter, ExecuteInput, ExecuteOutput};
-    use punk_domain::{DraftInput, RefineInput};
+    use punk_domain::{DraftInput, RefineInput, RunVcs};
     use std::ffi::OsString;
 
     struct EnvVarGuard {
@@ -4928,6 +4931,133 @@ mod tests {
             status_for_project.work_id.as_deref(),
             Some(ledger.work_id.as_str())
         );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn status_prefers_feature_with_latest_ledger_activity_over_newer_feature_timestamp() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-latest-ledger-activity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-latest-ledger-activity-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let project = service.bootstrap_project().unwrap();
+        fs::write(root.join("demo-a.txt"), "a\n").unwrap();
+        fs::write(root.join("demo-b.txt"), "b\n").unwrap();
+
+        let proposal_a = DraftProposal {
+            title: "feature a".into(),
+            summary: "first feature".into(),
+            entry_points: vec!["demo-a.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["demo a".into()],
+            behavior_requirements: vec!["update demo a".into()],
+            allowed_scope: vec!["demo-a.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+        };
+        let (_feature_a, contract_a) = service
+            .persist_draft_contract(&project, "first feature", &proposal_a)
+            .unwrap();
+        service.approve_contract(&contract_a.id).unwrap();
+        let (_run_a1, _receipt_a1) = service.cut_run(&FakeExecutor, &contract_a.id).unwrap();
+
+        let proposal_b = DraftProposal {
+            title: "feature b".into(),
+            summary: "second feature".into(),
+            entry_points: vec!["demo-b.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["demo b".into()],
+            behavior_requirements: vec!["update demo b".into()],
+            allowed_scope: vec!["demo-b.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+        };
+        let (_feature_b, contract_b) = service
+            .persist_draft_contract(&project, "second feature", &proposal_b)
+            .unwrap();
+        service.approve_contract(&contract_b.id).unwrap();
+
+        let stale_run = Run {
+            id: "run_stale_b".into(),
+            task_id: "task_stale_b".into(),
+            feature_id: contract_b.feature_id.clone(),
+            contract_id: contract_b.id.clone(),
+            attempt: 1,
+            status: RunStatus::Running,
+            mode_origin: ModeId::Cut,
+            vcs: RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: "HEAD".into(),
+                change_ref: "HEAD".into(),
+                base_ref: None,
+            },
+            started_at: now_rfc3339(),
+            ended_at: None,
+        };
+        let stale_dir = service.paths.runs_dir.join(&stale_run.id);
+        fs::create_dir_all(&stale_dir).unwrap();
+        write_json(&stale_dir.join("run.json"), &stale_run).unwrap();
+
+        let (run_a2, _receipt_a2) = service.cut_run(&FakeExecutor, &contract_a.id).unwrap();
+
+        let latest = service.inspect_work_ledger(None).unwrap();
+        assert_eq!(latest.work_id, contract_a.feature_id);
+        let expected_run_ref = format!(".punk/runs/{}/run.json", run_a2.id);
+        assert_eq!(latest.latest_run_ref.as_deref(), Some(expected_run_ref.as_str()));
+
+        let status = service.status(None).unwrap();
+        assert_eq!(status.work_id.as_deref(), Some(contract_a.feature_id.as_str()));
+        assert_eq!(status.last_run_id.as_deref(), Some(run_a2.id.as_str()));
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);

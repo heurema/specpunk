@@ -165,6 +165,7 @@ Current status behavior:
 - `punk status` now prefers `WorkLedgerView` for current work continuity fields
 - recovery-oriented status should surface durable autonomy-linked fields such as `autonomy_outcome`, `recovery_contract_ref`, and a shell-level `suggested_command`
 - latest work/lifecycle/next-action data should come from the derived work view, not direct raw-event scanning
+- when choosing the implicit current work item, `punk status` / `punk inspect work` should prefer the feature with the latest ledger activity (`run` / `receipt` / `decision` / `proof` / autonomy record), not merely the most recently drafted feature timestamp
 
 Longer-term shell expectation:
 
