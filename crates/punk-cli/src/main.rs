@@ -261,7 +261,17 @@ fn run() -> Result<()> {
             }
             if inspect.target == "work" {
                 let ledger = orch.inspect_work_ledger(inspect.id.as_deref())?;
-                return render(inspect.json, &ledger, &format_work_ledger_summary(&ledger));
+                let latest_proof_harness_evidence = if inspect.json {
+                    None
+                } else {
+                    load_latest_proofpack(&repo_root, &ledger)?
+                        .map(|proof| summarize_proof_harness_evidence(&proof))
+                };
+                return render(
+                    inspect.json,
+                    &ledger,
+                    &format_work_ledger_summary(&ledger, latest_proof_harness_evidence.as_deref()),
+                );
             }
             if !inspect.json && inspect.id.is_none() && inspect.target.starts_with("proof_") {
                 let proof = orch.inspect_proofpack(&inspect.target)?;
@@ -893,7 +903,10 @@ fn format_project_overlay_summary(overlay: &punk_orch::ProjectOverlay) -> String
     )
 }
 
-fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
+fn format_work_ledger_summary(
+    ledger: &punk_orch::WorkLedgerView,
+    latest_proof_harness_evidence: Option<&str>,
+) -> String {
     let goal = ledger.goal_ref.as_deref().unwrap_or("missing");
     let contract = ledger.active_contract_ref.as_deref().unwrap_or("none");
     let run = ledger.latest_run_ref.as_deref().unwrap_or("none");
@@ -921,6 +934,7 @@ fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let latest_proof_harness_evidence = latest_proof_harness_evidence.unwrap_or("none");
     let recovery_status = if ledger.recovery_contract_ref.is_some() {
         "prepared"
     } else {
@@ -928,7 +942,7 @@ fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
     };
 
     format!(
-        "Work: {work_id}\nProject: {project_id}\nLifecycle: {lifecycle_state}\nGoal: {goal}\nFeature: {feature_ref}\nContract: {contract}\nRun: {run}\nReceipt: {receipt}\nDecision: {decision}\nProof: {proof}\nLatest proof evidence:\n{latest_proof_evidence}\nAutonomy: {autonomy}\nAutonomy outcome: {autonomy_outcome}\nRecovery status: {recovery_status}\nRecovery contract: {recovery_contract}\nBlocked reason: {blocked_reason}\nNext action: {next_action}\nNext action ref: {next_action_ref}\nSuggested command: {suggested_command}\nUpdated at: {updated_at}",
+        "Work: {work_id}\nProject: {project_id}\nLifecycle: {lifecycle_state}\nGoal: {goal}\nFeature: {feature_ref}\nContract: {contract}\nRun: {run}\nReceipt: {receipt}\nDecision: {decision}\nProof: {proof}\nLatest proof evidence:\n{latest_proof_evidence}\nLatest proof harness evidence:\n{latest_proof_harness_evidence}\nAutonomy: {autonomy}\nAutonomy outcome: {autonomy_outcome}\nRecovery status: {recovery_status}\nRecovery contract: {recovery_contract}\nBlocked reason: {blocked_reason}\nNext action: {next_action}\nNext action ref: {next_action_ref}\nSuggested command: {suggested_command}\nUpdated at: {updated_at}",
         work_id = ledger.work_id,
         project_id = ledger.project_id,
         lifecycle_state = ledger.lifecycle_state,
@@ -940,6 +954,7 @@ fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
         decision = decision,
         proof = proof,
         latest_proof_evidence = latest_proof_evidence,
+        latest_proof_harness_evidence = latest_proof_harness_evidence,
         autonomy = autonomy,
         autonomy_outcome = autonomy_outcome,
         recovery_status = recovery_status,
@@ -950,6 +965,54 @@ fn format_work_ledger_summary(ledger: &punk_orch::WorkLedgerView) -> String {
         suggested_command = suggested_command,
         updated_at = ledger.updated_at,
     )
+}
+
+fn load_latest_proofpack(
+    repo_root: &Path,
+    ledger: &punk_orch::WorkLedgerView,
+) -> Result<Option<punk_domain::Proofpack>> {
+    let Some(proof_ref) = ledger.latest_proof_ref.as_deref() else {
+        return Ok(None);
+    };
+    let proof_path = repo_root.join(proof_ref);
+    if !proof_path.exists() {
+        return Ok(None);
+    }
+    let proof: punk_domain::Proofpack = punk_orch::read_json(&proof_path)?;
+    Ok(Some(proof))
+}
+
+fn summarize_proof_harness_evidence(proof: &punk_domain::Proofpack) -> String {
+    let mut lines = Vec::new();
+    lines.extend(proof.declared_harness_evidence.iter().map(|item| {
+        format!(
+            "declared {} [{}]: {}",
+            item.evidence_type, item.profile, item.summary
+        )
+    }));
+    lines.extend(proof.harness_evidence.iter().map(|item| {
+        let target = item
+            .artifact_ref
+            .as_deref()
+            .or(item.source_ref.as_deref())
+            .unwrap_or(item.summary.as_str());
+        format!(
+            "{} {} [{}]: {}",
+            item.evidence_type,
+            check_status_summary_label(&item.status),
+            item.profile,
+            target
+        )
+    }));
+    if lines.is_empty() {
+        "none".to_string()
+    } else {
+        lines
+            .into_iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 fn format_proofpack_summary(proof: &punk_domain::Proofpack) -> String {
@@ -1622,7 +1685,12 @@ mod tests {
             next_action_ref: Some("proof_456".into()),
             updated_at: "2026-04-03T00:00:00Z".into(),
         };
-        let rendered = format_work_ledger_summary(&ledger);
+        let rendered = format_work_ledger_summary(
+            &ledger,
+            Some(
+                "- declared log_query [default]: declared surface from persisted packet\n- artifact_assertion pass [default]: AGENTS.md",
+            ),
+        );
         assert!(rendered.contains("Work: feat_123"));
         assert!(rendered.contains("Lifecycle: accepted"));
         assert!(rendered.contains("Goal: add trace export"));
@@ -1630,6 +1698,10 @@ mod tests {
         assert!(rendered.contains("Proof: .punk/proofs/dec_456/proofpack.json"));
         assert!(rendered.contains("Latest proof evidence:"));
         assert!(rendered.contains("- target pass: cargo test -p punk-cli"));
+        assert!(rendered.contains("Latest proof harness evidence:"));
+        assert!(rendered
+            .contains("- declared log_query [default]: declared surface from persisted packet"));
+        assert!(rendered.contains("- artifact_assertion pass [default]: AGENTS.md"));
         assert!(rendered.contains("Autonomy: .punk/autonomy/feat_123/auto_456.json"));
         assert!(rendered.contains("Autonomy outcome: blocked"));
         assert!(rendered.contains("Recovery status: prepared"));
@@ -1711,6 +1783,43 @@ mod tests {
         assert!(rendered.contains("- artifact_assertion pass [default]: AGENTS.md"));
         assert!(rendered
             .contains("- artifact_assertion pass [default]: .punk/bootstrap/specpunk-core.md"));
+    }
+
+    #[test]
+    fn summarize_proof_harness_evidence_mentions_declared_and_executed_items() {
+        let proof = punk_domain::Proofpack {
+            id: "proof_789".into(),
+            decision_id: "dec_789".into(),
+            run_id: "run_789".into(),
+            contract_ref: ".punk/contracts/feat_789/v1.json".into(),
+            receipt_ref: ".punk/runs/run_789/receipt.json".into(),
+            decision_ref: ".punk/decisions/dec_789.json".into(),
+            check_refs: vec![],
+            command_evidence: vec![],
+            declared_harness_evidence: vec![punk_domain::DeclaredHarnessEvidence {
+                evidence_type: "log_query".into(),
+                profile: "default".into(),
+                source_ref: Some(".punk/project/harness.json".into()),
+                summary: "declared non-command harness surface from persisted packet".into(),
+            }],
+            harness_evidence: vec![punk_domain::HarnessEvidence {
+                evidence_type: "artifact_assertion".into(),
+                profile: "default".into(),
+                status: punk_domain::CheckStatus::Pass,
+                summary: "artifact exists".into(),
+                source_ref: Some(".punk/project/harness.json".into()),
+                artifact_ref: Some("AGENTS.md".into()),
+            }],
+            hashes: Default::default(),
+            summary: "proof for dec_789".into(),
+            created_at: "2026-04-09T00:00:00Z".into(),
+        };
+
+        let rendered = summarize_proof_harness_evidence(&proof);
+        assert!(rendered.contains(
+            "- declared log_query [default]: declared non-command harness surface from persisted packet"
+        ));
+        assert!(rendered.contains("- artifact_assertion pass [default]: AGENTS.md"));
     }
 
     #[test]

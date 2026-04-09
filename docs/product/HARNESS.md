@@ -254,6 +254,7 @@ Current inspect semantics:
 - `punk inspect proof_<id>` may surface `declared_harness_evidence` in the human summary while JSON remains the source of full structured detail
 - `gate` / `proof` may also execute `artifact_assertion` recipes when they are explicitly declared in the persisted packet
 - `punk inspect proof_<id>` may surface executed `harness_evidence` in the human summary while JSON remains the source of full structured detail
+- `punk inspect work` may surface a latest-proof harness summary derived from those same proof fields while `WorkLedgerView` JSON stays unchanged
 - this still does **not** execute UI, log, metric, or trace runtime checks
 
 Future `ProjectOverlay` growth can still add fields like:
