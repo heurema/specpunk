@@ -307,6 +307,7 @@ Preflight expectation:
 - fail early if no Git or jj repo is detected
 - return one explicit recovery path instead of a downstream adapter or scan error
 - recovery should point to `git init`, then `punk init --project <id> --enable-jj --verify`, then retry the original `punk go ...`
+- for a bootstrapped greenfield Rust repo with no existing inferred checks yet, a goal that explicitly asks to scaffold Rust (`rust`, `cargo`, `crate`, or `workspace` + `scaffold`/`init`/`bootstrap`) may derive an initial `cargo test` or `cargo test --workspace` intake check instead of failing at repo scan
 
 ### `punk start "<goal>"`
 
@@ -317,6 +318,7 @@ Preflight expectation:
 - fail early if no Git or jj repo is detected
 - do not defer this to a later drafter or repo-scan failure
 - return one explicit recovery path: `git init`, then `punk init --project <id> --enable-jj --verify`, then retry `punk start "<goal>"`
+- for a bootstrapped greenfield Rust repo with no existing inferred checks yet, an explicit Rust scaffold goal may derive an initial `cargo test` or `cargo test --workspace` intake check instead of failing at repo scan
 
 Creates:
 

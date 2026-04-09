@@ -75,6 +75,23 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
         }
     }
 
+    if candidate_integrity_checks.is_empty()
+        && repo_has_bootstrap_markers(repo_root)
+        && prompt_explicitly_requests_greenfield_rust_scaffold(&tokens)
+    {
+        let bootstrap_check = if tokens.iter().any(|token| token == "workspace") {
+            "cargo test --workspace".to_string()
+        } else {
+            "cargo test".to_string()
+        };
+        candidate_target_checks.push(bootstrap_check.clone());
+        candidate_integrity_checks.push(bootstrap_check);
+        notes.push(
+            "inferred initial Rust bootstrap checks from bootstrapped greenfield prompt"
+                .to_string(),
+        );
+    }
+
     dedupe(&mut candidate_integrity_checks);
     dedupe(&mut candidate_target_checks);
 
@@ -491,6 +508,32 @@ fn prompt_tokens(prompt: &str) -> Vec<String> {
     seen.into_iter().collect()
 }
 
+fn repo_has_bootstrap_markers(repo_root: &Path) -> bool {
+    let bootstrap_dir = repo_root.join(".punk/bootstrap");
+    let has_bootstrap_doc = fs::read_dir(&bootstrap_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .any(|entry| entry.path().is_file());
+    repo_root.join(".punk/AGENT_START.md").exists() && has_bootstrap_doc
+}
+
+fn prompt_explicitly_requests_greenfield_rust_scaffold(tokens: &[String]) -> bool {
+    let requests_rust = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "rust" | "cargo" | "crate" | "crates" | "workspace"
+        )
+    });
+    let requests_scaffold = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "scaffold" | "bootstrap" | "greenfield" | "init" | "initialize"
+        )
+    });
+    requests_rust && requests_scaffold
+}
+
 fn infer_entry_points(repo_root: &Path, prompt: &str, candidates: &[String]) -> Vec<String> {
     let tokens = prompt_tokens(prompt);
     let mut scored = candidates
@@ -585,8 +628,8 @@ fn workspace_member_package_names(repo_root: &Path) -> Result<Option<Vec<String>
     if !cargo_toml.exists() {
         return Ok(None);
     }
-    let contents =
-        fs::read_to_string(&cargo_toml).with_context(|| format!("read {}", cargo_toml.display()))?;
+    let contents = fs::read_to_string(&cargo_toml)
+        .with_context(|| format!("read {}", cargo_toml.display()))?;
     if !contents.lines().any(|line| line.trim() == "[workspace]") {
         return Ok(None);
     }
@@ -1781,7 +1824,11 @@ fn is_generated_runtime_artifact_path(path: &str) -> bool {
 
 fn prompt_explicitly_targets_generated_path(prompt: &str, path: &str) -> bool {
     let prompt = prompt.to_ascii_lowercase();
-    let path = path.trim().trim_matches('`').replace('\\', "/").to_ascii_lowercase();
+    let path = path
+        .trim()
+        .trim_matches('`')
+        .replace('\\', "/")
+        .to_ascii_lowercase();
     [
         format!("review `{path}`"),
         format!("review {path}"),
@@ -1822,7 +1869,9 @@ mod generated_runtime_artifact_scope_tests {
                 "crates/punk-cli/src/main.rs".to_string()
             ]
         );
-        assert!(!paths.iter().any(|path| path == ".punk/project/harness.json"));
+        assert!(!paths
+            .iter()
+            .any(|path| path == ".punk/project/harness.json"));
     }
 
     #[test]
@@ -1927,7 +1976,8 @@ fn explicit_entry_points_override(explicit_scope: &[String]) -> Option<Vec<Strin
 }
 
 fn explicit_target_checks_override(repo_root: &Path, prompt: &str) -> Option<Vec<String>> {
-    let explicit_target_checks = explicit_checks_from_prompt(repo_root, prompt, target_check_markers());
+    let explicit_target_checks =
+        explicit_checks_from_prompt(repo_root, prompt, target_check_markers());
     (!explicit_target_checks.is_empty()).then_some(explicit_target_checks)
 }
 
@@ -2447,8 +2497,10 @@ mod tests {
 
     #[test]
     fn rust_target_checks_ignore_nested_non_member_workspace_packages() {
-        let root =
-            std::env::temp_dir().join(format!("punk-core-workspace-members-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-workspace-members-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
         fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
@@ -2481,6 +2533,64 @@ mod tests {
         assert!(!summary
             .candidate_target_checks
             .contains(&"cargo test -p punk-run".to_string()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_greenfield_rust_prompt_infers_initial_workspace_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-rust-bootstrap-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+
+        let summary = scan_repo(
+            &root,
+            "scaffold Rust workspace and implement pubpunk init + validate",
+        )
+        .unwrap();
+        assert_eq!(
+            summary.candidate_target_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert_eq!(
+            summary.candidate_integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert!(summary
+            .notes
+            .iter()
+            .any(|note| note.contains("inferred initial Rust bootstrap checks")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_greenfield_non_rust_prompt_does_not_infer_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-non-rust-bootstrap-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+
+        let summary = scan_repo(&root, "write launch copy for landing page").unwrap();
+        assert!(summary.candidate_target_checks.is_empty());
+        assert!(summary.candidate_integrity_checks.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2695,8 +2805,16 @@ mod tests {
         fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
         fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
         fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
-        fs::write(root.join("crates/punk-core/src/lib.rs"), "pub fn core() {}\n").unwrap();
-        fs::write(root.join("crates/punk-orch/src/lib.rs"), "pub fn orch() {}\n").unwrap();
+        fs::write(
+            root.join("crates/punk-core/src/lib.rs"),
+            "pub fn core() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
         fs::write(root.join("punk/punk-run/src/main.rs"), "fn main() {}\n").unwrap();
 
         let guidance = "Restrict allowed_scope exactly to these two files and nothing else: crates/punk-core/src/lib.rs; crates/punk-orch/src/lib.rs. Do not include punk/punk-run in allowed_scope.";
@@ -2723,7 +2841,11 @@ mod tests {
         fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
         fs::create_dir_all(root.join("crates/punk-cli/src")).unwrap();
         fs::create_dir_all(root.join(".punk/project")).unwrap();
-        fs::write(root.join("crates/punk-orch/src/lib.rs"), "pub fn orch() {}\n").unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
         fs::write(root.join("crates/punk-cli/src/main.rs"), "fn main() {}\n").unwrap();
         fs::write(root.join(".punk/project/harness.json"), "{}\n").unwrap();
 
@@ -2750,8 +2872,16 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
         fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
-        fs::write(root.join("crates/punk-core/src/lib.rs"), "pub fn core() {}\n").unwrap();
-        fs::write(root.join("crates/punk-orch/src/lib.rs"), "pub fn orch() {}\n").unwrap();
+        fs::write(
+            root.join("crates/punk-core/src/lib.rs"),
+            "pub fn core() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
 
         let guidance = "Keep allowed_scope exactly as-is. target_checks must contain exactly one command: cargo test -p punk-core -p punk-orch. integrity_checks must contain exactly one command: cargo test --workspace. Remove every other target check.";
         let mut proposal = DraftProposal {

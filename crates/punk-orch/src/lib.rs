@@ -2745,6 +2745,33 @@ mod tests {
         }
     }
 
+    struct GreenfieldRustDrafter;
+
+    impl ContractDrafter for GreenfieldRustDrafter {
+        fn name(&self) -> &'static str {
+            "greenfield-rust-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "greenfield rust intake".into(),
+                summary: input.prompt,
+                entry_points: vec!["Cargo.toml".into(), "src/lib.rs".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["initial Rust scaffold".into()],
+                behavior_requirements: vec!["allow first Rust goal after init".into()],
+                allowed_scope: vec!["Cargo.toml".into(), "src/lib.rs".into()],
+                target_checks: input.scan.candidate_target_checks,
+                integrity_checks: input.scan.candidate_integrity_checks,
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
     struct PlaceholderScopeDrafter;
 
     impl ContractDrafter for PlaceholderScopeDrafter {
@@ -3252,6 +3279,50 @@ mod tests {
         assert!(!contract
             .target_checks
             .contains(&"cargo test -p punk-run".to_string()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_allows_bootstrapped_greenfield_rust_repo_without_existing_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-rust-intake-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &GreenfieldRustDrafter,
+                "scaffold Rust workspace and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert!(!contract.allowed_scope.is_empty());
+        assert!(!contract.entry_points.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }
