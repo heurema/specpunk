@@ -73,7 +73,7 @@ struct PlanLaneTimedOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EntryPointSnapshot {
     path: String,
-    content: String,
+    content: Option<String>,
 }
 
 struct AttemptOutcome {
@@ -149,7 +149,6 @@ impl Default for CodexCliExecutor {
         Self { model: None }
     }
 }
-
 
 impl GitGuardEnv {
     fn install() -> Result<Option<Self>> {
@@ -2014,8 +2013,8 @@ fn logs_indicate_compile_or_check_reason(
     combined.contains("Compiling ")
         || combined.contains("Running unittests")
         || combined.contains("Doc-tests ")
-        || combined.contains("cargo build ")
-        || combined.contains("cargo test ")
+        || combined.contains("/bin/zsh -lc 'cargo ")
+        || combined.contains("/bin/bash -lc 'cargo ")
         || combined.contains("error[")
         || combined.contains("error:")
         || combined.contains(BLOCKED_EXECUTION_SENTINEL)
@@ -2283,20 +2282,23 @@ fn capture_entry_point_snapshots(
 ) -> Result<Vec<EntryPointSnapshot>> {
     let mut snapshots = Vec::new();
     for entry_point in &contract.entry_points {
-        if !entry_point.ends_with(".rs") {
+        if !is_file_like_scope(entry_point) {
             continue;
         }
         if !path_is_in_allowed_scope(entry_point, &contract.allowed_scope) {
             continue;
         }
         let file_path = repo_root.join(entry_point);
-        if !file_path.exists() {
-            continue;
-        }
         snapshots.push(EntryPointSnapshot {
             path: entry_point.clone(),
-            content: fs::read_to_string(&file_path)
-                .with_context(|| format!("read entry point snapshot {entry_point}"))?,
+            content: if file_path.exists() {
+                Some(
+                    fs::read_to_string(&file_path)
+                        .with_context(|| format!("read entry point snapshot {entry_point}"))?,
+                )
+            } else {
+                None
+            },
         });
     }
     Ok(snapshots)
@@ -2309,11 +2311,14 @@ fn unchanged_entry_point_paths(
     let mut unchanged = Vec::new();
     for snapshot in snapshots {
         let file_path = repo_root.join(&snapshot.path);
-        if !file_path.exists() {
-            continue;
-        }
-        let current = fs::read_to_string(&file_path)
-            .with_context(|| format!("read entry point progress probe {}", snapshot.path))?;
+        let current =
+            if file_path.exists() {
+                Some(fs::read_to_string(&file_path).with_context(|| {
+                    format!("read entry point progress probe {}", snapshot.path)
+                })?)
+            } else {
+                None
+            };
         if current == snapshot.content {
             unchanged.push(snapshot.path.clone());
         }
@@ -3054,6 +3059,14 @@ fn path_is_in_allowed_scope(path: &str, allowed_scope: &[String]) -> bool {
     })
 }
 
+fn is_file_like_scope(path: &str) -> bool {
+    std::path::Path::new(path).extension().is_some()
+        || matches!(
+            path,
+            "Cargo.toml" | "Cargo.lock" | "README.md" | "go.mod" | "go.sum" | "pyproject.toml"
+        )
+}
+
 fn find_binary_in_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -3288,7 +3301,10 @@ mod tests {
             .iter()
             .position(|arg| arg == "--")
             .expect("codex args should contain separator");
-        assert_eq!(args.get(separator_index + 1).map(String::as_str), Some(prompt));
+        assert_eq!(
+            args.get(separator_index + 1).map(String::as_str),
+            Some(prompt)
+        );
         assert_eq!(proposal.title, "draft");
 
         let _ = fs::remove_dir_all(&root);
@@ -4613,7 +4629,7 @@ mod tests {
         fs::write(&file_path, "pub fn unchanged() {}\n").unwrap();
         let snapshots = vec![EntryPointSnapshot {
             path: "src/lib.rs".into(),
-            content: "pub fn unchanged() {}\n".into(),
+            content: Some("pub fn unchanged() {}\n".into()),
         }];
 
         let stdout_path = root.join("stdout.log");
@@ -4665,7 +4681,7 @@ mod tests {
         fs::write(&file_path, "pub fn unchanged() {}\n").unwrap();
         let snapshots = vec![EntryPointSnapshot {
             path: "src/lib.rs".into(),
-            content: "pub fn unchanged() {}\n".into(),
+            content: Some("pub fn unchanged() {}\n".into()),
         }];
 
         let stdout_path = root.join("stdout.log");
@@ -4701,6 +4717,56 @@ mod tests {
     }
 
     #[test]
+    fn run_command_with_timeout_and_tee_detects_no_progress_for_missing_file_entry_point() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-tee-no-progress-missing-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let snapshots = vec![EntryPointSnapshot {
+            path: "Cargo.toml".into(),
+            content: None,
+        }];
+
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        let mut command = Command::new("/bin/sh");
+        command.arg("-lc").arg(
+            "python3 - <<'PY'\nimport sys, time\nprint('MISSING Cargo.toml')\nsys.stdout.flush()\nfor _ in range(20):\n    sys.stderr.write('mcp: engram/mem_search (completed)\\n')\n    sys.stderr.flush()\n    time.sleep(0.15)\nPY",
+        );
+
+        let output = run_command_with_timeout_and_tee(
+            &mut command,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_millis(600),
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            stdout_path,
+            stderr_path,
+            root.join("executor.json"),
+            None,
+            Some((&root, snapshots.as_slice())),
+        )
+        .unwrap();
+
+        assert!(!output.timed_out);
+        assert!(!output.stalled);
+        assert!(!output.orphaned);
+        assert!(output.scaffold_only_paths.is_empty());
+        assert!(output.post_check_zero_progress_paths.is_empty());
+        assert_eq!(output.no_progress_paths, vec!["Cargo.toml".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn run_command_with_timeout_and_tee_detects_post_check_zero_progress_stall() {
         let root = std::env::temp_dir().join(format!(
             "punk-adapters-tee-post-check-stall-{}-{}",
@@ -4717,7 +4783,7 @@ mod tests {
         fs::write(&file_path, "pub fn unchanged() {}\n").unwrap();
         let snapshots = vec![EntryPointSnapshot {
             path: "src/lib.rs".into(),
-            content: "pub fn unchanged() {}\n".into(),
+            content: Some("pub fn unchanged() {}\n".into()),
         }];
 
         let stdout_path = root.join("stdout.log");
@@ -4778,6 +4844,36 @@ mod tests {
         .unwrap();
 
         assert!(logs_indicate_compile_or_check_reason(
+            &stdout_path,
+            &stderr_path
+        ));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compile_or_check_reason_ignores_prompt_declared_target_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-compile-reason-prompt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        fs::write(&stdout_path, "").unwrap();
+        fs::write(
+            &stderr_path,
+            "user\nTarget checks to satisfy: cargo test --workspace\nIntegrity checks to keep passing: cargo test --workspace\n",
+        )
+        .unwrap();
+
+        assert!(!logs_indicate_compile_or_check_reason(
             &stdout_path,
             &stderr_path
         ));
