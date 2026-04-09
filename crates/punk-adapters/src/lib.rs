@@ -445,19 +445,25 @@ impl CodexCliContractDrafter {
         ) {
             Ok(proposal) => Ok(proposal),
             Err(DrafterAttemptError::TimedOut { stdout, stderr }) => {
-                if let (Some(retry_prompt), Some(retry_timeout)) = (retry_prompt, retry_timeout) {
-                    match self.run_json_prompt_once(
-                        &retry_prompt,
-                        repo_root,
-                        &schema_path,
-                        &output_path,
-                        retry_timeout,
-                    ) {
-                        Ok(proposal) => Ok(proposal),
-                        Err(DrafterAttemptError::TimedOut { stdout, stderr }) => {
-                            Err(anyhow!(timeout_summary(total_timeout, &stdout, &stderr)))
+                if should_retry_drafter_timeout(&stdout, &stderr) {
+                    if let (Some(retry_prompt), Some(retry_timeout)) =
+                        (retry_prompt, retry_timeout)
+                    {
+                        match self.run_json_prompt_once(
+                            &retry_prompt,
+                            repo_root,
+                            &schema_path,
+                            &output_path,
+                            retry_timeout,
+                        ) {
+                            Ok(proposal) => Ok(proposal),
+                            Err(DrafterAttemptError::TimedOut { stdout, stderr }) => {
+                                Err(anyhow!(timeout_summary(total_timeout, &stdout, &stderr)))
+                            }
+                            Err(DrafterAttemptError::Failed(err)) => Err(err),
                         }
-                        Err(DrafterAttemptError::Failed(err)) => Err(err),
+                    } else {
+                        Err(anyhow!(timeout_summary(total_timeout, &stdout, &stderr)))
                     }
                 } else {
                     Err(anyhow!(timeout_summary(total_timeout, &stdout, &stderr)))
@@ -530,6 +536,28 @@ impl CodexCliContractDrafter {
             .map_err(DrafterAttemptError::Failed)?;
         Ok(proposal)
     }
+}
+
+fn should_retry_drafter_timeout(stdout: &str, stderr: &str) -> bool {
+    [stderr, stdout]
+        .into_iter()
+        .any(|stream| looks_like_partial_draft_json(stream))
+}
+
+fn looks_like_partial_draft_json(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "\"title\"",
+        "\"summary\"",
+        "\"entry_points\"",
+        "\"expected_interfaces\"",
+        "\"behavior_requirements\"",
+        "\"allowed_scope\"",
+        "\"target_checks\"",
+        "\"integrity_checks\"",
+    ]
+    .into_iter()
+    .any(|needle| lower.contains(needle))
 }
 
 impl CodexCliExecutor {
@@ -3451,7 +3479,7 @@ mod tests {
         };
 
         let start = Instant::now();
-        let err = drafter.draft(input).unwrap_err().to_string();
+        let _err = drafter.draft(input).unwrap_err().to_string();
         let elapsed = start.elapsed();
 
         if let Some(path) = old_path {
@@ -3470,6 +3498,251 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "drafter elapsed too long: {elapsed:?}"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_drafter_skips_retry_after_silent_timeout() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-drafter-silent-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let fake_bin = root.join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let fake_codex = fake_bin.join("codex");
+        let count_path = root.join("count.txt");
+        fs::write(
+            &fake_codex,
+            format!(
+                "#!/usr/bin/env python3\nimport pathlib, time\ncount_path = pathlib.Path({count_path:?})\ncount = int(count_path.read_text()) if count_path.exists() else 0\ncount_path.write_text(str(count + 1))\ntime.sleep(5)\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&fake_codex).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_codex, perms).unwrap();
+        }
+
+        let old_path = std::env::var_os("PATH");
+        let old_timeout = std::env::var_os("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
+        std::env::set_var(
+            "PATH",
+            std::env::join_paths(
+                [fake_bin.clone()]
+                    .into_iter()
+                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
+            )
+            .unwrap(),
+        );
+        std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", "6");
+
+        let drafter = CodexCliContractDrafter::default();
+        let input = DraftInput {
+            repo_root: root.display().to_string(),
+            prompt: "bounded prompt".into(),
+            scan: RepoScanSummary {
+                project_kind: "generic".into(),
+                manifests: vec![],
+                package_manager: None,
+                available_scripts: BTreeMap::new(),
+                candidate_entry_points: vec![],
+                candidate_scope_paths: vec![],
+                candidate_file_scope_paths: vec![],
+                candidate_directory_scope_paths: vec![],
+                candidate_target_checks: vec!["true".into()],
+                candidate_integrity_checks: vec!["true".into()],
+                notes: vec![],
+            },
+        };
+
+        let err = drafter.draft(input).unwrap_err().to_string();
+
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        if let Some(timeout) = old_timeout {
+            std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", timeout);
+        } else {
+            std::env::remove_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
+        }
+
+        assert!(err.contains("timed out after 6s"), "{err}");
+        assert_eq!(fs::read_to_string(&count_path).unwrap(), "1");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_drafter_skips_retry_after_mcp_only_timeout_noise() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-drafter-mcp-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let fake_bin = root.join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let fake_codex = fake_bin.join("codex");
+        let count_path = root.join("count.txt");
+        fs::write(
+            &fake_codex,
+            format!(
+                "#!/usr/bin/env python3\nimport pathlib, sys, time\ncount_path = pathlib.Path({count_path:?})\ncount = int(count_path.read_text()) if count_path.exists() else 0\ncount_path.write_text(str(count + 1))\nfor _ in range(6):\n    sys.stderr.write('mcp: engram/mem_search (completed)\\\\n')\n    sys.stderr.flush()\n    time.sleep(0.5)\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&fake_codex).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_codex, perms).unwrap();
+        }
+
+        let old_path = std::env::var_os("PATH");
+        let old_timeout = std::env::var_os("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
+        std::env::set_var(
+            "PATH",
+            std::env::join_paths(
+                [fake_bin.clone()]
+                    .into_iter()
+                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
+            )
+            .unwrap(),
+        );
+        std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", "6");
+
+        let drafter = CodexCliContractDrafter::default();
+        let input = DraftInput {
+            repo_root: root.display().to_string(),
+            prompt: "bounded prompt".into(),
+            scan: RepoScanSummary {
+                project_kind: "generic".into(),
+                manifests: vec![],
+                package_manager: None,
+                available_scripts: BTreeMap::new(),
+                candidate_entry_points: vec![],
+                candidate_scope_paths: vec![],
+                candidate_file_scope_paths: vec![],
+                candidate_directory_scope_paths: vec![],
+                candidate_target_checks: vec!["true".into()],
+                candidate_integrity_checks: vec!["true".into()],
+                notes: vec![],
+            },
+        };
+
+        let err = drafter.draft(input).unwrap_err().to_string();
+
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        if let Some(timeout) = old_timeout {
+            std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", timeout);
+        } else {
+            std::env::remove_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
+        }
+
+        assert!(err.contains("timed out after 6s"), "{err}");
+        assert_eq!(fs::read_to_string(&count_path).unwrap(), "1");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_drafter_retries_after_partial_draft_json_timeout() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-drafter-partial-json-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let fake_bin = root.join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let fake_codex = fake_bin.join("codex");
+        let count_path = root.join("count.txt");
+        fs::write(
+            &fake_codex,
+            format!(
+                "#!/usr/bin/env python3\nimport pathlib, sys, time\ncount_path = pathlib.Path({count_path:?})\ncount = int(count_path.read_text()) if count_path.exists() else 0\ncount_path.write_text(str(count + 1))\nsys.stderr.write('{{\\\"allowed_scope\\\":[')\nsys.stderr.flush()\ntime.sleep(5)\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&fake_codex).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_codex, perms).unwrap();
+        }
+
+        let old_path = std::env::var_os("PATH");
+        let old_timeout = std::env::var_os("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
+        std::env::set_var(
+            "PATH",
+            std::env::join_paths(
+                [fake_bin.clone()]
+                    .into_iter()
+                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
+            )
+            .unwrap(),
+        );
+        std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", "6");
+
+        let drafter = CodexCliContractDrafter::default();
+        let input = DraftInput {
+            repo_root: root.display().to_string(),
+            prompt: "bounded prompt".into(),
+            scan: RepoScanSummary {
+                project_kind: "generic".into(),
+                manifests: vec![],
+                package_manager: None,
+                available_scripts: BTreeMap::new(),
+                candidate_entry_points: vec![],
+                candidate_scope_paths: vec![],
+                candidate_file_scope_paths: vec![],
+                candidate_directory_scope_paths: vec![],
+                candidate_target_checks: vec!["true".into()],
+                candidate_integrity_checks: vec!["true".into()],
+                notes: vec![],
+            },
+        };
+
+        let err = drafter.draft(input).unwrap_err().to_string();
+
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        if let Some(timeout) = old_timeout {
+            std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", timeout);
+        } else {
+            std::env::remove_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
+        }
+
+        assert_eq!(fs::read_to_string(&count_path).unwrap(), "2");
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -2211,22 +2211,36 @@ fn timeout_seed_proposal(prompt: &str, scan: &punk_domain::RepoScanSummary) -> D
     } else {
         scan.candidate_target_checks.clone()
     };
+    let (expected_interfaces, behavior_requirements) =
+        timeout_seed_semantics(prompt, &entry_points);
 
     DraftProposal {
         title: summarize_prompt(prompt),
         summary: summarize_prompt(prompt),
         entry_points,
         import_paths: Vec::new(),
-        expected_interfaces: vec!["approve-ready bounded contract".to_string()],
-        behavior_requirements: vec![
-            "Recover an approve-ready bounded contract from deterministic repo scan after drafter timeout."
-                .to_string(),
-        ],
+        expected_interfaces,
+        behavior_requirements,
         allowed_scope,
         target_checks,
         integrity_checks: scan.candidate_integrity_checks.clone(),
         risk_level: "medium".to_string(),
     }
+}
+
+fn timeout_seed_semantics(prompt: &str, entry_points: &[String]) -> (Vec<String>, Vec<String>) {
+    let expected_interface = match entry_points.first().map(String::as_str) {
+        Some("Cargo.toml") => "initial Rust scaffold",
+        Some("go.mod") => "initial Go scaffold",
+        Some("pyproject.toml") => "initial Python scaffold",
+        Some("package.json") => "initial TypeScript/Node scaffold",
+        _ => "bounded implementation slice",
+    };
+
+    (
+        vec![expected_interface.to_string()],
+        vec![summarize_prompt(prompt)],
+    )
 }
 
 fn timeout_greenfield_scaffold_scope(
@@ -3645,6 +3659,16 @@ mod tests {
             contract.integrity_checks,
             vec!["cargo test --workspace".to_string()]
         );
+        assert_eq!(
+            contract.expected_interfaces,
+            vec!["initial Rust scaffold".to_string()]
+        );
+        assert_eq!(
+            contract.behavior_requirements,
+            vec![summarize_prompt(
+                "scaffold Rust workspace and implement pubpunk init + validate via go",
+            )]
+        );
         assert!(contract
             .allowed_scope
             .iter()
@@ -3703,6 +3727,16 @@ mod tests {
         );
         assert_eq!(contract.target_checks, vec!["go test ./...".to_string()]);
         assert_eq!(contract.integrity_checks, vec!["go test ./...".to_string()]);
+        assert_eq!(
+            contract.expected_interfaces,
+            vec!["initial Go scaffold".to_string()]
+        );
+        assert_eq!(
+            contract.behavior_requirements,
+            vec![summarize_prompt(
+                "scaffold Go module and implement pubpunk init + validate",
+            )]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -3756,6 +3790,16 @@ mod tests {
         );
         assert_eq!(contract.target_checks, vec!["pytest".to_string()]);
         assert_eq!(contract.integrity_checks, vec!["pytest".to_string()]);
+        assert_eq!(
+            contract.expected_interfaces,
+            vec!["initial Python scaffold".to_string()]
+        );
+        assert_eq!(
+            contract.behavior_requirements,
+            vec![summarize_prompt(
+                "scaffold Python package and implement pubpunk init + validate",
+            )]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -3807,6 +3851,16 @@ mod tests {
                 "src".to_string(),
                 "tests".to_string()
             ]
+        );
+        assert_eq!(
+            contract.expected_interfaces,
+            vec!["initial TypeScript/Node scaffold".to_string()]
+        );
+        assert_eq!(
+            contract.behavior_requirements,
+            vec![summarize_prompt(
+                "scaffold TypeScript package and implement pubpunk init + validate",
+            )]
         );
         assert_eq!(contract.target_checks, vec!["npm test".to_string()]);
         assert_eq!(contract.integrity_checks, vec!["npm test".to_string()]);

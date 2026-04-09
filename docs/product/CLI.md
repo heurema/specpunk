@@ -337,9 +337,11 @@ Creates:
 Timeout expectation:
 
 - if the contract drafter times out, `punk start` should attempt one deterministic bounded fallback derived from the repo scan and explicit prompt details before returning an error
+- if the drafter times out with no captured draft-JSON progress (including silent timeouts and MCP-only chatter), `punk start` should skip compact retry and fall back immediately instead of spending extra time on another blind attempt
 - for a bootstrapped greenfield Rust scaffold goal, timeout fallback should preserve scaffoldable Rust/workspace scope (`Cargo.toml`, `crates`, optional `tests`) instead of collapsing into docs/archive candidates
 - for bootstrapped greenfield Go and Python scaffold goals, timeout fallback should preserve their manifest-first scaffold scope (`go.mod`/`pyproject.toml` plus ecosystem directories) instead of collapsing into docs/archive candidates
 - for a bootstrapped greenfield TypeScript/Node scaffold goal, timeout fallback should preserve manifest-first scaffold scope (`package.json`, optional `tsconfig.json`, plus `src`/`tests` or workspace directories) instead of collapsing into docs/archive candidates
+- that same timeout fallback should keep scaffold-oriented `expected_interfaces` / `behavior_requirements` derived from the prompt and manifest kind instead of generic `approve-ready bounded contract` placeholder text
 - non-timeout drafter failures should still fail closed
 
 Writes:
