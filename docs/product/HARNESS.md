@@ -251,6 +251,7 @@ Current inspect semantics:
 - `punk inspect project --json` includes `harness_spec_ref` and `harness_spec`
 - the packet remains a derived mechanism only; it does not introduce a new primitive
 - `gate` / `proof` may copy declared non-command validation surfaces from the persisted packet into decision/proof artifacts as typed metadata only
+- `punk inspect proof_<id>` may surface `declared_harness_evidence` in the human summary while JSON remains the source of full structured detail
 - `gate` / `proof` may also execute `artifact_assertion` recipes when they are explicitly declared in the persisted packet
 - `punk inspect proof_<id>` may surface executed `harness_evidence` in the human summary while JSON remains the source of full structured detail
 - this still does **not** execute UI, log, metric, or trace runtime checks
