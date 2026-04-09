@@ -1802,7 +1802,16 @@ fn run_command_with_timeout_and_tee(
             break (true, false, false, Vec::new(), Vec::new(), Vec::new());
         }
         if let Some((repo_root, snapshots)) = no_progress_probe {
-            if progress.stalled_for(no_progress_timeout)
+            if start.elapsed() >= no_progress_timeout
+                && !logs_indicate_successful_check_output(&stdout_path, &stderr_path)
+                && !logs_indicate_compile_or_check_reason(&stdout_path, &stderr_path)
+            {
+                let unchanged_paths = unchanged_entry_point_paths(repo_root, snapshots)?;
+                if !unchanged_paths.is_empty() && unchanged_paths.len() == snapshots.len() {
+                    terminate_process_tree(&mut child, child_pid);
+                    break (false, false, false, unchanged_paths, Vec::new(), Vec::new());
+                }
+            } else if progress.stalled_for(no_progress_timeout)
                 && !logs_indicate_successful_check_output(&stdout_path, &stderr_path)
                 && !logs_indicate_compile_or_check_reason(&stdout_path, &stderr_path)
             {
@@ -4620,6 +4629,58 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_millis(400),
             Duration::from_secs(1),
+            Duration::from_secs(1),
+            stdout_path,
+            stderr_path,
+            root.join("executor.json"),
+            None,
+            Some((&root, snapshots.as_slice())),
+        )
+        .unwrap();
+
+        assert!(!output.timed_out);
+        assert!(!output.stalled);
+        assert!(!output.orphaned);
+        assert!(output.scaffold_only_paths.is_empty());
+        assert!(output.post_check_zero_progress_paths.is_empty());
+        assert_eq!(output.no_progress_paths, vec!["src/lib.rs".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_command_with_timeout_and_tee_detects_no_progress_despite_periodic_output_noise() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-tee-no-progress-noise-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+
+        let file_path = root.join("src/lib.rs");
+        fs::write(&file_path, "pub fn unchanged() {}\n").unwrap();
+        let snapshots = vec![EntryPointSnapshot {
+            path: "src/lib.rs".into(),
+            content: "pub fn unchanged() {}\n".into(),
+        }];
+
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        let mut command = Command::new("/bin/sh");
+        command.arg("-lc").arg(
+            "python3 - <<'PY'\nimport sys, time\nfor _ in range(20):\n    sys.stdout.write('mcp: engram/mem_search (completed)\\n')\n    sys.stdout.flush()\n    time.sleep(0.15)\nPY",
+        );
+
+        let output = run_command_with_timeout_and_tee(
+            &mut command,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+            Duration::from_millis(600),
+            Duration::from_secs(2),
             Duration::from_secs(1),
             stdout_path,
             stderr_path,
