@@ -166,6 +166,8 @@ Current status behavior:
 - recovery-oriented status should surface durable autonomy-linked fields such as `autonomy_outcome`, `recovery_contract_ref`, and a shell-level `suggested_command`
 - latest work/lifecycle/next-action data should come from the derived work view, not direct raw-event scanning
 - when choosing the implicit current work item, `punk status` / `punk inspect work` should prefer the feature with the latest ledger activity (`run` / `receipt` / `decision` / `proof` / autonomy record), not merely the most recently drafted feature timestamp
+- stale/orphaned `running` runs with a dead executor pid, no receipt/decision/proof, and old `heartbeat.last_progress_at` should be ignored by active status/work projections instead of dominating current-work selection
+- non-destructive hygiene should start with `punk gc stale --dry-run`, which reports `safe_to_archive` vs `manual_review` candidates without deleting or moving artifacts yet
 
 Longer-term shell expectation:
 
@@ -221,6 +223,7 @@ punk plot approve <contract-id>
 punk cut run <contract-id>
 punk gate run <run-id>
 punk gate proof <run-id|decision-id>
+punk gc stale --dry-run
 punk status [id]
 punk inspect <id> --json
 ```

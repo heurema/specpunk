@@ -32,6 +32,7 @@ enum Command {
     Plot(PlotCommand),
     Cut(CutCommand),
     Gate(GateCommand),
+    Gc(GcCommand),
     Status(StatusCommand),
     Inspect(InspectCommand),
     Vcs(VcsCommand),
@@ -137,6 +138,12 @@ struct GateCommand {
     action: GateAction,
 }
 
+#[derive(Args)]
+struct GcCommand {
+    #[command(subcommand)]
+    action: GcAction,
+}
+
 #[derive(Subcommand)]
 enum GateAction {
     Run {
@@ -146,6 +153,16 @@ enum GateAction {
     },
     Proof {
         run_or_decision_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum GcAction {
+    Stale {
+        #[arg(long)]
+        dry_run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -242,6 +259,18 @@ fn run() -> Result<()> {
                 let service = ProofService::new(&repo_root, &global_root);
                 let proof = service.write_proofpack(&run_or_decision_id)?;
                 render(json, &proof, &format!("proof {}", proof.id))
+            }
+        },
+        Command::Gc(gc) => match gc.action {
+            GcAction::Stale { dry_run, json } => {
+                if !dry_run {
+                    return Err(anyhow!(
+                        "only `punk gc stale --dry-run` is supported in this slice"
+                    ));
+                }
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let report = orch.gc_stale_dry_run()?;
+                render(json, &report, &format_stale_gc_report(&report))
             }
         },
         Command::Status(status) => {
@@ -351,6 +380,51 @@ fn format_status_summary(snapshot: &punk_orch::StatusSnapshot) -> String {
         snapshot.vcs_ref,
         snapshot.vcs_dirty,
         snapshot.workspace_root
+    )
+}
+
+fn format_stale_gc_report(report: &punk_orch::StaleGcReport) -> String {
+    let safe_to_archive = if report.safe_to_archive.is_empty() {
+        "none".to_string()
+    } else {
+        report
+            .safe_to_archive
+            .iter()
+            .map(|candidate| {
+                format!(
+                    "- {} ({})\n  work: {}\n  ref: {}\n  reason: {}",
+                    candidate.artifact_id,
+                    candidate.artifact_kind,
+                    candidate.work_id,
+                    candidate.artifact_ref,
+                    candidate.reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let manual_review = if report.manual_review.is_empty() {
+        "none".to_string()
+    } else {
+        report
+            .manual_review
+            .iter()
+            .map(|candidate| {
+                format!(
+                    "- {} ({})\n  work: {}\n  ref: {}\n  reason: {}",
+                    candidate.artifact_id,
+                    candidate.artifact_kind,
+                    candidate.work_id,
+                    candidate.artifact_ref,
+                    candidate.reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "Project: {}\nGenerated at: {}\nSafe to archive:\n{}\nManual review:\n{}",
+        report.project_id, report.generated_at, safe_to_archive, manual_review
     )
 }
 
@@ -1455,6 +1529,31 @@ mod tests {
         assert!(rendered.contains("next_action=Some(\"approve_contract\")"));
         assert!(rendered.contains("next_action_ref=Some(\"ct_2\")"));
         assert!(rendered.contains("suggested_command=punk plot approve ct_2"));
+    }
+
+    #[test]
+    fn stale_gc_report_summary_lists_safe_candidates() {
+        let report = punk_orch::StaleGcReport {
+            project_id: "proj".into(),
+            generated_at: "2026-04-09T12:00:00Z".into(),
+            safe_to_archive: vec![punk_orch::StaleArtifactCandidate {
+                artifact_kind: "run".into(),
+                artifact_id: "run_stale".into(),
+                work_id: "feat_1".into(),
+                artifact_ref: ".punk/runs/run_stale/run.json".into(),
+                reason: "status=running but child_pid 999999 is dead".into(),
+                last_progress_at: Some("2020-01-01T00:00:00Z".into()),
+                executor_pid: Some(999999),
+            }],
+            manual_review: Vec::new(),
+        };
+        let rendered = format_stale_gc_report(&report);
+        assert!(rendered.contains("Project: proj"));
+        assert!(rendered.contains("Safe to archive:"));
+        assert!(rendered.contains("run_stale (run)"));
+        assert!(rendered.contains(".punk/runs/run_stale/run.json"));
+        assert!(rendered.contains("child_pid 999999 is dead"));
+        assert!(rendered.contains("Manual review:\nnone"));
     }
 
     #[test]

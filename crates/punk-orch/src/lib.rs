@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use punk_adapters::{ContractDrafter, ExecuteInput, Executor};
 use punk_core::{
     apply_explicit_prompt_overrides, build_bounded_fallback_proposal, canonicalize_draft_proposal,
@@ -1195,6 +1195,47 @@ impl OrchService {
         })
     }
 
+    pub fn gc_stale_dry_run(&self) -> Result<StaleGcReport> {
+        let project = self.bootstrap_project()?;
+        let mut safe_to_archive = Vec::new();
+        let mut manual_review = Vec::new();
+
+        for entry in fs::read_dir(&self.paths.features_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let feature: Feature = read_json(&path)?;
+            if feature.project_id != project.id {
+                continue;
+            }
+            for run_record in work_run_records(&self.paths.runs_dir, &feature.id)? {
+                if let Some(candidate) =
+                    classify_stale_run_candidate(&self.paths, &feature.id, &run_record)?
+                {
+                    match candidate {
+                        StaleRunDisposition::SafeToArchive(candidate) => {
+                            safe_to_archive.push(candidate)
+                        }
+                        StaleRunDisposition::ManualReview(candidate) => {
+                            manual_review.push(candidate)
+                        }
+                    }
+                }
+            }
+        }
+
+        safe_to_archive.sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
+        manual_review.sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
+
+        Ok(StaleGcReport {
+            project_id: project.id,
+            generated_at: now_rfc3339(),
+            safe_to_archive,
+            manual_review,
+        })
+    }
+
     pub fn record_autonomy_outcome(
         &self,
         proof_id: &str,
@@ -1276,12 +1317,20 @@ impl OrchService {
         });
 
         let runs = work_run_records(&self.paths.runs_dir, feature_id)?;
-        let latest_run = runs.into_iter().max_by(|left, right| {
+        let latest_run = runs
+            .into_iter()
+            .filter(|record| {
+                !matches!(
+                    classify_stale_run_candidate(&self.paths, feature_id, record),
+                    Ok(Some(StaleRunDisposition::SafeToArchive(_)))
+                )
+            })
+            .max_by(|left, right| {
             left.run
                 .started_at
                 .cmp(&right.run.started_at)
                 .then_with(|| left.run.id.cmp(&right.run.id))
-        });
+            });
 
         let latest_decision = match latest_run.as_ref() {
             Some(run_record) => {
@@ -1651,6 +1700,11 @@ struct ProofRecord {
     proof: punk_domain::Proofpack,
 }
 
+enum StaleRunDisposition {
+    SafeToArchive(StaleArtifactCandidate),
+    ManualReview(StaleArtifactCandidate),
+}
+
 struct AutonomyRecordFile {
     path: PathBuf,
     record: AutonomyRecord,
@@ -1705,6 +1759,114 @@ fn work_run_records(runs_dir: &Path, feature_id: &str) -> Result<Vec<RunRecord>>
         });
     }
     Ok(records)
+}
+
+fn classify_stale_run_candidate(
+    paths: &RepoPaths,
+    feature_id: &str,
+    run_record: &RunRecord,
+) -> Result<Option<StaleRunDisposition>> {
+    if run_record.run.status != RunStatus::Running || run_record.receipt.is_some() {
+        return Ok(None);
+    }
+
+    let run_dir = run_record
+        .run_path
+        .parent()
+        .ok_or_else(|| anyhow!("run path missing parent: {}", run_record.run_path.display()))?;
+    let executor = read_executor_process_info(&run_dir.join("executor.json"))?;
+    let heartbeat = read_run_heartbeat_optional(&run_dir.join("heartbeat.json"))?;
+    let latest_decision = latest_decision_record(&paths.decisions_dir, &run_record.run.id)?;
+    if latest_decision.is_some() {
+        return Ok(None);
+    }
+
+    let Some(reason) =
+        stale_run_reason(&run_record.run, executor.as_ref(), heartbeat.as_ref(), false)
+    else {
+        return Ok(None);
+    };
+
+    let candidate = StaleArtifactCandidate {
+        artifact_kind: "run".to_string(),
+        artifact_id: run_record.run.id.clone(),
+        work_id: feature_id.to_string(),
+        artifact_ref: relative_ref(&paths.repo_root, &run_record.run_path)?,
+        reason,
+        last_progress_at: heartbeat.as_ref().map(|value| value.last_progress_at.clone()),
+        executor_pid: executor.as_ref().map(|value| value.child_pid),
+    };
+
+    if executor.is_none() || heartbeat.is_none() {
+        return Ok(Some(StaleRunDisposition::ManualReview(candidate)));
+    }
+
+    Ok(Some(StaleRunDisposition::SafeToArchive(candidate)))
+}
+
+fn read_executor_process_info(path: &Path) -> Result<Option<ExecutorProcessInfo>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_json(path).map(Some)
+}
+
+fn read_run_heartbeat_optional(path: &Path) -> Result<Option<RunHeartbeat>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_json(path).map(Some)
+}
+
+fn stale_run_reason(
+    _run: &Run,
+    executor: Option<&ExecutorProcessInfo>,
+    heartbeat: Option<&RunHeartbeat>,
+    has_decision: bool,
+) -> Option<String> {
+    if has_decision {
+        return None;
+    }
+    let executor = executor?;
+    let heartbeat = heartbeat?;
+    if heartbeat.state != "running" {
+        return None;
+    }
+    if process_is_alive(executor.child_pid) {
+        return None;
+    }
+    if !rfc3339_age_exceeds(&heartbeat.last_progress_at, Duration::from_secs(60)) {
+        return None;
+    }
+    Some(format!(
+        "status=running but child_pid {} is dead, heartbeat.state=running, last_progress_at={}, no receipt, no decision, no proof",
+        executor.child_pid, heartbeat.last_progress_at
+    ))
+}
+
+fn rfc3339_age_exceeds(timestamp: &str, threshold: Duration) -> bool {
+    let Ok(parsed) = DateTime::parse_from_rfc3339(timestamp) else {
+        return false;
+    };
+    let age = Utc::now().signed_duration_since(parsed.with_timezone(&Utc));
+    age.to_std().map(|value| value >= threshold).unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 fn latest_decision_record(decisions_dir: &Path, run_id: &str) -> Result<Option<DecisionRecord>> {
@@ -2326,13 +2488,37 @@ struct RunFinalizer {
     armed: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RunHeartbeat {
     run_id: String,
     state: String,
     last_progress_at: String,
     stdout_bytes: u64,
     stderr_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ExecutorProcessInfo {
+    child_pid: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StaleArtifactCandidate {
+    pub artifact_kind: String,
+    pub artifact_id: String,
+    pub work_id: String,
+    pub artifact_ref: String,
+    pub reason: String,
+    pub last_progress_at: Option<String>,
+    pub executor_pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StaleGcReport {
+    pub project_id: String,
+    pub generated_at: String,
+    pub safe_to_archive: Vec<StaleArtifactCandidate>,
+    pub manual_review: Vec<StaleArtifactCandidate>,
 }
 
 struct RunHeartbeatGuard {
@@ -5112,6 +5298,236 @@ mod tests {
         let status = service.status(None).unwrap();
         assert_eq!(status.work_id.as_deref(), Some(contract_a.feature_id.as_str()));
         assert_eq!(status.last_run_id.as_deref(), Some(run_a2.id.as_str()));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn inspect_work_ledger_ignores_stale_orphaned_running_run() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-ignore-stale-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-ignore-stale-run-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("demo.txt"), "seed\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let project = service.bootstrap_project().unwrap();
+        let proposal = DraftProposal {
+            title: "feature".into(),
+            summary: "feature".into(),
+            entry_points: vec!["demo.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["demo".into()],
+            behavior_requirements: vec!["update demo".into()],
+            allowed_scope: vec!["demo.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+        };
+        let (_feature, contract) = service
+            .persist_draft_contract(&project, "feature", &proposal)
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+        let (good_run, _receipt) = service.cut_run(&FakeExecutor, &contract.id).unwrap();
+
+        let stale_run = Run {
+            id: "run_stale_orphan".into(),
+            task_id: "task_stale_orphan".into(),
+            feature_id: contract.feature_id.clone(),
+            contract_id: contract.id.clone(),
+            attempt: 2,
+            status: RunStatus::Running,
+            mode_origin: ModeId::Cut,
+            vcs: good_run.vcs.clone(),
+            started_at: now_rfc3339(),
+            ended_at: None,
+        };
+        let stale_dir = service.paths.runs_dir.join(&stale_run.id);
+        fs::create_dir_all(&stale_dir).unwrap();
+        write_json(&stale_dir.join("run.json"), &stale_run).unwrap();
+        write_json(
+            &stale_dir.join("executor.json"),
+            &serde_json::json!({"child_pid": 999999_u32, "process_group_id": 999999_u32}),
+        )
+        .unwrap();
+        write_json(
+            &stale_dir.join("heartbeat.json"),
+            &RunHeartbeat {
+                run_id: stale_run.id.clone(),
+                state: "running".into(),
+                last_progress_at: "2020-01-01T00:00:00Z".into(),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            },
+        )
+        .unwrap();
+
+        let ledger = service.inspect_work_ledger(Some(&contract.feature_id)).unwrap();
+        assert_eq!(
+            ledger.latest_run_ref.as_deref(),
+            Some(format!(".punk/runs/{}/run.json", good_run.id).as_str())
+        );
+        assert_eq!(ledger.lifecycle_state, "awaiting_gate");
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn gc_stale_dry_run_reports_safe_orphaned_runs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-gc-stale-dry-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-gc-stale-dry-run-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("demo.txt"), "seed\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let project = service.bootstrap_project().unwrap();
+        let proposal = DraftProposal {
+            title: "feature".into(),
+            summary: "feature".into(),
+            entry_points: vec!["demo.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["demo".into()],
+            behavior_requirements: vec!["update demo".into()],
+            allowed_scope: vec!["demo.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+        };
+        let (_feature, contract) = service
+            .persist_draft_contract(&project, "feature", &proposal)
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let stale_run = Run {
+            id: "run_gc_stale".into(),
+            task_id: "task_gc_stale".into(),
+            feature_id: contract.feature_id.clone(),
+            contract_id: contract.id.clone(),
+            attempt: 1,
+            status: RunStatus::Running,
+            mode_origin: ModeId::Cut,
+            vcs: RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: "HEAD".into(),
+                change_ref: "HEAD".into(),
+                base_ref: None,
+            },
+            started_at: now_rfc3339(),
+            ended_at: None,
+        };
+        let stale_dir = service.paths.runs_dir.join(&stale_run.id);
+        fs::create_dir_all(&stale_dir).unwrap();
+        write_json(&stale_dir.join("run.json"), &stale_run).unwrap();
+        write_json(
+            &stale_dir.join("executor.json"),
+            &serde_json::json!({"child_pid": 999999_u32, "process_group_id": 999999_u32}),
+        )
+        .unwrap();
+        write_json(
+            &stale_dir.join("heartbeat.json"),
+            &RunHeartbeat {
+                run_id: stale_run.id.clone(),
+                state: "running".into(),
+                last_progress_at: "2020-01-01T00:00:00Z".into(),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            },
+        )
+        .unwrap();
+
+        let report = service.gc_stale_dry_run().unwrap();
+        assert_eq!(report.project_id, project.id);
+        assert_eq!(report.safe_to_archive.len(), 1);
+        assert!(report.manual_review.is_empty());
+        let candidate = &report.safe_to_archive[0];
+        assert_eq!(candidate.artifact_id, stale_run.id);
+        assert_eq!(candidate.work_id, contract.feature_id);
+        assert!(candidate.reason.contains("child_pid 999999 is dead"));
+        assert_eq!(
+            candidate.artifact_ref,
+            format!(".punk/runs/{}/run.json", stale_run.id)
+        );
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);
