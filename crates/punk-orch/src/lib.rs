@@ -742,6 +742,11 @@ impl OrchService {
         let preexisting_changed_files = backend.changed_files().unwrap_or_default();
         let isolated = backend.create_isolated_change(&task.id)?;
         let workspace_root = PathBuf::from(&isolated.workspace_ref);
+        sync_present_repo_root_changes_to_isolated_workspace(
+            &self.paths.repo_root,
+            &workspace_root,
+            &preexisting_changed_files,
+        )?;
         let isolated_backend = detect_backend(&workspace_root)?;
         let run_id = new_id("run");
         let run_dir = self.paths.runs_dir.join(&run_id);
@@ -2389,6 +2394,28 @@ fn sync_present_isolated_changes_to_repo_root(
     Ok(())
 }
 
+fn sync_present_repo_root_changes_to_isolated_workspace(
+    repo_root: &Path,
+    workspace_root: &Path,
+    changed_files: &[String],
+) -> Result<()> {
+    for path in changed_files
+        .iter()
+        .filter(|path| !path.starts_with(".punk/") && !path.starts_with("target/"))
+    {
+        let source = repo_root.join(path);
+        if !source.is_file() {
+            continue;
+        }
+        let destination = workspace_root.join(path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&source, &destination)?;
+    }
+    Ok(())
+}
+
 fn contract_implies_generated_cargo_lock(contract: &Contract) -> bool {
     scope_covers_contract_root_manifest(contract)
         && !contract
@@ -3852,6 +3879,87 @@ mod tests {
 
         assert!(root.join("crates/pubpunk-cli/src/main.rs").exists());
         assert!(!root.join(".punk/runs/run_1/stdout.log").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_present_repo_root_changes_to_isolated_workspace_copies_untracked_product_files() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-sync-root-{}-{suffix}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname='pubpunk-cli'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname='pubpunk-core'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "tests\n").unwrap();
+        fs::write(root.join(".punk/runs/run_1/stdout.log"), "noise\n").unwrap();
+        fs::write(root.join("target/debug/app"), "bin\n").unwrap();
+
+        sync_present_repo_root_changes_to_isolated_workspace(
+            &root,
+            &workspace,
+            &[
+                "Cargo.toml".into(),
+                "crates/pubpunk-cli/Cargo.toml".into(),
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/Cargo.toml".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/README.md".into(),
+                ".punk/runs/run_1/stdout.log".into(),
+                "target/debug/app".into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(workspace.join("Cargo.toml")).unwrap(),
+            "[workspace]\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("crates/pubpunk-cli/src/main.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("crates/pubpunk-core/src/lib.rs")).unwrap(),
+            "pub fn init() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("tests/README.md")).unwrap(),
+            "tests\n"
+        );
+        assert!(!workspace.join(".punk/runs/run_1/stdout.log").exists());
+        assert!(!workspace.join("target/debug/app").exists());
 
         let _ = fs::remove_dir_all(&root);
     }
