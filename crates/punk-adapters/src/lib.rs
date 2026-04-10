@@ -938,13 +938,18 @@ impl CodexCliExecutor {
                 .collect::<Vec<_>>();
 
             if let Err(err) = apply_patch_in_repo(&input.repo_root, &updates) {
+                let detail = err.to_string();
                 append_log_text(
                     &input.stderr_path,
-                    &format!("\n[punk patch/apply] failed to apply patch: {err}\n"),
+                    &format!("\n[punk patch/apply] failed to apply patch: {detail}\n"),
                 )?;
                 return Ok(ExecuteOutput {
                     success: false,
-                    summary: format!("patch/apply lane failed to apply patch: {err}"),
+                    summary: if detail.starts_with(BLOCKED_EXECUTION_SENTINEL) {
+                        detail
+                    } else {
+                        format!("patch/apply lane failed to apply patch: {detail}")
+                    },
                     checks_run: Vec::new(),
                     cost_usd: None,
                     duration_ms: start.elapsed().as_millis() as u64,
@@ -4507,6 +4512,12 @@ struct ApplyPatchUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ApplyPatchSnapshot {
+    path: String,
+    original: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ApplyPatchHunk {
     header: Option<String>,
     lines: Vec<String>,
@@ -4813,8 +4824,67 @@ fn parse_apply_patch_updates(patch: &str) -> Result<Vec<ApplyPatchUpdate>> {
 }
 
 fn apply_patch_in_repo(repo_root: &Path, updates: &[ApplyPatchUpdate]) -> Result<()> {
+    let snapshots = collect_apply_patch_snapshots(repo_root, updates)?;
+    let apply_result = apply_patch_updates_in_repo(repo_root, updates)
+        .and_then(|_| validate_patch_apply_results(repo_root, &snapshots));
+    if let Err(err) = apply_result {
+        restore_apply_patch_snapshots(repo_root, &snapshots)
+            .with_context(|| "restore patch targets after failed apply")?;
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn collect_apply_patch_snapshots(
+    repo_root: &Path,
+    updates: &[ApplyPatchUpdate],
+) -> Result<Vec<ApplyPatchSnapshot>> {
+    let mut snapshots = Vec::with_capacity(updates.len());
+    for update in updates {
+        let file_path = repo_root.join(&update.path);
+        if !file_path.exists() {
+            return Err(anyhow!("patch target does not exist: {}", update.path));
+        }
+        snapshots.push(ApplyPatchSnapshot {
+            path: update.path.clone(),
+            original: fs::read_to_string(&file_path)
+                .with_context(|| format!("read patch target {}", file_path.display()))?,
+        });
+    }
+    Ok(snapshots)
+}
+
+fn apply_patch_updates_in_repo(repo_root: &Path, updates: &[ApplyPatchUpdate]) -> Result<()> {
     for update in updates {
         apply_update_in_repo(repo_root, update)?;
+    }
+    Ok(())
+}
+
+fn validate_patch_apply_results(repo_root: &Path, snapshots: &[ApplyPatchSnapshot]) -> Result<()> {
+    let mut corrupted_paths = Vec::new();
+    for snapshot in snapshots {
+        let file_path = repo_root.join(&snapshot.path);
+        let metadata = fs::metadata(&file_path)
+            .with_context(|| format!("read patch target metadata {}", file_path.display()))?;
+        if metadata.len() == 0 && !snapshot.original.is_empty() {
+            corrupted_paths.push(snapshot.path.clone());
+        }
+    }
+    if !corrupted_paths.is_empty() {
+        return Err(anyhow!(
+            "{BLOCKED_EXECUTION_SENTINEL} patch/apply aborted because {} are currently zero-byte; original contents were restored",
+            corrupted_paths.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn restore_apply_patch_snapshots(repo_root: &Path, snapshots: &[ApplyPatchSnapshot]) -> Result<()> {
+    for snapshot in snapshots {
+        let file_path = repo_root.join(&snapshot.path);
+        fs::write(&file_path, &snapshot.original)
+            .with_context(|| format!("restore patch target {}", file_path.display()))?;
     }
     Ok(())
 }
@@ -6762,6 +6832,68 @@ mod tests {
         apply_patch_in_repo(&root, &updates).unwrap();
         let updated = fs::read_to_string(root.join("src/lib.rs")).unwrap();
         assert!(updated.contains("pub fn format_summary()"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_patch_in_repo_restores_prior_updates_when_later_hunk_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-apply-patch-rollback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.rs"), "pub fn a() {}\n").unwrap();
+        fs::write(root.join("src/b.rs"), "pub fn b() {}\n").unwrap();
+
+        let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-pub fn a() {}\n+pub fn a_changed() {}\n*** Update File: src/b.rs\n@@\n-pub fn missing() {}\n+pub fn b_changed() {}\n*** End Patch\n";
+        let updates =
+            validate_patch_scope(patch, &[String::from("src/a.rs"), String::from("src/b.rs")])
+                .unwrap();
+        let err = apply_patch_in_repo(&root, &updates).unwrap_err();
+        assert!(err.to_string().contains("apply hunk in src/b.rs"));
+        assert_eq!(
+            fs::read_to_string(root.join("src/a.rs")).unwrap(),
+            "pub fn a() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("src/b.rs")).unwrap(),
+            "pub fn b() {}\n"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_patch_in_repo_blocks_and_restores_zero_byte_results() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-apply-patch-zero-byte-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn old() {}").unwrap();
+
+        let patch =
+            "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn old() {}\n*** End Patch\n";
+        let updates = validate_patch_scope(patch, &[String::from("src/lib.rs")]).unwrap();
+        let err = apply_patch_in_repo(&root, &updates).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("PUNK_EXECUTION_BLOCKED: patch/apply aborted because src/lib.rs are currently zero-byte"));
+        assert_eq!(
+            fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "pub fn old() {}"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
