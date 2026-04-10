@@ -58,6 +58,13 @@ impl GateService {
         let mut decision_basis = Vec::new();
         let mut check_refs = Vec::new();
         let mut command_evidence = Vec::new();
+        let receipt_ok = receipt.status == "success";
+        if !receipt_ok {
+            decision_basis.push(format!(
+                "run receipt status is {}: {}",
+                receipt.status, receipt.summary
+            ));
+        }
         let scope_ok = validate_scope(&contract.allowed_scope, &receipt.changed_files);
         if !scope_ok {
             decision_basis.push("scope violation: changed files outside allowed_scope".to_string());
@@ -86,7 +93,8 @@ impl GateService {
         command_evidence.extend(target.command_evidence);
         command_evidence.extend(integrity.command_evidence);
 
-        let (decision, deterministic_status, confidence_estimate) = if !scope_ok
+        let (decision, deterministic_status, confidence_estimate) = if !receipt_ok
+            || !scope_ok
             || target.status == CheckStatus::Fail
             || integrity.status == CheckStatus::Fail
             || harness.status == CheckStatus::Fail
@@ -1044,6 +1052,90 @@ mod tests {
             .decision_basis
             .iter()
             .all(|reason| !reason.contains("failed")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gate_blocks_failed_receipt_even_when_trusted_checks_pass() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-failed-receipt-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "bootstrap".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["workspace scaffold".into()],
+            behavior_requirements: vec!["bootstrap project".into()],
+            allowed_scope: vec!["Cargo.toml".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
+
+        let run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "failure".into(),
+            executor_name: "fake".into(),
+            changed_files: vec!["Cargo.toml".into()],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec![],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "stalled after no progress".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+
+        let gate = GateService::new(&root, &global);
+        let decision = gate.gate_run("run_1").unwrap();
+
+        assert_eq!(decision.decision, Decision::Block);
+        assert_eq!(decision.deterministic_status, DeterministicStatus::Fail);
+        assert!(decision
+            .decision_basis
+            .iter()
+            .any(|reason| reason.contains("run receipt status is failure")));
 
         let _ = fs::remove_dir_all(&root);
     }
