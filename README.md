@@ -112,6 +112,7 @@ Bootstrap also ensures safe default ignore coverage for:
 
 - `.punk/`
 - `target/`
+- `.playwright-mcp/`
 
 Successful `cut run` receipts also backfill the same safe ignore coverage if a repo was bootstrapped without a `.gitignore`.
 

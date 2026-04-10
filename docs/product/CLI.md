@@ -274,7 +274,7 @@ Creates or refreshes:
 - project pin / resolver entry
 - bootstrap guidance
 - repo-local agent instructions
-- default `.gitignore` coverage for `.punk/` and `target/`
+- default `.gitignore` coverage for `.punk/`, `target/`, and `.playwright-mcp/`
 - successful `cut run` receipts should also backfill the same safe `.gitignore` coverage without surfacing `.gitignore` itself as bounded user work
 
 Verifies:
@@ -334,6 +334,7 @@ Preflight expectation:
 - for a bootstrapped greenfield Python repo with no existing inferred checks yet, an explicit Python scaffold goal may derive `pytest` plus scaffoldable scope around `pyproject.toml`, `src`, and `tests`
 - for a bootstrapped greenfield TypeScript/Node repo with no existing `package.json` or inferred checks yet, an explicit TS/Node scaffold goal may derive `npm test` plus scaffoldable scope around `package.json`, optional `tsconfig.json`, and `src`/`tests` (or workspace-style `packages`/`apps`)
 - that same greenfield Rust scaffold intake should prefer scaffoldable Rust/workspace surfaces like `Cargo.toml`, `crates`, and `tests` over existing docs/archive files when synthesizing initial scope candidates
+- if the repo root has no explicit integrity story but nested manifests/scripts do, `punk go` may infer trustworthy intake checks from nested `Cargo.toml`, nested `package.json` scripts, or nested `Makefile` `test` targets instead of failing immediately at repo scan
 
 ### `punk start "<goal>"`
 
@@ -351,6 +352,7 @@ Preflight expectation:
 - that same greenfield Rust scaffold draft should route scope toward scaffoldable Rust/workspace surfaces instead of existing docs/archive paths
 - if an explicit bootstrap prompt names nested scaffold touch targets under a missing scaffold root (for example `crates/pubpunk-cli` before `crates/` exists), the draft should still preserve those repo-relative paths in `allowed_scope` instead of collapsing back to only the root manifest
 - when a plain Rust bootstrap goal also mentions implementation semantics like `pubpunk init`, controller scaffold member inference should prefer the goal-derived app slug (`pubpunk-cli` / `pubpunk-core`) instead of article-shaped placeholders like `a-cli` / `a-core`
+- if the repo root has no explicit integrity story but nested manifests/scripts do, `punk start` may infer trustworthy intake checks from nested `Cargo.toml`, nested `package.json` scripts, or nested `Makefile` `test` targets instead of failing immediately at repo scan
 
 Creates:
 

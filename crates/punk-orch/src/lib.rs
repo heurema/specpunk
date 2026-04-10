@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -342,6 +343,8 @@ impl OrchService {
             "repo scan",
             scan_repo(&self.paths.repo_root, trimmed_prompt),
         )?;
+        let mut scan = scan;
+        enrich_scan_with_nested_integrity_fallback(&self.paths.repo_root, &mut scan)?;
         if scan.candidate_integrity_checks.is_empty() {
             return Err(anyhow!(
                 "phase repo scan: {}",
@@ -506,7 +509,8 @@ impl OrchService {
             .features_dir
             .join(format!("{}.json", current_contract.feature_id));
         let mut feature: Feature = read_json(&feature_path)?;
-        let scan = scan_repo(&self.paths.repo_root, &current_contract.prompt_source)?;
+        let mut scan = scan_repo(&self.paths.repo_root, &current_contract.prompt_source)?;
+        enrich_scan_with_nested_integrity_fallback(&self.paths.repo_root, &mut scan)?;
         if scan.candidate_integrity_checks.is_empty() {
             return Err(anyhow!(
                 "unable to infer trustworthy integrity checks from repo scan"
@@ -2419,10 +2423,11 @@ fn sync_present_isolated_changes_to_repo_root(
     workspace_root: &Path,
     changed_files: &[String],
 ) -> Result<()> {
-    for path in changed_files
-        .iter()
-        .filter(|path| !path.starts_with(".punk/") && !path.starts_with("target/"))
-    {
+    for path in changed_files.iter().filter(|path| {
+        !path.starts_with(".punk/")
+            && !path.starts_with("target/")
+            && !path.starts_with(".playwright-mcp/")
+    }) {
         let source = workspace_root.join(path);
         if !source.is_file() {
             continue;
@@ -2441,10 +2446,11 @@ fn sync_present_repo_root_changes_to_isolated_workspace(
     workspace_root: &Path,
     changed_files: &[String],
 ) -> Result<()> {
-    for path in changed_files
-        .iter()
-        .filter(|path| !path.starts_with(".punk/") && !path.starts_with("target/"))
-    {
+    for path in changed_files.iter().filter(|path| {
+        !path.starts_with(".punk/")
+            && !path.starts_with("target/")
+            && !path.starts_with(".playwright-mcp/")
+    }) {
         let source = repo_root.join(path);
         if !source.is_file() {
             continue;
@@ -2484,6 +2490,9 @@ fn merge_default_gitignore_entries(existing: &str) -> String {
     if !gitignore_covers_pattern(&lines, "target/") {
         lines.push("target/".to_string());
     }
+    if !gitignore_covers_pattern(&lines, ".playwright-mcp/") {
+        lines.push(".playwright-mcp/".to_string());
+    }
     if lines.is_empty() {
         String::new()
     } else {
@@ -2495,12 +2504,187 @@ fn gitignore_covers_pattern(lines: &[String], required: &str) -> bool {
     let aliases: &[&str] = match required {
         ".punk/" => &[".punk/", ".punk"],
         "target/" => &["target/", "target"],
+        ".playwright-mcp/" => &[".playwright-mcp/", ".playwright-mcp"],
         _ => &[required],
     };
     lines.iter().any(|line| {
         let trimmed = line.trim();
         aliases.iter().any(|alias| trimmed == *alias)
     })
+}
+
+#[derive(Default)]
+struct NestedCheckInference {
+    manifests: Vec<String>,
+    target_checks: Vec<String>,
+    integrity_checks: Vec<String>,
+}
+
+fn enrich_scan_with_nested_integrity_fallback(
+    repo_root: &Path,
+    scan: &mut punk_domain::RepoScanSummary,
+) -> Result<()> {
+    if !scan.candidate_integrity_checks.is_empty() {
+        return Ok(());
+    }
+    let inference = infer_nested_trustworthy_checks(repo_root)?;
+    if inference.integrity_checks.is_empty() {
+        return Ok(());
+    }
+    for manifest in inference.manifests {
+        push_unique_string(&mut scan.manifests, manifest);
+    }
+    for check in inference.target_checks {
+        push_unique_string(&mut scan.candidate_target_checks, check);
+    }
+    for check in inference.integrity_checks {
+        push_unique_string(&mut scan.candidate_integrity_checks, check);
+    }
+    push_unique_string(
+        &mut scan.notes,
+        "inferred trustworthy integrity checks from nested manifests because the repo root had no explicit integrity story".to_string(),
+    );
+    Ok(())
+}
+
+fn infer_nested_trustworthy_checks(repo_root: &Path) -> Result<NestedCheckInference> {
+    let mut inference = NestedCheckInference::default();
+    collect_nested_trustworthy_checks(repo_root, repo_root, &mut inference)?;
+    Ok(inference)
+}
+
+fn collect_nested_trustworthy_checks(
+    repo_root: &Path,
+    current: &Path,
+    inference: &mut NestedCheckInference,
+) -> Result<()> {
+    if current != repo_root {
+        let relative_dir = current
+            .strip_prefix(repo_root)
+            .map_err(|_| anyhow!("failed to relativize {}", current.display()))?;
+        if current.join("Cargo.toml").exists() {
+            let manifest = relative_dir.join("Cargo.toml");
+            let manifest = manifest.to_string_lossy().replace('\\', "/");
+            push_unique_string(&mut inference.manifests, manifest.clone());
+            let command = format!("cargo test --manifest-path {manifest}");
+            push_unique_string(&mut inference.target_checks, command.clone());
+            push_unique_string(&mut inference.integrity_checks, command);
+        }
+        if current.join("package.json").exists() {
+            let manifest = relative_dir.join("package.json");
+            let manifest = manifest.to_string_lossy().replace('\\', "/");
+            push_unique_string(&mut inference.manifests, manifest);
+            let scripts = read_package_scripts(&current.join("package.json"))?;
+            let package_manager = detect_nested_package_manager(current);
+            for script in ["check", "test", "lint", "typecheck"] {
+                if scripts.contains_key(script) {
+                    let command = nested_package_manager_run(
+                        package_manager.as_deref(),
+                        relative_dir,
+                        script,
+                    );
+                    push_unique_string(&mut inference.target_checks, command.clone());
+                    push_unique_string(&mut inference.integrity_checks, command);
+                }
+            }
+        }
+        if current.join("Makefile").exists() {
+            let manifest = relative_dir.join("Makefile");
+            let manifest = manifest.to_string_lossy().replace('\\', "/");
+            push_unique_string(&mut inference.manifests, manifest);
+            let makefile = fs::read_to_string(current.join("Makefile"))?;
+            if makefile
+                .lines()
+                .any(|line| line.trim_start().starts_with("test:"))
+            {
+                let command = format!("make -C {} test", relative_dir.to_string_lossy());
+                push_unique_string(&mut inference.target_checks, command.clone());
+                push_unique_string(&mut inference.integrity_checks, command);
+            }
+        }
+    }
+
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if ignored_nested_name(&name) {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(repo_root)
+            .map_err(|_| anyhow!("failed to relativize {}", path.display()))?;
+        if ignored_nested_relative_path(relative) {
+            continue;
+        }
+        collect_nested_trustworthy_checks(repo_root, &path, inference)?;
+    }
+
+    Ok(())
+}
+
+fn read_package_scripts(package_json: &Path) -> Result<BTreeMap<String, String>> {
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(package_json).map_err(|err| anyhow!("read {}: {err}", package_json.display()))?,
+    )
+    .map_err(|err| anyhow!("parse {}: {err}", package_json.display()))?;
+    Ok(value
+        .get("scripts")
+        .and_then(|value| value.as_object())
+        .map(|scripts| {
+            scripts
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default())
+}
+
+fn detect_nested_package_manager(package_dir: &Path) -> Option<String> {
+    for (file, pm) in [
+        ("pnpm-lock.yaml", "pnpm"),
+        ("yarn.lock", "yarn"),
+        ("bun.lockb", "bun"),
+        ("bun.lock", "bun"),
+        ("package-lock.json", "npm"),
+    ] {
+        if package_dir.join(file).exists() {
+            return Some(pm.to_string());
+        }
+    }
+    Some("npm".to_string())
+}
+
+fn nested_package_manager_run(
+    package_manager: Option<&str>,
+    relative_dir: &Path,
+    script: &str,
+) -> String {
+    let directory = relative_dir.to_string_lossy();
+    match package_manager.unwrap_or("npm") {
+        "pnpm" => format!("pnpm --dir {directory} {script}"),
+        "yarn" => format!("yarn --cwd {directory} {script}"),
+        "bun" => format!("bun --cwd {directory} run {script}"),
+        _ => format!("npm --prefix {directory} run {script}"),
+    }
+}
+
+fn ignored_nested_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | ".jj" | ".punk" | "target" | "node_modules" | ".playwright-mcp"
+    )
+}
+
+fn ignored_nested_relative_path(relative: &Path) -> bool {
+    relative.starts_with("docs/reference-repos")
+        || relative.starts_with("docs/research/_delve_runs")
+        || relative.starts_with(".build")
 }
 
 fn contract_implies_generated_cargo_lock(contract: &Contract) -> bool {
@@ -4290,12 +4474,65 @@ mod tests {
     }
 
     #[test]
-    fn merge_default_gitignore_entries_adds_punk_and_target_when_missing() {
+    fn merge_default_gitignore_entries_adds_runtime_artifact_ignores_when_missing() {
         let merged = merge_default_gitignore_entries("");
-        assert_eq!(merged, ".punk/\ntarget/\n");
+        assert_eq!(merged, ".punk/\ntarget/\n.playwright-mcp/\n");
 
-        let already_covered = merge_default_gitignore_entries("target\n.punk\n");
-        assert_eq!(already_covered, "target\n.punk\n");
+        let already_covered = merge_default_gitignore_entries("target\n.punk\n.playwright-mcp\n");
+        assert_eq!(already_covered, "target\n.punk\n.playwright-mcp\n");
+    }
+
+    #[test]
+    fn draft_contract_accepts_nested_package_checks_when_root_has_no_integrity_story() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-nested-integrity-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "test": "echo test"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(root.join(".gitignore"), ".playwright-mcp/\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&FakeDrafter, "tighten the baseline-site homepage")
+            .unwrap();
+
+        assert_eq!(
+            contract.target_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/package.json"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -4343,7 +4580,7 @@ mod tests {
         assert!(!receipt.changed_files.iter().any(|path| path == ".gitignore"));
         assert_eq!(
             fs::read_to_string(root.join(".gitignore")).unwrap(),
-            ".punk/\ntarget/\n"
+            ".punk/\ntarget/\n.playwright-mcp/\n"
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -4400,12 +4637,18 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(workspace.join("crates/pubpunk-cli/src")).unwrap();
         fs::create_dir_all(workspace.join(".punk/runs/run_1")).unwrap();
+        fs::create_dir_all(workspace.join(".playwright-mcp/state")).unwrap();
         fs::write(
             workspace.join("crates/pubpunk-cli/src/main.rs"),
             "fn main() {}\n",
         )
         .unwrap();
         fs::write(workspace.join(".punk/runs/run_1/stdout.log"), "noise\n").unwrap();
+        fs::write(
+            workspace.join(".playwright-mcp/state/session.json"),
+            "{\"ok\":true}\n",
+        )
+        .unwrap();
 
         sync_present_isolated_changes_to_repo_root(
             &root,
@@ -4413,12 +4656,14 @@ mod tests {
             &[
                 "crates/pubpunk-cli/src/main.rs".into(),
                 ".punk/runs/run_1/stdout.log".into(),
+                ".playwright-mcp/state/session.json".into(),
             ],
         )
         .unwrap();
 
         assert!(root.join("crates/pubpunk-cli/src/main.rs").exists());
         assert!(!root.join(".punk/runs/run_1/stdout.log").exists());
+        assert!(!root.join(".playwright-mcp/state/session.json").exists());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -4440,6 +4685,7 @@ mod tests {
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
         fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::create_dir_all(root.join(".playwright-mcp/state")).unwrap();
         fs::create_dir_all(&workspace).unwrap();
         fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
         fs::write(
@@ -4465,6 +4711,11 @@ mod tests {
         fs::write(root.join("tests/README.md"), "tests\n").unwrap();
         fs::write(root.join(".punk/runs/run_1/stdout.log"), "noise\n").unwrap();
         fs::write(root.join("target/debug/app"), "bin\n").unwrap();
+        fs::write(
+            root.join(".playwright-mcp/state/session.json"),
+            "{\"ok\":true}\n",
+        )
+        .unwrap();
 
         sync_present_repo_root_changes_to_isolated_workspace(
             &root,
@@ -4478,6 +4729,7 @@ mod tests {
                 "tests/README.md".into(),
                 ".punk/runs/run_1/stdout.log".into(),
                 "target/debug/app".into(),
+                ".playwright-mcp/state/session.json".into(),
             ],
         )
         .unwrap();
@@ -4500,6 +4752,9 @@ mod tests {
         );
         assert!(!workspace.join(".punk/runs/run_1/stdout.log").exists());
         assert!(!workspace.join("target/debug/app").exists());
+        assert!(!workspace
+            .join(".playwright-mcp/state/session.json")
+            .exists());
 
         let _ = fs::remove_dir_all(&root);
     }

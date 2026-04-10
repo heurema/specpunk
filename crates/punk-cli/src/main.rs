@@ -604,6 +604,9 @@ fn merge_default_gitignore_entries(existing: &str) -> String {
     if !gitignore_covers_pattern(&lines, "target/") {
         lines.push("target/".to_string());
     }
+    if !gitignore_covers_pattern(&lines, ".playwright-mcp/") {
+        lines.push(".playwright-mcp/".to_string());
+    }
     if lines.is_empty() {
         String::new()
     } else {
@@ -615,6 +618,7 @@ fn gitignore_covers_pattern(lines: &[String], required: &str) -> bool {
     let aliases: &[&str] = match required {
         ".punk/" => &[".punk/", ".punk"],
         "target/" => &["target/", "target"],
+        ".playwright-mcp/" => &[".playwright-mcp/", ".playwright-mcp"],
         _ => &[required],
     };
     lines.iter().any(|line| {
@@ -1838,18 +1842,18 @@ mod tests {
     }
 
     #[test]
-    fn merge_default_gitignore_entries_adds_punk_and_target_when_missing() {
+    fn merge_default_gitignore_entries_adds_runtime_artifact_ignores_when_missing() {
         let merged = merge_default_gitignore_entries("");
-        assert_eq!(merged, ".punk/\ntarget/\n");
+        assert_eq!(merged, ".punk/\ntarget/\n.playwright-mcp/\n");
     }
 
     #[test]
     fn merge_default_gitignore_entries_preserves_existing_lines_without_duplication() {
         let merged = merge_default_gitignore_entries("node_modules/\n.punk/\n");
-        assert_eq!(merged, "node_modules/\n.punk/\ntarget/\n");
+        assert_eq!(merged, "node_modules/\n.punk/\ntarget/\n.playwright-mcp/\n");
 
-        let already_covered = merge_default_gitignore_entries("target\n.punk\n");
-        assert_eq!(already_covered, "target\n.punk\n");
+        let already_covered = merge_default_gitignore_entries("target\n.punk\n.playwright-mcp\n");
+        assert_eq!(already_covered, "target\n.punk\n.playwright-mcp\n");
     }
 
     #[test]
@@ -1860,7 +1864,10 @@ mod tests {
         ensure_default_gitignore_coverage(&root).unwrap();
 
         let gitignore = fs::read_to_string(root.join(".gitignore")).unwrap();
-        assert_eq!(gitignore, "node_modules/\n.punk/\ntarget/\n");
+        assert_eq!(
+            gitignore,
+            "node_modules/\n.punk/\ntarget/\n.playwright-mcp/\n"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
