@@ -294,7 +294,8 @@ impl Executor for CodexCliExecutor {
         };
         let start = Instant::now();
 
-        if let Some(output) = maybe_execute_controller_pubpunk_init_recipe(&effective_input, start)? {
+        if let Some(output) = maybe_execute_controller_pubpunk_init_recipe(&effective_input, start)?
+        {
             return Ok(output);
         }
 
@@ -833,8 +834,10 @@ impl CodexCliExecutor {
                     continue;
                 }
                 if !patch_entry_point_snapshots.is_empty() {
-                    let unchanged_paths =
-                        unchanged_entry_point_paths(&input.repo_root, &patch_entry_point_snapshots)?;
+                    let unchanged_paths = unchanged_entry_point_paths(
+                        &input.repo_root,
+                        &patch_entry_point_snapshots,
+                    )?;
                     if !unchanged_paths.is_empty()
                         && unchanged_paths.len() == patch_entry_point_snapshots.len()
                     {
@@ -1450,11 +1453,7 @@ fn patch_apply_retry_feedback(
 }
 
 fn log_tail(text: &str, max_lines: usize, max_chars: usize) -> String {
-    let mut lines = text
-        .lines()
-        .rev()
-        .take(max_lines)
-        .collect::<Vec<_>>();
+    let mut lines = text.lines().rev().take(max_lines).collect::<Vec<_>>();
     lines.reverse();
     let joined = lines.join("\n");
     if joined.chars().count() <= max_chars {
@@ -2078,12 +2077,13 @@ fn render_rust_member_source(
         .to_string()
 }
 
-
 fn maybe_execute_controller_pubpunk_init_recipe(
     input: &ExecuteInput,
     start: Instant,
 ) -> Result<Option<ExecuteOutput>> {
-    let Some(updated_paths) = apply_controller_pubpunk_init_recipe(&input.repo_root, &input.contract)? else {
+    let Some(updated_paths) =
+        apply_controller_pubpunk_init_recipe(&input.repo_root, &input.contract)?
+    else {
         return Ok(None);
     };
 
@@ -2222,25 +2222,102 @@ fn pubpunk_init_contract_text(contract: &Contract) -> String {
 }
 
 fn render_pubpunk_init_core_source() -> String {
-    r##"use std::fs;
+    r####"use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 const SKELETON_DIRS: &[&str] = &[
     ".pubpunk",
     ".pubpunk/style",
+    ".pubpunk/style/examples",
+    ".pubpunk/targets",
+    ".pubpunk/review",
+    ".pubpunk/lint",
     ".pubpunk/agent",
     ".pubpunk/local",
+    ".pubpunk/local/drafts",
+    ".pubpunk/local/reports",
+    ".pubpunk/local/cache",
+    ".pubpunk/local/generated",
 ];
 
+const PROJECT_TOML: &str = concat!(
+    "schema_version = \"pubpunk.project.v1\"\n",
+    "project_id = \"pubpunk\"\n",
+    "display_name = \"Pubpunk\"\n",
+    "\n",
+    "[defaults]\n",
+    "target = \"forem\"\n",
+    "task = \"draft\"\n",
+    "locale = \"en\"\n",
+    "publish_mode = \"draft\"\n",
+    "\n",
+    "[paths]\n",
+    "style_dir = \"style\"\n",
+    "targets_dir = \"targets\"\n",
+    "review_dir = \"review\"\n",
+    "lint_dir = \"lint\"\n",
+    "agent_dir = \"agent\"\n",
+    "local_dir = \"local\"\n",
+    "\n",
+    "[agent]\n",
+    "skill_path = \"agent/skill.md\"\n",
+    "\n",
+    "[local]\n",
+    "state_db = \"local/state.db\"\n",
+    "drafts_dir = \"local/drafts\"\n",
+    "reports_dir = \"local/reports\"\n",
+    "cache_dir = \"local/cache\"\n",
+    "generated_dir = \"local/generated\"\n",
+);
+
 const SKELETON_FILES: &[(&str, &str)] = &[
-    (".pubpunk/project.toml", "[project]\nname = \"pubpunk\"\n"),
-    (".pubpunk/style/style.toml", "[style]\nversion = 1\n"),
+    (".pubpunk/project.toml", PROJECT_TOML),
+    (".pubpunk/style/style.toml", concat!("[style]\n", "version = 1\n")),
     (".pubpunk/style/voice.md", "# voice\n"),
     (".pubpunk/style/lexicon.toml", "[lexicon]\n"),
     (".pubpunk/style/normalize.toml", "[normalize]\n"),
     (".pubpunk/agent/skill.md", "# pubpunk local skill\n"),
-    (".pubpunk/local/.gitignore", "*\n!.gitignore\n"),
+    (".pubpunk/local/.gitignore", concat!("*\n", "!.gitignore\n")),
+];
+
+const REQUIRED_PROJECT_LINES: &[&str] = &[
+    "schema_version = \"pubpunk.project.v1\"",
+    "project_id = \"pubpunk\"",
+    "display_name = \"Pubpunk\"",
+    "target = \"forem\"",
+    "task = \"draft\"",
+    "locale = \"en\"",
+    "publish_mode = \"draft\"",
+    "style_dir = \"style\"",
+    "targets_dir = \"targets\"",
+    "review_dir = \"review\"",
+    "lint_dir = \"lint\"",
+    "agent_dir = \"agent\"",
+    "local_dir = \"local\"",
+    "skill_path = \"agent/skill.md\"",
+    "state_db = \"local/state.db\"",
+    "drafts_dir = \"local/drafts\"",
+    "reports_dir = \"local/reports\"",
+    "cache_dir = \"local/cache\"",
+    "generated_dir = \"local/generated\"",
+];
+
+const PATH_KEYS: &[&str] = &[
+    "style_dir",
+    "targets_dir",
+    "review_dir",
+    "lint_dir",
+    "agent_dir",
+    "local_dir",
+];
+
+const LOCAL_KEYS: &[&str] = &[
+    "state_db",
+    "drafts_dir",
+    "reports_dir",
+    "cache_dir",
+    "generated_dir",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2340,7 +2417,93 @@ pub fn validate(root: &Path) -> io::Result<()> {
             ));
         }
     }
+
+    let project_toml = fs::read_to_string(root.join(".pubpunk/project.toml"))?;
+    validate_project_toml(&project_toml)?;
     Ok(())
+}
+
+fn validate_project_toml(contents: &str) -> io::Result<()> {
+    for required in REQUIRED_PROJECT_LINES {
+        if !contents.contains(required) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing required project.toml line: {required}"),
+            ));
+        }
+    }
+
+    let project_id = assignment_value(contents, "project_id").ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing required project_id")
+    })?;
+    if !is_slug_safe(project_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("project_id is not slug-safe: {project_id}"),
+        ));
+    }
+
+    for key in PATH_KEYS {
+        let value = assignment_value(contents, key).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("missing required key: {key}"))
+        })?;
+        if Path::new(value).is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{key} must stay relative under .pubpunk: {value}"),
+            ));
+        }
+    }
+
+    for key in LOCAL_KEYS {
+        let value = assignment_value(contents, key).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("missing required key: {key}"))
+        })?;
+        if !value.starts_with("local/") || Path::new(value).is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{key} must stay under local/: {value}"),
+            ));
+        }
+    }
+
+    let lowered = contents.to_ascii_lowercase();
+    for secret_like in ["token", "secret", "password", "api_key"] {
+        if lowered.contains(secret_like) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("project.toml contains obvious secret-like field: {secret_like}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn assignment_value<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        let prefix = format!("{key} = ");
+        let Some(value) = trimmed.strip_prefix(&prefix) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+            return Some(&value[1..value.len() - 1]);
+        }
+    }
+    None
+}
+
+fn is_slug_safe(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_')
 }
 
 fn prepare_root(root: &Path) -> io::Result<PathBuf> {
@@ -2392,13 +2555,23 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn init_creates_full_skeleton_and_is_idempotent() {
+    fn init_creates_canonical_pubpunk_tree_and_is_idempotent() {
         let root = temp_dir("core-init");
         let first = init_with_options(&root, false).unwrap();
         assert!(first
             .created
             .iter()
             .any(|path| path == &PathBuf::from(".pubpunk/project.toml")));
+        assert!(root.join(".pubpunk/targets").is_dir());
+        assert!(root.join(".pubpunk/review").is_dir());
+        assert!(root.join(".pubpunk/lint").is_dir());
+        assert!(root.join(".pubpunk/local/drafts").is_dir());
+        assert!(root.join(".pubpunk/style/examples").is_dir());
+        assert_eq!(
+            fs::read_to_string(root.join(".pubpunk/project.toml")).unwrap(),
+            PROJECT_TOML
+        );
+
         let second = init_with_options(&root, false).unwrap();
         assert!(second.created.is_empty());
         assert!(second
@@ -2409,19 +2582,29 @@ mod tests {
     }
 
     #[test]
-    fn force_rewrites_modified_file() {
+    fn force_rewrites_modified_project_file() {
         let root = temp_dir("core-force");
         init_with_options(&root, false).unwrap();
-        fs::write(root.join(".pubpunk/agent/skill.md"), "mutated\n").unwrap();
+        fs::write(root.join(".pubpunk/project.toml"), "schema_version = \"wrong\"\n").unwrap();
         let result = init_with_options(&root, true).unwrap();
         assert!(result
             .rewritten
             .iter()
-            .any(|path| path == &PathBuf::from(".pubpunk/agent/skill.md")));
+            .any(|path| path == &PathBuf::from(".pubpunk/project.toml")));
         assert_eq!(
-            fs::read_to_string(root.join(".pubpunk/agent/skill.md")).unwrap(),
-            "# pubpunk local skill\n"
+            fs::read_to_string(root.join(".pubpunk/project.toml")).unwrap(),
+            PROJECT_TOML
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_missing_required_directory() {
+        let root = temp_dir("core-validate-missing");
+        init_with_options(&root, false).unwrap();
+        fs::remove_dir_all(root.join(".pubpunk/targets")).unwrap();
+        let err = validate(&root).expect_err("validate should fail when required tree is missing");
+        assert!(err.to_string().contains("missing directory"));
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2448,7 +2631,7 @@ mod tests {
         path
     }
 }
-"##
+"####
     .to_string()
 }
 
@@ -2631,20 +2814,65 @@ mod tests {
 }
 
 fn render_pubpunk_init_tests_source() -> String {
-    r##"use std::fs;
+    r####"use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const EXPECTED_PROJECT_TOML: &str = concat!(
+    "schema_version = \"pubpunk.project.v1\"\n",
+    "project_id = \"pubpunk\"\n",
+    "display_name = \"Pubpunk\"\n",
+    "\n",
+    "[defaults]\n",
+    "target = \"forem\"\n",
+    "task = \"draft\"\n",
+    "locale = \"en\"\n",
+    "publish_mode = \"draft\"\n",
+    "\n",
+    "[paths]\n",
+    "style_dir = \"style\"\n",
+    "targets_dir = \"targets\"\n",
+    "review_dir = \"review\"\n",
+    "lint_dir = \"lint\"\n",
+    "agent_dir = \"agent\"\n",
+    "local_dir = \"local\"\n",
+    "\n",
+    "[agent]\n",
+    "skill_path = \"agent/skill.md\"\n",
+    "\n",
+    "[local]\n",
+    "state_db = \"local/state.db\"\n",
+    "drafts_dir = \"local/drafts\"\n",
+    "reports_dir = \"local/reports\"\n",
+    "cache_dir = \"local/cache\"\n",
+    "generated_dir = \"local/generated\"\n",
+);
+
 #[test]
-fn init_creates_full_pubpunk_skeleton() {
+fn init_creates_canonical_pubpunk_skeleton() {
     let root = temp_dir("pubpunk-test-init");
     let result = pubpunk_core::init_with_options(&root, false).expect("init should succeed");
     assert!(result
         .created
         .iter()
         .any(|path| path == &PathBuf::from(".pubpunk/project.toml")));
-    assert!(root.join(".pubpunk/style/voice.md").is_file());
-    assert!(root.join(".pubpunk/agent/skill.md").is_file());
+    for relative in [
+        ".pubpunk/style/examples",
+        ".pubpunk/targets",
+        ".pubpunk/review",
+        ".pubpunk/lint",
+        ".pubpunk/local/drafts",
+        ".pubpunk/local/reports",
+        ".pubpunk/local/cache",
+        ".pubpunk/local/generated",
+    ] {
+        assert!(root.join(relative).is_dir(), "missing {relative}");
+    }
+    assert_eq!(
+        fs::read_to_string(root.join(".pubpunk/project.toml")).unwrap(),
+        EXPECTED_PROJECT_TOML
+    );
+    pubpunk_core::validate(&root).expect("validate should accept initialized tree");
     fs::remove_dir_all(&root).unwrap();
 }
 
@@ -2652,13 +2880,28 @@ fn init_creates_full_pubpunk_skeleton() {
 fn init_json_reports_rewrites_after_force() {
     let root = temp_dir("pubpunk-test-json");
     pubpunk_core::init_with_options(&root, false).unwrap();
-    fs::write(root.join(".pubpunk/style/voice.md"), "mutated\n").unwrap();
+    fs::write(root.join(".pubpunk/project.toml"), "schema_version = \"wrong\"\n").unwrap();
     let result = pubpunk_core::init_with_options(&root, true).unwrap();
     let json = result.to_json();
     assert!(
-        json.contains("\"rewritten\":[\".pubpunk/style/voice.md\"]"),
+        json.contains("\"rewritten\":[\".pubpunk/project.toml\"]"),
         "json={json}"
     );
+    assert_eq!(
+        fs::read_to_string(root.join(".pubpunk/project.toml")).unwrap(),
+        EXPECTED_PROJECT_TOML
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn validate_rejects_missing_targets_dir() {
+    let root = temp_dir("pubpunk-test-validate");
+    pubpunk_core::init_with_options(&root, false).unwrap();
+    fs::remove_dir_all(root.join(".pubpunk/targets")).unwrap();
+    let err =
+        pubpunk_core::validate(&root).expect_err("validate should fail when required tree is missing");
+    assert!(err.to_string().contains("missing directory"));
     fs::remove_dir_all(&root).unwrap();
 }
 
@@ -2671,7 +2914,7 @@ fn temp_dir(prefix: &str) -> PathBuf {
     fs::create_dir_all(&path).unwrap();
     path
 }
-"##
+"####
     .to_string()
 }
 
@@ -2882,7 +3125,9 @@ fn contract_needs_creatable_tests_scope(repo_root: &Path, contract: &Contract) -
     }
     let mut remaining = 16usize;
     let discovered = collect_existing_allowed_scope_files(repo_root, "tests", &mut remaining)?;
-    Ok(!discovered.iter().any(|path| is_executable_test_surface(path)))
+    Ok(!discovered
+        .iter()
+        .any(|path| is_executable_test_surface(path)))
 }
 
 fn is_executable_test_surface(path: &str) -> bool {
@@ -2946,15 +3191,11 @@ fn is_patch_apply_lane_candidate(repo_root: &Path, contract: &Contract) -> bool 
     if contract.allowed_scope.is_empty() || contract.entry_points.is_empty() {
         return false;
     }
-    if !contract
-        .allowed_scope
-        .iter()
-        .all(|path| {
-            repo_root.join(path).exists()
-                || (is_explicit_repo_file_scope(path)
-                    && contract.entry_points.iter().any(|entry| entry == path))
-        })
-    {
+    if !contract.allowed_scope.iter().all(|path| {
+        repo_root.join(path).exists()
+            || (is_explicit_repo_file_scope(path)
+                && contract.entry_points.iter().any(|entry| entry == path))
+    }) {
         return false;
     }
     if !contract
@@ -6261,7 +6502,11 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let stdout = root.join("stdout.log");
         let stderr = root.join("stderr.log");
-        fs::write(&stdout, "[punk check] cargo test -p pubpunk-cli\nrecent stdout\n").unwrap();
+        fs::write(
+            &stdout,
+            "[punk check] cargo test -p pubpunk-cli\nrecent stdout\n",
+        )
+        .unwrap();
         fs::write(&stderr, "error[E0408]: compile failed\n").unwrap();
 
         let feedback = patch_apply_retry_feedback(
@@ -8145,8 +8390,8 @@ mod tests {
     }
 
     #[test]
-    fn materialize_rust_workspace_bootstrap_scaffold_ignores_article_cli_phrase_when_inferring_slug()
-    {
+    fn materialize_rust_workspace_bootstrap_scaffold_ignores_article_cli_phrase_when_inferring_slug(
+    ) {
         let root = std::env::temp_dir().join(format!(
             "punk-adapters-greenfield-bootstrap-article-cli-{}-{}",
             std::process::id(),
