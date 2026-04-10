@@ -2608,6 +2608,9 @@ fn preserve_greenfield_scaffold_scope(
     scan: &punk_domain::RepoScanSummary,
     proposal: &mut DraftProposal,
 ) {
+    if prompt_declares_explicit_touch_set(prompt) {
+        return;
+    }
     let Some((entry_points, allowed_scope)) = timeout_greenfield_scaffold_scope(prompt, scan)
     else {
         return;
@@ -2624,6 +2627,19 @@ fn preserve_greenfield_scaffold_scope(
             proposal.allowed_scope.push(scope_path);
         }
     }
+}
+
+fn prompt_declares_explicit_touch_set(prompt: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    [
+        "touching exactly",
+        "touch exactly",
+        "exact touch set",
+        "requested touch set",
+        "scope bounded to",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
 }
 
 fn ensure_proposal_scope_covers_entry_points(proposal: &mut DraftProposal) {
@@ -3542,6 +3558,33 @@ mod tests {
                 target_checks: input.scan.candidate_target_checks,
                 integrity_checks: input.scan.candidate_integrity_checks,
                 risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct BroadBootstrapDrafter;
+
+    impl ContractDrafter for BroadBootstrapDrafter {
+        fn name(&self) -> &'static str {
+            "broad-bootstrap"
+        }
+
+        fn draft(&self, _input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "bootstrap".into(),
+                summary: "bootstrap".into(),
+                entry_points: vec!["Cargo.toml".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["initial Rust scaffold".into()],
+                behavior_requirements: vec!["scaffold rust workspace".into()],
+                allowed_scope: vec!["Cargo.toml".into(), "crates".into(), "tests".into()],
+                target_checks: vec!["cargo test --workspace".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "medium".into(),
             })
         }
 
@@ -4742,6 +4785,70 @@ mod tests {
                 "tests".to_string(),
                 "Cargo.toml".to_string(),
                 "crates".to_string()
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_explicit_follow_up_touch_set_does_not_readd_bootstrap_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-explicit-followup-touch-set-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\nresolver='2'\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "tests\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &BroadBootstrapDrafter,
+                "implement pubpunk init command touching exactly crates/pubpunk-cli/src/main.rs, crates/pubpunk-core/src/lib.rs, and tests; add --json output and keep cargo test --workspace green",
+            )
+            .unwrap();
+
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "crates/pubpunk-cli/src/main.rs".to_string(),
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests".to_string(),
+            ]
+        );
+        assert_eq!(
+            contract.entry_points,
+            vec![
+                "crates/pubpunk-cli/src/main.rs".to_string(),
+                "crates/pubpunk-core/src/lib.rs".to_string(),
             ]
         );
 

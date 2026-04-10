@@ -720,7 +720,13 @@ fn cmd_go(
     let executor = CodexCliExecutor::default();
     let gate = GateService::new(repo_root, global_root);
     let proof_service = ProofService::new(repo_root, global_root);
-    let initial_cycle = run_go_cycle(&orch, &drafter, &executor, &gate, &proof_service, trimmed_goal)?;
+    let initial_cycle =
+        run_go_cycle(&orch, &drafter, &executor, &gate, &proof_service, trimmed_goal)?;
+    let follow_up_goal = if should_auto_chain_after_bootstrap(trimmed_goal, &initial_cycle) {
+        Some(auto_chain_follow_up_goal(&project_root, trimmed_goal))
+    } else {
+        None
+    };
     let follow_up_cycle = if should_auto_chain_after_bootstrap(trimmed_goal, &initial_cycle) {
         Some(run_go_cycle(
             &orch,
@@ -728,7 +734,7 @@ fn cmd_go(
             &executor,
             &gate,
             &proof_service,
-            trimmed_goal,
+            follow_up_goal.as_deref().unwrap_or(trimmed_goal),
         )?)
     } else {
         None
@@ -782,6 +788,7 @@ fn cmd_go(
                 "recommended_mode": recommended_mode,
                 "fallback_staged_enabled": fallback_staged,
                 "auto_chained_after_bootstrap": follow_up_cycle.is_some(),
+                "auto_chain_goal": follow_up_goal,
                 "bootstrap_cycle": follow_up_cycle.as_ref().map(|_| serde_json::json!({
                     "contract": &initial_cycle.contract,
                     "run": &initial_cycle.run,
@@ -877,6 +884,76 @@ fn goal_requests_follow_up_implementation(goal: &str) -> bool {
     ["implement", "add ", "support ", "wire ", "with tests"]
         .iter()
         .any(|marker| lower.contains(marker))
+}
+
+fn auto_chain_follow_up_goal(repo_root: &Path, goal: &str) -> String {
+    synthesize_follow_up_goal(repo_root, goal).unwrap_or_else(|| goal.to_string())
+}
+
+fn synthesize_follow_up_goal(repo_root: &Path, goal: &str) -> Option<String> {
+    let lower = goal.to_ascii_lowercase();
+    if !lower.contains("init") {
+        return None;
+    }
+    let slug = infer_workspace_app_slug(repo_root, goal)?;
+    let tests_clause = if lower.contains("test") {
+        ", and tests"
+    } else {
+        ""
+    };
+    let mut requirements = Vec::new();
+    if lower.contains("json") {
+        requirements.push("add --json output");
+    }
+    if lower.contains("--force") || lower.contains(" force") {
+        requirements.push("support --force");
+    }
+    if lower.contains("--project-root") || lower.contains("project-root") {
+        requirements.push("support --project-root");
+    }
+    let mut follow_up = format!(
+        "implement {slug} init command touching exactly crates/{slug}-cli/src/main.rs, crates/{slug}-core/src/lib.rs{tests_clause}"
+    );
+    if requirements.is_empty() {
+        follow_up.push_str("; keep cargo test --workspace green");
+    } else {
+        follow_up.push_str("; ");
+        follow_up.push_str(&requirements.join(", "));
+        follow_up.push_str(", and keep cargo test --workspace green");
+    }
+    Some(follow_up)
+}
+
+fn infer_workspace_app_slug(repo_root: &Path, goal: &str) -> Option<String> {
+    let crates_dir = repo_root.join("crates");
+    let entries = fs::read_dir(&crates_dir).ok()?;
+    let mut slugs = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(slug) = name.strip_suffix("-cli") else {
+            continue;
+        };
+        if crates_dir.join(format!("{slug}-core")).is_dir() {
+            slugs.push(slug.to_string());
+        }
+    }
+    if slugs.is_empty() {
+        return None;
+    }
+    slugs.sort();
+    slugs.dedup();
+    let goal_lower = goal.to_ascii_lowercase();
+    if let Some(preferred) = slugs
+        .iter()
+        .find(|slug| goal_lower.contains(slug.as_str()))
+        .cloned()
+    {
+        return Some(preferred);
+    }
+    slugs.into_iter().next()
 }
 
 fn format_start_summary(
@@ -2230,6 +2307,31 @@ mod tests {
             "scaffold Rust workspace for pubpunk",
             &cycle
         ));
+    }
+
+    #[test]
+    fn synthesize_follow_up_goal_narrows_pubpunk_init_scope_after_bootstrap() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-cli-auto-chain-follow-up-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core")).unwrap();
+
+        let goal = "scaffold Rust workspace and implement pubpunk init command with --json output and tests";
+        let follow_up = synthesize_follow_up_goal(&root, goal).unwrap();
+
+        assert_eq!(
+            follow_up,
+            "implement pubpunk init command touching exactly crates/pubpunk-cli/src/main.rs, crates/pubpunk-core/src/lib.rs, and tests; add --json output, and keep cargo test --workspace green"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
