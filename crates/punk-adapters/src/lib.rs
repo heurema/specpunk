@@ -2133,6 +2133,7 @@ fn effective_execution_contract(repo_root: &Path, contract: &Contract) -> Result
         }
     }
     if needs_creatable_tests_scope {
+        expanded_scope.retain(|path| is_executable_test_surface(path));
         extend_unique_paths(
             &mut expanded_scope,
             &[synthesized_test_entrypoint(contract).to_string()],
@@ -7547,7 +7548,15 @@ mod tests {
         assert!(effective
             .entry_points
             .contains(&"tests/init.rs".to_string()));
+        assert!(!effective
+            .allowed_scope
+            .contains(&"tests/README.md".to_string()));
         assert!(!effective.allowed_scope.iter().any(|path| path == "tests"));
+        assert!(is_bounded_execution_task(&effective));
+        assert_eq!(
+            execution_lane_for_contract(&root, &effective),
+            ExecutionLane::PatchApply
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
