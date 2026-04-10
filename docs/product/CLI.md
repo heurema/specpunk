@@ -460,6 +460,7 @@ Behavior notes:
 - if a bounded patch/apply slice emits prompt/setup text and then goes silent without producing a patch, `cut run` should treat that as a no-output stall, spend at most one bounded retry on it, and then collapse unchanged entry points back into deterministic no-progress instead of waiting for the full raw timeout repeatedly
 - if `cut run` executes inside an isolated git worktree and produces product-file changes, those in-scope file edits must be synced back into the main repo root before the receipt is written so later `gate` / `proof` phases and the operator-visible worktree see the same result
 - if `cut run` executes inside an isolated git worktree while the main repo root already contains uncommitted product files from an earlier stage (for example bootstrap-created manifests or sources), those present repo-root files must be copied into the isolated workspace before execution so follow-up bounded slices see the same baseline instead of starting from bare `HEAD`
+- if `cut run` needs an isolated git workspace in degraded git-only mode on a repo that has no committed `HEAD` yet, it should create an unborn isolated branch/worktree instead of failing with `invalid reference: HEAD`
 - `gate` and `proof` remain authoritative; this cut-time success does not replace verification
 
 ### `punk gate run <run-id>`
