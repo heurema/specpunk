@@ -646,6 +646,9 @@ impl CodexCliExecutor {
             } else {
                 Vec::new()
             };
+        let finalize_output = |output| {
+            finalize_patch_lane_output(&input.repo_root, &patch_entry_point_snapshots, output)
+        };
         let mut retry_feedback = None;
         let mut slow_patch_retry_used = false;
         let max_attempts = patch_apply_max_attempts(&input.contract);
@@ -688,7 +691,8 @@ impl CodexCliExecutor {
                             checks_run: Vec::new(),
                             cost_usd: None,
                             duration_ms: start.elapsed().as_millis() as u64,
-                        });
+                        })
+                        .and_then(finalize_output);
                     }
                     Ok(PlanPrepassResponse::Blocked(reason)) => {
                         if let Some(guard) = excerpt_guard.as_mut() {
@@ -704,7 +708,8 @@ impl CodexCliExecutor {
                             checks_run: Vec::new(),
                             cost_usd: None,
                             duration_ms: start.elapsed().as_millis() as u64,
-                        });
+                        })
+                        .and_then(finalize_output);
                     }
                     Ok(PlanPrepassResponse::Plan { summary, targets }) => {
                         append_log_text(
@@ -794,6 +799,10 @@ impl CodexCliExecutor {
                     if let Some(guard) = excerpt_guard.as_mut() {
                         let _ = guard.restore();
                     }
+                    let _ = restore_damaged_entry_point_snapshots(
+                        &input.repo_root,
+                        &patch_entry_point_snapshots,
+                    );
                     return Err(err);
                 }
             };
@@ -851,7 +860,8 @@ impl CodexCliExecutor {
                             checks_run: Vec::new(),
                             cost_usd: None,
                             duration_ms: start.elapsed().as_millis() as u64,
-                        });
+                        })
+                        .and_then(finalize_output);
                     }
                 }
                 return Ok(ExecuteOutput {
@@ -860,7 +870,8 @@ impl CodexCliExecutor {
                     checks_run: Vec::new(),
                     cost_usd: None,
                     duration_ms: start.elapsed().as_millis() as u64,
-                });
+                })
+                .and_then(finalize_output);
             }
             if timed_output.orphaned {
                 return Ok(ExecuteOutput {
@@ -869,7 +880,8 @@ impl CodexCliExecutor {
                     checks_run: Vec::new(),
                     cost_usd: None,
                     duration_ms: start.elapsed().as_millis() as u64,
-                });
+                })
+                .and_then(finalize_output);
             }
             if !timed_output.output.status.success() && response.is_none() {
                 let (success, summary) = classify_execution_result(false, &stdout, &stderr);
@@ -879,7 +891,8 @@ impl CodexCliExecutor {
                     checks_run: Vec::new(),
                     cost_usd: None,
                     duration_ms: start.elapsed().as_millis() as u64,
-                });
+                })
+                .and_then(finalize_output);
             }
 
             let response = match response {
@@ -896,7 +909,8 @@ impl CodexCliExecutor {
                         checks_run: Vec::new(),
                         cost_usd: None,
                         duration_ms: start.elapsed().as_millis() as u64,
-                    });
+                    })
+                    .and_then(finalize_output);
                 }
             };
             let patch = match response {
@@ -911,7 +925,8 @@ impl CodexCliExecutor {
                         checks_run: Vec::new(),
                         cost_usd: None,
                         duration_ms: start.elapsed().as_millis() as u64,
-                    });
+                    })
+                    .and_then(finalize_output);
                 }
                 PatchLaneResponse::Patch(patch) => patch,
             };
@@ -929,7 +944,8 @@ impl CodexCliExecutor {
                         checks_run: Vec::new(),
                         cost_usd: None,
                         duration_ms: start.elapsed().as_millis() as u64,
-                    });
+                    })
+                    .and_then(finalize_output);
                 }
             };
             let patch_paths = updates
@@ -953,7 +969,8 @@ impl CodexCliExecutor {
                     checks_run: Vec::new(),
                     cost_usd: None,
                     duration_ms: start.elapsed().as_millis() as u64,
-                });
+                })
+                .and_then(finalize_output);
             }
             append_log_text(
                 &input.stdout_path,
@@ -1002,7 +1019,8 @@ impl CodexCliExecutor {
                         checks_run: Vec::new(),
                         cost_usd: None,
                         duration_ms: start.elapsed().as_millis() as u64,
-                    });
+                    })
+                    .and_then(finalize_output);
                 }
             };
 
@@ -1015,7 +1033,8 @@ impl CodexCliExecutor {
                 checks_run,
                 cost_usd: None,
                 duration_ms: start.elapsed().as_millis() as u64,
-            });
+            })
+            .and_then(finalize_output);
         }
 
         Ok(ExecuteOutput {
@@ -1027,6 +1046,7 @@ impl CodexCliExecutor {
             cost_usd: None,
             duration_ms: start.elapsed().as_millis() as u64,
         })
+        .and_then(finalize_output)
     }
 
     fn run_patch_plan_prepass(
@@ -4505,6 +4525,61 @@ fn unchanged_entry_point_paths(
     Ok(unchanged)
 }
 
+fn restore_damaged_entry_point_snapshots(
+    repo_root: &std::path::Path,
+    snapshots: &[EntryPointSnapshot],
+) -> Result<Vec<String>> {
+    let mut restored = Vec::new();
+    for snapshot in snapshots {
+        let Some(original) = snapshot.content.as_ref() else {
+            continue;
+        };
+        if original.is_empty() {
+            continue;
+        }
+        let file_path = repo_root.join(&snapshot.path);
+        let damaged = match fs::metadata(&file_path) {
+            Ok(metadata) => metadata.len() == 0,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("read entry point damage probe {}", snapshot.path));
+            }
+        };
+        if !damaged {
+            continue;
+        }
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create restored entry point parent {}", snapshot.path))?;
+        }
+        fs::write(&file_path, original)
+            .with_context(|| format!("restore damaged entry point {}", snapshot.path))?;
+        restored.push(snapshot.path.clone());
+    }
+    Ok(restored)
+}
+
+fn finalize_patch_lane_output(
+    repo_root: &std::path::Path,
+    snapshots: &[EntryPointSnapshot],
+    mut output: ExecuteOutput,
+) -> Result<ExecuteOutput> {
+    let restored_paths = restore_damaged_entry_point_snapshots(repo_root, snapshots)?;
+    if restored_paths.is_empty() {
+        return Ok(output);
+    }
+    let original_summary = output.summary;
+    output.success = false;
+    output.checks_run.clear();
+    output.summary = format!(
+        "{BLOCKED_EXECUTION_SENTINEL} bounded patch/apply execution damaged {}; original contents were restored (original outcome: {})",
+        restored_paths.join(", "),
+        original_summary
+    );
+    Ok(output)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ApplyPatchUpdate {
     path: String,
@@ -6516,6 +6591,74 @@ mod tests {
         assert_eq!(
             execution_lane_for_contract(&root, &effective),
             ExecutionLane::PatchApply
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finalize_patch_lane_output_restores_damaged_entry_points() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-finalize-zero-byte-restore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn stable() {}\n").unwrap();
+        fs::write(root.join("tests/cleanup.rs"), "#[test]\nfn cleanup() {}\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_cleanup".into(),
+            feature_id: "feat_cleanup".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "remove style/examples cleanup".into(),
+            entry_points: vec!["src/lib.rs".into(), "tests/cleanup.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["cleanup slice".into()],
+            behavior_requirements: vec!["remove obsolete style examples references".into()],
+            allowed_scope: vec!["src/lib.rs".into(), "tests/cleanup.rs".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let snapshots = capture_entry_point_snapshots(&root, &contract, &[]).unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        fs::write(root.join("tests/cleanup.rs"), "").unwrap();
+        let output = finalize_patch_lane_output(
+            &root,
+            &snapshots,
+            ExecuteOutput {
+                success: false,
+                summary: "PUNK_EXECUTION_BLOCKED: Missing file context for cleanup patch".into(),
+                checks_run: Vec::new(),
+                cost_usd: None,
+                duration_ms: 0,
+            },
+        )
+        .unwrap();
+
+        assert!(!output.success);
+        assert!(output.summary.starts_with(BLOCKED_EXECUTION_SENTINEL));
+        assert!(
+            output.summary.contains("original contents were restored"),
+            "{}",
+            output.summary
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "pub fn stable() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("tests/cleanup.rs")).unwrap(),
+            "#[test]\nfn cleanup() {}\n"
         );
 
         let _ = fs::remove_dir_all(&root);

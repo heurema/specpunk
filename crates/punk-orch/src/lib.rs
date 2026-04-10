@@ -2860,22 +2860,29 @@ fn prompt_prefers_ui(prompt: &str) -> bool {
 
 fn prompt_mentions_generated_surface(prompt: &str) -> bool {
     let lowered = prompt.to_ascii_lowercase();
-    lowered.contains("dist") || lowered.contains("pack") || lowered.contains("bundle")
+    lowered.contains("dist")
+        || lowered.contains("pack")
+        || lowered.contains("bundle")
+        || lowered.contains(".astro")
 }
 
 fn path_is_generated_noise(path: &str) -> bool {
     let lowered = path.to_ascii_lowercase();
     lowered == "dist"
         || lowered == "packs"
+        || lowered == ".astro"
         || lowered.starts_with("dist/")
         || lowered.starts_with("packs/")
+        || lowered.starts_with(".astro/")
         || lowered.contains("/dist/")
         || lowered.contains("/packs/")
+        || lowered.contains("/.astro/")
 }
 
 fn path_looks_ui_surface(path: &str) -> bool {
     let lowered = path.to_ascii_lowercase();
     lowered.ends_with(".astro")
+        || lowered.contains("astro.config")
         || lowered.ends_with(".css")
         || lowered.ends_with(".scss")
         || lowered.ends_with(".sass")
@@ -2890,9 +2897,14 @@ fn path_looks_ui_surface(path: &str) -> bool {
 
 fn path_looks_backend_data(path: &str) -> bool {
     let lowered = path.to_ascii_lowercase();
-    lowered.ends_with(".sql")
+    lowered.ends_with("package.json")
+        || lowered.contains("drizzle.config")
+        || lowered.ends_with(".sql")
         || lowered.contains("/db/")
+        || lowered.contains("/lib/db/")
         || lowered.contains("/database/")
+        || lowered.contains("/lib/persistence/")
+        || lowered.contains("/actions/")
         || lowered.contains("schema")
         || lowered.contains("migration")
         || lowered.contains("session")
@@ -4869,6 +4881,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("baseline-site/src/components")).unwrap();
         fs::create_dir_all(root.join("baseline-site/src/db")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/persistence")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/actions")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/.astro/integrations/astro_db")).unwrap();
         fs::create_dir_all(root.join("baseline-site/dist")).unwrap();
         fs::create_dir_all(root.join("packs")).unwrap();
         fs::write(
@@ -4899,6 +4914,31 @@ mod tests {
         )
         .unwrap();
         fs::write(
+            root.join("baseline-site/src/lib/persistence/store.ts"),
+            "export const store = {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/actions/create-session.ts"),
+            "export async function createSession() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/drizzle.config.ts"),
+            "export default {};\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/astro.config.mjs"),
+            "export default {};\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/.astro/integrations/astro_db/db.d.ts"),
+            "export {};\n",
+        )
+        .unwrap();
+        fs::write(
             root.join("baseline-site/dist/app.js"),
             "console.log('dist')\n",
         )
@@ -4918,14 +4958,17 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            contract.allowed_scope.first().map(String::as_str),
-            Some("baseline-site/src/db/schema.ts")
-        );
-        assert_eq!(
-            contract.entry_points.first().map(String::as_str),
-            Some("baseline-site/src/db/schema.ts")
-        );
+        let first_allowed = contract.allowed_scope.first().map(String::as_str);
+        let first_entry = contract.entry_points.first().map(String::as_str);
+        let preferred_backend_paths = [
+            "baseline-site/src/db/schema.ts",
+            "baseline-site/src/lib/persistence/store.ts",
+            "baseline-site/src/actions/create-session.ts",
+            "baseline-site/drizzle.config.ts",
+            "baseline-site/package.json",
+        ];
+        assert!(first_allowed.is_some_and(|path| preferred_backend_paths.contains(&path)));
+        assert!(first_entry.is_some_and(|path| preferred_backend_paths.contains(&path)));
         assert!(!contract
             .entry_points
             .iter()
@@ -4934,6 +4977,18 @@ mod tests {
             .entry_points
             .iter()
             .any(|path| path.contains("/dist/") || path.starts_with("packs/")));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path.contains("/.astro/") || path.contains("astro.config")));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/package.json"
+                || path == "baseline-site/drizzle.config.ts"
+                || path == "baseline-site/src/db/schema.ts"
+                || path == "baseline-site/src/lib/persistence/store.ts"
+                || path == "baseline-site/src/actions/create-session.ts"));
 
         let _ = fs::remove_dir_all(&root);
     }
