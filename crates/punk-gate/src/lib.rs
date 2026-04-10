@@ -61,12 +61,19 @@ impl GateService {
         if !scope_ok {
             decision_basis.push("scope violation: changed files outside allowed_scope".to_string());
         }
-        let target = run_checks(&self.repo_root, &run.id, "target", &contract.target_checks)?;
+        let target = run_checks(
+            &self.repo_root,
+            &run.id,
+            "target",
+            &contract.target_checks,
+            &contract.allowed_scope,
+        )?;
         let integrity = run_checks(
             &self.repo_root,
             &run.id,
             "integrity",
             &contract.integrity_checks,
+            &contract.allowed_scope,
         )?;
         check_refs.extend(target.refs.iter().cloned());
         check_refs.extend(integrity.refs.iter().cloned());
@@ -146,11 +153,32 @@ fn is_controller_runtime_artifact(path: &str) -> bool {
     path.starts_with(".punk/runs/")
 }
 
+fn prune_generated_cargo_lock_if_out_of_scope(
+    repo_root: &Path,
+    allowed_scope: &[String],
+    command: &str,
+    cargo_lock_existed_before_check: bool,
+) -> Result<()> {
+    if cargo_lock_existed_before_check
+        || !allowed_scope.iter().any(|path| path == "Cargo.toml")
+        || allowed_scope.iter().any(|path| path == "Cargo.lock")
+        || !command.trim_start().starts_with("cargo ")
+    {
+        return Ok(());
+    }
+    let cargo_lock = repo_root.join("Cargo.lock");
+    if cargo_lock.exists() {
+        fs::remove_file(cargo_lock)?;
+    }
+    Ok(())
+}
+
 fn run_checks(
     repo_root: &Path,
     run_id: &str,
     kind: &str,
     commands: &[String],
+    allowed_scope: &[String],
 ) -> Result<CheckRunSummary> {
     if commands.is_empty() {
         return Ok(CheckRunSummary {
@@ -203,10 +231,17 @@ fn run_checks(
             continue;
         }
 
+        let cargo_lock_existed_before_check = repo_root.join("Cargo.lock").exists();
         let output = std::process::Command::new(&args[0])
             .args(&args[1..])
             .current_dir(repo_root)
             .output()?;
+        prune_generated_cargo_lock_if_out_of_scope(
+            repo_root,
+            allowed_scope,
+            command_str,
+            cargo_lock_existed_before_check,
+        )?;
 
         fs::write(&stdout_path, &output.stdout)?;
         fs::write(&stderr_path, &output.stderr)?;
@@ -888,6 +923,67 @@ mod tests {
             .decision_basis
             .iter()
             .any(|reason| reason.contains("scope violation")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_generated_cargo_lock_removes_new_out_of_scope_lockfile() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-cargo-lock-prune-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Cargo.lock"), "generated\n").unwrap();
+
+        prune_generated_cargo_lock_if_out_of_scope(
+            &root,
+            &["Cargo.toml".into()],
+            "cargo test --workspace",
+            false,
+        )
+        .unwrap();
+
+        assert!(!root.join("Cargo.lock").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_generated_cargo_lock_keeps_preexisting_or_allowed_lockfile() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-cargo-lock-keep-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        fs::write(root.join("Cargo.lock"), "existing\n").unwrap();
+        prune_generated_cargo_lock_if_out_of_scope(
+            &root,
+            &["Cargo.toml".into()],
+            "cargo test --workspace",
+            true,
+        )
+        .unwrap();
+        assert!(root.join("Cargo.lock").exists());
+
+        prune_generated_cargo_lock_if_out_of_scope(
+            &root,
+            &["Cargo.toml".into(), "Cargo.lock".into()],
+            "cargo test --workspace",
+            false,
+        )
+        .unwrap();
+        assert!(root.join("Cargo.lock").exists());
 
         let _ = fs::remove_dir_all(&root);
     }

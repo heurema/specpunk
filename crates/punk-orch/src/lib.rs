@@ -757,6 +757,7 @@ impl OrchService {
         let stderr_path = run_dir.join("stderr.log");
         let executor_pid_path = run_dir.join("executor.json");
         let heartbeat_path = run_dir.join("heartbeat.json");
+        let cargo_lock_existed_before_run = workspace_root.join("Cargo.lock").exists();
         fs::write(&stdout_path, b"")?;
         fs::write(&stderr_path, b"")?;
         write_run_heartbeat(
@@ -877,6 +878,11 @@ impl OrchService {
                 )
             }
         };
+        prune_generated_cargo_lock_if_out_of_scope(
+            &workspace_root,
+            &contract,
+            cargo_lock_existed_before_run,
+        )?;
         run.ended_at = Some(now_rfc3339());
         run_finalizer.sync(&run);
         write_json(&run_path, &run)?;
@@ -2297,6 +2303,35 @@ fn path_covers_entry_point(changed_path: &str, entry_point: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+fn prune_generated_cargo_lock_if_out_of_scope(
+    repo_root: &Path,
+    contract: &Contract,
+    cargo_lock_existed_before_run: bool,
+) -> Result<()> {
+    if cargo_lock_existed_before_run || !contract_implies_generated_cargo_lock(contract) {
+        return Ok(());
+    }
+    let cargo_lock = repo_root.join("Cargo.lock");
+    if cargo_lock.exists() {
+        fs::remove_file(cargo_lock)?;
+    }
+    Ok(())
+}
+
+fn contract_implies_generated_cargo_lock(contract: &Contract) -> bool {
+    scope_covers_contract_root_manifest(contract)
+        && !contract.allowed_scope.iter().any(|path| path == "Cargo.lock")
+        && contract
+            .target_checks
+            .iter()
+            .chain(contract.integrity_checks.iter())
+            .any(|command| command.trim_start().starts_with("cargo "))
+}
+
+fn scope_covers_contract_root_manifest(contract: &Contract) -> bool {
+    contract.allowed_scope.iter().any(|path| path == "Cargo.toml")
+}
+
 fn already_satisfied_before_dispatch_summary(
     entry_points: &[String],
     original_summary: &str,
@@ -2874,6 +2909,54 @@ mod tests {
         }
     }
 
+    struct CargoLockExecutor;
+
+    impl Executor for CargoLockExecutor {
+        fn name(&self) -> &'static str {
+            "cargo-lock"
+        }
+
+        fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+            fs::write(input.repo_root.join("Cargo.lock"), b"# generated\n")?;
+            fs::write(&input.stdout_path, b"done")?;
+            fs::write(&input.stderr_path, b"")?;
+            Ok(ExecuteOutput {
+                success: true,
+                summary: "done".into(),
+                checks_run: vec!["cargo test --workspace".into()],
+                cost_usd: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    struct CargoLockDrafter;
+
+    impl ContractDrafter for CargoLockDrafter {
+        fn name(&self) -> &'static str {
+            "cargo-lock-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "cargo lock".into(),
+                summary: input.prompt,
+                entry_points: vec!["Cargo.toml".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["demo".into()],
+                behavior_requirements: vec!["keep bootstrap bounded".into()],
+                allowed_scope: vec!["Cargo.toml".into()],
+                target_checks: vec!["cargo test --workspace".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
     struct HeartbeatObservingExecutor;
 
     impl Executor for HeartbeatObservingExecutor {
@@ -3442,6 +3525,58 @@ mod tests {
             .summary
             .contains("already satisfied in allowed scope before bounded dispatch"));
         assert!(receipt.summary.contains("src/lib.rs"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_prunes_generated_cargo_lock_when_out_of_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-cargo-lock-prune-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[]\nresolver='2'\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&CargoLockDrafter, "bounded rust bootstrap")
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (_run, receipt) = service.cut_run(&CargoLockExecutor, &contract.id).unwrap();
+        assert!(!receipt.changed_files.iter().any(|path| path == "Cargo.lock"));
+        assert!(!root.join("Cargo.lock").exists());
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -428,6 +428,7 @@ Behavior notes:
 - manifest-only greenfield bootstrap runs should use a short executor timeout budget instead of waiting for the full generic execution timeout before normalizing to blocked/no-progress
 - if that same greenfield missing-manifest bootstrap case later degrades into timeout, stall, or orphan classification, `cut run` should still collapse it into the same deterministic blocked summary instead of flapping between blocked and stall-style failures
 - for an approved Rust workspace bootstrap contract that explicitly names crate directories under `crates/...`, `cut run` may materialize a minimal controller-owned workspace scaffold inside `allowed_scope` before dispatch so execution starts from concrete files instead of immediately blocking on an empty layout
+- when Rust bootstrap or cargo-based bounded execution would generate a new `Cargo.lock` outside `allowed_scope`, `cut run` should prune that generated side effect before writing the receipt so the project is not left with avoidable out-of-scope dirt
 - `gate` and `proof` remain authoritative; this cut-time success does not replace verification
 
 ### `punk gate run <run-id>`
@@ -451,6 +452,7 @@ Checks:
 Behavior notes:
 
 - controller-owned runtime artifacts written under `.punk/runs/<run-id>/...` should not count as user scope violations during `gate run`; scope validation should judge only repo changes attributable to the bounded work itself
+- if `gate run` executes cargo-based trusted checks for a contract whose scope includes `Cargo.toml` but not `Cargo.lock`, a newly generated `Cargo.lock` should be pruned after the check rather than left behind as avoidable project litter
 
 Target and integrity checks must be validated and executed as direct trusted runners, not interpolated through `/bin/sh -lc` or other shell-fragment execution.
 
