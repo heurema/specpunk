@@ -1440,12 +1440,7 @@ fn rust_workspace_bootstrap_templates(contract: &Contract) -> Option<Vec<(String
     {
         return None;
     }
-    let crate_dirs = contract
-        .allowed_scope
-        .iter()
-        .filter(|scope| scope.starts_with("crates/") && !is_file_like_scope(scope))
-        .cloned()
-        .collect::<Vec<_>>();
+    let crate_dirs = rust_workspace_bootstrap_crate_dirs(contract);
     if crate_dirs.is_empty() {
         return None;
     }
@@ -1489,6 +1484,135 @@ fn rust_workspace_bootstrap_templates(contract: &Contract) -> Option<Vec<(String
     }
 
     Some(files)
+}
+
+fn rust_workspace_bootstrap_crate_dirs(contract: &Contract) -> Vec<String> {
+    let explicit = contract
+        .allowed_scope
+        .iter()
+        .filter(|scope| scope.starts_with("crates/") && !is_file_like_scope(scope))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    if !contract.allowed_scope.iter().any(|scope| scope == "crates") {
+        return Vec::new();
+    }
+    let Some(app_slug) = infer_rust_bootstrap_app_slug(contract) else {
+        return Vec::new();
+    };
+    vec![
+        format!("crates/{app_slug}-cli"),
+        format!("crates/{app_slug}-core"),
+    ]
+}
+
+fn infer_rust_bootstrap_app_slug(contract: &Contract) -> Option<String> {
+    let mut candidates = Vec::new();
+    candidates.extend(extract_backticked_identifiers(&contract.prompt_source));
+    for item in &contract.expected_interfaces {
+        candidates.extend(extract_backticked_identifiers(item));
+        if let Some(cli_name) = extract_cli_name(item) {
+            candidates.push(cli_name);
+        }
+    }
+    for item in &contract.behavior_requirements {
+        candidates.extend(extract_backticked_identifiers(item));
+        if let Some(cli_name) = extract_cli_name(item) {
+            candidates.push(cli_name);
+        }
+    }
+    candidates.extend(extract_prompt_bootstrap_targets(&contract.prompt_source));
+    candidates
+        .into_iter()
+        .find(|candidate| is_viable_bootstrap_app_slug(candidate))
+}
+
+fn extract_backticked_identifiers(text: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut inside = false;
+    let mut current = String::new();
+    for ch in text.chars() {
+        match ch {
+            '`' if inside => {
+                let candidate = current.trim().to_string();
+                if !candidate.is_empty() {
+                    values.push(candidate);
+                }
+                current.clear();
+                inside = false;
+            }
+            '`' => {
+                inside = true;
+                current.clear();
+            }
+            _ if inside => current.push(ch),
+            _ => {}
+        }
+    }
+    values
+}
+
+fn extract_cli_name(text: &str) -> Option<String> {
+    let tokens = tokenize_ascii_words(text);
+    tokens
+        .windows(2)
+        .find(|window| window[1] == "cli" && is_viable_bootstrap_app_slug(&window[0]))
+        .map(|window| window[0].clone())
+}
+
+fn extract_prompt_bootstrap_targets(text: &str) -> Vec<String> {
+    let tokens = tokenize_ascii_words(text);
+    let mut out = Vec::new();
+    for window in tokens.windows(3) {
+        if window[0] == "implement"
+            && is_viable_bootstrap_app_slug(&window[1])
+            && (window[2] == "init" || window[2] == "validate")
+        {
+            out.push(window[1].clone());
+        }
+    }
+    out
+}
+
+fn tokenize_ascii_words(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn is_viable_bootstrap_app_slug(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.contains('/')
+        || normalized == "cargo"
+        || normalized == "cargo.toml"
+        || normalized == "rust"
+        || normalized == "workspace"
+        || normalized == "scaffold"
+        || normalized == "crates"
+        || normalized == "tests"
+        || normalized == "cli"
+        || normalized == "core"
+        || normalized == "init"
+        || normalized == "validate"
+    {
+        return false;
+    }
+    normalized
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
 }
 
 fn controller_bootstrap_scaffold_paths(contract: &Contract) -> Vec<String> {
@@ -6015,6 +6139,62 @@ mod tests {
                 "crates/pubpunk-core".into(),
                 "tests".into(),
             ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let created = materialize_rust_workspace_bootstrap_scaffold(&root, &contract).unwrap();
+        assert!(created.iter().any(|path| path == "Cargo.toml"));
+        assert!(created.iter().any(|path| path == "crates/pubpunk-cli/Cargo.toml"));
+        assert!(created.iter().any(|path| path == "crates/pubpunk-cli/src/main.rs"));
+        assert!(created.iter().any(|path| path == "crates/pubpunk-core/Cargo.toml"));
+        assert!(created.iter().any(|path| path == "crates/pubpunk-core/src/lib.rs"));
+        assert!(created.iter().any(|path| path == "tests/README.md"));
+
+        let status = Command::new("cargo")
+            .args(["test", "--workspace"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn materialize_rust_workspace_bootstrap_scaffold_infers_generic_crate_dirs_from_cli_goal() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-greenfield-bootstrap-infer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let contract = Contract {
+            id: "ct_manifest".into(),
+            feature_id: "feat_manifest".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "scaffold Rust workspace and implement pubpunk init + validate".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec!["crates".into()],
+            expected_interfaces: vec![
+                "A Rust workspace rooted at `Cargo.toml`.".into(),
+                "A `pubpunk` CLI exposing `init` and `validate` subcommands.".into(),
+            ],
+            behavior_requirements: vec![
+                "Scaffold a minimal Rust workspace only.".into(),
+                "Implement `pubpunk init` and `pubpunk validate` with conservative bounded behavior."
+                    .into(),
+            ],
+            allowed_scope: vec!["Cargo.toml".into(), "crates".into(), "tests".into()],
             target_checks: vec!["cargo test --workspace".into()],
             integrity_checks: vec!["cargo test --workspace".into()],
             risk_level: "medium".into(),

@@ -428,6 +428,7 @@ Behavior notes:
 - manifest-only greenfield bootstrap runs should use a short executor timeout budget instead of waiting for the full generic execution timeout before normalizing to blocked/no-progress
 - if that same greenfield missing-manifest bootstrap case later degrades into timeout, stall, or orphan classification, `cut run` should still collapse it into the same deterministic blocked summary instead of flapping between blocked and stall-style failures
 - for an approved Rust workspace bootstrap contract that explicitly names crate directories under `crates/...`, `cut run` may materialize a minimal controller-owned workspace scaffold inside `allowed_scope` before dispatch so execution starts from concrete files instead of immediately blocking on an empty layout
+- for generic Rust workspace bootstrap contracts whose scope is only `Cargo.toml`, `crates`, and `tests`, `cut run` may infer bounded crate members from the contract semantics (for example a named CLI like `pubpunk`) and materialize the corresponding minimal workspace scaffold inside `allowed_scope`
 - when Rust bootstrap or cargo-based bounded execution would generate a new `Cargo.lock` outside `allowed_scope`, `cut run` should prune that generated side effect before writing the receipt so the project is not left with avoidable out-of-scope dirt
 - `gate` and `proof` remain authoritative; this cut-time success does not replace verification
 
