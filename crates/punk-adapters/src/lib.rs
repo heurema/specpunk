@@ -2132,8 +2132,10 @@ fn effective_execution_contract(repo_root: &Path, contract: &Contract) -> Result
             break;
         }
     }
-    if needs_creatable_tests_scope {
+    if contract.allowed_scope.iter().any(|path| path == "tests") {
         expanded_scope.retain(|path| is_executable_test_surface(path));
+    }
+    if needs_creatable_tests_scope {
         extend_unique_paths(
             &mut expanded_scope,
             &[synthesized_test_entrypoint(contract).to_string()],
@@ -5438,6 +5440,7 @@ mod tests {
             "pub fn init() {}\n",
         )
         .unwrap();
+        fs::write(root.join("tests/README.md"), "# tests\n").unwrap();
         fs::write(root.join("tests/init_json.rs"), "#[test]\nfn smoke() {}\n").unwrap();
 
         let contract = Contract {
@@ -5467,6 +5470,12 @@ mod tests {
 
         let effective = effective_execution_contract(&root, &contract).unwrap();
         assert!(is_bounded_execution_task(&effective));
+        assert!(!effective
+            .allowed_scope
+            .contains(&"tests/README.md".to_string()));
+        assert!(effective
+            .allowed_scope
+            .contains(&"tests/init_json.rs".to_string()));
         assert_eq!(
             execution_lane_for_contract(&root, &effective),
             ExecutionLane::PatchApply
