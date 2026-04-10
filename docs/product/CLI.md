@@ -436,6 +436,7 @@ Behavior notes:
 - executor prompts should include the original approved goal text alongside condensed behavior requirements so bounded slices do not lose critical implementation details when drafter requirements are abbreviated
 - when `allowed_scope` is directory-scoped but bounded, executor prompts should also enumerate the current in-scope files available for direct edit so the model does not stall on ambiguous directory-level scope
 - executor may narrow a small directory-scoped bounded contract to the currently existing in-scope files for execution only, which allows fail-closed context packing and patch-apply routing without mutating the persisted approved contract
+- if `cut run` executes inside an isolated git worktree and produces product-file changes, those in-scope file edits must be synced back into the main repo root before the receipt is written so later `gate` / `proof` phases and the operator-visible worktree see the same result
 - `gate` and `proof` remain authoritative; this cut-time success does not replace verification
 
 ### `punk gate run <run-id>`

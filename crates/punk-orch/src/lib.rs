@@ -896,6 +896,17 @@ impl OrchService {
             &contract,
             cargo_lock_existed_before_run,
         )?;
+        let changed_files = provenance_baseline
+            .as_ref()
+            .and_then(|baseline| isolated_backend.changed_files_since(baseline).ok())
+            .unwrap_or_default();
+        if backend.kind() == VcsKind::Git && workspace_root != self.paths.repo_root {
+            sync_present_isolated_changes_to_repo_root(
+                &self.paths.repo_root,
+                &workspace_root,
+                &changed_files,
+            )?;
+        }
         run.ended_at = Some(now_rfc3339());
         run_finalizer.sync(&run);
         write_json(&run_path, &run)?;
@@ -913,10 +924,7 @@ impl OrchService {
             task_id: task.id.clone(),
             status,
             executor_name: executor.name().to_string(),
-            changed_files: provenance_baseline
-                .as_ref()
-                .and_then(|baseline| isolated_backend.changed_files_since(baseline).ok())
-                .unwrap_or_default(),
+            changed_files,
             artifacts: ReceiptArtifacts {
                 stdout_ref: relative_ref(&self.paths.repo_root, &stdout_path)?,
                 stderr_ref: relative_ref(&self.paths.repo_root, &stderr_path)?,
@@ -2338,6 +2346,28 @@ fn prune_generated_cargo_lock_if_out_of_scope(
     Ok(())
 }
 
+fn sync_present_isolated_changes_to_repo_root(
+    repo_root: &Path,
+    workspace_root: &Path,
+    changed_files: &[String],
+) -> Result<()> {
+    for path in changed_files
+        .iter()
+        .filter(|path| !path.starts_with(".punk/") && !path.starts_with("target/"))
+    {
+        let source = workspace_root.join(path);
+        if !source.is_file() {
+            continue;
+        }
+        let destination = repo_root.join(path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&source, &destination)?;
+    }
+    Ok(())
+}
+
 fn contract_implies_generated_cargo_lock(contract: &Contract) -> bool {
     scope_covers_contract_root_manifest(contract)
         && !contract
@@ -3630,6 +3660,43 @@ mod tests {
             .iter()
             .any(|path| path == "Cargo.lock"));
         assert!(!root.join("Cargo.lock").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_present_isolated_changes_to_repo_root_copies_product_files_only() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-sync-isolated-{}-{suffix}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(workspace.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(workspace.join(".punk/runs/run_1")).unwrap();
+        fs::write(
+            workspace.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(workspace.join(".punk/runs/run_1/stdout.log"), "noise\n").unwrap();
+
+        sync_present_isolated_changes_to_repo_root(
+            &root,
+            &workspace,
+            &[
+                "crates/pubpunk-cli/src/main.rs".into(),
+                ".punk/runs/run_1/stdout.log".into(),
+            ],
+        )
+        .unwrap();
+
+        assert!(root.join("crates/pubpunk-cli/src/main.rs").exists());
+        assert!(!root.join(".punk/runs/run_1/stdout.log").exists());
 
         let _ = fs::remove_dir_all(&root);
     }
