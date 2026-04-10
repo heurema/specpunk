@@ -430,6 +430,7 @@ Behavior notes:
 - for an approved Rust workspace bootstrap contract that explicitly names crate directories under `crates/...`, `cut run` may materialize a minimal controller-owned workspace scaffold inside `allowed_scope` before dispatch so execution starts from concrete files instead of immediately blocking on an empty layout
 - for generic Rust workspace bootstrap contracts whose scope is only `Cargo.toml`, `crates`, and `tests`, `cut run` may infer bounded crate members from the contract semantics (for example a named CLI like `pubpunk`) and materialize the corresponding minimal workspace scaffold inside `allowed_scope`
 - when Rust bootstrap or cargo-based bounded execution would generate a new `Cargo.lock` outside `allowed_scope`, `cut run` should prune that generated side effect before writing the receipt so the project is not left with avoidable out-of-scope dirt
+- when bounded execution only performs inspection/check commands inside allowed scope, makes no product-file changes, and then stalls without emitting a sentinel, `cut run` should normalize that case into deterministic no-progress failure instead of surfacing raw noisy stall tails like `mcp: ...` or `succeeded in ...`
 - `gate` and `proof` remain authoritative; this cut-time success does not replace verification
 
 ### `punk gate run <run-id>`

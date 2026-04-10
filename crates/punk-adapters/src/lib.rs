@@ -488,8 +488,7 @@ impl CodexCliContractDrafter {
             Ok(proposal) => Ok(proposal),
             Err(DrafterAttemptError::TimedOut { stdout, stderr }) => {
                 if should_retry_drafter_timeout(&stdout, &stderr) {
-                    if let (Some(retry_prompt), Some(retry_timeout)) =
-                        (retry_prompt, retry_timeout)
+                    if let (Some(retry_prompt), Some(retry_timeout)) = (retry_prompt, retry_timeout)
                     {
                         match self.run_json_prompt_once(
                             &retry_prompt,
@@ -969,14 +968,11 @@ impl CodexCliExecutor {
             &mut progress_probe_paths,
             &controller_bootstrap_scaffold_paths(&input.contract),
         );
-        let entry_point_snapshots = if is_fail_closed_scope_task(&input.contract)
-            || !progress_probe_paths.is_empty()
-        {
-            capture_entry_point_snapshots(
-                &input.repo_root,
-                &input.contract,
-                &progress_probe_paths,
-            )?
+        let entry_point_snapshots = if should_capture_progress_snapshots(
+            &input.contract,
+            progress_probe_paths.as_slice(),
+        ) {
+            capture_entry_point_snapshots(&input.repo_root, &input.contract, &progress_probe_paths)?
         } else {
             Vec::new()
         };
@@ -1026,10 +1022,19 @@ impl CodexCliExecutor {
             Some((&input.repo_root, entry_point_snapshots.as_slice())),
         ) {
             Ok(output) => {
+                let reclassified = if !entry_point_snapshots.is_empty() {
+                    reclassify_stalled_post_check_zero_progress(
+                        &input.repo_root,
+                        entry_point_snapshots.as_slice(),
+                        output,
+                    )
+                } else {
+                    Ok(output)
+                };
                 if let Some(guard) = excerpt_guard.as_mut() {
                     guard.restore()?;
                 }
-                output
+                reclassified?
             }
             Err(err) => {
                 if let Some(guard) = excerpt_guard.as_mut() {
@@ -1407,7 +1412,9 @@ fn restore_rust_workspace_bootstrap_scaffold(
     let Some(files) = rust_workspace_bootstrap_templates(contract) else {
         return Ok(Vec::new());
     };
-    let template_map = files.into_iter().collect::<std::collections::BTreeMap<_, _>>();
+    let template_map = files
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
     let mut restored = Vec::new();
     for path in created_paths {
         let Some(contents) = template_map.get(path) else {
@@ -1631,9 +1638,7 @@ fn render_rust_workspace_manifest(crate_dirs: &[String]) -> String {
         .map(|dir| format!("    \"{dir}\","))
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
-        "[workspace]\nresolver = \"2\"\nmembers = [\n{members}\n]\n"
-    )
+    format!("[workspace]\nresolver = \"2\"\nmembers = [\n{members}\n]\n")
 }
 
 fn render_rust_member_manifest(
@@ -1641,9 +1646,8 @@ fn render_rust_member_manifest(
     is_binary: bool,
     core_crate: Option<&str>,
 ) -> String {
-    let mut manifest = format!(
-        "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
-    );
+    let mut manifest =
+        format!("[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
     if is_binary {
         if let Some(core_crate) = core_crate.filter(|core| *core != crate_name) {
             manifest.push_str("\n[dependencies]\n");
@@ -1806,6 +1810,15 @@ fn is_bounded_execution_task(contract: &Contract) -> bool {
             .entry_points
             .iter()
             .all(|path| is_explicit_repo_file_scope(path))
+}
+
+fn should_capture_progress_snapshots(contract: &Contract, progress_probe_paths: &[String]) -> bool {
+    is_fail_closed_scope_task(contract)
+        || !progress_probe_paths.is_empty()
+        || (!contract.allowed_scope.is_empty()
+            && contract.allowed_scope.len() <= 5
+            && !contract.entry_points.is_empty()
+            && contract.entry_points.len() <= 5)
 }
 
 fn fail_closed_scope_rule(contract: &Contract) -> &'static str {
@@ -2008,16 +2021,27 @@ fn is_greenfield_manifest_no_progress(contract: &Contract, paths: &[String]) -> 
             .entry_points
             .iter()
             .all(|path| is_greenfield_manifest_entry_point(path))
-        && paths.iter().all(|path| is_greenfield_manifest_entry_point(path))
-        && paths.iter().all(|path| contract.entry_points.contains(path))
+        && paths
+            .iter()
+            .all(|path| is_greenfield_manifest_entry_point(path))
+        && paths
+            .iter()
+            .all(|path| contract.entry_points.contains(path))
 }
 
 fn is_greenfield_manifest_entry_point(path: &str) -> bool {
-    matches!(path, "Cargo.toml" | "go.mod" | "pyproject.toml" | "package.json")
+    matches!(
+        path,
+        "Cargo.toml" | "go.mod" | "pyproject.toml" | "package.json"
+    )
 }
 
 fn logs_indicate_missing_manifest_wiring(stdout: &str, stderr: &str, paths: &[String]) -> bool {
-    if paths.is_empty() || !paths.iter().all(|path| is_greenfield_manifest_entry_point(path)) {
+    if paths.is_empty()
+        || !paths
+            .iter()
+            .all(|path| is_greenfield_manifest_entry_point(path))
+    {
         return false;
     }
     let haystack = format!("{stdout}\n{stderr}").to_ascii_lowercase();
@@ -2428,6 +2452,17 @@ fn run_command_with_timeout_and_tee(
         }
         if let Some((repo_root, snapshots)) = no_progress_probe {
             if progress.stalled_for(scaffold_progress_timeout)
+                && logs_indicate_successful_check_output(&stdout_path, &stderr_path)
+            {
+                let unchanged_paths = unchanged_entry_point_paths(repo_root, snapshots)?;
+                if !unchanged_paths.is_empty() && unchanged_paths.len() == snapshots.len() {
+                    terminate_process_tree(&mut child, child_pid);
+                    break (false, false, false, Vec::new(), Vec::new(), unchanged_paths);
+                }
+            }
+        }
+        if let Some((repo_root, snapshots)) = no_progress_probe {
+            if progress.stalled_for(scaffold_progress_timeout)
                 && logs_indicate_post_check_zero_progress_tail(&stdout_path, &stderr_path)
             {
                 let unchanged_paths = unchanged_entry_point_paths(repo_root, snapshots)?;
@@ -2662,10 +2697,7 @@ fn logs_indicate_successful_check_output(
 ) -> bool {
     let stdout = read_tail_text(stdout_path, 1024).unwrap_or_default();
     let stderr = read_tail_text(stderr_path, 1024).unwrap_or_default();
-    let combined = format!("{stdout}\n{stderr}");
-    combined.contains("test result: ok.")
-        || combined.contains("Finished `test` profile")
-        || combined.contains("Finished `dev` profile")
+    output_indicates_successful_check_output(&stdout, &stderr)
 }
 
 fn logs_indicate_compile_or_check_reason(
@@ -2692,6 +2724,24 @@ fn logs_indicate_post_check_zero_progress_tail(
 ) -> bool {
     let stdout = read_tail_text(stdout_path, 1024).unwrap_or_default();
     let stderr = read_tail_text(stderr_path, 1024).unwrap_or_default();
+    output_indicates_post_check_zero_progress_tail(&stdout, &stderr)
+}
+
+fn output_indicates_successful_check_output(stdout: &str, stderr: &str) -> bool {
+    let combined = format!("{stdout}\n{stderr}");
+    combined.contains("test result: ok.")
+        || combined.contains("Finished `test` profile")
+        || combined.contains("Finished `dev` profile")
+        || (combined.contains("succeeded in ")
+            && (combined.contains("cargo test")
+                || combined.contains("cargo check")
+                || combined.contains("cargo build")
+                || combined.contains("Running unittests")
+                || combined.contains("0 tests, 0 benchmarks")
+                || combined.contains("0 passed; 0 failed;")))
+}
+
+fn output_indicates_post_check_zero_progress_tail(stdout: &str, stderr: &str) -> bool {
     let combined = format!("{stdout}\n{stderr}");
     combined.contains("0 tests, 0 benchmarks")
         || combined.contains("0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out")
@@ -2782,6 +2832,38 @@ fn classify_post_check_zero_progress_result(
         false,
         post_check_zero_progress_summary(paths, stdout, stderr),
     )
+}
+
+fn reclassify_stalled_post_check_zero_progress(
+    repo_root: &std::path::Path,
+    snapshots: &[EntryPointSnapshot],
+    mut timed_output: TimedOutput,
+) -> Result<TimedOutput> {
+    if !timed_output.stalled
+        || !timed_output.no_progress_paths.is_empty()
+        || !timed_output.scaffold_only_paths.is_empty()
+        || !timed_output.post_check_zero_progress_paths.is_empty()
+        || snapshots.is_empty()
+    {
+        return Ok(timed_output);
+    }
+
+    let stdout = String::from_utf8_lossy(&timed_output.output.stdout);
+    let stderr = String::from_utf8_lossy(&timed_output.output.stderr);
+    let unchanged_paths = unchanged_entry_point_paths(repo_root, snapshots)?;
+    if unchanged_paths.is_empty() || unchanged_paths.len() != snapshots.len() {
+        return Ok(timed_output);
+    }
+
+    timed_output.stalled = false;
+    if output_indicates_successful_check_output(&stdout, &stderr)
+        || output_indicates_post_check_zero_progress_tail(&stdout, &stderr)
+    {
+        timed_output.post_check_zero_progress_paths = unchanged_paths;
+    } else {
+        timed_output.no_progress_paths = unchanged_paths;
+    }
+    Ok(timed_output)
 }
 
 fn blocked_execution_template() -> &'static str {
@@ -2958,6 +3040,18 @@ fn capture_entry_point_snapshots(
     let mut snapshots = Vec::new();
     let mut paths = contract.entry_points.clone();
     extend_unique_paths(&mut paths, extra_paths);
+    let mut remaining_scope_files = 64usize;
+    for scope in &contract.allowed_scope {
+        if is_file_like_scope(scope) {
+            continue;
+        }
+        if remaining_scope_files == 0 {
+            break;
+        }
+        let discovered =
+            collect_existing_allowed_scope_files(repo_root, scope, &mut remaining_scope_files)?;
+        extend_unique_paths(&mut paths, &discovered);
+    }
     for entry_point in &paths {
         if !is_file_like_scope(entry_point) {
             continue;
@@ -2979,6 +3073,62 @@ fn capture_entry_point_snapshots(
         });
     }
     Ok(snapshots)
+}
+
+fn collect_existing_allowed_scope_files(
+    repo_root: &std::path::Path,
+    scope: &str,
+    remaining: &mut usize,
+) -> Result<Vec<String>> {
+    let mut collected = Vec::new();
+    let root = repo_root.join(scope);
+    if !root.exists() || *remaining == 0 {
+        return Ok(collected);
+    }
+    collect_existing_allowed_scope_files_recursive(repo_root, &root, remaining, &mut collected)?;
+    collected.sort();
+    Ok(collected)
+}
+
+fn collect_existing_allowed_scope_files_recursive(
+    repo_root: &std::path::Path,
+    current: &std::path::Path,
+    remaining: &mut usize,
+    collected: &mut Vec<String>,
+) -> Result<()> {
+    if *remaining == 0 {
+        return Ok(());
+    }
+    let metadata = match fs::metadata(current) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(()),
+    };
+    if metadata.is_file() {
+        if let Ok(relative) = current.strip_prefix(repo_root) {
+            collected.push(relative.to_string_lossy().replace('\\', "/"));
+            *remaining = remaining.saturating_sub(1);
+        }
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+
+    let mut entries =
+        fs::read_dir(current)?.collect::<std::result::Result<Vec<_>, std::io::Error>>()?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        if *remaining == 0 {
+            break;
+        }
+        collect_existing_allowed_scope_files_recursive(
+            repo_root,
+            &entry.path(),
+            remaining,
+            collected,
+        )?;
+    }
+    Ok(())
 }
 
 fn unchanged_entry_point_paths(
@@ -6004,6 +6154,119 @@ mod tests {
     }
 
     #[test]
+    fn successful_check_output_detects_shell_success_tail_after_cargo_tests() {
+        assert!(output_indicates_successful_check_output(
+            "",
+            "exec\n/bin/zsh -lc 'cargo test -p pubpunk-cli'\nsucceeded in 827ms:\n",
+        ));
+    }
+
+    #[test]
+    fn reclassify_stalled_post_check_zero_progress_recovers_successful_check_tail() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-reclassify-post-check-stall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn validate() {}\n",
+        )
+        .unwrap();
+
+        let snapshots = vec![EntryPointSnapshot {
+            path: "crates/pubpunk-core/src/lib.rs".into(),
+            content: Some("pub fn validate() {}\n".into()),
+        }];
+
+        let output = Command::new("/bin/sh")
+            .arg("-lc")
+            .arg(
+                "printf \"exec\\n/bin/zsh -lc 'cargo test -p pubpunk-core'\\nsucceeded in 827ms:\\n\" 1>&2; exit 1",
+            )
+            .output()
+            .unwrap();
+        let timed_output = TimedOutput {
+            output,
+            timed_out: false,
+            stalled: true,
+            orphaned: false,
+            no_progress_paths: Vec::new(),
+            scaffold_only_paths: Vec::new(),
+            post_check_zero_progress_paths: Vec::new(),
+        };
+
+        let reclassified =
+            reclassify_stalled_post_check_zero_progress(&root, &snapshots, timed_output).unwrap();
+
+        assert!(!reclassified.stalled);
+        assert_eq!(
+            reclassified.post_check_zero_progress_paths,
+            vec!["crates/pubpunk-core/src/lib.rs".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reclassify_stalled_post_check_zero_progress_recovers_inspection_only_stall() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-reclassify-inspection-stall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("tests/README.md"),
+            "# Controller-owned bootstrap placeholder\n",
+        )
+        .unwrap();
+
+        let snapshots = vec![EntryPointSnapshot {
+            path: "tests/README.md".into(),
+            content: Some("# Controller-owned bootstrap placeholder\n".into()),
+        }];
+
+        let output = Command::new("/bin/sh")
+            .arg("-lc")
+            .arg(
+                "printf \"mcp: engram/mem_search (completed)\\nexec\\n/bin/zsh -lc \\\"find tests -maxdepth 3 -type f | sort\\\" in /tmp\\n succeeded in 0ms:\\n# Controller-owned bootstrap placeholder\\n\" 1>&2; exit 1",
+            )
+            .output()
+            .unwrap();
+        let timed_output = TimedOutput {
+            output,
+            timed_out: false,
+            stalled: true,
+            orphaned: false,
+            no_progress_paths: Vec::new(),
+            scaffold_only_paths: Vec::new(),
+            post_check_zero_progress_paths: Vec::new(),
+        };
+
+        let reclassified =
+            reclassify_stalled_post_check_zero_progress(&root, &snapshots, timed_output).unwrap();
+
+        assert!(!reclassified.stalled);
+        assert_eq!(
+            reclassified.no_progress_paths,
+            vec!["tests/README.md".to_string()]
+        );
+        assert!(reclassified.post_check_zero_progress_paths.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn scaffold_only_classification_reports_precise_failure() {
         let (success, summary) = classify_scaffold_only_result(
             &[String::from("crates/punk-council/src/synthesis.rs")],
@@ -6035,7 +6298,10 @@ mod tests {
             "",
         );
         assert!(!success);
-        assert_eq!(summary, "PUNK_EXECUTION_BLOCKED: missing manifest wiring for Cargo.toml");
+        assert_eq!(
+            summary,
+            "PUNK_EXECUTION_BLOCKED: missing manifest wiring for Cargo.toml"
+        );
     }
 
     #[test]
@@ -6098,7 +6364,9 @@ mod tests {
         };
 
         let summary = greenfield_manifest_blocked_summary(&root, &contract).unwrap();
-        assert!(summary.contains("PUNK_EXECUTION_BLOCKED: missing manifest wiring in allowed scope"));
+        assert!(
+            summary.contains("PUNK_EXECUTION_BLOCKED: missing manifest wiring in allowed scope")
+        );
         assert!(summary.contains("Cargo.toml"));
         assert!(summary.contains("crates/"));
         assert!(summary.contains("tests/"));
@@ -6127,10 +6395,7 @@ mod tests {
             status: punk_domain::ContractStatus::Approved,
             prompt_source: "bootstrap initial Rust workspace for pubpunk".into(),
             entry_points: vec!["Cargo.toml".into()],
-            import_paths: vec![
-                "crates/pubpunk-cli".into(),
-                "crates/pubpunk-core".into(),
-            ],
+            import_paths: vec!["crates/pubpunk-cli".into(), "crates/pubpunk-core".into()],
             expected_interfaces: vec!["initial Rust scaffold".into()],
             behavior_requirements: vec!["bootstrap project".into()],
             allowed_scope: vec![
@@ -6148,10 +6413,18 @@ mod tests {
 
         let created = materialize_rust_workspace_bootstrap_scaffold(&root, &contract).unwrap();
         assert!(created.iter().any(|path| path == "Cargo.toml"));
-        assert!(created.iter().any(|path| path == "crates/pubpunk-cli/Cargo.toml"));
-        assert!(created.iter().any(|path| path == "crates/pubpunk-cli/src/main.rs"));
-        assert!(created.iter().any(|path| path == "crates/pubpunk-core/Cargo.toml"));
-        assert!(created.iter().any(|path| path == "crates/pubpunk-core/src/lib.rs"));
+        assert!(created
+            .iter()
+            .any(|path| path == "crates/pubpunk-cli/Cargo.toml"));
+        assert!(created
+            .iter()
+            .any(|path| path == "crates/pubpunk-cli/src/main.rs"));
+        assert!(created
+            .iter()
+            .any(|path| path == "crates/pubpunk-core/Cargo.toml"));
+        assert!(created
+            .iter()
+            .any(|path| path == "crates/pubpunk-core/src/lib.rs"));
         assert!(created.iter().any(|path| path == "tests/README.md"));
 
         let status = Command::new("cargo")
@@ -6204,10 +6477,18 @@ mod tests {
 
         let created = materialize_rust_workspace_bootstrap_scaffold(&root, &contract).unwrap();
         assert!(created.iter().any(|path| path == "Cargo.toml"));
-        assert!(created.iter().any(|path| path == "crates/pubpunk-cli/Cargo.toml"));
-        assert!(created.iter().any(|path| path == "crates/pubpunk-cli/src/main.rs"));
-        assert!(created.iter().any(|path| path == "crates/pubpunk-core/Cargo.toml"));
-        assert!(created.iter().any(|path| path == "crates/pubpunk-core/src/lib.rs"));
+        assert!(created
+            .iter()
+            .any(|path| path == "crates/pubpunk-cli/Cargo.toml"));
+        assert!(created
+            .iter()
+            .any(|path| path == "crates/pubpunk-cli/src/main.rs"));
+        assert!(created
+            .iter()
+            .any(|path| path == "crates/pubpunk-core/Cargo.toml"));
+        assert!(created
+            .iter()
+            .any(|path| path == "crates/pubpunk-core/src/lib.rs"));
         assert!(created.iter().any(|path| path == "tests/README.md"));
 
         let status = Command::new("cargo")
@@ -6240,10 +6521,7 @@ mod tests {
             status: punk_domain::ContractStatus::Approved,
             prompt_source: "bootstrap initial Rust workspace for pubpunk".into(),
             entry_points: vec!["Cargo.toml".into()],
-            import_paths: vec![
-                "crates/pubpunk-cli".into(),
-                "crates/pubpunk-core".into(),
-            ],
+            import_paths: vec!["crates/pubpunk-cli".into(), "crates/pubpunk-core".into()],
             expected_interfaces: vec!["initial Rust scaffold".into()],
             behavior_requirements: vec!["bootstrap project".into()],
             allowed_scope: vec![
@@ -6276,6 +6554,154 @@ mod tests {
     }
 
     #[test]
+    fn capture_entry_point_snapshots_includes_existing_files_under_allowed_scope_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-snapshot-allowed-scope-files-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname = \"pubpunk-cli\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname = \"pubpunk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "# tests\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_manifest".into(),
+            feature_id: "feat_manifest".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/Cargo.toml".into(),
+                "crates/pubpunk-core/Cargo.toml".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["bounded implementation slice".into()],
+            behavior_requirements: vec!["implement pubpunk init".into()],
+            allowed_scope: vec![
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let snapshots = capture_entry_point_snapshots(&root, &contract, &[]).unwrap();
+        let paths = snapshots
+            .iter()
+            .map(|snapshot| snapshot.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"crates/pubpunk-cli/Cargo.toml"));
+        assert!(paths.contains(&"crates/pubpunk-cli/src/main.rs"));
+        assert!(paths.contains(&"crates/pubpunk-core/Cargo.toml"));
+        assert!(paths.contains(&"crates/pubpunk-core/src/lib.rs"));
+        assert!(paths.contains(&"tests/README.md"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_command_with_timeout_and_tee_detects_successful_check_stall_without_code_progress() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-tee-success-check-stall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname = \"pubpunk-cli\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+
+        let snapshots = vec![
+            EntryPointSnapshot {
+                path: "crates/pubpunk-cli/Cargo.toml".into(),
+                content: Some("[package]\nname = \"pubpunk-cli\"\nversion = \"0.1.0\"\n".into()),
+            },
+            EntryPointSnapshot {
+                path: "crates/pubpunk-cli/src/main.rs".into(),
+                content: Some("fn main() {}\n".into()),
+            },
+        ];
+
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-lc")
+            .arg("printf 'Finished `test` profile\\n'; sleep 2");
+
+        let output = run_command_with_timeout_and_tee(
+            &mut command,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            Duration::from_millis(400),
+            Duration::from_secs(1),
+            stdout_path,
+            stderr_path,
+            root.join("executor.json"),
+            None,
+            Some((&root, snapshots.as_slice())),
+        )
+        .unwrap();
+
+        assert!(!output.timed_out);
+        assert!(!output.stalled);
+        assert!(!output.orphaned);
+        assert!(output.no_progress_paths.is_empty());
+        assert!(output.scaffold_only_paths.is_empty());
+        assert_eq!(
+            output.post_check_zero_progress_paths,
+            vec![
+                "crates/pubpunk-cli/Cargo.toml".to_string(),
+                "crates/pubpunk-cli/src/main.rs".to_string()
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn no_progress_only_in_controller_scaffold_matches_created_paths() {
         assert!(no_progress_only_in_controller_scaffold(
             &[
@@ -6292,6 +6718,36 @@ mod tests {
             &["Cargo.toml".to_string(), "README.md".to_string()],
             &["Cargo.toml".to_string()],
         ));
+    }
+
+    #[test]
+    fn directory_scoped_bounded_contracts_capture_progress_snapshots() {
+        let contract = Contract {
+            id: "ct_init".into(),
+            feature_id: "feat_init".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/Cargo.toml".into(),
+                "crates/pubpunk-core/Cargo.toml".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["bounded implementation slice".into()],
+            behavior_requirements: vec!["implement pubpunk init".into()],
+            allowed_scope: vec![
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert!(should_capture_progress_snapshots(&contract, &[]));
     }
 
     #[test]
