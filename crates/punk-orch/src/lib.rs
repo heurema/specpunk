@@ -882,7 +882,7 @@ impl OrchService {
             }
         };
 
-        let (status, summary, checks_run, cost_usd, duration_ms) = match execution {
+        let (mut status, mut summary, checks_run, cost_usd, duration_ms) = match execution {
             Ok(output) => {
                 let already_satisfied_before_dispatch = !output.success
                     && should_treat_cut_run_as_already_satisfied(
@@ -942,6 +942,11 @@ impl OrchService {
                 &workspace_root,
                 &changed_files,
             )?;
+        }
+        if should_reject_empty_successful_bounded_run(&contract, &status, &summary, &changed_files) {
+            status = "failure".to_string();
+            summary = empty_successful_bounded_run_summary(&contract.entry_points, &summary);
+            run.status = RunStatus::Failed;
         }
         if status == "success" {
             ensure_default_gitignore_coverage(&workspace_root)?;
@@ -2529,6 +2534,57 @@ fn already_satisfied_before_dispatch_summary(
     }
 }
 
+fn should_reject_empty_successful_bounded_run(
+    contract: &Contract,
+    status: &str,
+    summary: &str,
+    changed_files: &[String],
+) -> bool {
+    status == "success"
+        && changed_files.is_empty()
+        && contract_has_non_manifest_entry_points(contract)
+        && !summary
+            .trim()
+            .starts_with("already satisfied in allowed scope before bounded dispatch")
+}
+
+fn contract_has_non_manifest_entry_points(contract: &Contract) -> bool {
+    contract
+        .entry_points
+        .iter()
+        .any(|entry_point| is_non_manifest_entry_point(entry_point))
+}
+
+fn is_non_manifest_entry_point(path: &str) -> bool {
+    if !is_file_like_contract_path(path) {
+        return false;
+    }
+    !matches!(
+        path,
+        "Cargo.toml" | "Cargo.lock" | "README.md" | "rust-toolchain.toml"
+    )
+}
+
+fn empty_successful_bounded_run_summary(entry_points: &[String], original_summary: &str) -> String {
+    let scope = if entry_points.is_empty() {
+        "approved entry points".to_string()
+    } else {
+        entry_points.join(", ")
+    };
+    let trimmed = original_summary.trim();
+    if trimmed.is_empty() {
+        format!(
+            "no implementation progress after bounded success report in {}: executor reported success without observable repo changes",
+            scope
+        )
+    } else {
+        format!(
+            "no implementation progress after bounded success report in {}: executor reported success without observable repo changes (original executor summary: {})",
+            scope, trimmed
+        )
+    }
+}
+
 fn summarize_prompt(prompt: &str) -> String {
     let trimmed = prompt.trim();
     trimmed.chars().take(60).collect()
@@ -3245,6 +3301,29 @@ mod tests {
                 success: false,
                 summary: "PUNK_EXECUTION_BLOCKED: bounded executor found no additional edits"
                     .into(),
+                checks_run: vec![],
+                cost_usd: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    struct SuccessNoOpExecutor;
+
+    impl Executor for SuccessNoOpExecutor {
+        fn name(&self) -> &'static str {
+            "success-noop"
+        }
+
+        fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+            fs::write(
+                &input.stdout_path,
+                b"PUNK_EXECUTION_COMPLETE: claimed success without edits\n",
+            )?;
+            fs::write(&input.stderr_path, b"")?;
+            Ok(ExecuteOutput {
+                success: true,
+                summary: "PUNK_EXECUTION_COMPLETE: claimed success without edits".into(),
                 checks_run: vec![],
                 cost_usd: None,
                 duration_ms: 1,
@@ -4095,6 +4174,64 @@ mod tests {
         assert!(!receipt
             .summary
             .contains("already satisfied in allowed scope before bounded dispatch"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_rejects_successful_noop_for_bounded_source_slice() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-empty-success-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&AlreadySatisfiedDrafter, "demo implementation slice")
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (run, receipt) = service.cut_run(&SuccessNoOpExecutor, &contract.id).unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(receipt.status, "failure");
+        assert!(receipt.changed_files.is_empty());
+        assert!(receipt.summary.contains("no implementation progress after bounded success report"));
+        assert!(receipt
+            .summary
+            .contains("PUNK_EXECUTION_COMPLETE: claimed success without edits"));
 
         let _ = fs::remove_dir_all(&root);
     }

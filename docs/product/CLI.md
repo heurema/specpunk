@@ -458,6 +458,7 @@ Behavior notes:
 - whenever a bounded Rust slice narrows a `tests` directory into concrete file paths, execution should drop placeholder-only test files from the narrowed execution scope so the bounded slice stays patch/apply-sized instead of tipping into the noisier general exec lane
 - if a bounded patch/apply Rust slice exposes sequential failed checks (for example one compile error in `cargo test -p <crate>` and then a later failure in `cargo test --workspace`), `cut run` may spend one bounded repair pass per newly exposed failed check, capped at three total patch/apply passes
 - if a bounded patch/apply slice emits prompt/setup text and then goes silent without producing a patch, `cut run` should treat that as a no-output stall, spend at most one bounded retry on it, and then collapse unchanged entry points back into deterministic no-progress instead of waiting for the full raw timeout repeatedly
+- if a bounded implementation run reports `PUNK_EXECUTION_COMPLETE` but the observed repo change set is still empty, `cut run` must normalize that into deterministic no-progress/failure instead of writing a false success receipt
 - if `cut run` executes inside an isolated git worktree and produces product-file changes, those in-scope file edits must be synced back into the main repo root before the receipt is written so later `gate` / `proof` phases and the operator-visible worktree see the same result
 - if `cut run` executes inside an isolated git worktree while the main repo root already contains uncommitted product files from an earlier stage (for example bootstrap-created manifests or sources), those present repo-root files must be copied into the isolated workspace before execution so follow-up bounded slices see the same baseline instead of starting from bare `HEAD`
 - if `cut run` needs an isolated git workspace in degraded git-only mode on a repo that has no committed `HEAD` yet, it should create an unborn isolated branch/worktree instead of failing with `invalid reference: HEAD`
@@ -484,6 +485,7 @@ Checks:
 Behavior notes:
 
 - `gate run` must never accept a run whose receipt status is not `success`, even if trusted target and integrity checks happen to pass afterward
+- `gate run` must also block a bounded implementation receipt that claims success while reporting no observable repo changes, unless the receipt explicitly says the slice was already satisfied before bounded dispatch
 - controller-owned runtime artifacts written under `.punk/runs/<run-id>/...` should not count as user scope violations during `gate run`; scope validation should judge only repo changes attributable to the bounded work itself
 - when a run executed inside an isolated VCS workspace (for example a git worktree in degraded git-only mode), `gate run` must execute trusted target and integrity checks inside that recorded `workspace_ref`, not back on the original repo root
 - if `gate run` executes cargo-based trusted checks for a contract whose scope does not include `Cargo.lock`, a newly generated `Cargo.lock` should be pruned after the check rather than left behind as avoidable project litter

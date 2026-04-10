@@ -58,12 +58,22 @@ impl GateService {
         let mut decision_basis = Vec::new();
         let mut check_refs = Vec::new();
         let mut command_evidence = Vec::new();
-        let receipt_ok = receipt.status == "success";
+        let receipt_ok = receipt.status == "success"
+            && !is_empty_successful_bounded_receipt(&contract, &receipt);
         if !receipt_ok {
-            decision_basis.push(format!(
-                "run receipt status is {}: {}",
-                receipt.status, receipt.summary
-            ));
+            if receipt.status == "success"
+                && is_empty_successful_bounded_receipt(&contract, &receipt)
+            {
+                decision_basis.push(format!(
+                    "run receipt reported success without observable repo changes: {}",
+                    receipt.summary
+                ));
+            } else {
+                decision_basis.push(format!(
+                    "run receipt status is {}: {}",
+                    receipt.status, receipt.summary
+                ));
+            }
         }
         let scope_ok = validate_scope(&contract.allowed_scope, &receipt.changed_files);
         if !scope_ok {
@@ -158,6 +168,31 @@ fn validate_scope(allowed_scope: &[String], changed_files: &[String]) -> bool {
             .iter()
             .any(|prefix| file == prefix || file.starts_with(&format!("{prefix}/")))
     })
+}
+
+fn is_empty_successful_bounded_receipt(contract: &Contract, receipt: &Receipt) -> bool {
+    receipt.status == "success"
+        && receipt.changed_files.is_empty()
+        && contract_has_non_manifest_entry_points(contract)
+        && !receipt
+            .summary
+            .trim()
+            .starts_with("already satisfied in allowed scope before bounded dispatch")
+}
+
+fn contract_has_non_manifest_entry_points(contract: &Contract) -> bool {
+    contract
+        .entry_points
+        .iter()
+        .any(|entry_point| is_non_manifest_entry_point(entry_point))
+}
+
+fn is_non_manifest_entry_point(path: &str) -> bool {
+    Path::new(path).extension().is_some()
+        && !matches!(
+            path,
+            "Cargo.toml" | "Cargo.lock" | "README.md" | "rust-toolchain.toml"
+        )
 }
 
 fn is_controller_runtime_artifact(path: &str) -> bool {
@@ -574,6 +609,85 @@ mod tests {
             .command_evidence
             .iter()
             .all(|item| item.evidence_type == "command"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gate_blocks_successful_noop_bounded_receipt() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-successful-noop-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "implement demo source change".into(),
+            entry_points: vec!["src/lib.rs".into()],
+            import_paths: vec!["src/lib.rs".into()],
+            expected_interfaces: vec!["demo source edit".into()],
+            behavior_requirements: vec!["change source".into()],
+            allowed_scope: vec!["src/lib.rs".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
+        let run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "success".into(),
+            executor_name: "fake".into(),
+            changed_files: vec![],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec![],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "PUNK_EXECUTION_COMPLETE: claimed success without edits".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        let gate = GateService::new(&root, &global);
+        let decision = gate.gate_run("run_1").unwrap();
+        assert_eq!(decision.decision, Decision::Block);
+        assert!(decision
+            .decision_basis
+            .iter()
+            .any(|reason| reason.contains("reported success without observable repo changes")));
         let _ = fs::remove_dir_all(&root);
     }
 
