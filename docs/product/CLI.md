@@ -448,6 +448,10 @@ Checks:
 - target checks
 - integrity checks
 
+Behavior notes:
+
+- controller-owned runtime artifacts written under `.punk/runs/<run-id>/...` should not count as user scope violations during `gate run`; scope validation should judge only repo changes attributable to the bounded work itself
+
 Target and integrity checks must be validated and executed as direct trusted runners, not interpolated through `/bin/sh -lc` or other shell-fragment execution.
 
 ### `punk gate proof <run-id|decision-id>`

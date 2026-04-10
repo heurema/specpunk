@@ -133,10 +133,17 @@ fn validate_scope(allowed_scope: &[String], changed_files: &[String]) -> bool {
         return false;
     }
     changed_files.iter().all(|file| {
+        if is_controller_runtime_artifact(file) {
+            return true;
+        }
         allowed_scope
             .iter()
             .any(|prefix| file == prefix || file.starts_with(&format!("{prefix}/")))
     })
+}
+
+fn is_controller_runtime_artifact(path: &str) -> bool {
+    path.starts_with(".punk/runs/")
 }
 
 fn run_checks(
@@ -773,6 +780,116 @@ mod tests {
             &["src/lib.rs.bak".into()]
         ));
         assert!(!validate_scope(&["foo".into()], &["foobar".into()]));
+    }
+
+    #[test]
+    fn validate_scope_ignores_controller_runtime_artifacts() {
+        assert!(validate_scope(
+            &["Cargo.toml".into()],
+            &[
+                ".punk/runs/run_1/run.json".into(),
+                ".punk/runs/run_1/stdout.log".into(),
+                ".punk/runs/run_1/stderr.log".into(),
+            ]
+        ));
+        assert!(!validate_scope(
+            &["Cargo.toml".into()],
+            &[
+                ".punk/runs/run_1/stdout.log".into(),
+                "not-allowed.txt".into(),
+            ]
+        ));
+    }
+
+    #[test]
+    fn gate_accepts_when_only_runtime_artifacts_changed_outside_scope() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-runtime-artifacts-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "x".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["Cargo.toml".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
+        let run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "success".into(),
+            executor_name: "fake".into(),
+            changed_files: vec![
+                ".punk/runs/run_1/run.json".into(),
+                ".punk/runs/run_1/stdout.log".into(),
+                ".punk/runs/run_1/stderr.log".into(),
+            ],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec!["true".into()],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "done".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+
+        let gate = GateService::new(&root, &global);
+        let decision = gate.gate_run("run_1").unwrap();
+
+        assert_eq!(decision.decision, Decision::Accept);
+        assert_eq!(decision.deterministic_status, DeterministicStatus::Pass);
+        assert!(!decision
+            .decision_basis
+            .iter()
+            .any(|reason| reason.contains("scope violation")));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
