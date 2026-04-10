@@ -267,6 +267,7 @@ impl EntryPointExcerptGuard {
                 .with_context(|| format!("mask test tail for {}", file.path))?;
             masked_files.push(MaskedEntryPointFile {
                 path: file.path.clone(),
+                original_head: head.to_string(),
                 original_tail: tail.to_string(),
             });
         }
@@ -1620,6 +1621,8 @@ fn choose_confidence(scoreboard: &CouncilScoreboard, outcome: &CouncilOutcome) -
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MaskedEntryPointFile {
     path: String,
+    #[serde(default)]
+    original_head: String,
     original_tail: String,
 }
 
@@ -1655,12 +1658,34 @@ fn write_mask_manifest(repo_root: &Path, files: &[MaskedEntryPointFile]) -> Resu
 fn restore_masked_files(repo_root: &Path, files: &[MaskedEntryPointFile]) -> Result<()> {
     for file in files {
         let file_path = repo_root.join(&file.path);
-        let current_head = fs::read_to_string(&file_path)
-            .with_context(|| format!("read masked entry point {}", file.path))?;
-        if current_head.ends_with(&file.original_tail) {
+        let current_head = match fs::read_to_string(&file_path) {
+            Ok(current) => current,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("read masked entry point {}", file.path));
+            }
+        };
+        let expected = format!("{}{}", file.original_head, file.original_tail);
+        let restored = if current_head.is_empty() && !expected.is_empty() {
+            expected.clone()
+        } else if current_head.ends_with(&file.original_tail)
+            && (file.original_tail.is_empty()
+                || current_head.len() > file.original_tail.len()
+                || file.original_head.is_empty())
+        {
+            current_head.clone()
+        } else {
+            format!("{current_head}{}", file.original_tail)
+        };
+        if restored == current_head {
             continue;
         }
-        fs::write(&file_path, format!("{current_head}{}", file.original_tail))
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create masked entry point parent {}", file.path))?;
+        }
+        fs::write(&file_path, restored)
             .with_context(|| format!("restore masked entry point {}", file.path))?;
     }
     Ok(())
@@ -2812,6 +2837,39 @@ mod tests {
             &root,
             &[MaskedEntryPointFile {
                 path: "src/lib.rs".into(),
+                original_head: String::new(),
+                original_tail: "\n#[cfg(test)]\nmod tests {}\n".into(),
+            }],
+        )
+        .unwrap();
+
+        restore_stale_entry_point_masks(&root).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&file_path).unwrap(),
+            "pub fn score() {}\n\n#[cfg(test)]\nmod tests {}\n"
+        );
+        assert!(!mask_manifest_path(&root).exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_stale_entry_point_masks_restores_zero_byte_masked_file() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-context-pack-restore-zero-byte-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        let file_path = root.join("src/lib.rs");
+        fs::write(&file_path, "").unwrap();
+
+        write_mask_manifest(
+            &root,
+            &[MaskedEntryPointFile {
+                path: "src/lib.rs".into(),
+                original_head: "pub fn score() {}\n".into(),
                 original_tail: "\n#[cfg(test)]\nmod tests {}\n".into(),
             }],
         )

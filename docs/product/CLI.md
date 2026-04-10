@@ -354,6 +354,7 @@ Preflight expectation:
 - when a plain Rust bootstrap goal also mentions implementation semantics like `pubpunk init`, controller scaffold member inference should prefer the goal-derived app slug (`pubpunk-cli` / `pubpunk-core`) instead of article-shaped placeholders like `a-cli` / `a-core`
 - if the repo root has no explicit integrity story but nested manifests/scripts do, `punk start` may infer trustworthy intake checks from nested `Cargo.toml`, nested `package.json` scripts, or nested `Makefile` `test` targets instead of failing immediately at repo scan
 - when those nested-manifest fallbacks are active and the prompt clearly looks backend/data-oriented (`db`, `session`, `seed`, `service`, `dispatch`, etc.), candidate targeting should bias away from obvious UI/generated surfaces like `.astro`, `astro.config.*`, `dist`, and `packs`, and prefer source-first anchors such as `package.json`, `drizzle.config.*`, `src/lib/db/*`, `src/lib/persistence/*`, and `src/actions/*`
+- when a draft/refine prompt explicitly says to exclude or not touch generated/runtime paths, those excluded prefixes must be pruned back out of persisted `allowed_scope` and `entry_points` instead of leaking in as candidate scope
 
 Creates:
 
@@ -464,6 +465,7 @@ Behavior notes:
 - if a bounded patch/apply slice emits prompt/setup text and then goes silent without producing a patch, `cut run` should treat that as a no-output stall, spend at most one bounded retry on it, and then collapse unchanged entry points back into deterministic no-progress instead of waiting for the full raw timeout repeatedly
 - if patch/apply partially mutates multiple files and a later hunk fails or validation detects that a previously non-empty source file became zero-byte, `cut run` must restore the original contents of every touched file and surface a blocked corruption summary instead of leaving the repo in a damaged state
 - if a blocked or failed patch/apply attempt damages previously non-empty entry-point files outside the final validated patch (for example by leaving them zero-byte or missing), `cut run` must restore those original entry-point contents before returning the blocked result
+- if entry-point test-boundary masking is active and an execution attempt empties or deletes the masked head, stale-mask restoration must still reconstruct the original file instead of appending only the preserved test tail
 - `already satisfied in allowed scope before bounded dispatch` is only valid for deterministic file-bounded no-progress slices; blocked summaries must stay blocked and must not be upgraded to success
 - if a bounded implementation run reports `PUNK_EXECUTION_COMPLETE` but the observed repo change set is still empty, `cut run` must normalize that into deterministic no-progress/failure instead of writing a false success receipt
 - if `cut run` executes inside an isolated git worktree and produces product-file changes, those in-scope file edits must be synced back into the main repo root before the receipt is written so later `gate` / `proof` phases and the operator-visible worktree see the same result

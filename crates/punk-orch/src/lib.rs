@@ -370,8 +370,7 @@ impl OrchService {
         }
         .0;
         canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
-        preserve_greenfield_scaffold_scope(trimmed_prompt, &scan, &mut proposal);
-        ensure_proposal_scope_covers_entry_points(&mut proposal);
+        normalize_proposal_scope(trimmed_prompt, &scan, &mut proposal);
         let mut errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
         if errors.is_empty() {
             if let Some(mut fallback) = build_bounded_fallback_proposal(
@@ -381,8 +380,7 @@ impl OrchService {
                 &scan,
                 &errors,
             ) {
-                preserve_greenfield_scaffold_scope(trimmed_prompt, &scan, &mut fallback);
-                ensure_proposal_scope_covers_entry_points(&mut fallback);
+                normalize_proposal_scope(trimmed_prompt, &scan, &mut fallback);
                 proposal = fallback;
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
@@ -415,8 +413,7 @@ impl OrchService {
             }
             .0;
             canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
-            preserve_greenfield_scaffold_scope(trimmed_prompt, &scan, &mut proposal);
-            ensure_proposal_scope_covers_entry_points(&mut proposal);
+            normalize_proposal_scope(trimmed_prompt, &scan, &mut proposal);
             errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             if errors.is_empty() {
                 if let Some(mut fallback) = build_bounded_fallback_proposal(
@@ -426,8 +423,7 @@ impl OrchService {
                     &scan,
                     &errors,
                 ) {
-                    preserve_greenfield_scaffold_scope(trimmed_prompt, &scan, &mut fallback);
-                    ensure_proposal_scope_covers_entry_points(&mut fallback);
+                    normalize_proposal_scope(trimmed_prompt, &scan, &mut fallback);
                     proposal = fallback;
                     errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
                 }
@@ -441,8 +437,7 @@ impl OrchService {
                 &scan,
                 &errors,
             ) {
-                preserve_greenfield_scaffold_scope(trimmed_prompt, &scan, &mut fallback);
-                ensure_proposal_scope_covers_entry_points(&mut fallback);
+                normalize_proposal_scope(trimmed_prompt, &scan, &mut fallback);
                 proposal = fallback;
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
@@ -536,14 +531,14 @@ impl OrchService {
             )?,
             Err(err) => return Err(err),
         };
+        let combined_guidance = format!("{}\n{}", current_contract.prompt_source, guidance);
         canonicalize_draft_proposal(
             &self.paths.repo_root,
             &current_contract.prompt_source,
             &mut proposal,
         );
         apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
-        preserve_greenfield_scaffold_scope(&current_contract.prompt_source, &scan, &mut proposal);
-        ensure_proposal_scope_covers_entry_points(&mut proposal);
+        normalize_proposal_scope(&combined_guidance, &scan, &mut proposal);
         let mut errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
         if errors.is_empty() {
             if let Some(mut fallback) = build_bounded_fallback_proposal(
@@ -553,20 +548,10 @@ impl OrchService {
                 &scan,
                 &errors,
             ) {
-                preserve_greenfield_scaffold_scope(
-                    &current_contract.prompt_source,
-                    &scan,
-                    &mut fallback,
-                );
-                ensure_proposal_scope_covers_entry_points(&mut fallback);
+                normalize_proposal_scope(&combined_guidance, &scan, &mut fallback);
                 proposal = fallback;
                 apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
-                preserve_greenfield_scaffold_scope(
-                    &current_contract.prompt_source,
-                    &scan,
-                    &mut proposal,
-                );
-                ensure_proposal_scope_covers_entry_points(&mut proposal);
+                normalize_proposal_scope(&combined_guidance, &scan, &mut proposal);
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
         }
@@ -578,20 +563,10 @@ impl OrchService {
                 &scan,
                 &errors,
             ) {
-                preserve_greenfield_scaffold_scope(
-                    &current_contract.prompt_source,
-                    &scan,
-                    &mut fallback,
-                );
-                ensure_proposal_scope_covers_entry_points(&mut fallback);
+                normalize_proposal_scope(&combined_guidance, &scan, &mut fallback);
                 proposal = fallback;
                 apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
-                preserve_greenfield_scaffold_scope(
-                    &current_contract.prompt_source,
-                    &scan,
-                    &mut proposal,
-                );
-                ensure_proposal_scope_covers_entry_points(&mut proposal);
+                normalize_proposal_scope(&combined_guidance, &scan, &mut proposal);
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
         }
@@ -3113,6 +3088,95 @@ fn preserve_greenfield_scaffold_scope(
     }
 }
 
+fn normalize_proposal_scope(
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+    proposal: &mut DraftProposal,
+) {
+    preserve_greenfield_scaffold_scope(prompt, scan, proposal);
+    apply_prompt_exclusion_pruning(prompt, proposal);
+    ensure_proposal_scope_covers_entry_points(proposal);
+}
+
+fn apply_prompt_exclusion_pruning(prompt: &str, proposal: &mut DraftProposal) {
+    let excluded = extract_prompt_excluded_scope_prefixes(prompt);
+    if excluded.is_empty() {
+        return;
+    }
+    proposal
+        .entry_points
+        .retain(|path| !path_matches_excluded_prefixes(path, &excluded));
+    proposal
+        .allowed_scope
+        .retain(|path| !path_matches_excluded_prefixes(path, &excluded));
+}
+
+fn extract_prompt_excluded_scope_prefixes(prompt: &str) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    for line in prompt.lines() {
+        let lowered = line.to_ascii_lowercase();
+        if ![
+            "exclude",
+            "excluding",
+            "do not touch",
+            "don't touch",
+            "must not touch",
+            "not in scope",
+            "out of scope",
+            "without touching",
+            "without modifying",
+        ]
+        .iter()
+        .any(|marker| lowered.contains(marker))
+        {
+            continue;
+        }
+        for token in line.split_whitespace() {
+            let Some(prefix) = normalize_prompt_scope_token(token) else {
+                continue;
+            };
+            if !prefixes.iter().any(|existing| existing == &prefix) {
+                prefixes.push(prefix);
+            }
+        }
+    }
+    prefixes
+}
+
+fn normalize_prompt_scope_token(token: &str) -> Option<String> {
+    let mut trimmed = token
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\''
+                    | '`'
+            )
+        })
+        .trim()
+        .to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    while trimmed.ends_with('*') {
+        trimmed.pop();
+    }
+    while trimmed.ends_with('/') {
+        trimmed.pop();
+    }
+    if trimmed.is_empty() || !trimmed.contains('/') {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn path_matches_excluded_prefixes(path: &str, excluded: &[String]) -> bool {
+    let normalized = path.trim().trim_matches('/');
+    excluded.iter().any(|prefix| {
+        let prefix = prefix.trim().trim_matches('/');
+        normalized == prefix || normalized.starts_with(&format!("{prefix}/"))
+    })
+}
+
 fn prompt_declares_explicit_touch_set(prompt: &str) -> bool {
     let lowered = prompt.to_ascii_lowercase();
     [
@@ -4989,6 +5053,113 @@ mod tests {
                 || path == "baseline-site/src/db/schema.ts"
                 || path == "baseline-site/src/lib/persistence/store.ts"
                 || path == "baseline-site/src/actions/create-session.ts"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_prunes_prompt_excluded_generated_scope_paths() {
+        struct PollutedScopeDrafter;
+
+        impl ContractDrafter for PollutedScopeDrafter {
+            fn name(&self) -> &'static str {
+                "polluted-scope"
+            }
+
+            fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+                Ok(DraftProposal {
+                    title: "db slice".into(),
+                    summary: input.prompt,
+                    entry_points: vec![
+                        "baseline-site/package.json".into(),
+                        "baseline-site/db/config.ts".into(),
+                        "baseline-site/db/seed.ts".into(),
+                        "baseline-site/src/lib/persistence/leads.ts".into(),
+                    ],
+                    import_paths: vec![],
+                    expected_interfaces: vec!["db layer".into()],
+                    behavior_requirements: vec!["implement db slice".into()],
+                    allowed_scope: vec![
+                        "baseline-site/package.json".into(),
+                        "baseline-site/db/config.ts".into(),
+                        "baseline-site/db/seed.ts".into(),
+                        "baseline-site/src/lib/persistence/leads.ts".into(),
+                        "baseline-site/design/stitch/mock.png".into(),
+                        "baseline-site/dist/server/chunk.mjs".into(),
+                        "baseline-site/.astro/integrations/astro_db/db.d.ts".into(),
+                        "baseline-site/.playwright-mcp/state.json".into(),
+                    ],
+                    target_checks: vec!["npm --prefix baseline-site test".into()],
+                    integrity_checks: vec!["npm --prefix baseline-site test".into()],
+                    risk_level: "medium".into(),
+                })
+            }
+
+            fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+                Ok(input.current)
+            }
+        }
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-exclusion-prune-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/db")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/persistence")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{"name":"baseline-site","scripts":{"test":"echo test"}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("baseline-site/db/config.ts"), "export default {};\n").unwrap();
+        fs::write(root.join("baseline-site/db/seed.ts"), "export async function seed() {}\n")
+            .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/persistence/leads.ts"),
+            "export const leads = {};\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &PollutedScopeDrafter,
+                "implement DB layer for baseline-site; exclude baseline-site/design/** baseline-site/dist/** baseline-site/.astro/** baseline-site/.playwright-mcp/**",
+            )
+            .unwrap();
+
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .all(|path| !path.contains("/design/")));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .all(|path| !path.contains("/dist/")));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .all(|path| !path.contains("/.astro/")));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .all(|path| !path.contains("/.playwright-mcp/")));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/db/config.ts"), "{:?}", contract.allowed_scope);
+        assert!(!contract.allowed_scope.is_empty());
 
         let _ = fs::remove_dir_all(&root);
     }
