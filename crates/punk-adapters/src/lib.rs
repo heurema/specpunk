@@ -619,38 +619,199 @@ impl CodexCliExecutor {
     fn execute_patch_apply_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
         let start = Instant::now();
         restore_stale_entry_point_masks(&input.repo_root)?;
-        let mut context_pack = build_context_pack(&input.repo_root, &input.contract)?;
-        let mut controller_plan_seed = derive_plan_seed(&input.contract, &context_pack);
-        hydrate_plan_seed_excerpts(&context_pack, &mut controller_plan_seed);
-        if !controller_plan_seed.targets.is_empty() {
-            context_pack.plan_seed = Some(controller_plan_seed.clone());
-        }
-        let mut excerpt_guard = EntryPointExcerptGuard::apply(&input.repo_root, &context_pack)?;
-        if needs_patch_plan_prepass(&input.contract, &context_pack) {
-            match self.run_patch_plan_prepass(&input, &context_pack) {
-                Err(err) => {
+        let mut retry_feedback = None;
+
+        for retry_mode in [false, true] {
+            let mut context_pack = build_context_pack(&input.repo_root, &input.contract)?;
+            if retry_mode {
+                ensure_retry_patch_seed(&input.repo_root, &input.contract, &mut context_pack);
+            }
+            let mut controller_plan_seed = derive_plan_seed(&input.contract, &context_pack);
+            hydrate_plan_seed_excerpts(&context_pack, &mut controller_plan_seed);
+            if !controller_plan_seed.targets.is_empty() {
+                context_pack.plan_seed = Some(controller_plan_seed.clone());
+            }
+            let mut excerpt_guard = EntryPointExcerptGuard::apply(&input.repo_root, &context_pack)?;
+            if needs_patch_plan_prepass(&input.contract, &context_pack) {
+                match self.run_patch_plan_prepass(&input, &context_pack) {
+                    Err(err) => {
+                        if let Some(guard) = excerpt_guard.as_mut() {
+                            guard.restore()?;
+                        }
+                        append_log_text(
+                            &input.stderr_path,
+                            &format!("\n[punk patch/prepass] failed: {err}\n"),
+                        )?;
+                        return Ok(ExecuteOutput {
+                            success: false,
+                            summary: format!("patch prepass failed: {err}"),
+                            checks_run: Vec::new(),
+                            cost_usd: None,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        });
+                    }
+                    Ok(PlanPrepassResponse::Blocked(reason)) => {
+                        if let Some(guard) = excerpt_guard.as_mut() {
+                            guard.restore()?;
+                        }
+                        append_log_text(
+                            &input.stderr_path,
+                            &format!("\n[punk patch/prepass] blocked: {reason}\n"),
+                        )?;
+                        return Ok(ExecuteOutput {
+                            success: false,
+                            summary: reason,
+                            checks_run: Vec::new(),
+                            cost_usd: None,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        });
+                    }
+                    Ok(PlanPrepassResponse::Plan { summary, targets }) => {
+                        append_log_text(
+                            &input.stdout_path,
+                            &format!(
+                                "\n[punk patch/prepass] planned targets: {}\n",
+                                targets
+                                    .iter()
+                                    .map(|target| format!(
+                                        "{}:{}@{}",
+                                        target.path, target.symbol, target.insertion_point
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        )?;
+                        let mut plan_seed = if controller_plan_seed.targets.is_empty() {
+                            ContextPlanSeed {
+                                title: "Controller-owned plan prepass".to_string(),
+                                summary,
+                                targets: targets
+                                    .into_iter()
+                                    .map(|target| ContextPlanTarget {
+                                        path: target.path,
+                                        symbol: target.symbol,
+                                        insertion_point: target.insertion_point,
+                                        execution_sketch: target.execution_sketch,
+                                        anchor_excerpt: String::new(),
+                                    })
+                                    .collect(),
+                            }
+                        } else {
+                            let mut seed = controller_plan_seed.clone();
+                            seed.title = "Controller-owned plan prepass".to_string();
+                            seed.summary = summary;
+                            seed
+                        };
+                        hydrate_plan_seed_excerpts(&context_pack, &mut plan_seed);
+                        context_pack.plan_seed = Some(plan_seed);
+                    }
+                }
+            }
+            let prompt = build_patch_apply_prompt(
+                &input.contract,
+                &context_pack,
+                retry_mode,
+                retry_feedback.as_deref(),
+            );
+
+            let mut command = Command::new("codex");
+            command
+                .arg("exec")
+                .arg("--full-auto")
+                .arg("--ephemeral")
+                .arg("-s")
+                .arg("read-only")
+                .arg("-C")
+                .arg(&input.repo_root);
+            if let Some(model) = &self.model {
+                command.arg("-m").arg(model);
+            }
+            if let Some(reasoning_effort) = codex_executor_reasoning_effort(&input.contract) {
+                command
+                    .arg("-c")
+                    .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""));
+            }
+            let orientation_guard = OrientationGuardEnv::install()?;
+            orientation_guard.apply(&mut command);
+            command.arg("--").arg(prompt);
+
+            let timed_output = match run_patch_lane_command_with_timeout(
+                &mut command,
+                codex_patch_lane_timeout(),
+                input.stdout_path.clone(),
+                input.stderr_path.clone(),
+                input.executor_pid_path.clone(),
+            ) {
+                Ok(output) => {
                     if let Some(guard) = excerpt_guard.as_mut() {
                         guard.restore()?;
                     }
+                    output
+                }
+                Err(err) => {
+                    if let Some(guard) = excerpt_guard.as_mut() {
+                        let _ = guard.restore();
+                    }
+                    return Err(err);
+                }
+            };
+            let stdout = String::from_utf8_lossy(&timed_output.output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&timed_output.output.stderr).to_string();
+            let response = timed_output
+                .response
+                .clone()
+                .or_else(|| load_patch_lane_response(&stdout, &stderr).ok());
+            if timed_output.timed_out && response.is_none() {
+                return Ok(ExecuteOutput {
+                    success: false,
+                    summary: timeout_summary(codex_patch_lane_timeout(), &stdout, &stderr),
+                    checks_run: Vec::new(),
+                    cost_usd: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+            if timed_output.orphaned {
+                return Ok(ExecuteOutput {
+                    success: false,
+                    summary: orphan_summary(&stdout, &stderr),
+                    checks_run: Vec::new(),
+                    cost_usd: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+            if !timed_output.output.status.success() && response.is_none() {
+                let (success, summary) = classify_execution_result(false, &stdout, &stderr);
+                return Ok(ExecuteOutput {
+                    success,
+                    summary,
+                    checks_run: Vec::new(),
+                    cost_usd: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+
+            let response = match response {
+                Some(response) => response,
+                None => {
+                    let err = anyhow!("patch lane returned no complete patch artifact");
                     append_log_text(
                         &input.stderr_path,
-                        &format!("\n[punk patch/prepass] failed: {err}\n"),
+                        &format!("\n[punk patch/apply] failed to parse patch output: {err}\n"),
                     )?;
                     return Ok(ExecuteOutput {
                         success: false,
-                        summary: format!("patch prepass failed: {err}"),
+                        summary: format!("patch/apply lane returned invalid patch text: {err}"),
                         checks_run: Vec::new(),
                         cost_usd: None,
                         duration_ms: start.elapsed().as_millis() as u64,
                     });
                 }
-                Ok(PlanPrepassResponse::Blocked(reason)) => {
-                    if let Some(guard) = excerpt_guard.as_mut() {
-                        guard.restore()?;
-                    }
+            };
+            let patch = match response {
+                PatchLaneResponse::Blocked(reason) => {
                     append_log_text(
                         &input.stderr_path,
-                        &format!("\n[punk patch/prepass] blocked: {reason}\n"),
+                        &format!("\n[punk patch/apply] blocked: {reason}\n"),
                     )?;
                     return Ok(ExecuteOutput {
                         success: false,
@@ -660,228 +821,103 @@ impl CodexCliExecutor {
                         duration_ms: start.elapsed().as_millis() as u64,
                     });
                 }
-                Ok(PlanPrepassResponse::Plan { summary, targets }) => {
+                PatchLaneResponse::Patch(patch) => patch,
+            };
+
+            let updates = match validate_patch_scope(&patch, &input.contract.allowed_scope) {
+                Ok(updates) => updates,
+                Err(err) => {
                     append_log_text(
-                        &input.stdout_path,
-                        &format!(
-                            "\n[punk patch/prepass] planned targets: {}\n",
-                            targets
-                                .iter()
-                                .map(|target| format!(
-                                    "{}:{}@{}",
-                                    target.path, target.symbol, target.insertion_point
-                                ))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
+                        &input.stderr_path,
+                        &format!("\n[punk patch/apply] invalid patch scope: {err}\n"),
                     )?;
-                    let mut plan_seed = if controller_plan_seed.targets.is_empty() {
-                        ContextPlanSeed {
-                            title: "Controller-owned plan prepass".to_string(),
-                            summary,
-                            targets: targets
-                                .into_iter()
-                                .map(|target| ContextPlanTarget {
-                                    path: target.path,
-                                    symbol: target.symbol,
-                                    insertion_point: target.insertion_point,
-                                    execution_sketch: target.execution_sketch,
-                                    anchor_excerpt: String::new(),
-                                })
-                                .collect(),
-                        }
-                    } else {
-                        let mut seed = controller_plan_seed.clone();
-                        seed.title = "Controller-owned plan prepass".to_string();
-                        seed.summary = summary;
-                        seed
-                    };
-                    hydrate_plan_seed_excerpts(&context_pack, &mut plan_seed);
-                    context_pack.plan_seed = Some(plan_seed);
+                    return Ok(ExecuteOutput {
+                        success: false,
+                        summary: format!("patch/apply lane rejected patch: {err}"),
+                        checks_run: Vec::new(),
+                        cost_usd: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
                 }
-            }
-        }
-        let prompt = build_patch_apply_prompt(&input.contract, &context_pack);
+            };
+            let patch_paths = updates
+                .iter()
+                .map(|update| update.path.clone())
+                .collect::<Vec<_>>();
 
-        let mut command = Command::new("codex");
-        command
-            .arg("exec")
-            .arg("--full-auto")
-            .arg("--ephemeral")
-            .arg("-s")
-            .arg("read-only")
-            .arg("-C")
-            .arg(&input.repo_root);
-        if let Some(model) = &self.model {
-            command.arg("-m").arg(model);
-        }
-        if let Some(reasoning_effort) = codex_executor_reasoning_effort(&input.contract) {
-            command
-                .arg("-c")
-                .arg(format!("model_reasoning_effort=\"{reasoning_effort}\""));
-        }
-        let orientation_guard = OrientationGuardEnv::install()?;
-        orientation_guard.apply(&mut command);
-        command.arg("--").arg(prompt);
-
-        let timed_output = match run_patch_lane_command_with_timeout(
-            &mut command,
-            codex_patch_lane_timeout(),
-            input.stdout_path.clone(),
-            input.stderr_path.clone(),
-            input.executor_pid_path.clone(),
-        ) {
-            Ok(output) => {
-                if let Some(guard) = excerpt_guard.as_mut() {
-                    guard.restore()?;
-                }
-                output
-            }
-            Err(err) => {
-                if let Some(guard) = excerpt_guard.as_mut() {
-                    let _ = guard.restore();
-                }
-                return Err(err);
-            }
-        };
-        let stdout = String::from_utf8_lossy(&timed_output.output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&timed_output.output.stderr).to_string();
-        let response = timed_output
-            .response
-            .clone()
-            .or_else(|| load_patch_lane_response(&stdout, &stderr).ok());
-        if timed_output.timed_out && response.is_none() {
-            return Ok(ExecuteOutput {
-                success: false,
-                summary: timeout_summary(codex_patch_lane_timeout(), &stdout, &stderr),
-                checks_run: Vec::new(),
-                cost_usd: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-        if timed_output.orphaned {
-            return Ok(ExecuteOutput {
-                success: false,
-                summary: orphan_summary(&stdout, &stderr),
-                checks_run: Vec::new(),
-                cost_usd: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-        if !timed_output.output.status.success() && response.is_none() {
-            let (success, summary) = classify_execution_result(false, &stdout, &stderr);
-            return Ok(ExecuteOutput {
-                success,
-                summary,
-                checks_run: Vec::new(),
-                cost_usd: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-
-        let response = match response {
-            Some(response) => response,
-            None => {
-                let err = anyhow!("patch lane returned no complete patch artifact");
+            if let Err(err) = apply_patch_in_repo(&input.repo_root, &updates) {
                 append_log_text(
                     &input.stderr_path,
-                    &format!("\n[punk patch/apply] failed to parse patch output: {err}\n"),
+                    &format!("\n[punk patch/apply] failed to apply patch: {err}\n"),
                 )?;
                 return Ok(ExecuteOutput {
                     success: false,
-                    summary: format!("patch/apply lane returned invalid patch text: {err}"),
+                    summary: format!("patch/apply lane failed to apply patch: {err}"),
                     checks_run: Vec::new(),
                     cost_usd: None,
                     duration_ms: start.elapsed().as_millis() as u64,
                 });
             }
-        };
-        let patch = match response {
-            PatchLaneResponse::Blocked(reason) => {
-                append_log_text(
-                    &input.stderr_path,
-                    &format!("\n[punk patch/apply] blocked: {reason}\n"),
-                )?;
-                return Ok(ExecuteOutput {
-                    success: false,
-                    summary: reason,
-                    checks_run: Vec::new(),
-                    cost_usd: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                });
-            }
-            PatchLaneResponse::Patch(patch) => patch,
-        };
-
-        let updates = match validate_patch_scope(&patch, &input.contract.allowed_scope) {
-            Ok(updates) => updates,
-            Err(err) => {
-                append_log_text(
-                    &input.stderr_path,
-                    &format!("\n[punk patch/apply] invalid patch scope: {err}\n"),
-                )?;
-                return Ok(ExecuteOutput {
-                    success: false,
-                    summary: format!("patch/apply lane rejected patch: {err}"),
-                    checks_run: Vec::new(),
-                    cost_usd: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                });
-            }
-        };
-        let patch_paths = updates
-            .iter()
-            .map(|update| update.path.clone())
-            .collect::<Vec<_>>();
-
-        if let Err(err) = apply_patch_in_repo(&input.repo_root, &updates) {
             append_log_text(
-                &input.stderr_path,
-                &format!("\n[punk patch/apply] failed to apply patch: {err}\n"),
+                &input.stdout_path,
+                &format!(
+                    "\n[punk patch/apply] applied patch for: {}\n",
+                    patch_paths.join(", ")
+                ),
             )?;
+
+            let checks = collect_contract_checks(&input.contract);
+            let checks_run = match run_contract_checks(
+                &input.repo_root,
+                &input.contract,
+                &checks,
+                &input.stdout_path,
+                &input.stderr_path,
+            ) {
+                Ok(checks_run) => checks_run,
+                Err(summary) => {
+                    if !retry_mode
+                        && should_retry_patch_apply_after_check_failure(&input.contract, &summary)
+                    {
+                        retry_feedback = Some(patch_apply_retry_feedback(
+                            &summary,
+                            &input.repo_root,
+                            &input.contract.allowed_scope,
+                            &input.stdout_path,
+                            &input.stderr_path,
+                        )?);
+                        append_log_text(
+                            &input.stderr_path,
+                            "\n[punk patch/apply] retrying once after failed checks with bounded repair context\n",
+                        )?;
+                        continue;
+                    }
+                    return Ok(ExecuteOutput {
+                        success: false,
+                        summary,
+                        checks_run: Vec::new(),
+                        cost_usd: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
+            };
+
             return Ok(ExecuteOutput {
-                success: false,
-                summary: format!("patch/apply lane failed to apply patch: {err}"),
-                checks_run: Vec::new(),
+                success: true,
+                summary: format!(
+                    "{SUCCESSFUL_EXECUTION_SENTINEL} patch/apply lane succeeded after applying patch for {}",
+                    patch_paths.join(", ")
+                ),
+                checks_run,
                 cost_usd: None,
                 duration_ms: start.elapsed().as_millis() as u64,
             });
         }
-        append_log_text(
-            &input.stdout_path,
-            &format!(
-                "\n[punk patch/apply] applied patch for: {}\n",
-                patch_paths.join(", ")
-            ),
-        )?;
-
-        let checks = collect_contract_checks(&input.contract);
-        let checks_run = match run_contract_checks(
-            &input.repo_root,
-            &input.contract,
-            &checks,
-            &input.stdout_path,
-            &input.stderr_path,
-        ) {
-            Ok(checks_run) => checks_run,
-            Err(summary) => {
-                return Ok(ExecuteOutput {
-                    success: false,
-                    summary,
-                    checks_run: Vec::new(),
-                    cost_usd: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                });
-            }
-        };
 
         Ok(ExecuteOutput {
-            success: true,
-            summary: format!(
-                "{SUCCESSFUL_EXECUTION_SENTINEL} patch/apply lane succeeded after applying patch for {}",
-                patch_paths.join(", ")
-            ),
-            checks_run,
+            success: false,
+            summary: "patch/apply lane exhausted repair attempts".to_string(),
+            checks_run: Vec::new(),
             cost_usd: None,
             duration_ms: start.elapsed().as_millis() as u64,
         })
@@ -1186,13 +1222,30 @@ fn build_exec_prompt_with_mode_and_visible_files(
     )
 }
 
-fn build_patch_apply_prompt(contract: &Contract, context_pack: &ContextPack) -> String {
+fn build_patch_apply_prompt(
+    contract: &Contract,
+    context_pack: &ContextPack,
+    retry_mode: bool,
+    retry_feedback: Option<&str>,
+) -> String {
     let context_pack_section = format_patch_context_pack(context_pack);
     let plan_rule = if context_pack.plan_seed.is_some() {
         "- if the controller-owned plan prepass is present, treat its target files, symbols, and insertion points as authoritative and produce the patch directly against that plan\n"
     } else {
         ""
     };
+    let retry_rule = if retry_mode {
+        "- this is the second and final patch/apply pass after failed checks; repair the current in-scope files in place instead of restarting from scratch\n\
+- repair only the concrete failed-check errors from the feedback below; keep the patch surgical and do not re-add modules, tests, or helpers that already exist in the current file state\n\
+- if the feedback reports duplicate definitions or duplicate test modules, remove or merge the duplicate instead of adding another copy\n\
+- if the feedback includes current file snippets around failing lines, treat those snippets as the authoritative current state over any earlier baseline excerpt\n"
+    } else {
+        ""
+    };
+    let retry_feedback_section = retry_feedback
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("Latest failed-check feedback to repair:\n```text\n{}\n```\n", value.trim()))
+        .unwrap_or_default();
     format!(
         "Produce plain text only for a controller-owned patch/apply lane.\n\
 Return exactly one of:\n\
@@ -1206,6 +1259,8 @@ Entry points: {}\n\
 Expected interfaces: {}\n\
 Target checks to satisfy after apply: {}\n\
 Integrity checks to keep passing after apply: {}\n\
+{}\n\
+{}\n\
 {}\n\
 {}\n\
 Requirements:\n\
@@ -1228,9 +1283,187 @@ Requirements:\n\
         contract.target_checks.join("; "),
         contract.integrity_checks.join("; "),
         context_pack_section,
+        retry_feedback_section,
         plan_rule,
+        retry_rule,
         blocked = blocked_execution_template(),
     )
+}
+
+fn should_retry_patch_apply_after_check_failure(contract: &Contract, summary: &str) -> bool {
+    is_fail_closed_scope_task(contract)
+        && summary
+            .trim_start()
+            .starts_with("patch/apply lane check failed:")
+}
+
+fn patch_apply_retry_feedback(
+    summary: &str,
+    repo_root: &Path,
+    allowed_scope: &[String],
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<String> {
+    let stdout = fs::read_to_string(stdout_path).unwrap_or_default();
+    let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
+    let stdout_tail = log_tail(&stdout, 60, 4000);
+    let stderr_tail = log_tail(&stderr, 80, 6000);
+    let mut sections = vec![format!("Summary: {}", summary.trim())];
+    let repair_directives = patch_apply_repair_directives(summary, &stderr);
+    if !repair_directives.is_empty() {
+        sections.push(format!(
+            "Repair directives:\n{}",
+            repair_directives
+                .into_iter()
+                .map(|directive| format!("- {directive}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    let source_snippets =
+        patch_apply_retry_source_snippets(repo_root, allowed_scope, &stderr).unwrap_or_default();
+    if !source_snippets.is_empty() {
+        sections.push(format!(
+            "Current source near reported failures:\n{}",
+            source_snippets
+        ));
+    }
+    if !stdout_tail.is_empty() {
+        sections.push(format!("Recent stdout:\n{}", stdout_tail));
+    }
+    if !stderr_tail.is_empty() {
+        sections.push(format!("Recent stderr:\n{}", stderr_tail));
+    }
+    Ok(sections.join("\n\n"))
+}
+
+fn log_tail(text: &str, max_lines: usize, max_chars: usize) -> String {
+    let mut lines = text
+        .lines()
+        .rev()
+        .take(max_lines)
+        .collect::<Vec<_>>();
+    lines.reverse();
+    let joined = lines.join("\n");
+    if joined.chars().count() <= max_chars {
+        return joined;
+    }
+    let tail = joined
+        .chars()
+        .rev()
+        .take(max_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("...{}", tail)
+}
+
+fn patch_apply_repair_directives(summary: &str, stderr: &str) -> Vec<String> {
+    let mut directives =
+        vec!["Repair only the reported failed-check errors in the current in-scope files.".into()];
+    let lower = format!("{summary}\n{stderr}").to_ascii_lowercase();
+    if lower.contains("defined multiple times") || lower.contains("error[e0428]") {
+        directives.push(
+            "Keep exactly one definition for the reported item; remove or merge the duplicate instead of adding another copy."
+                .into(),
+        );
+    }
+    if (lower.contains("mod tests") || lower.contains("name `tests`"))
+        && (lower.contains("defined multiple times") || lower.contains("error[e0428]"))
+    {
+        directives.push(
+            "Keep exactly one `mod tests` block per file and edit the existing block in place."
+                .into(),
+        );
+    }
+    if lower.contains("not bound in all patterns")
+        || lower.contains("possibly-uninitialized")
+        || lower.contains("error[e0408]")
+        || lower.contains("error[e0381]")
+    {
+        directives.push(
+            "Fix the reported match arm or binding in place; do not rewrite unrelated code paths."
+                .into(),
+        );
+    }
+    directives
+}
+
+fn patch_apply_retry_source_snippets(
+    repo_root: &Path,
+    allowed_scope: &[String],
+    stderr: &str,
+) -> Result<String> {
+    let mut seen = Vec::new();
+    let mut snippets = Vec::new();
+    for line in stderr.lines() {
+        let Some((raw_path, line_number)) = parse_rust_diagnostic_location(line) else {
+            continue;
+        };
+        let Some(path) = normalize_retry_feedback_path(repo_root, raw_path) else {
+            continue;
+        };
+        if !path_is_in_allowed_scope(&path, allowed_scope) {
+            continue;
+        }
+        if seen
+            .iter()
+            .any(|(seen_path, seen_line)| seen_path == &path && *seen_line == line_number)
+        {
+            continue;
+        }
+        seen.push((path.clone(), line_number));
+        let snippet = read_source_snippet_around_line(repo_root, &path, line_number, 6)?;
+        if !snippet.is_empty() {
+            snippets.push(format!("{path} around line {line_number}\n{snippet}"));
+        }
+        if snippets.len() >= 4 {
+            break;
+        }
+    }
+    Ok(snippets.join("\n\n"))
+}
+
+fn parse_rust_diagnostic_location(line: &str) -> Option<(&str, usize)> {
+    let rest = line.trim().strip_prefix("--> ")?;
+    let mut parts = rest.splitn(3, ':');
+    let path = parts.next()?.trim();
+    let line_number = parts.next()?.trim().parse().ok()?;
+    Some((path, line_number))
+}
+
+fn normalize_retry_feedback_path(repo_root: &Path, raw_path: &str) -> Option<String> {
+    if !Path::new(raw_path).is_absolute() {
+        return Some(raw_path.replace('\\', "/"));
+    }
+    Path::new(raw_path)
+        .strip_prefix(repo_root)
+        .ok()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+}
+
+fn read_source_snippet_around_line(
+    repo_root: &Path,
+    rel_path: &str,
+    line_number: usize,
+    radius: usize,
+) -> Result<String> {
+    let source = match fs::read_to_string(repo_root.join(rel_path)) {
+        Ok(source) => source,
+        Err(_) => return Ok(String::new()),
+    };
+    let lines = source.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Ok(String::new());
+    }
+    let start = line_number.saturating_sub(radius).max(1);
+    let end = (line_number + radius).min(lines.len());
+    let snippet = (start..=end)
+        .map(|current| format!("{:>4} | {}", current, lines[current - 1]))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(format!("```rust\n{}\n```", snippet))
 }
 
 fn build_patch_plan_prompt(contract: &Contract, context_pack: &ContextPack) -> String {
@@ -4562,7 +4795,7 @@ mod tests {
             created_at: "now".into(),
             approved_at: Some("now".into()),
         };
-        let prompt = build_patch_apply_prompt(&contract, &ContextPack::default());
+        let prompt = build_patch_apply_prompt(&contract, &ContextPack::default(), false, None);
         assert!(prompt.contains("single apply_patch-style patch"));
         assert!(prompt.contains("do not output JSON"));
         assert!(prompt.contains("do not run `rg`, `grep`, `sed`, `cat`, `find`, `ls`, or any other shell command for orientation"));
@@ -5157,6 +5390,115 @@ mod tests {
                 "PUNK_EXECUTION_BLOCKED: waiting on missing interface details".to_string()
             )
         );
+    }
+
+    #[test]
+    fn patch_apply_retry_feedback_includes_summary_and_recent_logs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-patch-retry-feedback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let stdout = root.join("stdout.log");
+        let stderr = root.join("stderr.log");
+        fs::write(&stdout, "[punk check] cargo test -p pubpunk-cli\nrecent stdout\n").unwrap();
+        fs::write(&stderr, "error[E0408]: compile failed\n").unwrap();
+
+        let feedback = patch_apply_retry_feedback(
+            "patch/apply lane check failed: cargo test -p pubpunk-cli: compile failed",
+            &root,
+            &["crates/pubpunk-cli/src/main.rs".into()],
+            &stdout,
+            &stderr,
+        )
+        .unwrap();
+        assert!(feedback.contains("Summary: patch/apply lane check failed"));
+        assert!(feedback.contains("Recent stdout:"));
+        assert!(feedback.contains("Recent stderr:"));
+        assert!(feedback.contains("error[E0408]"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_patch_apply_prompt_includes_retry_feedback_on_second_pass() {
+        let contract = Contract {
+            id: "ct_retry".into(),
+            feature_id: "feat_retry".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init command".into(),
+            entry_points: vec!["crates/pubpunk-cli/src/main.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["pubpunk init".into()],
+            behavior_requirements: vec!["add --json behavior".into()],
+            allowed_scope: vec!["crates/pubpunk-cli/src/main.rs".into()],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let pack = ContextPack::default();
+        let prompt = build_patch_apply_prompt(
+            &contract,
+            &pack,
+            true,
+            Some("Summary: patch/apply lane check failed: cargo test -p pubpunk-cli"),
+        );
+        assert!(prompt.contains("second and final patch/apply pass after failed checks"));
+        assert!(prompt.contains("Latest failed-check feedback to repair:"));
+        assert!(prompt.contains("cargo test -p pubpunk-cli"));
+        assert!(prompt.contains("repair only the concrete failed-check errors"));
+        assert!(prompt.contains("duplicate definitions or duplicate test modules"));
+    }
+
+    #[test]
+    fn patch_apply_retry_feedback_includes_current_source_snippets_for_reported_lines() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-patch-retry-snippets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        let stdout = root.join("stdout.log");
+        let stderr = root.join("stderr.log");
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n\n#[cfg(test)]\nmod tests {}\n\n#[cfg(test)]\nmod tests {}\n",
+        )
+        .unwrap();
+        fs::write(&stdout, "").unwrap();
+        fs::write(
+            &stderr,
+            "error[E0428]: the name `tests` is defined multiple times\n  --> crates/pubpunk-cli/src/main.rs:6:1\n",
+        )
+        .unwrap();
+
+        let feedback = patch_apply_retry_feedback(
+            "patch/apply lane check failed: cargo test -p pubpunk-cli: compile failed",
+            &root,
+            &["crates/pubpunk-cli/src/main.rs".into()],
+            &stdout,
+            &stderr,
+        )
+        .unwrap();
+        assert!(feedback.contains("Repair directives:"));
+        assert!(feedback.contains("Keep exactly one `mod tests` block per file"));
+        assert!(feedback.contains("Current source near reported failures:"));
+        assert!(feedback.contains("crates/pubpunk-cli/src/main.rs around line 6"));
+        assert!(feedback.contains("mod tests {}"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
