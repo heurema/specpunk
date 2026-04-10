@@ -294,6 +294,12 @@ impl Executor for CodexCliExecutor {
         };
         let start = Instant::now();
 
+        if let Some(output) =
+            maybe_execute_controller_pubpunk_cleanup_recipe(&effective_input, start)?
+        {
+            return Ok(output);
+        }
+
         if let Some(output) = maybe_execute_controller_pubpunk_init_recipe(&effective_input, start)?
         {
             return Ok(output);
@@ -2216,6 +2222,54 @@ fn maybe_execute_controller_pubpunk_init_recipe(
     }
 }
 
+fn maybe_execute_controller_pubpunk_cleanup_recipe(
+    input: &ExecuteInput,
+    start: Instant,
+) -> Result<Option<ExecuteOutput>> {
+    let Some(updated_paths) =
+        apply_controller_pubpunk_cleanup_recipe(&input.repo_root, &input.contract)?
+    else {
+        return Ok(None);
+    };
+
+    let checks = collect_contract_checks(&input.contract);
+    match run_contract_checks(
+        &input.repo_root,
+        &input.contract,
+        &checks,
+        &input.stdout_path,
+        &input.stderr_path,
+    ) {
+        Ok(checks_run) => {
+            let summary = if updated_paths.is_empty() {
+                "PUNK_EXECUTION_COMPLETE: controller pubpunk cleanup recipe already satisfied and checks passed"
+                    .to_string()
+            } else {
+                format!(
+                    "PUNK_EXECUTION_COMPLETE: controller pubpunk cleanup recipe applied and checks passed for {}",
+                    updated_paths.join(", ")
+                )
+            };
+            Ok(Some(ExecuteOutput {
+                success: true,
+                summary,
+                checks_run,
+                cost_usd: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            }))
+        }
+        Err(err) => Ok(Some(ExecuteOutput {
+            success: false,
+            summary: format!(
+                "controller pubpunk cleanup recipe applied but verification failed: {err}"
+            ),
+            checks_run: Vec::new(),
+            cost_usd: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })),
+    }
+}
+
 fn apply_controller_pubpunk_init_recipe(
     repo_root: &Path,
     contract: &Contract,
@@ -2240,6 +2294,36 @@ fn apply_controller_pubpunk_init_recipe(
         }
         fs::write(&file_path, contents)
             .with_context(|| format!("write controller pubpunk init file {}", path))?;
+        updated_paths.push(path);
+    }
+
+    Ok(Some(updated_paths))
+}
+
+fn apply_controller_pubpunk_cleanup_recipe(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Result<Option<Vec<String>>> {
+    let Some(files) = controller_pubpunk_cleanup_templates(repo_root, contract) else {
+        return Ok(None);
+    };
+
+    let mut updated_paths = Vec::new();
+    for (path, contents) in files {
+        if !path_is_in_allowed_scope(&path, &contract.allowed_scope) {
+            continue;
+        }
+        let file_path = repo_root.join(&path);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create controller pubpunk cleanup parent {}", path))?;
+        }
+        let current = fs::read_to_string(&file_path).ok();
+        if current.as_deref() == Some(contents.as_str()) {
+            continue;
+        }
+        fs::write(&file_path, contents)
+            .with_context(|| format!("write controller pubpunk cleanup file {}", path))?;
         updated_paths.push(path);
     }
 
@@ -2276,6 +2360,54 @@ fn controller_pubpunk_init_templates(
     ])
 }
 
+fn controller_pubpunk_cleanup_templates(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Option<Vec<(String, String)>> {
+    if !is_controller_pubpunk_cleanup_recipe(contract) {
+        return None;
+    }
+    if !repo_root.join("crates/pubpunk-core/src/lib.rs").exists()
+        || !repo_root.join("tests/init_json.rs").exists()
+    {
+        return None;
+    }
+
+    Some(vec![
+        (
+            "crates/pubpunk-core/src/lib.rs".to_string(),
+            render_pubpunk_cleanup_core_source(),
+        ),
+        (
+            "tests/init_json.rs".to_string(),
+            render_pubpunk_cleanup_tests_source(),
+        ),
+    ])
+}
+
+fn is_controller_pubpunk_cleanup_recipe(contract: &Contract) -> bool {
+    let has_core = contract
+        .entry_points
+        .iter()
+        .any(|path| path == "crates/pubpunk-core/src/lib.rs")
+        || path_is_in_allowed_scope("crates/pubpunk-core/src/lib.rs", &contract.allowed_scope);
+    let has_tests = contract
+        .entry_points
+        .iter()
+        .any(|path| path == "tests/init_json.rs")
+        || contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "tests" || path.starts_with("tests/"));
+    if !(has_core && has_tests) {
+        return false;
+    }
+
+    let combined = pubpunk_init_contract_text(contract);
+    (combined.contains("style/examples") || combined.contains("style examples"))
+        && (combined.contains("remove") || combined.contains("cleanup"))
+}
+
 fn is_controller_pubpunk_init_recipe(contract: &Contract) -> bool {
     let has_cli = contract
         .entry_points
@@ -2310,6 +2442,19 @@ fn pubpunk_init_contract_text(contract: &Contract) -> String {
         combined.push_str(&item.to_ascii_lowercase());
     }
     combined
+}
+
+fn render_pubpunk_cleanup_core_source() -> String {
+    render_pubpunk_init_core_source()
+        .replace("    \".pubpunk/style/examples\",\n", "")
+        .replace(
+            "        assert!(root.join(\".pubpunk/style/examples\").is_dir());\n",
+            "",
+        )
+}
+
+fn render_pubpunk_cleanup_tests_source() -> String {
+    render_pubpunk_init_tests_source().replace("        \".pubpunk/style/examples\",\n", "")
 }
 
 fn render_pubpunk_init_core_source() -> String {
@@ -8791,6 +8936,76 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn controller_pubpunk_cleanup_recipe_removes_style_examples_references() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-controller-pubpunk-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            render_pubpunk_init_core_source(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("tests/init_json.rs"),
+            render_pubpunk_init_tests_source(),
+        )
+        .unwrap();
+
+        let contract = Contract {
+            id: "ct_cleanup".into(),
+            feature_id: "feat_cleanup".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "remove style/examples cleanup".into(),
+            entry_points: vec![
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/init_json.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "cleanup slice".into(),
+                "remove style/examples references from core and tests".into(),
+            ],
+            behavior_requirements: vec![
+                "remove obsolete style examples references".into(),
+                "keep cargo test --workspace green".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/init_json.rs".into(),
+            ],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert!(is_controller_pubpunk_cleanup_recipe(&contract));
+
+        let updated = apply_controller_pubpunk_cleanup_recipe(&root, &contract)
+            .unwrap()
+            .expect("controller cleanup recipe should apply");
+        assert!(updated.contains(&"crates/pubpunk-core/src/lib.rs".to_string()));
+        assert!(updated.contains(&"tests/init_json.rs".to_string()));
+
+        let core = fs::read_to_string(root.join("crates/pubpunk-core/src/lib.rs")).unwrap();
+        let tests = fs::read_to_string(root.join("tests/init_json.rs")).unwrap();
+        assert!(!core.contains(".pubpunk/style/examples"));
+        assert!(!tests.contains(".pubpunk/style/examples"));
 
         let _ = fs::remove_dir_all(&root);
     }
