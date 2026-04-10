@@ -326,8 +326,8 @@ The intended durable behavior is stronger than shell text:
 
 Preflight expectation:
 
-- fail early if no Git or jj repo is detected
-- return one explicit recovery path instead of a downstream adapter or scan error
+- if no Git or jj repo is detected, `punk go` should first auto-run `git init` in place and continue in degraded git-only mode instead of failing before intake
+- if that automatic `git init` fails, return one explicit recovery path instead of a downstream adapter or scan error
 - recovery should point to `git init`, then `punk init --project <id> --enable-jj --verify`, then retry the original `punk go ...`
 - for a bootstrapped greenfield Rust repo with no existing inferred checks yet, a goal that explicitly asks to scaffold Rust (`rust`, `cargo`, `crate`, or `workspace` + `scaffold`/`init`/`bootstrap`) may derive an initial `cargo test` or `cargo test --workspace` intake check instead of failing at repo scan
 - for a bootstrapped greenfield Go repo with no existing inferred checks yet, an explicit Go scaffold goal may derive `go test ./...` plus scaffoldable scope around `go.mod`, `cmd`, `internal`, and `pkg`
@@ -341,9 +341,9 @@ Runs the staged/manual intake from a plain goal.
 
 Preflight expectation:
 
-- fail early if no Git or jj repo is detected
-- do not defer this to a later drafter or repo-scan failure
-- return one explicit recovery path: `git init`, then `punk init --project <id> --enable-jj --verify`, then retry `punk start "<goal>"`
+- if no Git or jj repo is detected, `punk start` should first auto-run `git init` in place and continue in degraded git-only mode instead of failing before intake
+- do not defer missing-VCS handling to a later drafter or repo-scan failure
+- if that automatic `git init` fails, return one explicit recovery path: `git init`, then `punk init --project <id> --enable-jj --verify`, then retry `punk start "<goal>"`
 - for a bootstrapped greenfield Rust repo with no existing inferred checks yet, an explicit Rust scaffold goal may derive an initial `cargo test` or `cargo test --workspace` intake check instead of failing at repo scan
 - for a bootstrapped greenfield Go repo with no existing inferred checks yet, an explicit Go scaffold goal may derive `go test ./...` and scaffoldable Go scope instead of failing at repo scan
 - for a bootstrapped greenfield Python repo with no existing inferred checks yet, an explicit Python scaffold goal may derive `pytest` and scaffoldable Python scope instead of failing at repo scan

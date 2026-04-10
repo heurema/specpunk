@@ -96,7 +96,7 @@ If the repo basename is not a good project id, use:
 punk init --project <id> --enable-jj --verify
 ```
 
-Goal-intake commands assume a VCS-backed repo. If `punk start` or `punk go` reports `no VCS detected`, initialize the repo first:
+Goal-intake commands will auto-run `git init` if the directory has no VCS yet, then continue in degraded git-only mode. If that automatic init fails, initialize the repo manually:
 
 ```bash
 git init
@@ -172,7 +172,7 @@ punk gate run <run-id>
 punk gate proof <run-id|decision-id>
 ```
 
-If the workspace is not a Git or jj repo yet, `punk start` should stop early and point back to:
+If the workspace cannot auto-initialize Git, `punk start` should stop early and point back to:
 
 ```bash
 git init

@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use punk_adapters::{CodexCliContractDrafter, CodexCliExecutor};
 use punk_gate::GateService;
@@ -662,7 +662,11 @@ fn cmd_start(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Re
     let project_root = resolve_project_root(repo_root);
     let project = infer_project_id(&project_root).unwrap_or_else(|| "project".to_string());
     let retry_command = format!("punk start {}", shell_quote_goal(trimmed_goal));
-    ensure_vcs_ready_for_goal_intake(repo_root, &project, "punk start", &retry_command)?;
+    if let Some(note) =
+        ensure_vcs_ready_for_goal_intake(repo_root, &project, "punk start", &retry_command)?
+    {
+        eprintln!("{note}");
+    }
 
     let orch = OrchService::new(repo_root, global_root)?;
     let drafter = CodexCliContractDrafter::default();
@@ -713,7 +717,11 @@ fn cmd_go(
     } else {
         format!("punk go {}", shell_quote_goal(trimmed_goal))
     };
-    ensure_vcs_ready_for_goal_intake(repo_root, &project, "punk go", &retry_command)?;
+    if let Some(note) =
+        ensure_vcs_ready_for_goal_intake(repo_root, &project, "punk go", &retry_command)?
+    {
+        eprintln!("{note}");
+    }
 
     let orch = OrchService::new(repo_root, global_root)?;
     let drafter = CodexCliContractDrafter::default();
@@ -972,16 +980,53 @@ fn ensure_vcs_ready_for_goal_intake(
     project_id: &str,
     command_name: &str,
     retry_command: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if detect_vcs_mode(repo_root) == VcsMode::NoVcs {
-        return Err(anyhow!(format_goal_intake_no_vcs_error(
-            repo_root,
-            project_id,
-            command_name,
-            retry_command
+        init_git_repo_for_goal_intake(repo_root).map_err(|error| {
+            anyhow!(format_goal_intake_no_vcs_error(
+                repo_root,
+                project_id,
+                command_name,
+                retry_command,
+                Some(&error.to_string())
+            ))
+        })?;
+        if detect_vcs_mode(repo_root) == VcsMode::NoVcs {
+            return Err(anyhow!(format_goal_intake_no_vcs_error(
+                repo_root,
+                project_id,
+                command_name,
+                retry_command,
+                Some("git init completed but no supported VCS was detected afterward")
+            )));
+        }
+        return Ok(Some(format!(
+            "Note: initialized a Git repo for goal intake at {}. VCS mode: git-only (degraded; run `punk vcs enable-jj` for fuller punk functionality).",
+            repo_root.display()
         )));
     }
-    Ok(())
+    Ok(None)
+}
+
+fn init_git_repo_for_goal_intake(repo_root: &Path) -> Result<()> {
+    let output = ProcessCommand::new("git")
+        .args(["init", "-q"])
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("spawn git init in {}", repo_root.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "git init failed without output".to_string()
+    };
+    Err(anyhow!(detail))
 }
 
 fn format_goal_intake_no_vcs_error(
@@ -989,11 +1034,19 @@ fn format_goal_intake_no_vcs_error(
     project_id: &str,
     command_name: &str,
     retry_command: &str,
+    init_error: Option<&str>,
 ) -> String {
-    format!(
-        "{command_name} requires a Git or jj-backed repo before goal intake. No VCS detected at {}. Recovery: run `git init`, then `punk init --project {project_id} --enable-jj --verify`, then retry `{retry_command}`.",
+    let mut message = format!(
+        "{command_name} requires a Git or jj-backed repo before goal intake. No VCS detected at {}.",
         repo_root.display()
-    )
+    );
+    if let Some(init_error) = init_error {
+        message.push_str(&format!(" Automatic `git init` failed: {init_error}."));
+    }
+    message.push_str(&format!(
+        " Recovery: run `git init`, then `punk init --project {project_id} --enable-jj --verify`, then retry `{retry_command}`."
+    ));
+    message
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1841,31 +1894,42 @@ mod tests {
     }
 
     #[test]
-    fn no_vcs_goal_intake_error_mentions_recovery_path_for_start() {
+    fn no_vcs_goal_intake_bootstraps_git_for_start() {
         let root = temp_test_dir("start-no-vcs");
         let retry = "punk start \"ship demo\"";
-        let err = ensure_vcs_ready_for_goal_intake(&root, "demo", "punk start", retry)
-            .expect_err("no-vcs workspace should fail preflight")
-            .to_string();
-        assert!(err.contains("punk start requires a Git or jj-backed repo"));
-        assert!(err.contains("No VCS detected"));
-        assert!(err.contains("git init"));
-        assert!(err.contains("punk init --project demo --enable-jj --verify"));
-        assert!(err.contains(retry));
+        let note = ensure_vcs_ready_for_goal_intake(&root, "demo", "punk start", retry)
+            .expect("no-vcs workspace should auto-init git")
+            .expect("auto-init note should be returned");
+        assert!(note.contains("initialized a Git repo"));
+        assert_ne!(detect_vcs_mode(&root), VcsMode::NoVcs);
+        let git_dir = root.join(".git");
+        assert!(git_dir.exists());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn no_vcs_goal_intake_error_mentions_recovery_path_for_go() {
+    fn no_vcs_goal_intake_bootstraps_git_for_go() {
         let root = temp_test_dir("go-no-vcs");
         let retry = "punk go --fallback-staged \"ship demo\"";
-        let err = ensure_vcs_ready_for_goal_intake(&root, "demo", "punk go", retry)
-            .expect_err("no-vcs workspace should fail preflight")
-            .to_string();
-        assert!(err.contains("punk go requires a Git or jj-backed repo"));
-        assert!(err.contains("punk init --project demo --enable-jj --verify"));
-        assert!(err.contains(retry));
+        let note = ensure_vcs_ready_for_goal_intake(&root, "demo", "punk go", retry)
+            .expect("no-vcs workspace should auto-init git")
+            .expect("auto-init note should be returned");
+        assert!(note.contains("git-only"));
+        assert_ne!(detect_vcs_mode(&root), VcsMode::NoVcs);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_vcs_error_still_mentions_manual_recovery_when_git_init_fails() {
+        let rendered = format_goal_intake_no_vcs_error(
+            Path::new("/tmp/demo"),
+            "demo",
+            "punk go",
+            "punk go --fallback-staged \"ship demo\"",
+            Some("permission denied"),
+        );
+        assert!(rendered.contains("Automatic `git init` failed: permission denied."));
+        assert!(rendered.contains("punk init --project demo --enable-jj --verify"));
     }
 
     #[test]
