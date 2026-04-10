@@ -256,6 +256,7 @@ pub fn build_bounded_fallback_proposal(
     }
 
     let mut allowed_scope = fallback_source_paths(repo_root, prompt, proposal, scan);
+    extend_greenfield_scaffold_scope(repo_root, prompt, &mut allowed_scope);
     if allowed_scope.is_empty() {
         return None;
     }
@@ -289,7 +290,24 @@ pub fn build_bounded_fallback_proposal(
     fallback.target_checks = target_checks;
     fallback.integrity_checks = integrity_checks;
     canonicalize_draft_proposal(repo_root, prompt, &mut fallback);
+    extend_greenfield_scaffold_scope(repo_root, prompt, &mut fallback.allowed_scope);
+    stable_dedupe(&mut fallback.allowed_scope);
     Some(fallback)
+}
+
+fn extend_greenfield_scaffold_scope(repo_root: &Path, prompt: &str, allowed_scope: &mut Vec<String>) {
+    let tokens = prompt_tokens(prompt);
+    let Some(kind) = greenfield_scaffold_kind(repo_root, &tokens) else {
+        return;
+    };
+    let seed = greenfield_scaffold_seed(&kind, &tokens);
+    for path in seed
+        .file_scope_paths
+        .into_iter()
+        .chain(seed.directory_scope_paths.into_iter())
+    {
+        push_unique(allowed_scope, path);
+    }
 }
 
 pub fn canonicalize_draft_proposal(repo_root: &Path, prompt: &str, proposal: &mut DraftProposal) {
@@ -3888,6 +3906,53 @@ mod tests {
             fallback.integrity_checks,
             vec!["cargo test --workspace".to_string()]
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bounded_fallback_preserves_greenfield_rust_scaffold_scope_for_plain_init_goal() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-rust-fallback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/bootstrap/pubpunk-core.md"), "bootstrap\n").unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "agent start\n").unwrap();
+
+        let prompt = "scaffold Rust workspace and implement pubpunk init command with --json output and tests";
+        let scan = scan_repo(&root, prompt).unwrap();
+        let proposal = DraftProposal {
+            title: "pubpunk init".into(),
+            summary: "broken plain-goal fallback".into(),
+            entry_points: vec![
+                "Cargo.toml".into(),
+                "crates/pubpunk-cli/src/main.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "A Rust workspace with a `pubpunk` CLI crate.".into(),
+                "A `pubpunk init` command exposed through the CLI.".into(),
+            ],
+            behavior_requirements: vec![
+                "Scaffold a minimal Rust workspace rooted at Cargo.toml.".into(),
+                "Implement a conservative `pubpunk init` command with `--json` output.".into(),
+                "Add tests covering the `init` command and its JSON output.".into(),
+            ],
+            allowed_scope: vec!["tests".into()],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+        };
+        let errors = validate_draft_proposal(&root, &proposal);
+        let fallback =
+            build_bounded_fallback_proposal(&root, prompt, &proposal, &scan, &errors).unwrap();
+
+        assert!(fallback.allowed_scope.contains(&"Cargo.toml".to_string()));
+        assert!(fallback.allowed_scope.contains(&"crates".to_string()));
+        assert!(fallback.allowed_scope.contains(&"tests".to_string()));
+        assert!(fallback.entry_points.contains(&"Cargo.toml".to_string()));
 
         let _ = fs::remove_dir_all(&root);
     }

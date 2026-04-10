@@ -353,7 +353,7 @@ impl OrchService {
             prompt: trimmed_prompt.to_string(),
             scan: scan.clone(),
         };
-        let (mut proposal, proposal_recovered_from_timeout) = match drafter.draft(input) {
+        let mut proposal = match drafter.draft(input) {
             Ok(proposal) => (proposal, false),
             Err(err) if is_drafter_timeout_error(&err) => (
                 phase_error(
@@ -363,20 +363,22 @@ impl OrchService {
                 true,
             ),
             Err(err) => return Err(anyhow!("phase drafter request: {err}")),
-        };
-        canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
-        if proposal_recovered_from_timeout {
-            ensure_timeout_fallback_scope_covers_entry_points(&mut proposal);
         }
+        .0;
+        canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
+        preserve_greenfield_scaffold_scope(trimmed_prompt, &scan, &mut proposal);
+        ensure_proposal_scope_covers_entry_points(&mut proposal);
         let mut errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
         if errors.is_empty() {
-            if let Some(fallback) = build_bounded_fallback_proposal(
+            if let Some(mut fallback) = build_bounded_fallback_proposal(
                 &self.paths.repo_root,
                 trimmed_prompt,
                 &proposal,
                 &scan,
                 &errors,
             ) {
+                preserve_greenfield_scaffold_scope(trimmed_prompt, &scan, &mut fallback);
+                ensure_proposal_scope_covers_entry_points(&mut fallback);
                 proposal = fallback;
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
@@ -384,8 +386,7 @@ impl OrchService {
         if !errors.is_empty() {
             let repair_guidance = format_validation_guidance(&errors);
             let repair_current = proposal.clone();
-            let repaired_from_timeout;
-            (proposal, repaired_from_timeout) = match drafter.refine(RefineInput {
+            proposal = match drafter.refine(RefineInput {
                 repo_root: self.paths.repo_root.display().to_string(),
                 prompt: trimmed_prompt.to_string(),
                 guidance: repair_guidance.clone(),
@@ -407,33 +408,37 @@ impl OrchService {
                     true,
                 ),
                 Err(err) => return Err(anyhow!("phase drafter repair: {err}")),
-            };
-            canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
-            if repaired_from_timeout {
-                ensure_timeout_fallback_scope_covers_entry_points(&mut proposal);
             }
+            .0;
+            canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
+            preserve_greenfield_scaffold_scope(trimmed_prompt, &scan, &mut proposal);
+            ensure_proposal_scope_covers_entry_points(&mut proposal);
             errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             if errors.is_empty() {
-                if let Some(fallback) = build_bounded_fallback_proposal(
+                if let Some(mut fallback) = build_bounded_fallback_proposal(
                     &self.paths.repo_root,
                     trimmed_prompt,
                     &proposal,
                     &scan,
                     &errors,
                 ) {
+                    preserve_greenfield_scaffold_scope(trimmed_prompt, &scan, &mut fallback);
+                    ensure_proposal_scope_covers_entry_points(&mut fallback);
                     proposal = fallback;
                     errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
                 }
             }
         }
         if !errors.is_empty() {
-            if let Some(fallback) = build_bounded_fallback_proposal(
+            if let Some(mut fallback) = build_bounded_fallback_proposal(
                 &self.paths.repo_root,
                 trimmed_prompt,
                 &proposal,
                 &scan,
                 &errors,
             ) {
+                preserve_greenfield_scaffold_scope(trimmed_prompt, &scan, &mut fallback);
+                ensure_proposal_scope_covers_entry_points(&mut fallback);
                 proposal = fallback;
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
@@ -531,30 +536,56 @@ impl OrchService {
             &mut proposal,
         );
         apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
+        preserve_greenfield_scaffold_scope(&current_contract.prompt_source, &scan, &mut proposal);
+        ensure_proposal_scope_covers_entry_points(&mut proposal);
         let mut errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
         if errors.is_empty() {
-            if let Some(fallback) = build_bounded_fallback_proposal(
+            if let Some(mut fallback) = build_bounded_fallback_proposal(
                 &self.paths.repo_root,
                 &current_contract.prompt_source,
                 &proposal,
                 &scan,
                 &errors,
             ) {
+                preserve_greenfield_scaffold_scope(
+                    &current_contract.prompt_source,
+                    &scan,
+                    &mut fallback,
+                );
+                ensure_proposal_scope_covers_entry_points(&mut fallback);
                 proposal = fallback;
                 apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
+                preserve_greenfield_scaffold_scope(
+                    &current_contract.prompt_source,
+                    &scan,
+                    &mut proposal,
+                );
+                ensure_proposal_scope_covers_entry_points(&mut proposal);
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
         }
         if !errors.is_empty() {
-            if let Some(fallback) = build_bounded_fallback_proposal(
+            if let Some(mut fallback) = build_bounded_fallback_proposal(
                 &self.paths.repo_root,
                 &current_contract.prompt_source,
                 &proposal,
                 &scan,
                 &errors,
             ) {
+                preserve_greenfield_scaffold_scope(
+                    &current_contract.prompt_source,
+                    &scan,
+                    &mut fallback,
+                );
+                ensure_proposal_scope_covers_entry_points(&mut fallback);
                 proposal = fallback;
                 apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
+                preserve_greenfield_scaffold_scope(
+                    &current_contract.prompt_source,
+                    &scan,
+                    &mut proposal,
+                );
+                ensure_proposal_scope_covers_entry_points(&mut proposal);
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
         }
@@ -2493,7 +2524,8 @@ fn finalize_timeout_fallback_proposal(
     if let Some(guidance) = guidance {
         apply_explicit_prompt_overrides(repo_root, guidance, &mut proposal);
     }
-    ensure_timeout_fallback_scope_covers_entry_points(&mut proposal);
+    preserve_greenfield_scaffold_scope(prompt, scan, &mut proposal);
+    ensure_proposal_scope_covers_entry_points(&mut proposal);
     let mut errors = validate_draft_proposal(repo_root, &proposal);
     if errors.is_empty() {
         return Ok(proposal);
@@ -2506,7 +2538,8 @@ fn finalize_timeout_fallback_proposal(
         if let Some(guidance) = guidance {
             apply_explicit_prompt_overrides(repo_root, guidance, &mut fallback);
         }
-        ensure_timeout_fallback_scope_covers_entry_points(&mut fallback);
+        preserve_greenfield_scaffold_scope(prompt, scan, &mut fallback);
+        ensure_proposal_scope_covers_entry_points(&mut fallback);
         errors = validate_draft_proposal(repo_root, &fallback);
         if errors.is_empty() {
             return Ok(fallback);
@@ -2519,12 +2552,35 @@ fn finalize_timeout_fallback_proposal(
     ))
 }
 
-fn ensure_timeout_fallback_scope_covers_entry_points(proposal: &mut DraftProposal) {
+fn preserve_greenfield_scaffold_scope(
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+    proposal: &mut DraftProposal,
+) {
+    let Some((entry_points, allowed_scope)) = timeout_greenfield_scaffold_scope(prompt, scan)
+    else {
+        return;
+    };
+
+    for entry_point in entry_points {
+        if !proposal.entry_points.iter().any(|existing| existing == &entry_point) {
+            proposal.entry_points.push(entry_point);
+        }
+    }
+
+    for scope_path in allowed_scope {
+        if !proposal.allowed_scope.iter().any(|existing| existing == &scope_path) {
+            proposal.allowed_scope.push(scope_path);
+        }
+    }
+}
+
+fn ensure_proposal_scope_covers_entry_points(proposal: &mut DraftProposal) {
     let missing_entry_points = proposal
         .entry_points
         .iter()
         .filter(|entry_point| {
-            !timeout_fallback_scope_covers_entry_point(&proposal.allowed_scope, entry_point)
+            !proposal_scope_covers_entry_point(&proposal.allowed_scope, entry_point)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2535,7 +2591,7 @@ fn ensure_timeout_fallback_scope_covers_entry_points(proposal: &mut DraftProposa
     }
 }
 
-fn timeout_fallback_scope_covers_entry_point(allowed_scope: &[String], entry_point: &str) -> bool {
+fn proposal_scope_covers_entry_point(allowed_scope: &[String], entry_point: &str) -> bool {
     let entry = entry_point.trim().trim_matches('/');
     allowed_scope.iter().any(|scope| {
         let scope = scope.trim().trim_matches('/');
@@ -3246,6 +3302,33 @@ mod tests {
                 integrity_checks: vec!["true".into()],
                 risk_level: "medium".into(),
             })
+        }
+    }
+
+    struct EntryPointScopeLeakDrafter;
+
+    impl ContractDrafter for EntryPointScopeLeakDrafter {
+        fn name(&self) -> &'static str {
+            "entry-point-scope-leak"
+        }
+
+        fn draft(&self, _input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "pubpunk init".into(),
+                summary: "scope leak".into(),
+                entry_points: vec!["src/lib.rs".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["library init surface".into()],
+                behavior_requirements: vec!["implement init".into()],
+                allowed_scope: vec!["Cargo.toml".into()],
+                target_checks: vec!["cargo test".into()],
+                integrity_checks: vec!["cargo test".into()],
+                risk_level: "medium".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
         }
     }
 
@@ -4512,6 +4595,49 @@ mod tests {
     }
 
     #[test]
+    fn draft_contract_timeout_fallback_keeps_crates_scope_when_plain_prompt_mentions_tests() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-rust-plain-tests-scope-timeout-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &TimeoutDrafter,
+                "scaffold Rust workspace and implement pubpunk init command with --json output and tests",
+            )
+            .unwrap();
+
+        assert_eq!(contract.entry_points, vec!["Cargo.toml".to_string()]);
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "tests".to_string(),
+                "Cargo.toml".to_string(),
+                "crates".to_string()
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn draft_contract_timeout_fallback_prefers_greenfield_go_scaffold_scope_over_docs() {
         let root = std::env::temp_dir().join(format!(
             "punk-orch-greenfield-go-scope-timeout-{}",
@@ -4832,7 +4958,7 @@ mod tests {
     }
 
     #[test]
-    fn timeout_fallback_scope_readds_missing_entry_points_before_validation() {
+    fn proposal_scope_readds_missing_entry_points_before_validation() {
         let root = std::env::temp_dir().join(format!(
             "punk-orch-timeout-entry-point-coverage-{}",
             std::process::id()
@@ -4879,7 +5005,7 @@ mod tests {
             risk_level: "medium".to_string(),
         };
 
-        ensure_timeout_fallback_scope_covers_entry_points(&mut proposal);
+        ensure_proposal_scope_covers_entry_points(&mut proposal);
 
         assert!(proposal
             .allowed_scope
@@ -4888,6 +5014,45 @@ mod tests {
             .allowed_scope
             .contains(&"crates/pubpunk-core/Cargo.toml".to_string()));
         assert!(validate_draft_proposal(&root, &proposal).is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_repairs_missing_entry_point_scope_coverage_before_validation() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-entry-point-scope-leak-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn init() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &EntryPointScopeLeakDrafter,
+                "implement init behavior in src/lib.rs and keep cargo test green",
+            )
+            .unwrap();
+
+        assert!(contract
+            .entry_points
+            .contains(&"src/lib.rs".to_string()));
+        assert!(contract
+            .allowed_scope
+            .contains(&"src/lib.rs".to_string()));
 
         let _ = fs::remove_dir_all(&root);
     }

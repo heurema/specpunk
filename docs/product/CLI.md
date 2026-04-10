@@ -349,10 +349,13 @@ Timeout expectation:
 - if the contract drafter times out, `punk start` should attempt one deterministic bounded fallback derived from the repo scan and explicit prompt details before returning an error
 - if the drafter times out with no captured draft-JSON progress (including silent timeouts and MCP-only chatter), `punk start` should skip compact retry and fall back immediately instead of spending extra time on another blind attempt
 - for a bootstrapped greenfield Rust scaffold goal, timeout fallback should preserve scaffoldable Rust/workspace scope (`Cargo.toml`, `crates`, optional `tests`) instead of collapsing into docs/archive candidates
+- bounded fallback repair for a plain Rust bootstrap+implementation goal should also preserve scaffoldable workspace scope (`Cargo.toml`, `crates`, optional `tests`) instead of collapsing to manifest-only/file-only recovery that cannot materialize the requested CLI crates
+- that same greenfield scaffold-scope preservation must survive later prompt canonicalization and plain prompt mentions like `tests`, so a natural Rust bootstrap+init goal cannot collapse back to `Cargo.toml` + `tests` after repair
 - for bootstrapped greenfield Go and Python scaffold goals, timeout fallback should preserve their manifest-first scaffold scope (`go.mod`/`pyproject.toml` plus ecosystem directories) instead of collapsing into docs/archive candidates
 - for a bootstrapped greenfield TypeScript/Node scaffold goal, timeout fallback should preserve manifest-first scaffold scope (`package.json`, optional `tsconfig.json`, plus `src`/`tests` or workspace directories) instead of collapsing into docs/archive candidates
 - that same timeout fallback should keep scaffold-oriented `expected_interfaces` / `behavior_requirements` derived from the prompt and manifest kind instead of generic `approve-ready bounded contract` placeholder text
 - when timeout fallback keeps or recovers file-level `entry_points`, it must re-add any missing entry points into `allowed_scope` before validation so recovery does not fail on self-inconsistent scope coverage
+- the same entry-point coverage repair should also apply to normal draft/refine bounded-repair paths, so intake does not fail solely because a drafter returned a self-inconsistent `entry_points` vs `allowed_scope` shape
 - non-timeout drafter failures should still fail closed
 
 Writes:
