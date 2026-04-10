@@ -2093,7 +2093,10 @@ fn explicit_scaffold_dir_tokens(prompt: &str) -> Vec<String> {
     prompt
         .split(|c: char| {
             c.is_whitespace()
-                || matches!(c, '`' | '"' | '\'' | ',' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
+                || matches!(
+                    c,
+                    '`' | '"' | '\'' | ',' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+                )
         })
         .map(|token| token.trim_end_matches('.'))
         .filter(|token| {

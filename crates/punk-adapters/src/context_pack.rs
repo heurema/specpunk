@@ -2171,12 +2171,10 @@ mod tests {
                 && target.symbol.contains("pub fn resolve")
         }));
         assert!(seed.targets.iter().any(|target| {
-            target.path == "punk/punk-run/src/main.rs"
-                && target.symbol.contains("fn cmd_resolve")
+            target.path == "punk/punk-run/src/main.rs" && target.symbol.contains("fn cmd_resolve")
         }));
         assert!(seed.targets.iter().any(|target| {
-            target.path == "punk/punk-run/src/main.rs"
-                && target.symbol.contains("fn cmd_queue")
+            target.path == "punk/punk-run/src/main.rs" && target.symbol.contains("fn cmd_queue")
         }));
         assert!(!seed.targets.iter().any(|target| {
             target.path == "punk/punk-orch/src/resolver.rs"

@@ -1870,6 +1870,14 @@ fn effective_execution_contract(repo_root: &Path, contract: &Contract) -> Result
     {
         return Ok(contract.clone());
     }
+    let bootstrap_scaffold_paths = controller_bootstrap_scaffold_paths(contract);
+    if !bootstrap_scaffold_paths.is_empty()
+        && bootstrap_scaffold_paths
+            .iter()
+            .any(|path| !repo_root.join(path).exists())
+    {
+        return Ok(contract.clone());
+    }
 
     let mut remaining_scope_files = 16usize;
     let mut expanded_scope = Vec::new();
@@ -7013,6 +7021,49 @@ mod tests {
         assert!(effective
             .entry_points
             .contains(&"tests/README.md".to_string()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn effective_execution_contract_preserves_missing_bootstrap_scaffold_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-effective-bootstrap-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let contract = Contract {
+            id: "ct_manifest".into(),
+            feature_id: "feat_manifest".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "bootstrap initial Rust workspace for pubpunk".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec!["crates/pubpunk-cli".into(), "crates/pubpunk-core".into()],
+            expected_interfaces: vec!["initial Rust scaffold".into()],
+            behavior_requirements: vec!["bootstrap project".into()],
+            allowed_scope: vec![
+                "Cargo.toml".into(),
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let effective = effective_execution_contract(&root, &contract).unwrap();
+        assert_eq!(effective.allowed_scope, contract.allowed_scope);
+        assert_eq!(effective.entry_points, contract.entry_points);
 
         let _ = fs::remove_dir_all(&root);
     }

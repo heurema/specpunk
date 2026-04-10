@@ -353,15 +353,21 @@ impl OrchService {
             prompt: trimmed_prompt.to_string(),
             scan: scan.clone(),
         };
-        let mut proposal = match drafter.draft(input) {
-            Ok(proposal) => proposal,
-            Err(err) if is_drafter_timeout_error(&err) => phase_error(
-                "drafter timeout fallback",
-                recover_timeout_draft_proposal(&self.paths.repo_root, trimmed_prompt, &scan),
-            )?,
+        let (mut proposal, proposal_recovered_from_timeout) = match drafter.draft(input) {
+            Ok(proposal) => (proposal, false),
+            Err(err) if is_drafter_timeout_error(&err) => (
+                phase_error(
+                    "drafter timeout fallback",
+                    recover_timeout_draft_proposal(&self.paths.repo_root, trimmed_prompt, &scan),
+                )?,
+                true,
+            ),
             Err(err) => return Err(anyhow!("phase drafter request: {err}")),
         };
         canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
+        if proposal_recovered_from_timeout {
+            ensure_timeout_fallback_scope_covers_entry_points(&mut proposal);
+        }
         let mut errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
         if errors.is_empty() {
             if let Some(fallback) = build_bounded_fallback_proposal(
@@ -378,27 +384,34 @@ impl OrchService {
         if !errors.is_empty() {
             let repair_guidance = format_validation_guidance(&errors);
             let repair_current = proposal.clone();
-            proposal = match drafter.refine(RefineInput {
+            let repaired_from_timeout;
+            (proposal, repaired_from_timeout) = match drafter.refine(RefineInput {
                 repo_root: self.paths.repo_root.display().to_string(),
                 prompt: trimmed_prompt.to_string(),
                 guidance: repair_guidance.clone(),
                 current: repair_current.clone(),
                 scan: scan.clone(),
             }) {
-                Ok(proposal) => proposal,
-                Err(err) if is_drafter_timeout_error(&err) => phase_error(
-                    "drafter timeout fallback",
-                    recover_timeout_refine_proposal(
-                        &self.paths.repo_root,
-                        trimmed_prompt,
-                        &repair_guidance,
-                        repair_current,
-                        &scan,
-                    ),
-                )?,
+                Ok(proposal) => (proposal, false),
+                Err(err) if is_drafter_timeout_error(&err) => (
+                    phase_error(
+                        "drafter timeout fallback",
+                        recover_timeout_refine_proposal(
+                            &self.paths.repo_root,
+                            trimmed_prompt,
+                            &repair_guidance,
+                            repair_current,
+                            &scan,
+                        ),
+                    )?,
+                    true,
+                ),
                 Err(err) => return Err(anyhow!("phase drafter repair: {err}")),
             };
             canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
+            if repaired_from_timeout {
+                ensure_timeout_fallback_scope_covers_entry_points(&mut proposal);
+            }
             errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             if errors.is_empty() {
                 if let Some(fallback) = build_bounded_fallback_proposal(
@@ -1378,10 +1391,10 @@ impl OrchService {
                 )
             })
             .max_by(|left, right| {
-            left.run
-                .started_at
-                .cmp(&right.run.started_at)
-                .then_with(|| left.run.id.cmp(&right.run.id))
+                left.run
+                    .started_at
+                    .cmp(&right.run.started_at)
+                    .then_with(|| left.run.id.cmp(&right.run.id))
             });
 
         let latest_decision = match latest_run.as_ref() {
@@ -1833,9 +1846,12 @@ fn classify_stale_run_candidate(
         return Ok(None);
     }
 
-    let Some(reason) =
-        stale_run_reason(&run_record.run, executor.as_ref(), heartbeat.as_ref(), false)
-    else {
+    let Some(reason) = stale_run_reason(
+        &run_record.run,
+        executor.as_ref(),
+        heartbeat.as_ref(),
+        false,
+    ) else {
         return Ok(None);
     };
 
@@ -1845,7 +1861,9 @@ fn classify_stale_run_candidate(
         work_id: feature_id.to_string(),
         artifact_ref: relative_ref(&paths.repo_root, &run_record.run_path)?,
         reason,
-        last_progress_at: heartbeat.as_ref().map(|value| value.last_progress_at.clone()),
+        last_progress_at: heartbeat
+            .as_ref()
+            .map(|value| value.last_progress_at.clone()),
         executor_pid: executor.as_ref().map(|value| value.child_pid),
     };
 
@@ -1901,7 +1919,9 @@ fn rfc3339_age_exceeds(timestamp: &str, threshold: Duration) -> bool {
         return false;
     };
     let age = Utc::now().signed_duration_since(parsed.with_timezone(&Utc));
-    age.to_std().map(|value| value >= threshold).unwrap_or(false)
+    age.to_std()
+        .map(|value| value >= threshold)
+        .unwrap_or(false)
 }
 
 #[cfg(unix)]
@@ -2320,7 +2340,10 @@ fn prune_generated_cargo_lock_if_out_of_scope(
 
 fn contract_implies_generated_cargo_lock(contract: &Contract) -> bool {
     scope_covers_contract_root_manifest(contract)
-        && !contract.allowed_scope.iter().any(|path| path == "Cargo.lock")
+        && !contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "Cargo.lock")
         && contract
             .target_checks
             .iter()
@@ -2329,7 +2352,10 @@ fn contract_implies_generated_cargo_lock(contract: &Contract) -> bool {
 }
 
 fn scope_covers_contract_root_manifest(contract: &Contract) -> bool {
-    contract.allowed_scope.iter().any(|path| path == "Cargo.toml")
+    contract
+        .allowed_scope
+        .iter()
+        .any(|path| path == "Cargo.toml")
 }
 
 fn already_satisfied_before_dispatch_summary(
@@ -3557,10 +3583,8 @@ mod tests {
 
     #[test]
     fn cut_run_prunes_generated_cargo_lock_when_out_of_scope() {
-        let root = std::env::temp_dir().join(format!(
-            "punk-orch-cargo-lock-prune-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("punk-orch-cargo-lock-prune-{}", std::process::id()));
         let global = root.join("global");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -3601,7 +3625,10 @@ mod tests {
         service.approve_contract(&contract.id).unwrap();
 
         let (_run, receipt) = service.cut_run(&CargoLockExecutor, &contract.id).unwrap();
-        assert!(!receipt.changed_files.iter().any(|path| path == "Cargo.lock"));
+        assert!(!receipt
+            .changed_files
+            .iter()
+            .any(|path| path == "Cargo.lock"));
         assert!(!root.join("Cargo.lock").exists());
 
         let _ = fs::remove_dir_all(&root);
@@ -5676,10 +5703,16 @@ mod tests {
         let latest = service.inspect_work_ledger(None).unwrap();
         assert_eq!(latest.work_id, contract_a.feature_id);
         let expected_run_ref = format!(".punk/runs/{}/run.json", run_a2.id);
-        assert_eq!(latest.latest_run_ref.as_deref(), Some(expected_run_ref.as_str()));
+        assert_eq!(
+            latest.latest_run_ref.as_deref(),
+            Some(expected_run_ref.as_str())
+        );
 
         let status = service.status(None).unwrap();
-        assert_eq!(status.work_id.as_deref(), Some(contract_a.feature_id.as_str()));
+        assert_eq!(
+            status.work_id.as_deref(),
+            Some(contract_a.feature_id.as_str())
+        );
         assert_eq!(status.last_run_id.as_deref(), Some(run_a2.id.as_str()));
 
         let _ = fs::remove_dir_all(&root);
@@ -5785,7 +5818,9 @@ mod tests {
         )
         .unwrap();
 
-        let ledger = service.inspect_work_ledger(Some(&contract.feature_id)).unwrap();
+        let ledger = service
+            .inspect_work_ledger(Some(&contract.feature_id))
+            .unwrap();
         assert_eq!(
             ledger.latest_run_ref.as_deref(),
             Some(format!(".punk/runs/{}/run.json", good_run.id).as_str())
@@ -6027,11 +6062,9 @@ mod tests {
             read_json(&archived_dir.join("quarantine.json")).unwrap();
         assert_eq!(quarantine.run_id, stale_run.id);
         assert_eq!(quarantine.work_id, contract.feature_id);
-        assert!(
-            quarantine
-                .reason
-                .contains("status=running but child_pid 999999 is dead")
-        );
+        assert!(quarantine
+            .reason
+            .contains("status=running but child_pid 999999 is dead"));
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);
