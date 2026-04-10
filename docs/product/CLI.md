@@ -355,6 +355,7 @@ Preflight expectation:
 - if the repo root has no explicit integrity story but nested manifests/scripts do, `punk start` may infer trustworthy intake checks from nested `Cargo.toml`, nested `package.json` scripts, or nested `Makefile` `test` targets instead of failing immediately at repo scan
 - when those nested-manifest fallbacks are active and the prompt clearly looks backend/data-oriented (`db`, `session`, `seed`, `service`, `dispatch`, etc.), candidate targeting should bias away from obvious UI/generated surfaces like `.astro`, `astro.config.*`, `dist`, and `packs`, and prefer source-first anchors such as `package.json`, `drizzle.config.*`, `src/lib/db/*`, `src/lib/persistence/*`, and `src/actions/*`
 - when a draft/refine prompt explicitly says to exclude or not touch generated/runtime paths, those excluded prefixes must be pruned back out of persisted `allowed_scope` and `entry_points` instead of leaking in as candidate scope
+- when a backend/service prompt clearly spans mixed Node+Rust surfaces (for example `session`, `dispatch`, `handoff`, `service`, `api` plus both `package.json` and `Cargo.toml`/`crates` candidates), scope normalization should preserve a small mixed-service envelope instead of collapsing the contract into a single TS file path
 
 Creates:
 

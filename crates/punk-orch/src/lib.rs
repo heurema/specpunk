@@ -3039,6 +3039,7 @@ fn finalize_timeout_fallback_proposal(
         apply_explicit_prompt_overrides(repo_root, guidance, &mut proposal);
     }
     preserve_greenfield_scaffold_scope(prompt, scan, &mut proposal);
+    preserve_mixed_service_scope(prompt, scan, &mut proposal);
     ensure_proposal_scope_covers_entry_points(&mut proposal);
     let mut errors = validate_draft_proposal(repo_root, &proposal);
     if errors.is_empty() {
@@ -3053,6 +3054,7 @@ fn finalize_timeout_fallback_proposal(
             apply_explicit_prompt_overrides(repo_root, guidance, &mut fallback);
         }
         preserve_greenfield_scaffold_scope(prompt, scan, &mut fallback);
+        preserve_mixed_service_scope(prompt, scan, &mut fallback);
         ensure_proposal_scope_covers_entry_points(&mut fallback);
         errors = validate_draft_proposal(repo_root, &fallback);
         if errors.is_empty() {
@@ -3106,8 +3108,168 @@ fn normalize_proposal_scope(
     proposal: &mut DraftProposal,
 ) {
     preserve_greenfield_scaffold_scope(prompt, scan, proposal);
+    preserve_mixed_service_scope(prompt, scan, proposal);
     apply_prompt_exclusion_pruning(prompt, proposal);
     ensure_proposal_scope_covers_entry_points(proposal);
+}
+
+fn preserve_mixed_service_scope(
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+    proposal: &mut DraftProposal,
+) {
+    if prompt_declares_explicit_touch_set(prompt)
+        || !prompt_requests_mixed_service_scope(prompt, scan)
+    {
+        return;
+    }
+
+    let mut preferred_files = scan
+        .candidate_file_scope_paths
+        .iter()
+        .filter(|path| path_looks_mixed_service_file_anchor(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut preferred_dirs = scan
+        .candidate_directory_scope_paths
+        .iter()
+        .filter(|path| path_looks_mixed_service_directory_anchor(path))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if preferred_files.is_empty() && preferred_dirs.is_empty() {
+        return;
+    }
+
+    preferred_files.sort_by_key(|path| mixed_service_file_anchor_rank(path));
+    preferred_dirs.sort_by_key(|path| mixed_service_directory_anchor_rank(path));
+
+    for path in preferred_files.into_iter().take(4) {
+        if !proposal
+            .allowed_scope
+            .iter()
+            .any(|existing| existing == &path)
+        {
+            proposal.allowed_scope.push(path);
+        }
+    }
+
+    for path in preferred_dirs.into_iter().take(4) {
+        if !proposal
+            .allowed_scope
+            .iter()
+            .any(|existing| existing == &path)
+        {
+            proposal.allowed_scope.push(path);
+        }
+    }
+}
+
+fn prompt_requests_mixed_service_scope(prompt: &str, scan: &punk_domain::RepoScanSummary) -> bool {
+    if !prompt_prefers_backend_data(prompt) || prompt_prefers_ui(prompt) {
+        return false;
+    }
+    let lowered = prompt.to_ascii_lowercase();
+    let service_intent = [
+        "session",
+        "dispatch",
+        "handoff",
+        "bridge",
+        "transaction",
+        "service",
+        "services",
+        "api",
+        "operator_session",
+        "probe_state",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle));
+    if !service_intent {
+        return false;
+    }
+
+    let mentions_rust = ["rust", "cargo", "crate", "crates"]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+        || scan_has_rust_service_surface(scan);
+    let mentions_node = ["node", "npm", "package.json", "astro", "typescript", "ts"]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+        || scan_has_node_service_surface(scan);
+
+    mentions_rust && mentions_node
+}
+
+fn scan_has_rust_service_surface(scan: &punk_domain::RepoScanSummary) -> bool {
+    scan.candidate_file_scope_paths
+        .iter()
+        .any(|path| path.ends_with("Cargo.toml"))
+        || scan.candidate_directory_scope_paths.iter().any(|path| {
+            path == "crates" || path.starts_with("crates/") || path.contains("/crates/")
+        })
+}
+
+fn scan_has_node_service_surface(scan: &punk_domain::RepoScanSummary) -> bool {
+    scan.candidate_file_scope_paths
+        .iter()
+        .any(|path| path.ends_with("package.json"))
+}
+
+fn path_looks_mixed_service_file_anchor(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered.ends_with("package.json")
+        || lowered.ends_with("cargo.toml")
+        || lowered.contains("drizzle.config")
+        || lowered.contains("/lib/db/")
+        || lowered.contains("/lib/persistence/")
+        || lowered.contains("/actions/")
+        || lowered.contains("/api/")
+        || lowered.contains("/server/")
+        || (lowered.starts_with("crates/") && lowered.ends_with(".rs"))
+}
+
+fn mixed_service_file_anchor_rank(path: &str) -> u8 {
+    let lowered = path.to_ascii_lowercase();
+    if lowered.ends_with("package.json") {
+        0
+    } else if lowered.ends_with("cargo.toml") {
+        1
+    } else if lowered.contains("drizzle.config") {
+        2
+    } else if lowered.contains("/lib/db/") || lowered.contains("/lib/persistence/") {
+        3
+    } else if lowered.contains("/actions/")
+        || lowered.contains("/api/")
+        || lowered.contains("/server/")
+    {
+        4
+    } else {
+        5
+    }
+}
+
+fn path_looks_mixed_service_directory_anchor(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered == "crates"
+        || lowered.starts_with("crates/")
+        || lowered.contains("/lib/db")
+        || lowered.contains("/lib/persistence")
+        || lowered.contains("/actions")
+        || lowered.contains("/api")
+        || lowered.contains("/server")
+}
+
+fn mixed_service_directory_anchor_rank(path: &str) -> u8 {
+    let lowered = path.to_ascii_lowercase();
+    if lowered == "crates" || lowered.starts_with("crates/") {
+        0
+    } else if lowered.contains("/lib/db") || lowered.contains("/lib/persistence") {
+        1
+    } else if lowered.contains("/actions") {
+        2
+    } else {
+        3
+    }
 }
 
 fn apply_prompt_exclusion_pruning(prompt: &str, proposal: &mut DraftProposal) {
@@ -3160,8 +3322,7 @@ fn normalize_prompt_scope_token(token: &str) -> Option<String> {
         .trim_matches(|ch: char| {
             matches!(
                 ch,
-                ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\''
-                    | '`'
+                ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | '`'
             )
         })
         .trim()
@@ -5070,6 +5231,123 @@ mod tests {
     }
 
     #[test]
+    fn draft_contract_preserves_mixed_node_rust_service_scope() {
+        struct NarrowMixedServiceDrafter;
+
+        impl ContractDrafter for NarrowMixedServiceDrafter {
+            fn name(&self) -> &'static str {
+                "narrow-mixed-service"
+            }
+
+            fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+                Ok(DraftProposal {
+                    title: "session service".into(),
+                    summary: input.prompt,
+                    entry_points: vec!["baseline-site/src/lib/persistence/leads.ts".into()],
+                    import_paths: vec![],
+                    expected_interfaces: vec!["session handoff service".into()],
+                    behavior_requirements: vec!["implement session dispatch bridge".into()],
+                    allowed_scope: vec!["baseline-site/src/lib/persistence/leads.ts".into()],
+                    target_checks: vec!["npm --prefix baseline-site test".into()],
+                    integrity_checks: vec!["npm --prefix baseline-site test".into()],
+                    risk_level: "medium".into(),
+                })
+            }
+
+            fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+                Ok(input.current)
+            }
+        }
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-mixed-node-rust-service-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/lib/db")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/persistence")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/actions")).unwrap();
+        fs::create_dir_all(root.join("crates/session-bridge/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "test": "echo test"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/db/probe-state.ts"),
+            "export const probeState = {};\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/persistence/leads.ts"),
+            "export const leads = {};\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/actions/report.ts"),
+            "export async function report() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/session-bridge\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/session-bridge/Cargo.toml"),
+            "[package]\nname = \"session-bridge\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/session-bridge/src/lib.rs"),
+            "pub fn handoff() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &NarrowMixedServiceDrafter,
+                "implement session dispatch service bridge between baseline-site and Rust crates with transactional report handoff",
+            )
+            .unwrap();
+
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/package.json"));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "Cargo.toml" || path == "crates"));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/db"
+                || path == "baseline-site/src/lib/persistence"
+                || path == "baseline-site/src/actions"
+                || path == "baseline-site/src/lib/db/probe-state.ts"
+                || path == "baseline-site/src/actions/report.ts"
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn draft_contract_prunes_prompt_excluded_generated_scope_paths() {
         struct PollutedScopeDrafter;
 
@@ -5129,9 +5407,16 @@ mod tests {
             r#"{"name":"baseline-site","scripts":{"test":"echo test"}}"#,
         )
         .unwrap();
-        fs::write(root.join("baseline-site/db/config.ts"), "export default {};\n").unwrap();
-        fs::write(root.join("baseline-site/db/seed.ts"), "export async function seed() {}\n")
-            .unwrap();
+        fs::write(
+            root.join("baseline-site/db/config.ts"),
+            "export default {};\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/db/seed.ts"),
+            "export async function seed() {}\n",
+        )
+        .unwrap();
         fs::write(
             root.join("baseline-site/src/lib/persistence/leads.ts"),
             "export const leads = {};\n",
@@ -5167,10 +5452,14 @@ mod tests {
             .allowed_scope
             .iter()
             .all(|path| !path.contains("/.playwright-mcp/")));
-        assert!(contract
-            .allowed_scope
-            .iter()
-            .any(|path| path == "baseline-site/db/config.ts"), "{:?}", contract.allowed_scope);
+        assert!(
+            contract
+                .allowed_scope
+                .iter()
+                .any(|path| path == "baseline-site/db/config.ts"),
+            "{:?}",
+            contract.allowed_scope
+        );
         assert!(!contract.allowed_scope.is_empty());
 
         let _ = fs::remove_dir_all(&root);
@@ -5450,16 +5739,16 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("tests")).unwrap();
-        fs::write(root.join("tests/init_json.rs"), "#[test]
+        fs::write(
+            root.join("tests/init_json.rs"),
+            "#[test]
 fn ok() {}
-").unwrap();
-
-        sync_present_isolated_changes_to_repo_root(
-            &root,
-            &root,
-            &["tests/init_json.rs".into()],
+",
         )
         .unwrap();
+
+        sync_present_isolated_changes_to_repo_root(&root, &root, &["tests/init_json.rs".into()])
+            .unwrap();
 
         assert_eq!(
             fs::read_to_string(root.join("tests/init_json.rs")).unwrap(),
