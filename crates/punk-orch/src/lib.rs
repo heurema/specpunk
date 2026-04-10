@@ -2724,15 +2724,58 @@ fn timeout_seed_semantics(prompt: &str, entry_points: &[String]) -> (Vec<String>
         Some("package.json") => "initial TypeScript/Node scaffold",
         _ => "bounded implementation slice",
     };
+    let mut expected_interfaces = vec![expected_interface.to_string()];
+    let mut behavior_requirements = vec![summarize_prompt(prompt)];
+    let lowered = prompt.to_ascii_lowercase();
 
-    (
-        vec![expected_interface.to_string()],
-        vec![summarize_prompt(prompt)],
-    )
+    if lowered.contains(" init ") || lowered.starts_with("init ") || lowered.contains("init command")
+    {
+        push_unique_string(
+            &mut expected_interfaces,
+            "CLI accepts an `init` command.".to_string(),
+        );
+    }
+    for flag in ["--json", "--force", "--project-root"] {
+        if lowered.contains(flag) {
+            push_unique_string(
+                &mut expected_interfaces,
+                format!("CLI supports `{flag}`."),
+            );
+            push_unique_string(
+                &mut behavior_requirements,
+                format!("Support `{flag}` in the init flow."),
+            );
+        }
+    }
+    let starter_files = timeout_prompt_starter_files(prompt);
+    if !starter_files.is_empty() {
+        push_unique_string(
+            &mut expected_interfaces,
+            format!(
+                "Init creates canonical starter files: {}.",
+                starter_files.join(", ")
+            ),
+        );
+        push_unique_string(
+            &mut behavior_requirements,
+            format!(
+                "Create canonical starter files: {}.",
+                starter_files.join(", ")
+            ),
+        );
+    }
+    if lowered.contains("test") {
+        push_unique_string(
+            &mut expected_interfaces,
+            "Tests cover the init command behavior.".to_string(),
+        );
+    }
+
+    (expected_interfaces, behavior_requirements)
 }
 
 fn timeout_greenfield_scaffold_scope(
-    _prompt: &str,
+    prompt: &str,
     scan: &punk_domain::RepoScanSummary,
 ) -> Option<(Vec<String>, Vec<String>)> {
     let manifest = scan
@@ -2745,6 +2788,9 @@ fn timeout_greenfield_scaffold_scope(
             )
         })?
         .clone();
+    if !prompt_requests_timeout_greenfield_scaffold(prompt, &manifest) {
+        return None;
+    }
 
     let preferred_directories: &[&str] = match manifest.as_str() {
         "Cargo.toml" => &["crates", "src", "tests"],
@@ -2779,6 +2825,97 @@ fn timeout_greenfield_scaffold_scope(
     }
 
     Some((entry_points, allowed_scope))
+}
+
+fn prompt_requests_timeout_greenfield_scaffold(prompt: &str, manifest: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    match manifest {
+        "Cargo.toml" => {
+            let requests_rust = ["rust", "cargo", "workspace", "crate", "crates"]
+                .iter()
+                .any(|needle| lowered.contains(needle));
+            let requests_scaffold = ["scaffold", "bootstrap", "greenfield"]
+                .iter()
+                .any(|needle| lowered.contains(needle))
+                || (lowered.contains("create") && lowered.contains("workspace"));
+            requests_rust && requests_scaffold
+        }
+        "go.mod" => {
+            let requests_go = ["go", "golang", "module"]
+                .iter()
+                .any(|needle| lowered.contains(needle));
+            let requests_scaffold = ["scaffold", "bootstrap", "greenfield"]
+                .iter()
+                .any(|needle| lowered.contains(needle))
+                || (lowered.contains("create") && lowered.contains("module"));
+            requests_go && requests_scaffold
+        }
+        "pyproject.toml" => {
+            let requests_python = ["python", "pytest", "pyproject", "package"]
+                .iter()
+                .any(|needle| lowered.contains(needle));
+            let requests_scaffold = ["scaffold", "bootstrap", "greenfield"]
+                .iter()
+                .any(|needle| lowered.contains(needle))
+                || (lowered.contains("create") && lowered.contains("project"));
+            requests_python && requests_scaffold
+        }
+        "package.json" => {
+            let requests_node = [
+                "typescript",
+                "javascript",
+                "node",
+                "npm",
+                "pnpm",
+                "yarn",
+                "package",
+                "workspace",
+            ]
+            .iter()
+            .any(|needle| lowered.contains(needle));
+            let requests_scaffold = ["scaffold", "bootstrap", "greenfield"]
+                .iter()
+                .any(|needle| lowered.contains(needle))
+                || (lowered.contains("create")
+                    && ["package", "workspace", "app"]
+                        .iter()
+                        .any(|needle| lowered.contains(needle)));
+            requests_node && requests_scaffold
+        }
+        _ => false,
+    }
+}
+
+fn timeout_prompt_starter_files(prompt: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for token in prompt.split(|c: char| {
+        c.is_whitespace()
+            || matches!(c, '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']')
+    }) {
+        let token = token.trim_end_matches('.').trim();
+        if token.is_empty() {
+            continue;
+        }
+        if !(token.contains('/')
+            || token.ends_with(".toml")
+            || token.ends_with(".md")
+            || token.ends_with(".json")
+            || token.ends_with(".gitignore"))
+        {
+            continue;
+        }
+        if token.starts_with("crates/") || token.starts_with("src/") || token.starts_with("tests/") {
+            continue;
+        }
+        push_unique_string(&mut files, token.to_string());
+    }
+    files
+}
+
+fn push_unique_string(values: &mut Vec<String>, candidate: String) {
+    if !values.iter().any(|existing| existing == &candidate) {
+        values.push(candidate);
+    }
 }
 
 fn contract_to_proposal(feature: &Feature, contract: &Contract) -> DraftProposal {
@@ -4850,6 +4987,108 @@ mod tests {
                 "crates/pubpunk-cli/src/main.rs".to_string(),
                 "crates/pubpunk-core/src/lib.rs".to_string(),
             ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_timeout_fallback_rich_init_prompt_keeps_file_scope_on_bootstrapped_repo() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-rich-init-file-scope-timeout-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\nresolver='2'\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname = \"pubpunk-cli\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname = \"pubpunk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {\n    let _ = \"init --json --force --project-root\";\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() -> &'static str {\n    \"project.toml style/style.toml style/voice.md\"\n}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/init_json.rs"), "#[test]\nfn smoke() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &TimeoutDrafter,
+                "implement pubpunk init command with canonical starter files project.toml, style/style.toml, style/voice.md, style/lexicon.toml, style/normalize.toml, agent/skill.md, local/.gitignore; support --json, --force, --project-root; add tests; keep cargo test --workspace green",
+            )
+            .unwrap();
+
+        assert!(!contract.allowed_scope.iter().any(|scope| scope == "crates"));
+        assert!(!contract.allowed_scope.iter().any(|scope| scope == "Cargo.toml"));
+        assert!(
+            contract
+                .entry_points
+                .iter()
+                .all(|scope| scope.contains('/') || scope.ends_with(".toml"))
+        );
+        assert!(
+            contract
+                .allowed_scope
+                .iter()
+                .any(|scope| scope.ends_with("tests/init_json.rs")
+                    || scope.ends_with("tests/README.md")
+                    || scope == "tests")
+        );
+        assert!(contract.allowed_scope.len() <= 4);
+        assert!(
+            contract
+                .expected_interfaces
+                .iter()
+                .any(|value| value.contains("`--json`"))
+        );
+        assert!(
+            contract
+                .expected_interfaces
+                .iter()
+                .any(|value| value.contains("`--force`"))
+        );
+        assert!(
+            contract
+                .expected_interfaces
+                .iter()
+                .any(|value| value.contains("`--project-root`"))
+        );
+        assert!(
+            contract
+                .behavior_requirements
+                .iter()
+                .any(|value| value.contains("project.toml")
+                    && value.contains("style/style.toml")
+                    && value.contains("agent/skill.md"))
         );
 
         let _ = fs::remove_dir_all(&root);

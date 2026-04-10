@@ -308,6 +308,8 @@ Auto-chain expectation:
 - `punk go` should immediately run one bounded follow-up cycle instead of stopping at the bootstrap proof
 - for greenfield Rust bootstrap+implementation goals, that follow-up cycle should narrow toward implementation files like `crates/<app>-cli/src/main.rs`, `crates/<app>-core/src/lib.rs`, and `tests`, rather than reusing the original broad bootstrap prompt unchanged
 - if that narrowed follow-up goal declares an exact touch set, later proposal repair must not re-expand it back to bootstrap scope (`Cargo.toml`, `crates`, etc.)
+- timeout bootstrap fallback must only preserve scaffold scope for prompts that still actually request scaffold/bootstrap work; rich follow-up implementation prompts on an already bootstrapped repo should stay file-bounded
+- timeout fallback must also preserve explicit implementation semantics from the prompt (`--json`, `--force`, `--project-root`, named starter files) instead of collapsing them into a generic bounded slice
 - the final shell summary / JSON payload should report the follow-up cycle as the main result and keep the bootstrap cycle as auxiliary context
 
 When `--fallback-staged` is set and autonomy blocks:
