@@ -356,6 +356,7 @@ Preflight expectation:
 - when those nested-manifest fallbacks are active and the prompt clearly looks backend/data-oriented (`db`, `session`, `seed`, `service`, `dispatch`, etc.), candidate targeting should bias away from obvious UI/generated surfaces like `.astro`, `astro.config.*`, `dist`, and `packs`, and prefer source-first anchors such as `package.json`, `drizzle.config.*`, `src/lib/db/*`, `src/lib/persistence/*`, and `src/actions/*`
 - when a draft/refine prompt explicitly says to exclude or not touch generated/runtime paths, those excluded prefixes must be pruned back out of persisted `allowed_scope` and `entry_points` instead of leaking in as candidate scope
 - when a backend/service prompt clearly spans mixed Node+Rust surfaces (for example `session`, `dispatch`, `handoff`, `service`, `api` plus both `package.json` and `Cargo.toml`/`crates` candidates), scope normalization should preserve a small mixed-service envelope instead of collapsing the contract into a single TS file path
+- for mixed Node+Rust service/session/runtime prompts, candidate augmentation should surface backend anchors like `src/lib/services/*`, `src/lib/session/*`, `src/pages/api/*`, and CLI crate manifests/main files, treat `src/pages/api/**` as backend routes rather than UI pages, and prefer lighter mixed checks such as `cargo check -p <cli-crate>`, nested `npm run check`, and optional nested `npm run build:web`
 
 Creates:
 

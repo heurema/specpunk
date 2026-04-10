@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -345,7 +345,7 @@ impl OrchService {
         )?;
         let mut scan = scan;
         enrich_scan_with_nested_integrity_fallback(&self.paths.repo_root, &mut scan)?;
-        apply_prompt_targeting_bias(trimmed_prompt, &mut scan);
+        apply_prompt_targeting_bias(&self.paths.repo_root, trimmed_prompt, &mut scan);
         if scan.candidate_integrity_checks.is_empty() {
             return Err(anyhow!(
                 "phase repo scan: {}",
@@ -507,7 +507,11 @@ impl OrchService {
         let mut feature: Feature = read_json(&feature_path)?;
         let mut scan = scan_repo(&self.paths.repo_root, &current_contract.prompt_source)?;
         enrich_scan_with_nested_integrity_fallback(&self.paths.repo_root, &mut scan)?;
-        apply_prompt_targeting_bias(&current_contract.prompt_source, &mut scan);
+        apply_prompt_targeting_bias(
+            &self.paths.repo_root,
+            &current_contract.prompt_source,
+            &mut scan,
+        );
         if scan.candidate_integrity_checks.is_empty() {
             return Err(anyhow!(
                 "unable to infer trustworthy integrity checks from repo scan"
@@ -2677,7 +2681,13 @@ fn ignored_nested_relative_path(relative: &Path) -> bool {
         || relative.starts_with(".build")
 }
 
-fn apply_prompt_targeting_bias(prompt: &str, scan: &mut punk_domain::RepoScanSummary) {
+fn apply_prompt_targeting_bias(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &mut punk_domain::RepoScanSummary,
+) {
+    augment_mixed_service_backend_candidates(repo_root, prompt, scan);
+    prefer_mixed_service_checks(repo_root, prompt, scan);
     prune_generated_noise_candidates(prompt, scan);
     if !prompt_prefers_backend_data(prompt) || prompt_prefers_ui(prompt) {
         return;
@@ -2719,6 +2729,235 @@ fn apply_prompt_targeting_bias(prompt: &str, scan: &mut punk_domain::RepoScanSum
             "biased candidate targeting toward backend/data surfaces because the prompt looked non-UI".to_string(),
         );
     }
+}
+
+fn augment_mixed_service_backend_candidates(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &mut punk_domain::RepoScanSummary,
+) {
+    if !prompt_requests_mixed_service_scope(prompt, scan) {
+        return;
+    }
+    let Ok(anchors) = collect_mixed_service_backend_anchors(repo_root) else {
+        return;
+    };
+    if anchors.files.is_empty() && anchors.directories.is_empty() {
+        return;
+    }
+
+    let mut files = anchors.files;
+    let mut directories = anchors.directories;
+    files.sort_by_key(|path| mixed_service_file_anchor_rank(path));
+    directories.sort_by_key(|path| mixed_service_directory_anchor_rank(path));
+
+    prepend_candidate_paths(&mut scan.candidate_entry_points, &files, 10);
+    prepend_candidate_paths(&mut scan.candidate_file_scope_paths, &files, 20);
+    prepend_candidate_paths(&mut scan.candidate_scope_paths, &files, 20);
+    prepend_candidate_paths(&mut scan.candidate_directory_scope_paths, &directories, 20);
+    prepend_candidate_paths(&mut scan.candidate_scope_paths, &directories, 20);
+    push_unique_string(
+        &mut scan.notes,
+        "augmented candidate targeting with mixed service backend anchors from the repo tree"
+            .to_string(),
+    );
+}
+
+#[derive(Default)]
+struct MixedServiceBackendAnchors {
+    files: Vec<String>,
+    directories: Vec<String>,
+}
+
+fn collect_mixed_service_backend_anchors(repo_root: &Path) -> Result<MixedServiceBackendAnchors> {
+    let mut anchors = MixedServiceBackendAnchors::default();
+    collect_mixed_service_backend_anchors_inner(repo_root, repo_root, &mut anchors)?;
+    Ok(anchors)
+}
+
+fn collect_mixed_service_backend_anchors_inner(
+    repo_root: &Path,
+    current: &Path,
+    anchors: &mut MixedServiceBackendAnchors,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if ignored_nested_name(&name) {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(repo_root)
+            .map_err(|_| anyhow!("failed to relativize {}", path.display()))?;
+        if ignored_nested_relative_path(relative) {
+            continue;
+        }
+        if path.is_dir() {
+            let relative_str = relative.to_string_lossy().replace('\\', "/");
+            if path_looks_mixed_service_directory_anchor(&relative_str) {
+                push_unique_string(&mut anchors.directories, relative_str);
+            }
+            collect_mixed_service_backend_anchors_inner(repo_root, &path, anchors)?;
+            continue;
+        }
+
+        let relative_str = relative.to_string_lossy().replace('\\', "/");
+        if path_looks_mixed_service_file_anchor(&relative_str) {
+            push_unique_string(&mut anchors.files, relative_str.clone());
+        }
+        if let Some(parent) = Path::new(&relative_str).parent() {
+            let parent = parent.to_string_lossy().replace('\\', "/");
+            if !parent.is_empty() && path_looks_mixed_service_directory_anchor(&parent) {
+                push_unique_string(&mut anchors.directories, parent);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prepend_candidate_paths(existing: &mut Vec<String>, preferred: &[String], limit: usize) {
+    let mut merged = preferred.to_vec();
+    for candidate in existing.drain(..) {
+        if !merged.iter().any(|existing| existing == &candidate) {
+            merged.push(candidate);
+        }
+    }
+    *existing = merged.into_iter().take(limit).collect();
+}
+
+fn prefer_mixed_service_checks(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &mut punk_domain::RepoScanSummary,
+) {
+    if !prompt_requests_mixed_service_scope(prompt, scan) {
+        return;
+    }
+
+    let mut target_checks = Vec::new();
+    let mut integrity_checks = Vec::new();
+
+    if let Some(command) = preferred_mixed_service_rust_check(repo_root, prompt, scan) {
+        push_unique_string(&mut target_checks, command);
+    }
+
+    if let Some((integrity, target)) = preferred_mixed_service_node_checks(repo_root, scan) {
+        push_unique_string(&mut integrity_checks, integrity.clone());
+        push_unique_string(&mut target_checks, target.unwrap_or(integrity));
+    }
+
+    if target_checks.is_empty() || integrity_checks.is_empty() {
+        return;
+    }
+
+    scan.candidate_target_checks = target_checks;
+    scan.candidate_integrity_checks = integrity_checks;
+    push_unique_string(
+        &mut scan.notes,
+        "preferred mixed service checks for combined Node and Rust service work".to_string(),
+    );
+}
+
+fn preferred_mixed_service_rust_check(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+) -> Option<String> {
+    let prompt_tokens = prompt_tokens(prompt);
+    let mut manifests = scan
+        .candidate_file_scope_paths
+        .iter()
+        .filter(|path| path.ends_with("Cargo.toml") && path.contains("crates/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    manifests.sort_by_key(|path| mixed_service_rust_manifest_rank(path, &prompt_tokens));
+    for manifest in manifests {
+        let manifest_path = repo_root.join(&manifest);
+        let parent = manifest_path.parent()?;
+        if !parent.join("src/main.rs").exists() {
+            continue;
+        }
+        let Some(package_name) = cargo_package_name_from_manifest(&manifest_path) else {
+            continue;
+        };
+        return Some(format!("cargo check -p {package_name}"));
+    }
+    None
+}
+
+fn mixed_service_rust_manifest_rank(path: &str, prompt_tokens: &[String]) -> u8 {
+    let lowered = path.to_ascii_lowercase();
+    if lowered.contains("baseline-cli") || lowered.contains("/cli/") {
+        return 0;
+    }
+    if prompt_tokens
+        .iter()
+        .any(|token| lowered.contains(token.as_str()))
+    {
+        return 1;
+    }
+    2
+}
+
+fn cargo_package_name_from_manifest(manifest_path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(manifest_path).ok()?;
+    let mut in_package = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if !in_package || !trimmed.starts_with("name") {
+            continue;
+        }
+        let (_, value) = trimmed.split_once('=')?;
+        let package_name = value.trim().trim_matches('"');
+        if !package_name.is_empty() {
+            return Some(package_name.to_string());
+        }
+    }
+    None
+}
+
+fn preferred_mixed_service_node_checks(
+    repo_root: &Path,
+    scan: &punk_domain::RepoScanSummary,
+) -> Option<(String, Option<String>)> {
+    let package_json = scan
+        .candidate_file_scope_paths
+        .iter()
+        .find(|path| path.ends_with("package.json") && path.contains('/'))
+        .or_else(|| {
+            scan.candidate_file_scope_paths
+                .iter()
+                .find(|path| path.ends_with("package.json"))
+        })?
+        .clone();
+    let package_dir = Path::new(&package_json).parent()?.to_path_buf();
+    let scripts = read_package_scripts(&repo_root.join(&package_json)).ok()?;
+    if !scripts.contains_key("check") {
+        return None;
+    }
+    let package_manager = detect_nested_package_manager(&repo_root.join(&package_dir));
+    let integrity = nested_package_manager_run(package_manager.as_deref(), &package_dir, "check");
+    let target = if scripts.contains_key("build:web") {
+        Some(nested_package_manager_run(
+            package_manager.as_deref(),
+            &package_dir,
+            "build:web",
+        ))
+    } else if scripts.contains_key("build") {
+        Some(nested_package_manager_run(
+            package_manager.as_deref(),
+            &package_dir,
+            "build",
+        ))
+    } else {
+        None
+    };
+    Some((integrity, target))
 }
 
 fn prune_generated_noise_candidates(prompt: &str, scan: &mut punk_domain::RepoScanSummary) {
@@ -2790,6 +3029,18 @@ fn prune_demoted_candidates_if_preferred_exists(
     before_len != paths.len()
 }
 
+fn prompt_tokens(prompt: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    for token in prompt
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| token.len() >= 3)
+    {
+        seen.insert(token);
+    }
+    seen.into_iter().collect()
+}
+
 fn prompt_prefers_backend_data(prompt: &str) -> bool {
     let lowered = prompt.to_ascii_lowercase();
     [
@@ -2812,11 +3063,17 @@ fn prompt_prefers_backend_data(prompt: &str) -> bool {
         "support",
         "backend",
         "server",
+        "runtime",
+        "token",
+        "activation",
+        "cli",
         "store",
         "repo",
         "model",
         "models",
         "api",
+        "enroll",
+        "handshake",
     ]
     .iter()
     .any(|token| lowered.contains(token))
@@ -2868,6 +3125,9 @@ fn path_is_generated_noise(path: &str) -> bool {
 
 fn path_looks_ui_surface(path: &str) -> bool {
     let lowered = path.to_ascii_lowercase();
+    if lowered.contains("/pages/api/") {
+        return false;
+    }
     lowered.ends_with(".astro")
         || lowered.contains("astro.config")
         || lowered.ends_with(".css")
@@ -2888,10 +3148,13 @@ fn path_looks_backend_data(path: &str) -> bool {
         || lowered.contains("drizzle.config")
         || lowered.ends_with(".sql")
         || lowered.contains("/db/")
+        || lowered.contains("/lib/services/")
+        || lowered.contains("/lib/session/")
         || lowered.contains("/lib/db/")
         || lowered.contains("/database/")
         || lowered.contains("/lib/persistence/")
         || lowered.contains("/actions/")
+        || lowered.contains("/pages/api/")
         || lowered.contains("schema")
         || lowered.contains("migration")
         || lowered.contains("session")
@@ -3144,7 +3407,7 @@ fn preserve_mixed_service_scope(
     preferred_files.sort_by_key(|path| mixed_service_file_anchor_rank(path));
     preferred_dirs.sort_by_key(|path| mixed_service_directory_anchor_rank(path));
 
-    for path in preferred_files.into_iter().take(4) {
+    for path in preferred_files.into_iter().take(8) {
         if !proposal
             .allowed_scope
             .iter()
@@ -3179,6 +3442,11 @@ fn prompt_requests_mixed_service_scope(prompt: &str, scan: &punk_domain::RepoSca
         "service",
         "services",
         "api",
+        "cli",
+        "runtime",
+        "token",
+        "activation",
+        "enroll",
         "operator_session",
         "probe_state",
     ]
@@ -3220,9 +3488,12 @@ fn path_looks_mixed_service_file_anchor(path: &str) -> bool {
     lowered.ends_with("package.json")
         || lowered.ends_with("cargo.toml")
         || lowered.contains("drizzle.config")
+        || lowered.contains("/lib/services/")
+        || lowered.contains("/lib/session/")
         || lowered.contains("/lib/db/")
         || lowered.contains("/lib/persistence/")
         || lowered.contains("/actions/")
+        || lowered.contains("/pages/api/")
         || lowered.contains("/api/")
         || lowered.contains("/server/")
         || (lowered.starts_with("crates/") && lowered.ends_with(".rs"))
@@ -3232,19 +3503,27 @@ fn mixed_service_file_anchor_rank(path: &str) -> u8 {
     let lowered = path.to_ascii_lowercase();
     if lowered.ends_with("package.json") {
         0
-    } else if lowered.ends_with("cargo.toml") {
+    } else if lowered == "cargo.toml" {
         1
-    } else if lowered.contains("drizzle.config") {
+    } else if lowered.ends_with("cargo.toml") {
         2
-    } else if lowered.contains("/lib/db/") || lowered.contains("/lib/persistence/") {
+    } else if lowered.ends_with("/src/main.rs") {
         3
+    } else if lowered.contains("drizzle.config") {
+        4
+    } else if lowered.contains("/pages/api/") {
+        5
+    } else if lowered.contains("/lib/services/") || lowered.contains("/lib/session/") {
+        6
+    } else if lowered.contains("/lib/db/") || lowered.contains("/lib/persistence/") {
+        7
     } else if lowered.contains("/actions/")
         || lowered.contains("/api/")
         || lowered.contains("/server/")
     {
-        4
+        8
     } else {
-        5
+        9
     }
 }
 
@@ -3252,9 +3531,12 @@ fn path_looks_mixed_service_directory_anchor(path: &str) -> bool {
     let lowered = path.to_ascii_lowercase();
     lowered == "crates"
         || lowered.starts_with("crates/")
+        || lowered.contains("/lib/services")
+        || lowered.contains("/lib/session")
         || lowered.contains("/lib/db")
         || lowered.contains("/lib/persistence")
         || lowered.contains("/actions")
+        || lowered.contains("/pages/api")
         || lowered.contains("/api")
         || lowered.contains("/server")
 }
@@ -3263,12 +3545,16 @@ fn mixed_service_directory_anchor_rank(path: &str) -> u8 {
     let lowered = path.to_ascii_lowercase();
     if lowered == "crates" || lowered.starts_with("crates/") {
         0
-    } else if lowered.contains("/lib/db") || lowered.contains("/lib/persistence") {
+    } else if lowered.contains("/lib/services") || lowered.contains("/lib/session") {
         1
-    } else if lowered.contains("/actions") {
+    } else if lowered.contains("/lib/db") || lowered.contains("/lib/persistence") {
         2
-    } else {
+    } else if lowered.contains("/pages/api") {
         3
+    } else if lowered.contains("/actions") {
+        4
+    } else {
+        5
     }
 }
 
@@ -5343,6 +5629,264 @@ mod tests {
                 || path == "baseline-site/src/lib/db/probe-state.ts"
                 || path == "baseline-site/src/actions/report.ts"
         }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_prefers_mixed_service_backend_anchors_over_ui_pages() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-mixed-service-anchors-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/components")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "build:web": "echo build"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/dispatch.astro"),
+            "---\n---\n<div>dispatch</div>\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/components/SiteHeader.astro"),
+            "---\n---\n<header />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/components/SiteFooter.astro"),
+            "---\n---\n<footer />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/dispatch.ts"),
+            "export async function dispatch() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/cookies.ts"),
+            "export function readCookies() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let prompt =
+            "mixed service/session/runtime handshake around enrollment activation across Astro server layer and Rust CLI layer";
+        let mut scan = scan_repo(&root, prompt).unwrap();
+        apply_prompt_targeting_bias(&root, prompt, &mut scan);
+
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api/cli/enroll.ts"));
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/services/enrollments.ts"));
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/session/operator.ts"));
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "crates/baseline-cli/src/main.rs"));
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "crates/baseline-cli/Cargo.toml"));
+        assert!(scan.candidate_file_scope_paths.iter().any(|path| {
+            path == "baseline-site/src/lib/services/enrollments.ts"
+                || path == "baseline-site/src/lib/services/dispatch.ts"
+        }));
+        assert!(scan.candidate_file_scope_paths.iter().any(|path| {
+            path == "baseline-site/src/lib/session/operator.ts"
+                || path == "baseline-site/src/lib/session/cookies.ts"
+        }));
+        assert!(scan
+            .candidate_file_scope_paths
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api/cli/enroll.ts"));
+        assert!(scan
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/services"));
+        assert!(scan
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/session"));
+        assert!(scan
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api"));
+        assert!(scan
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "crates/baseline-cli"));
+        assert!(!scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path.ends_with("dispatch.astro")
+                || path.ends_with("SiteHeader.astro")
+                || path.ends_with("SiteFooter.astro")));
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&FakeDrafter, prompt).unwrap();
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/services"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+        }));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "Cargo.toml" || path == "crates/baseline-cli"));
+        assert!(!contract
+            .allowed_scope
+            .iter()
+            .any(|path| path.ends_with("dispatch.astro")
+                || path.ends_with("SiteHeader.astro")
+                || path.ends_with("SiteFooter.astro")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_prefers_mixed_service_checks_for_nested_node_rust_repo() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-mixed-service-checks-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "build:web": "echo build"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &ScanTargetChecksDrafter,
+                "mixed service/session/runtime handshake around enrollment activation across Astro server layer and Rust CLI layer",
+            )
+            .unwrap();
+
+        assert_eq!(
+            contract.target_checks,
+            vec![
+                "cargo check -p baseline-cli".to_string(),
+                "npm --prefix baseline-site run build:web".to_string()
+            ]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
