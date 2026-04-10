@@ -651,6 +651,7 @@ impl CodexCliExecutor {
         };
         let mut retry_feedback = None;
         let mut slow_patch_retry_used = false;
+        let mut patched_worktree = false;
         let max_attempts = patch_apply_max_attempts(&input.contract);
 
         for attempt_index in 0..max_attempts {
@@ -685,14 +686,19 @@ impl CodexCliExecutor {
                             &input.stderr_path,
                             &format!("\n[punk patch/prepass] failed: {err}\n"),
                         )?;
-                        return Ok(ExecuteOutput {
-                            success: false,
-                            summary: format!("patch prepass failed: {err}"),
-                            checks_run: Vec::new(),
-                            cost_usd: None,
-                            duration_ms: start.elapsed().as_millis() as u64,
-                        })
-                        .and_then(finalize_output);
+                        let output = maybe_rollback_failed_patch_lane_output(
+                            &input.repo_root,
+                            &patch_entry_point_snapshots,
+                            patched_worktree,
+                            ExecuteOutput {
+                                success: false,
+                                summary: format!("patch prepass failed: {err}"),
+                                checks_run: Vec::new(),
+                                cost_usd: None,
+                                duration_ms: start.elapsed().as_millis() as u64,
+                            },
+                        )?;
+                        return Ok(output).and_then(finalize_output);
                     }
                     Ok(PlanPrepassResponse::Blocked(reason)) => {
                         if let Some(guard) = excerpt_guard.as_mut() {
@@ -702,14 +708,19 @@ impl CodexCliExecutor {
                             &input.stderr_path,
                             &format!("\n[punk patch/prepass] blocked: {reason}\n"),
                         )?;
-                        return Ok(ExecuteOutput {
-                            success: false,
-                            summary: reason,
-                            checks_run: Vec::new(),
-                            cost_usd: None,
-                            duration_ms: start.elapsed().as_millis() as u64,
-                        })
-                        .and_then(finalize_output);
+                        let output = maybe_rollback_failed_patch_lane_output(
+                            &input.repo_root,
+                            &patch_entry_point_snapshots,
+                            patched_worktree,
+                            ExecuteOutput {
+                                success: false,
+                                summary: reason,
+                                checks_run: Vec::new(),
+                                cost_usd: None,
+                                duration_ms: start.elapsed().as_millis() as u64,
+                            },
+                        )?;
+                        return Ok(output).and_then(finalize_output);
                     }
                     Ok(PlanPrepassResponse::Plan { summary, targets }) => {
                         append_log_text(
@@ -799,6 +810,10 @@ impl CodexCliExecutor {
                     if let Some(guard) = excerpt_guard.as_mut() {
                         let _ = guard.restore();
                     }
+                    let _ = restore_entry_point_snapshots(
+                        &input.repo_root,
+                        &patch_entry_point_snapshots,
+                    );
                     let _ = restore_damaged_entry_point_snapshots(
                         &input.repo_root,
                         &patch_entry_point_snapshots,
@@ -850,49 +865,69 @@ impl CodexCliExecutor {
                     if !unchanged_paths.is_empty()
                         && unchanged_paths.len() == patch_entry_point_snapshots.len()
                     {
-                        return Ok(ExecuteOutput {
-                            success: false,
-                            summary: no_progress_after_dispatch_summary(
-                                &unchanged_paths,
-                                &stdout,
-                                &stderr,
-                            ),
-                            checks_run: Vec::new(),
-                            cost_usd: None,
-                            duration_ms: start.elapsed().as_millis() as u64,
-                        })
-                        .and_then(finalize_output);
+                        let output = maybe_rollback_failed_patch_lane_output(
+                            &input.repo_root,
+                            &patch_entry_point_snapshots,
+                            patched_worktree,
+                            ExecuteOutput {
+                                success: false,
+                                summary: no_progress_after_dispatch_summary(
+                                    &unchanged_paths,
+                                    &stdout,
+                                    &stderr,
+                                ),
+                                checks_run: Vec::new(),
+                                cost_usd: None,
+                                duration_ms: start.elapsed().as_millis() as u64,
+                            },
+                        )?;
+                        return Ok(output).and_then(finalize_output);
                     }
                 }
-                return Ok(ExecuteOutput {
-                    success: false,
-                    summary,
-                    checks_run: Vec::new(),
-                    cost_usd: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                })
-                .and_then(finalize_output);
+                let output = maybe_rollback_failed_patch_lane_output(
+                    &input.repo_root,
+                    &patch_entry_point_snapshots,
+                    patched_worktree,
+                    ExecuteOutput {
+                        success: false,
+                        summary,
+                        checks_run: Vec::new(),
+                        cost_usd: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    },
+                )?;
+                return Ok(output).and_then(finalize_output);
             }
             if timed_output.orphaned {
-                return Ok(ExecuteOutput {
-                    success: false,
-                    summary: orphan_summary(&stdout, &stderr),
-                    checks_run: Vec::new(),
-                    cost_usd: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                })
-                .and_then(finalize_output);
+                let output = maybe_rollback_failed_patch_lane_output(
+                    &input.repo_root,
+                    &patch_entry_point_snapshots,
+                    patched_worktree,
+                    ExecuteOutput {
+                        success: false,
+                        summary: orphan_summary(&stdout, &stderr),
+                        checks_run: Vec::new(),
+                        cost_usd: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    },
+                )?;
+                return Ok(output).and_then(finalize_output);
             }
             if !timed_output.output.status.success() && response.is_none() {
                 let (success, summary) = classify_execution_result(false, &stdout, &stderr);
-                return Ok(ExecuteOutput {
-                    success,
-                    summary,
-                    checks_run: Vec::new(),
-                    cost_usd: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                })
-                .and_then(finalize_output);
+                let output = maybe_rollback_failed_patch_lane_output(
+                    &input.repo_root,
+                    &patch_entry_point_snapshots,
+                    patched_worktree,
+                    ExecuteOutput {
+                        success,
+                        summary,
+                        checks_run: Vec::new(),
+                        cost_usd: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    },
+                )?;
+                return Ok(output).and_then(finalize_output);
             }
 
             let response = match response {
@@ -903,14 +938,19 @@ impl CodexCliExecutor {
                         &input.stderr_path,
                         &format!("\n[punk patch/apply] failed to parse patch output: {err}\n"),
                     )?;
-                    return Ok(ExecuteOutput {
-                        success: false,
-                        summary: format!("patch/apply lane returned invalid patch text: {err}"),
-                        checks_run: Vec::new(),
-                        cost_usd: None,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                    })
-                    .and_then(finalize_output);
+                    let output = maybe_rollback_failed_patch_lane_output(
+                        &input.repo_root,
+                        &patch_entry_point_snapshots,
+                        patched_worktree,
+                        ExecuteOutput {
+                            success: false,
+                            summary: format!("patch/apply lane returned invalid patch text: {err}"),
+                            checks_run: Vec::new(),
+                            cost_usd: None,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        },
+                    )?;
+                    return Ok(output).and_then(finalize_output);
                 }
             };
             let patch = match response {
@@ -919,14 +959,19 @@ impl CodexCliExecutor {
                         &input.stderr_path,
                         &format!("\n[punk patch/apply] blocked: {reason}\n"),
                     )?;
-                    return Ok(ExecuteOutput {
-                        success: false,
-                        summary: reason,
-                        checks_run: Vec::new(),
-                        cost_usd: None,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                    })
-                    .and_then(finalize_output);
+                    let output = maybe_rollback_failed_patch_lane_output(
+                        &input.repo_root,
+                        &patch_entry_point_snapshots,
+                        patched_worktree,
+                        ExecuteOutput {
+                            success: false,
+                            summary: reason,
+                            checks_run: Vec::new(),
+                            cost_usd: None,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        },
+                    )?;
+                    return Ok(output).and_then(finalize_output);
                 }
                 PatchLaneResponse::Patch(patch) => patch,
             };
@@ -938,14 +983,19 @@ impl CodexCliExecutor {
                         &input.stderr_path,
                         &format!("\n[punk patch/apply] invalid patch scope: {err}\n"),
                     )?;
-                    return Ok(ExecuteOutput {
-                        success: false,
-                        summary: format!("patch/apply lane rejected patch: {err}"),
-                        checks_run: Vec::new(),
-                        cost_usd: None,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                    })
-                    .and_then(finalize_output);
+                    let output = maybe_rollback_failed_patch_lane_output(
+                        &input.repo_root,
+                        &patch_entry_point_snapshots,
+                        patched_worktree,
+                        ExecuteOutput {
+                            success: false,
+                            summary: format!("patch/apply lane rejected patch: {err}"),
+                            checks_run: Vec::new(),
+                            cost_usd: None,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        },
+                    )?;
+                    return Ok(output).and_then(finalize_output);
                 }
             };
             let patch_paths = updates
@@ -959,19 +1009,25 @@ impl CodexCliExecutor {
                     &input.stderr_path,
                     &format!("\n[punk patch/apply] failed to apply patch: {detail}\n"),
                 )?;
-                return Ok(ExecuteOutput {
-                    success: false,
-                    summary: if detail.starts_with(BLOCKED_EXECUTION_SENTINEL) {
-                        detail
-                    } else {
-                        format!("patch/apply lane failed to apply patch: {detail}")
+                let output = maybe_rollback_failed_patch_lane_output(
+                    &input.repo_root,
+                    &patch_entry_point_snapshots,
+                    patched_worktree,
+                    ExecuteOutput {
+                        success: false,
+                        summary: if detail.starts_with(BLOCKED_EXECUTION_SENTINEL) {
+                            detail
+                        } else {
+                            format!("patch/apply lane failed to apply patch: {detail}")
+                        },
+                        checks_run: Vec::new(),
+                        cost_usd: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
                     },
-                    checks_run: Vec::new(),
-                    cost_usd: None,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                })
-                .and_then(finalize_output);
+                )?;
+                return Ok(output).and_then(finalize_output);
             }
+            patched_worktree = true;
             append_log_text(
                 &input.stdout_path,
                 &format!(
@@ -1013,14 +1069,19 @@ impl CodexCliExecutor {
                         )?;
                         continue;
                     }
-                    return Ok(ExecuteOutput {
-                        success: false,
-                        summary,
-                        checks_run: Vec::new(),
-                        cost_usd: None,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                    })
-                    .and_then(finalize_output);
+                    let output = maybe_rollback_failed_patch_lane_output(
+                        &input.repo_root,
+                        &patch_entry_point_snapshots,
+                        patched_worktree,
+                        ExecuteOutput {
+                            success: false,
+                            summary,
+                            checks_run: Vec::new(),
+                            cost_usd: None,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        },
+                    )?;
+                    return Ok(output).and_then(finalize_output);
                 }
             };
 
@@ -1037,16 +1098,21 @@ impl CodexCliExecutor {
             .and_then(finalize_output);
         }
 
-        Ok(ExecuteOutput {
-            success: false,
-            summary: format!(
-                "patch/apply lane exhausted repair attempts after {max_attempts} passes"
-            ),
-            checks_run: Vec::new(),
-            cost_usd: None,
-            duration_ms: start.elapsed().as_millis() as u64,
-        })
-        .and_then(finalize_output)
+        let output = maybe_rollback_failed_patch_lane_output(
+            &input.repo_root,
+            &patch_entry_point_snapshots,
+            patched_worktree,
+            ExecuteOutput {
+                success: false,
+                summary: format!(
+                    "patch/apply lane exhausted repair attempts after {max_attempts} passes"
+                ),
+                checks_run: Vec::new(),
+                cost_usd: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            },
+        )?;
+        Ok(output).and_then(finalize_output)
     }
 
     fn run_patch_plan_prepass(
@@ -4560,6 +4626,65 @@ fn restore_damaged_entry_point_snapshots(
     Ok(restored)
 }
 
+fn restore_entry_point_snapshots(
+    repo_root: &std::path::Path,
+    snapshots: &[EntryPointSnapshot],
+) -> Result<Vec<String>> {
+    let mut restored = Vec::new();
+    for snapshot in snapshots {
+        let file_path = repo_root.join(&snapshot.path);
+        match snapshot.content.as_ref() {
+            Some(original) => {
+                let current = fs::read_to_string(&file_path).ok();
+                if current.as_ref() == Some(original) {
+                    continue;
+                }
+                if let Some(parent) = file_path.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("create restored entry point parent {}", snapshot.path)
+                    })?;
+                }
+                fs::write(&file_path, original)
+                    .with_context(|| format!("restore entry point {}", snapshot.path))?;
+                restored.push(snapshot.path.clone());
+            }
+            None => {
+                if !file_path.exists() {
+                    continue;
+                }
+                fs::remove_file(&file_path)
+                    .with_context(|| format!("remove created entry point {}", snapshot.path))?;
+                restored.push(snapshot.path.clone());
+            }
+        }
+    }
+    Ok(restored)
+}
+
+fn maybe_rollback_failed_patch_lane_output(
+    repo_root: &std::path::Path,
+    snapshots: &[EntryPointSnapshot],
+    patched_worktree: bool,
+    mut output: ExecuteOutput,
+) -> Result<ExecuteOutput> {
+    if !patched_worktree || output.success {
+        return Ok(output);
+    }
+    let restored_paths = restore_entry_point_snapshots(repo_root, snapshots)?;
+    if restored_paths.is_empty() {
+        return Ok(output);
+    }
+    let original_summary = output.summary;
+    output.success = false;
+    output.checks_run.clear();
+    output.summary = format!(
+        "failed bounded patch/apply changes were rolled back for {}; original outcome: {}",
+        restored_paths.join(", "),
+        original_summary
+    );
+    Ok(output)
+}
+
 fn finalize_patch_lane_output(
     repo_root: &std::path::Path,
     snapshots: &[EntryPointSnapshot],
@@ -6591,6 +6716,76 @@ mod tests {
         assert_eq!(
             execution_lane_for_contract(&root, &effective),
             ExecutionLane::PatchApply
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollback_failed_patch_lane_output_restores_pre_run_snapshots() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-rollback-failed-patch-lane-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn stable() {}\n").unwrap();
+        fs::write(
+            root.join("tests/init_json.rs"),
+            "#[test]\nfn init_json() {}\n",
+        )
+        .unwrap();
+
+        let contract = Contract {
+            id: "ct_cleanup".into(),
+            feature_id: "feat_cleanup".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "remove style/examples cleanup".into(),
+            entry_points: vec!["src/lib.rs".into(), "tests/init_json.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["cleanup slice".into()],
+            behavior_requirements: vec!["remove obsolete style examples references".into()],
+            allowed_scope: vec!["src/lib.rs".into(), "tests/init_json.rs".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let snapshots = capture_entry_point_snapshots(&root, &contract, &[]).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn broken() {\n").unwrap();
+        fs::write(root.join("tests/init_json.rs"), "#[test]\nfn broken() {\n").unwrap();
+
+        let output = maybe_rollback_failed_patch_lane_output(
+            &root,
+            &snapshots,
+            true,
+            ExecuteOutput {
+                success: false,
+                summary: "patch/apply lane failed to apply patch: apply hunk in src/lib.rs".into(),
+                checks_run: vec!["cargo test --workspace".into()],
+                cost_usd: None,
+                duration_ms: 0,
+            },
+        )
+        .unwrap();
+
+        assert!(!output.success);
+        assert!(output.summary.contains("rolled back"), "{}", output.summary);
+        assert!(output.checks_run.is_empty());
+        assert_eq!(
+            fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "pub fn stable() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("tests/init_json.rs")).unwrap(),
+            "#[test]\nfn init_json() {}\n"
         );
 
         let _ = fs::remove_dir_all(&root);
