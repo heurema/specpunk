@@ -2417,23 +2417,15 @@ fn sync_present_repo_root_changes_to_isolated_workspace(
 }
 
 fn contract_implies_generated_cargo_lock(contract: &Contract) -> bool {
-    scope_covers_contract_root_manifest(contract)
-        && !contract
-            .allowed_scope
-            .iter()
-            .any(|path| path == "Cargo.lock")
+    !contract
+        .allowed_scope
+        .iter()
+        .any(|path| path == "Cargo.lock")
         && contract
             .target_checks
             .iter()
             .chain(contract.integrity_checks.iter())
             .any(|command| command.trim_start().starts_with("cargo "))
-}
-
-fn scope_covers_contract_root_manifest(contract: &Contract) -> bool {
-    contract
-        .allowed_scope
-        .iter()
-        .any(|path| path == "Cargo.toml")
 }
 
 fn already_satisfied_before_dispatch_summary(
@@ -3843,6 +3835,43 @@ mod tests {
             .any(|path| path == "Cargo.lock"));
         assert!(!root.join("Cargo.lock").exists());
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_generated_cargo_lock_for_file_scoped_cargo_contract() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-file-scope-cargo-lock-prune-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Cargo.lock"), "# generated\n").unwrap();
+        let contract = Contract {
+            id: "ct_file_scope_lock".into(),
+            feature_id: "feat_file_scope_lock".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "implement pubpunk init".into(),
+            entry_points: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["pubpunk init".into()],
+            behavior_requirements: vec!["keep tests green".into()],
+            allowed_scope: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            target_checks: vec!["cargo test -p pubpunk-core".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        prune_generated_cargo_lock_if_out_of_scope(&root, &contract, false).unwrap();
+
+        assert!(!root.join("Cargo.lock").exists());
         let _ = fs::remove_dir_all(&root);
     }
 

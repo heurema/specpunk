@@ -163,7 +163,6 @@ fn prune_generated_cargo_lock_if_out_of_scope(
     cargo_lock_existed_before_check: bool,
 ) -> Result<()> {
     if cargo_lock_existed_before_check
-        || !allowed_scope.iter().any(|path| path == "Cargo.toml")
         || allowed_scope.iter().any(|path| path == "Cargo.lock")
         || !command.trim_start().starts_with("cargo ")
     {
@@ -1107,6 +1106,32 @@ mod tests {
         .unwrap();
         assert!(root.join("Cargo.lock").exists());
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_generated_cargo_lock_for_file_scoped_cargo_checks() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-file-scope-cargo-lock-prune-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Cargo.lock"), "generated\n").unwrap();
+
+        prune_generated_cargo_lock_if_out_of_scope(
+            &root,
+            &["crates/pubpunk-core/src/lib.rs".into()],
+            "cargo test -p pubpunk-core",
+            false,
+        )
+        .unwrap();
+
+        assert!(!root.join("Cargo.lock").exists());
         let _ = fs::remove_dir_all(&root);
     }
 
