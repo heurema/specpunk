@@ -345,6 +345,7 @@ impl OrchService {
         )?;
         let mut scan = scan;
         enrich_scan_with_nested_integrity_fallback(&self.paths.repo_root, &mut scan)?;
+        apply_prompt_targeting_bias(trimmed_prompt, &mut scan);
         if scan.candidate_integrity_checks.is_empty() {
             return Err(anyhow!(
                 "phase repo scan: {}",
@@ -511,6 +512,7 @@ impl OrchService {
         let mut feature: Feature = read_json(&feature_path)?;
         let mut scan = scan_repo(&self.paths.repo_root, &current_contract.prompt_source)?;
         enrich_scan_with_nested_integrity_fallback(&self.paths.repo_root, &mut scan)?;
+        apply_prompt_targeting_bias(&current_contract.prompt_source, &mut scan);
         if scan.candidate_integrity_checks.is_empty() {
             return Err(anyhow!(
                 "unable to infer trustworthy integrity checks from repo scan"
@@ -947,7 +949,8 @@ impl OrchService {
                 &changed_files,
             )?;
         }
-        if should_reject_empty_successful_bounded_run(&contract, &status, &summary, &changed_files) {
+        if should_reject_empty_successful_bounded_run(&contract, &status, &summary, &changed_files)
+        {
             status = "failure".to_string();
             summary = empty_successful_bounded_run_summary(&contract.entry_points, &summary);
             run.status = RunStatus::Failed;
@@ -2354,14 +2357,14 @@ fn should_treat_cut_run_as_already_satisfied(
     preexisting_changed_files: &[String],
 ) -> bool {
     contract_is_file_bounded(contract)
-        && is_cut_run_noop_or_blocked_summary(summary)
+        && is_cut_run_noop_summary(summary)
         && entry_points_already_changed_before_dispatch(contract, preexisting_changed_files)
 }
 
-fn is_cut_run_noop_or_blocked_summary(summary: &str) -> bool {
-    let trimmed = summary.trim();
-    trimmed.starts_with("no implementation progress after bounded context dispatch")
-        || trimmed.starts_with("PUNK_EXECUTION_BLOCKED:")
+fn is_cut_run_noop_summary(summary: &str) -> bool {
+    summary
+        .trim()
+        .starts_with("no implementation progress after bounded context dispatch")
 }
 
 fn entry_points_already_changed_before_dispatch(
@@ -2687,6 +2690,227 @@ fn ignored_nested_relative_path(relative: &Path) -> bool {
         || relative.starts_with(".build")
 }
 
+fn apply_prompt_targeting_bias(prompt: &str, scan: &mut punk_domain::RepoScanSummary) {
+    prune_generated_noise_candidates(prompt, scan);
+    if !prompt_prefers_backend_data(prompt) || prompt_prefers_ui(prompt) {
+        return;
+    }
+    let mut rebalanced = false;
+    rebalanced |= rebalance_candidate_paths(
+        &mut scan.candidate_file_scope_paths,
+        path_looks_backend_data,
+        path_looks_ui_surface,
+    );
+    rebalanced |= prune_demoted_candidates_if_preferred_exists(
+        &mut scan.candidate_file_scope_paths,
+        path_looks_backend_data,
+        path_looks_ui_surface,
+    );
+    rebalanced |= rebalance_candidate_paths(
+        &mut scan.candidate_entry_points,
+        path_looks_backend_data,
+        path_looks_ui_surface,
+    );
+    rebalanced |= prune_demoted_candidates_if_preferred_exists(
+        &mut scan.candidate_entry_points,
+        path_looks_backend_data,
+        path_looks_ui_surface,
+    );
+    rebalanced |= rebalance_candidate_paths(
+        &mut scan.candidate_scope_paths,
+        path_looks_backend_data,
+        path_looks_ui_surface,
+    );
+    rebalanced |= rebalance_candidate_paths(
+        &mut scan.candidate_directory_scope_paths,
+        path_looks_backend_data,
+        path_looks_ui_surface,
+    );
+    if rebalanced {
+        push_unique_string(
+            &mut scan.notes,
+            "biased candidate targeting toward backend/data surfaces because the prompt looked non-UI".to_string(),
+        );
+    }
+}
+
+fn prune_generated_noise_candidates(prompt: &str, scan: &mut punk_domain::RepoScanSummary) {
+    if prompt_mentions_generated_surface(prompt) {
+        return;
+    }
+    let mut pruned = false;
+    pruned |= retain_non_generated_noise(&mut scan.candidate_file_scope_paths);
+    pruned |= retain_non_generated_noise(&mut scan.candidate_entry_points);
+    pruned |= retain_non_generated_noise(&mut scan.candidate_scope_paths);
+    pruned |= retain_non_generated_noise(&mut scan.candidate_directory_scope_paths);
+    if pruned {
+        push_unique_string(
+            &mut scan.notes,
+            "pruned generated/output surfaces like dist and packs from candidate targeting"
+                .to_string(),
+        );
+    }
+}
+
+fn retain_non_generated_noise(paths: &mut Vec<String>) -> bool {
+    let before_len = paths.len();
+    paths.retain(|path| !path_is_generated_noise(path));
+    before_len != paths.len()
+}
+
+fn rebalance_candidate_paths(
+    paths: &mut Vec<String>,
+    prefer: fn(&str) -> bool,
+    demote: fn(&str) -> bool,
+) -> bool {
+    if !paths.iter().any(|path| prefer(path)) {
+        return false;
+    }
+    let original = paths.clone();
+    let mut preferred = Vec::new();
+    let mut neutral = Vec::new();
+    let mut demoted = Vec::new();
+    for path in original.iter() {
+        if prefer(path) {
+            preferred.push(path.clone());
+        } else if demote(path) {
+            demoted.push(path.clone());
+        } else {
+            neutral.push(path.clone());
+        }
+    }
+    let mut reordered = Vec::with_capacity(original.len());
+    reordered.extend(preferred);
+    reordered.extend(neutral);
+    reordered.extend(demoted);
+    if reordered == original {
+        return false;
+    }
+    *paths = reordered;
+    true
+}
+
+fn prune_demoted_candidates_if_preferred_exists(
+    paths: &mut Vec<String>,
+    prefer: fn(&str) -> bool,
+    demote: fn(&str) -> bool,
+) -> bool {
+    if !paths.iter().any(|path| prefer(path)) {
+        return false;
+    }
+    let before_len = paths.len();
+    paths.retain(|path| !demote(path) || prefer(path));
+    before_len != paths.len()
+}
+
+fn prompt_prefers_backend_data(prompt: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    [
+        " db",
+        "db ",
+        "database",
+        "schema",
+        "migration",
+        "session",
+        "seed",
+        "service",
+        "services",
+        "dispatch",
+        "profile",
+        "profiles",
+        "track",
+        "tracks",
+        "enrollment",
+        "enrollments",
+        "support",
+        "backend",
+        "server",
+        "store",
+        "repo",
+        "model",
+        "models",
+        "api",
+    ]
+    .iter()
+    .any(|token| lowered.contains(token))
+}
+
+fn prompt_prefers_ui(prompt: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    [
+        " ui",
+        "frontend",
+        "front-end",
+        "header",
+        "footer",
+        "layout",
+        "layouts",
+        "page",
+        "pages",
+        "component",
+        "components",
+        ".astro",
+        "tailwind",
+        "css",
+        "landing",
+    ]
+    .iter()
+    .any(|token| lowered.contains(token))
+}
+
+fn prompt_mentions_generated_surface(prompt: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    lowered.contains("dist") || lowered.contains("pack") || lowered.contains("bundle")
+}
+
+fn path_is_generated_noise(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered == "dist"
+        || lowered == "packs"
+        || lowered.starts_with("dist/")
+        || lowered.starts_with("packs/")
+        || lowered.contains("/dist/")
+        || lowered.contains("/packs/")
+}
+
+fn path_looks_ui_surface(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered.ends_with(".astro")
+        || lowered.ends_with(".css")
+        || lowered.ends_with(".scss")
+        || lowered.ends_with(".sass")
+        || lowered.contains("/components/")
+        || lowered.contains("/layouts/")
+        || lowered.contains("/pages/")
+        || lowered.contains("/styles/")
+        || lowered.contains("/public/")
+        || lowered.contains("header")
+        || lowered.contains("footer")
+}
+
+fn path_looks_backend_data(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered.ends_with(".sql")
+        || lowered.contains("/db/")
+        || lowered.contains("/database/")
+        || lowered.contains("schema")
+        || lowered.contains("migration")
+        || lowered.contains("session")
+        || lowered.contains("seed")
+        || lowered.contains("service")
+        || lowered.contains("dispatch")
+        || lowered.contains("profile")
+        || lowered.contains("track")
+        || lowered.contains("enrollment")
+        || lowered.contains("support")
+        || lowered.contains("/server/")
+        || lowered.contains("/api/")
+        || lowered.contains("/store/")
+        || lowered.contains("/repo/")
+        || lowered.contains("/model")
+        || lowered.contains("/data/")
+}
+
 fn contract_implies_generated_cargo_lock(contract: &Contract) -> bool {
     !contract
         .allowed_scope
@@ -2857,13 +3081,21 @@ fn preserve_greenfield_scaffold_scope(
     };
 
     for entry_point in entry_points {
-        if !proposal.entry_points.iter().any(|existing| existing == &entry_point) {
+        if !proposal
+            .entry_points
+            .iter()
+            .any(|existing| existing == &entry_point)
+        {
             proposal.entry_points.push(entry_point);
         }
     }
 
     for scope_path in allowed_scope {
-        if !proposal.allowed_scope.iter().any(|existing| existing == &scope_path) {
+        if !proposal
+            .allowed_scope
+            .iter()
+            .any(|existing| existing == &scope_path)
+        {
             proposal.allowed_scope.push(scope_path);
         }
     }
@@ -2892,7 +3124,11 @@ fn ensure_proposal_scope_covers_entry_points(proposal: &mut DraftProposal) {
         .cloned()
         .collect::<Vec<_>>();
     for entry_point in missing_entry_points {
-        if !proposal.allowed_scope.iter().any(|existing| existing == &entry_point) {
+        if !proposal
+            .allowed_scope
+            .iter()
+            .any(|existing| existing == &entry_point)
+        {
             proposal.allowed_scope.push(entry_point);
         }
     }
@@ -2968,7 +3204,9 @@ fn timeout_seed_semantics(prompt: &str, entry_points: &[String]) -> (Vec<String>
     let mut behavior_requirements = vec![summarize_prompt(prompt)];
     let lowered = prompt.to_ascii_lowercase();
 
-    if lowered.contains(" init ") || lowered.starts_with("init ") || lowered.contains("init command")
+    if lowered.contains(" init ")
+        || lowered.starts_with("init ")
+        || lowered.contains("init command")
     {
         push_unique_string(
             &mut expected_interfaces,
@@ -2977,10 +3215,7 @@ fn timeout_seed_semantics(prompt: &str, entry_points: &[String]) -> (Vec<String>
     }
     for flag in ["--json", "--force", "--project-root"] {
         if lowered.contains(flag) {
-            push_unique_string(
-                &mut expected_interfaces,
-                format!("CLI supports `{flag}`."),
-            );
+            push_unique_string(&mut expected_interfaces, format!("CLI supports `{flag}`."));
             push_unique_string(
                 &mut behavior_requirements,
                 format!("Support `{flag}` in the init flow."),
@@ -3130,7 +3365,10 @@ fn timeout_prompt_starter_files(prompt: &str) -> Vec<String> {
     let mut files = Vec::new();
     for token in prompt.split(|c: char| {
         c.is_whitespace()
-            || matches!(c, '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']')
+            || matches!(
+                c,
+                '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']'
+            )
     }) {
         let token = token.trim_end_matches('.').trim();
         if token.is_empty() {
@@ -3144,7 +3382,8 @@ fn timeout_prompt_starter_files(prompt: &str) -> Vec<String> {
         {
             continue;
         }
-        if token.starts_with("crates/") || token.starts_with("src/") || token.starts_with("tests/") {
+        if token.starts_with("crates/") || token.starts_with("src/") || token.starts_with("tests/")
+        {
             continue;
         }
         push_unique_string(&mut files, token.to_string());
@@ -3468,11 +3707,34 @@ mod tests {
         }
     }
 
-    struct AlreadySatisfiedNoOpExecutor;
+    struct NoProgressNoOpExecutor;
 
-    impl Executor for AlreadySatisfiedNoOpExecutor {
+    impl Executor for NoProgressNoOpExecutor {
         fn name(&self) -> &'static str {
-            "already-satisfied-noop"
+            "no-progress-noop"
+        }
+
+        fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+            fs::write(
+                &input.stdout_path,
+                b"no implementation progress after bounded context dispatch in src/lib.rs: bounded executor found no additional edits\n",
+            )?;
+            fs::write(&input.stderr_path, b"")?;
+            Ok(ExecuteOutput {
+                success: false,
+                summary: "no implementation progress after bounded context dispatch in src/lib.rs: bounded executor found no additional edits".into(),
+                checks_run: vec![],
+                cost_usd: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    struct BlockedNoOpExecutor;
+
+    impl Executor for BlockedNoOpExecutor {
+        fn name(&self) -> &'static str {
+            "blocked-noop"
         }
 
         fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
@@ -4253,7 +4515,7 @@ mod tests {
         service.approve_contract(&contract.id).unwrap();
 
         let (run, receipt) = service
-            .cut_run(&AlreadySatisfiedNoOpExecutor, &contract.id)
+            .cut_run(&NoProgressNoOpExecutor, &contract.id)
             .unwrap();
         assert_eq!(run.status, RunStatus::Finished);
         assert_eq!(receipt.status, "success");
@@ -4262,6 +4524,66 @@ mod tests {
             .summary
             .contains("already satisfied in allowed scope before bounded dispatch"));
         assert!(receipt.summary.contains("src/lib.rs"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_does_not_upgrade_blocked_file_slice_to_already_satisfied() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-blocked-not-already-satisfied-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn demo() { println!(\"done\"); }\n",
+        )
+        .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&AlreadySatisfiedDrafter, "demo cleanup slice")
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (run, receipt) = service.cut_run(&BlockedNoOpExecutor, &contract.id).unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(receipt.status, "failure");
+        assert!(receipt.changed_files.is_empty());
+        assert!(receipt.summary.starts_with("PUNK_EXECUTION_BLOCKED:"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -4347,9 +4669,7 @@ mod tests {
             .unwrap();
         service.approve_contract(&contract.id).unwrap();
 
-        let (run, receipt) = service
-            .cut_run(&AlreadySatisfiedNoOpExecutor, &contract.id)
-            .unwrap();
+        let (run, receipt) = service.cut_run(&BlockedNoOpExecutor, &contract.id).unwrap();
         assert_eq!(run.status, RunStatus::Failed);
         assert_eq!(receipt.status, "failure");
         assert!(receipt
@@ -4364,10 +4684,8 @@ mod tests {
 
     #[test]
     fn cut_run_rejects_successful_noop_for_bounded_source_slice() {
-        let root = std::env::temp_dir().join(format!(
-            "punk-orch-empty-success-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("punk-orch-empty-success-{}", std::process::id()));
         let global = root.join("global");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).unwrap();
@@ -4412,7 +4730,9 @@ mod tests {
         assert_eq!(run.status, RunStatus::Failed);
         assert_eq!(receipt.status, "failure");
         assert!(receipt.changed_files.is_empty());
-        assert!(receipt.summary.contains("no implementation progress after bounded success report"));
+        assert!(receipt
+            .summary
+            .contains("no implementation progress after bounded success report"));
         assert!(receipt
             .summary
             .contains("PUNK_EXECUTION_COMPLETE: claimed success without edits"));
@@ -4536,6 +4856,89 @@ mod tests {
     }
 
     #[test]
+    fn draft_contract_prefers_backend_candidates_over_ui_for_nested_repo() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-nested-backend-bias-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/components")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/db")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/dist")).unwrap();
+        fs::create_dir_all(root.join("packs")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "test": "echo test"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/components/SiteHeader.astro"),
+            "---\n---\n<header />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/components/SiteFooter.astro"),
+            "---\n---\n<footer />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/db/schema.ts"),
+            "export const schema = {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/dist/app.js"),
+            "console.log('dist')\n",
+        )
+        .unwrap();
+        fs::write(root.join("packs/generated.json"), "{}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &FakeDrafter,
+                "implement DB session seed services for baseline dispatch",
+            )
+            .unwrap();
+
+        assert_eq!(
+            contract.allowed_scope.first().map(String::as_str),
+            Some("baseline-site/src/db/schema.ts")
+        );
+        assert_eq!(
+            contract.entry_points.first().map(String::as_str),
+            Some("baseline-site/src/db/schema.ts")
+        );
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path.ends_with(".astro")));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path.contains("/dist/") || path.starts_with("packs/")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn cut_run_success_ensures_default_gitignore_coverage_without_receipt_noise() {
         let root = std::env::temp_dir().join(format!(
             "punk-orch-success-gitignore-{}",
@@ -4577,7 +4980,10 @@ mod tests {
 
         let (_run, receipt) = service.cut_run(&FakeExecutor, &contract.id).unwrap();
         assert_eq!(receipt.status, "success");
-        assert!(!receipt.changed_files.iter().any(|path| path == ".gitignore"));
+        assert!(!receipt
+            .changed_files
+            .iter()
+            .any(|path| path == ".gitignore"));
         assert_eq!(
             fs::read_to_string(root.join(".gitignore")).unwrap(),
             ".punk/\ntarget/\n.playwright-mcp/\n"
@@ -5440,48 +5846,39 @@ mod tests {
             .unwrap();
 
         assert!(!contract.allowed_scope.iter().any(|scope| scope == "crates"));
-        assert!(!contract.allowed_scope.iter().any(|scope| scope == "Cargo.toml"));
-        assert!(
-            contract
-                .entry_points
-                .iter()
-                .all(|scope| scope.contains('/') || scope.ends_with(".toml"))
-        );
-        assert!(
-            contract
-                .allowed_scope
-                .iter()
-                .any(|scope| scope.ends_with("tests/init_json.rs")
-                    || scope.ends_with("tests/README.md")
-                    || scope == "tests")
-        );
+        assert!(!contract
+            .allowed_scope
+            .iter()
+            .any(|scope| scope == "Cargo.toml"));
+        assert!(contract
+            .entry_points
+            .iter()
+            .all(|scope| scope.contains('/') || scope.ends_with(".toml")));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|scope| scope.ends_with("tests/init_json.rs")
+                || scope.ends_with("tests/README.md")
+                || scope == "tests"));
         assert!(contract.allowed_scope.len() <= 4);
-        assert!(
-            contract
-                .expected_interfaces
-                .iter()
-                .any(|value| value.contains("`--json`"))
-        );
-        assert!(
-            contract
-                .expected_interfaces
-                .iter()
-                .any(|value| value.contains("`--force`"))
-        );
-        assert!(
-            contract
-                .expected_interfaces
-                .iter()
-                .any(|value| value.contains("`--project-root`"))
-        );
-        assert!(
-            contract
-                .behavior_requirements
-                .iter()
-                .any(|value| value.contains("project.toml")
-                    && value.contains("style/style.toml")
-                    && value.contains("agent/skill.md"))
-        );
+        assert!(contract
+            .expected_interfaces
+            .iter()
+            .any(|value| value.contains("`--json`")));
+        assert!(contract
+            .expected_interfaces
+            .iter()
+            .any(|value| value.contains("`--force`")));
+        assert!(contract
+            .expected_interfaces
+            .iter()
+            .any(|value| value.contains("`--project-root`")));
+        assert!(contract
+            .behavior_requirements
+            .iter()
+            .any(|value| value.contains("project.toml")
+                && value.contains("style/style.toml")
+                && value.contains("agent/skill.md")));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -5826,7 +6223,11 @@ mod tests {
             "[package]\nname = \"pubpunk-core\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        fs::write(root.join("crates/pubpunk-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
         fs::write(
             root.join("crates/pubpunk-core/src/lib.rs"),
             "pub fn init() {}\n",
@@ -5896,12 +6297,8 @@ mod tests {
             )
             .unwrap();
 
-        assert!(contract
-            .entry_points
-            .contains(&"src/lib.rs".to_string()));
-        assert!(contract
-            .allowed_scope
-            .contains(&"src/lib.rs".to_string()));
+        assert!(contract.entry_points.contains(&"src/lib.rs".to_string()));
+        assert!(contract.allowed_scope.contains(&"src/lib.rs".to_string()));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -5932,7 +6329,11 @@ mod tests {
             "[package]\nname = \"pubpunk-core\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        fs::write(root.join("crates/pubpunk-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
         fs::write(
             root.join("crates/pubpunk-core/src/lib.rs"),
             "pub fn init() {}\n",
