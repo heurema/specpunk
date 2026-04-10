@@ -424,7 +424,7 @@ Writes:
 
 Behavior notes:
 
-- if bounded execution makes no additional edits because the approved entry points were already changed in-scope before dispatch, `cut run` may still record a successful run summary explaining that the slice was already satisfied before dispatch
+- if bounded execution makes no additional edits because a file-bounded slice's approved entry points were already changed in-scope before dispatch, `cut run` may still record a successful run summary explaining that the slice was already satisfied before dispatch; directory-scoped implementation contracts must still fail honestly as no-progress
 - if bounded execution emits noisy progress lines but still makes no entry-point changes and never reaches meaningful compile/check progress, `cut run` may still fail closed as no-progress instead of waiting indefinitely on output noise
 - if file-level entry points like `Cargo.toml`, `go.mod`, `pyproject.toml`, or `package.json` were missing at baseline and remain missing after bounded dispatch, `cut run` should still fail closed as no-progress instead of hanging indefinitely on executor noise
 - manifest-only greenfield bootstrap runs should use a short executor timeout budget instead of waiting for the full generic execution timeout before normalizing to blocked/no-progress

@@ -2302,7 +2302,8 @@ fn should_treat_cut_run_as_already_satisfied(
     summary: &str,
     preexisting_changed_files: &[String],
 ) -> bool {
-    is_cut_run_noop_or_blocked_summary(summary)
+    contract_is_file_bounded(contract)
+        && is_cut_run_noop_or_blocked_summary(summary)
         && entry_points_already_changed_before_dispatch(contract, preexisting_changed_files)
 }
 
@@ -2322,6 +2323,26 @@ fn entry_points_already_changed_before_dispatch(
                 .iter()
                 .any(|changed| path_covers_entry_point(changed, entry_point))
         })
+}
+
+fn contract_is_file_bounded(contract: &Contract) -> bool {
+    !contract.entry_points.is_empty()
+        && contract
+            .entry_points
+            .iter()
+            .all(|entry_point| is_file_like_contract_path(entry_point))
+        && contract
+            .allowed_scope
+            .iter()
+            .all(|scope| is_file_like_contract_path(scope))
+}
+
+fn is_file_like_contract_path(path: &str) -> bool {
+    Path::new(path).extension().is_some()
+        || matches!(
+            path,
+            "Cargo.toml" | "Cargo.lock" | "README.md" | "rust-toolchain.toml"
+        )
 }
 
 fn path_covers_entry_point(changed_path: &str, entry_point: &str) -> bool {
@@ -2979,6 +3000,44 @@ mod tests {
         }
     }
 
+    struct DirectoryScopedAlreadySatisfiedDrafter;
+
+    impl ContractDrafter for DirectoryScopedAlreadySatisfiedDrafter {
+        fn name(&self) -> &'static str {
+            "directory-scoped-already-satisfied-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "directory scoped already satisfied".into(),
+                summary: input.prompt,
+                entry_points: vec![
+                    "crates/pubpunk-cli/Cargo.toml".into(),
+                    "crates/pubpunk-core/Cargo.toml".into(),
+                ],
+                import_paths: vec![
+                    "crates/pubpunk-cli".into(),
+                    "crates/pubpunk-core".into(),
+                    "tests".into(),
+                ],
+                expected_interfaces: vec!["bounded implementation slice".into()],
+                behavior_requirements: vec!["implement init logic".into()],
+                allowed_scope: vec![
+                    "crates/pubpunk-cli".into(),
+                    "crates/pubpunk-core".into(),
+                    "tests".into(),
+                ],
+                target_checks: vec!["cargo test -p pubpunk-cli".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "medium".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
     struct PanicExecutor;
 
     impl Executor for PanicExecutor {
@@ -3607,6 +3666,102 @@ mod tests {
             .summary
             .contains("already satisfied in allowed scope before bounded dispatch"));
         assert!(receipt.summary.contains("src/lib.rs"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_does_not_upgrade_directory_scoped_no_progress_to_already_satisfied() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-directory-already-satisfied-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=['crates/pubpunk-cli','crates/pubpunk-core']\nresolver='2'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname='pubpunk-cli'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname='pubpunk-core'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "tests\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname='pubpunk-cli'\nversion='0.2.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname='pubpunk-core'\nversion='0.2.0'\n",
+        )
+        .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &DirectoryScopedAlreadySatisfiedDrafter,
+                "implement pubpunk init in bounded dirs",
+            )
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (run, receipt) = service
+            .cut_run(&AlreadySatisfiedNoOpExecutor, &contract.id)
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(receipt.status, "failure");
+        assert!(receipt
+            .summary
+            .starts_with("PUNK_EXECUTION_BLOCKED: bounded executor found no additional edits"));
+        assert!(!receipt
+            .summary
+            .contains("already satisfied in allowed scope before bounded dispatch"));
 
         let _ = fs::remove_dir_all(&root);
     }
