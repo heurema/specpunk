@@ -619,6 +619,11 @@ impl CodexCliExecutor {
     fn execute_patch_apply_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
         let start = Instant::now();
         restore_stale_entry_point_masks(&input.repo_root)?;
+        let _materialized_entry_points = if is_fail_closed_scope_task(&input.contract) {
+            materialize_missing_entry_points(&input.repo_root, &input.contract)?
+        } else {
+            Vec::new()
+        };
         let mut retry_feedback = None;
 
         for retry_mode in [false, true] {
@@ -2103,6 +2108,7 @@ fn effective_execution_contract(repo_root: &Path, contract: &Contract) -> Result
     {
         return Ok(contract.clone());
     }
+    let needs_creatable_tests_scope = contract_needs_creatable_tests_scope(repo_root, contract)?;
     let bootstrap_scaffold_paths = controller_bootstrap_scaffold_paths(contract);
     if !bootstrap_scaffold_paths.is_empty()
         && bootstrap_scaffold_paths
@@ -2126,6 +2132,12 @@ fn effective_execution_contract(repo_root: &Path, contract: &Contract) -> Result
             break;
         }
     }
+    if needs_creatable_tests_scope {
+        extend_unique_paths(
+            &mut expanded_scope,
+            &[synthesized_test_entrypoint(contract).to_string()],
+        );
+    }
     if expanded_scope.is_empty()
         || expanded_scope.len() > 8
         || expanded_scope
@@ -2140,6 +2152,42 @@ fn effective_execution_contract(repo_root: &Path, contract: &Contract) -> Result
     effective.entry_points = contract.entry_points.clone();
     extend_unique_paths(&mut effective.entry_points, &expanded_scope);
     Ok(effective)
+}
+
+fn contract_needs_creatable_tests_scope(repo_root: &Path, contract: &Contract) -> Result<bool> {
+    if !contract.allowed_scope.iter().any(|path| path == "tests") {
+        return Ok(false);
+    }
+    let mut remaining = 16usize;
+    let discovered = collect_existing_allowed_scope_files(repo_root, "tests", &mut remaining)?;
+    Ok(!discovered.iter().any(|path| is_executable_test_surface(path)))
+}
+
+fn is_executable_test_surface(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    !(lower.ends_with("/readme.md")
+        || lower.ends_with("/readme.txt")
+        || lower.ends_with("/.gitkeep")
+        || lower == "tests/readme.md"
+        || lower == "tests/readme.txt"
+        || lower == "tests/.gitkeep")
+}
+
+fn synthesized_test_entrypoint(contract: &Contract) -> &'static str {
+    let mut text = contract.prompt_source.to_ascii_lowercase();
+    for item in contract
+        .expected_interfaces
+        .iter()
+        .chain(contract.behavior_requirements.iter())
+    {
+        text.push('\n');
+        text.push_str(&item.to_ascii_lowercase());
+    }
+    if text.contains("json") {
+        "tests/init_json.rs"
+    } else {
+        "tests/init.rs"
+    }
 }
 
 fn fail_closed_scope_rule(contract: &Contract) -> &'static str {
@@ -2179,14 +2227,18 @@ fn is_patch_apply_lane_candidate(repo_root: &Path, contract: &Contract) -> bool 
     if !contract
         .allowed_scope
         .iter()
-        .all(|path| repo_root.join(path).exists())
+        .all(|path| {
+            repo_root.join(path).exists()
+                || (is_explicit_repo_file_scope(path)
+                    && contract.entry_points.iter().any(|entry| entry == path))
+        })
     {
         return false;
     }
     if !contract
         .entry_points
         .iter()
-        .all(|path| repo_root.join(path).exists())
+        .all(|path| repo_root.join(path).exists() || is_explicit_repo_file_scope(path))
     {
         return false;
     }
@@ -5294,7 +5346,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_lane_uses_patch_apply_for_small_existing_file_init_slice() {
+    fn execution_lane_uses_patch_apply_for_init_slice_when_tests_dir_needs_new_test_file() {
         let root = std::env::temp_dir().join(format!(
             "punk-adapters-patch-lane-init-{}-{}",
             std::process::id(),
@@ -5328,15 +5380,15 @@ mod tests {
             status: punk_domain::ContractStatus::Approved,
             prompt_source: "implement pubpunk init command".into(),
             entry_points: vec![
-                "crates/pubpunk-cli/Cargo.toml".into(),
-                "crates/pubpunk-core/Cargo.toml".into(),
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
             ],
             import_paths: vec![],
             expected_interfaces: vec!["bounded implementation slice".into()],
             behavior_requirements: vec!["implement pubpunk init".into()],
             allowed_scope: vec![
-                "crates/pubpunk-cli".into(),
-                "crates/pubpunk-core".into(),
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
                 "tests".into(),
             ],
             target_checks: vec!["cargo test -p pubpunk-cli".into()],
@@ -5347,6 +5399,73 @@ mod tests {
         };
 
         let effective = effective_execution_contract(&root, &contract).unwrap();
+        assert!(is_bounded_execution_task(&effective));
+        assert!(effective
+            .allowed_scope
+            .contains(&"tests/init.rs".to_string()));
+        assert_eq!(
+            execution_lane_for_contract(&root, &effective),
+            ExecutionLane::PatchApply
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn execution_lane_uses_patch_apply_for_init_slice_with_existing_test_file() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-patch-lane-init-existing-tests-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("crates/pubpunk-cli/Cargo.toml"), "[package]\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/pubpunk-core/Cargo.toml"), "[package]\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/init_json.rs"), "#[test]\nfn smoke() {}\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_init_existing_tests".into(),
+            feature_id: "feat_init_existing_tests".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init command".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["bounded implementation slice".into()],
+            behavior_requirements: vec!["implement pubpunk init".into()],
+            allowed_scope: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let effective = effective_execution_contract(&root, &contract).unwrap();
+        assert!(is_bounded_execution_task(&effective));
         assert_eq!(
             execution_lane_for_contract(&root, &effective),
             ExecutionLane::PatchApply
@@ -7315,7 +7434,7 @@ mod tests {
             "pub fn init() {}\n",
         )
         .unwrap();
-        fs::write(root.join("tests/README.md"), "# tests\n").unwrap();
+        fs::write(root.join("tests/init_json.rs"), "#[test]\nfn smoke() {}\n").unwrap();
 
         let contract = Contract {
             id: "ct_init".into(),
@@ -7351,7 +7470,7 @@ mod tests {
                 "crates/pubpunk-cli/src/main.rs".to_string(),
                 "crates/pubpunk-core/Cargo.toml".to_string(),
                 "crates/pubpunk-core/src/lib.rs".to_string(),
-                "tests/README.md".to_string(),
+                "tests/init_json.rs".to_string(),
             ]
         );
         assert!(effective
@@ -7362,9 +7481,98 @@ mod tests {
             .contains(&"crates/pubpunk-core/src/lib.rs".to_string()));
         assert!(effective
             .entry_points
-            .contains(&"tests/README.md".to_string()));
+            .contains(&"tests/init_json.rs".to_string()));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn effective_execution_contract_synthesizes_missing_test_entrypoint_when_only_placeholder_exists(
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-effective-contract-preserve-tests-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("crates/pubpunk-cli/Cargo.toml"), "[package]\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/pubpunk-core/Cargo.toml"), "[package]\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "# tests\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_init".into(),
+            feature_id: "feat_init".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/Cargo.toml".into(),
+                "crates/pubpunk-core/Cargo.toml".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["bounded implementation slice".into()],
+            behavior_requirements: vec!["implement pubpunk init".into()],
+            allowed_scope: vec![
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let effective = effective_execution_contract(&root, &contract).unwrap();
+        assert!(effective
+            .allowed_scope
+            .contains(&"tests/init.rs".to_string()));
+        assert!(effective
+            .entry_points
+            .contains(&"tests/init.rs".to_string()));
+        assert!(!effective.allowed_scope.iter().any(|path| path == "tests"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn synthesized_test_entrypoint_prefers_json_named_test_when_contract_mentions_json() {
+        let contract = Contract {
+            id: "ct_json_test".into(),
+            feature_id: "feat_json_test".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init".into(),
+            entry_points: vec!["crates/pubpunk-cli/src/main.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["pubpunk init --json".into()],
+            behavior_requirements: vec!["add --json behavior".into()],
+            allowed_scope: vec!["crates/pubpunk-cli/src/main.rs".into(), "tests".into()],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert_eq!(synthesized_test_entrypoint(&contract), "tests/init_json.rs");
     }
 
     #[test]
