@@ -146,6 +146,8 @@ This path runs:
 goal -> draft -> approve -> cut -> gate -> proof
 ```
 
+If the first accepted cycle only proves a controller-created bootstrap scaffold and the same goal still clearly asks for implementation work, `punk go` should immediately continue into one bounded follow-up cycle instead of stopping at the bootstrap proof.
+
 If autonomy blocks or escalates, `punk` prepares a staged recovery contract and returns a non-zero exit.
 
 The intended operator experience is:

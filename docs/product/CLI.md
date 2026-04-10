@@ -301,6 +301,13 @@ Returns:
 - structured JSON when `--json` is requested
 - non-zero exit for `block` or `escalate`
 
+Auto-chain expectation:
+
+- if the first accepted cycle only proves a controller-created bootstrap scaffold
+- and the original goal still clearly asks for implementation work (`implement`, `add`, `support`, `wire`, or `with tests`)
+- `punk go` should immediately run one bounded follow-up cycle against the same goal instead of stopping at the bootstrap proof
+- the final shell summary / JSON payload should report the follow-up cycle as the main result and keep the bootstrap cycle as auxiliary context
+
 When `--fallback-staged` is set and autonomy blocks:
 
 - a staged recovery contract is drafted automatically

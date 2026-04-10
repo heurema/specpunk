@@ -717,19 +717,28 @@ fn cmd_go(
 
     let orch = OrchService::new(repo_root, global_root)?;
     let drafter = CodexCliContractDrafter::default();
-    let contract = orch.draft_contract(&drafter, trimmed_goal)?;
-    let approved = orch.approve_contract(&contract.id)?;
     let executor = CodexCliExecutor::default();
-    let (run, receipt) = orch.cut_run(&executor, &approved.id)?;
     let gate = GateService::new(repo_root, global_root);
-    let decision = gate.gate_run(&run.id)?;
     let proof_service = ProofService::new(repo_root, global_root);
-    let proof = proof_service.write_proofpack(&decision.id)?;
-    let outcome = go_outcome_label(&decision.decision);
-    let success = go_decision_succeeds(&decision.decision);
-    let basis_summary = summarize_decision_basis(&decision.decision_basis);
-    let recovery_command = go_recovery_command(&decision.decision, trimmed_goal);
-    let recommended_mode = go_recommended_mode(&decision.decision);
+    let initial_cycle = run_go_cycle(&orch, &drafter, &executor, &gate, &proof_service, trimmed_goal)?;
+    let follow_up_cycle = if should_auto_chain_after_bootstrap(trimmed_goal, &initial_cycle) {
+        Some(run_go_cycle(
+            &orch,
+            &drafter,
+            &executor,
+            &gate,
+            &proof_service,
+            trimmed_goal,
+        )?)
+    } else {
+        None
+    };
+    let final_cycle = follow_up_cycle.as_ref().unwrap_or(&initial_cycle);
+    let outcome = go_outcome_label(&final_cycle.decision.decision);
+    let success = go_decision_succeeds(&final_cycle.decision.decision);
+    let basis_summary = summarize_decision_basis(&final_cycle.decision.decision_basis);
+    let recovery_command = go_recovery_command(&final_cycle.decision.decision, trimmed_goal);
+    let recommended_mode = go_recommended_mode(&final_cycle.decision.decision);
     let staged_recovery = if fallback_staged && !success {
         Some(orch.draft_contract(&drafter, trimmed_goal)?)
     } else {
@@ -739,14 +748,20 @@ fn cmd_go(
         .as_ref()
         .map(|contract| format!("punk plot approve {}", contract.id));
     let autonomy = orch.record_autonomy_outcome(
-        &proof.id,
+        &final_cycle.proof.id,
         staged_recovery
             .as_ref()
             .map(|contract| contract.id.as_str()),
     )?;
-    let status = orch.status(Some(&run.id))?;
+    let status = orch.status(Some(&final_cycle.run.id))?;
     let project = infer_project_id(&project_root).unwrap_or_else(|| status.project_id.clone());
-    let next_command = format!("punk inspect {} --json", proof.id);
+    let next_command = format!("punk inspect {} --json", final_cycle.proof.id);
+    let auto_chain_note = follow_up_cycle.as_ref().map(|cycle| {
+        format!(
+            "bootstrap proof {} triggered follow-up implementation cycle {}",
+            initial_cycle.proof.id, cycle.proof.id
+        )
+    });
 
     if json {
         println!(
@@ -755,21 +770,30 @@ fn cmd_go(
                 "goal": trimmed_goal,
                 "project": project,
                 "project_id": status.project_id,
-                "contract": approved,
-                "run": run,
-                "receipt": receipt,
-                "decision": decision,
-                "proof": proof,
+                "contract": &final_cycle.contract,
+                "run": &final_cycle.run,
+                "receipt": &final_cycle.receipt,
+                "decision": &final_cycle.decision,
+                "proof": &final_cycle.proof,
                 "autonomy_record": autonomy,
                 "outcome": outcome,
                 "success": success,
                 "decision_basis_summary": basis_summary,
                 "recommended_mode": recommended_mode,
                 "fallback_staged_enabled": fallback_staged,
+                "auto_chained_after_bootstrap": follow_up_cycle.is_some(),
+                "bootstrap_cycle": follow_up_cycle.as_ref().map(|_| serde_json::json!({
+                    "contract": &initial_cycle.contract,
+                    "run": &initial_cycle.run,
+                    "receipt": &initial_cycle.receipt,
+                    "decision": &initial_cycle.decision,
+                    "proof": &initial_cycle.proof,
+                })),
                 "next_command": next_command,
                 "recovery_command": recovery_command,
                 "recovery_contract": staged_recovery,
                 "recovery_next_command": recovery_next_command,
+                "auto_chain_note": auto_chain_note,
                 "follow_up": next_command,
             }))?
         );
@@ -779,15 +803,16 @@ fn cmd_go(
             format_go_summary(
                 &project,
                 trimmed_goal,
-                &approved.id,
-                &run.id,
-                &receipt.status,
-                &receipt.summary,
+                &final_cycle.contract.id,
+                &final_cycle.run.id,
+                &final_cycle.receipt.status,
+                &final_cycle.receipt.summary,
                 outcome,
-                decision_label(&decision.decision),
+                decision_label(&final_cycle.decision.decision),
                 &basis_summary,
-                &proof.id,
+                &final_cycle.proof.id,
                 &next_command,
+                auto_chain_note.as_deref(),
                 recovery_command.as_deref(),
                 staged_recovery
                     .as_ref()
@@ -800,12 +825,58 @@ fn cmd_go(
         Ok(())
     } else {
         Err(anyhow!(format_go_error(
-            &decision.decision,
-            &proof.id,
+            &final_cycle.decision.decision,
+            &final_cycle.proof.id,
             &next_command,
             recovery_command.as_deref(),
         )))
     }
+}
+
+struct GoCycleResult {
+    contract: punk_domain::Contract,
+    run: punk_domain::Run,
+    receipt: punk_domain::Receipt,
+    decision: punk_domain::DecisionObject,
+    proof: punk_domain::Proofpack,
+}
+
+fn run_go_cycle(
+    orch: &OrchService,
+    drafter: &CodexCliContractDrafter,
+    executor: &CodexCliExecutor,
+    gate: &GateService,
+    proof_service: &ProofService,
+    goal: &str,
+) -> Result<GoCycleResult> {
+    let contract = orch.draft_contract(drafter, goal)?;
+    let approved = orch.approve_contract(&contract.id)?;
+    let (run, receipt) = orch.cut_run(executor, &approved.id)?;
+    let decision = gate.gate_run(&run.id)?;
+    let proof = proof_service.write_proofpack(&decision.id)?;
+    Ok(GoCycleResult {
+        contract: approved,
+        run,
+        receipt,
+        decision,
+        proof,
+    })
+}
+
+fn should_auto_chain_after_bootstrap(goal: &str, cycle: &GoCycleResult) -> bool {
+    go_decision_succeeds(&cycle.decision.decision)
+        && cycle
+            .receipt
+            .summary
+            .contains("controller bootstrap scaffold created and checks passed")
+        && goal_requests_follow_up_implementation(goal)
+}
+
+fn goal_requests_follow_up_implementation(goal: &str) -> bool {
+    let lower = goal.to_ascii_lowercase();
+    ["implement", "add ", "support ", "wire ", "with tests"]
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 fn format_start_summary(
@@ -861,6 +932,7 @@ fn format_go_summary(
     basis_summary: &str,
     proof_id: &str,
     next_command: &str,
+    auto_chain_note: Option<&str>,
     recovery_command: Option<&str>,
     recovery_contract_id: Option<&str>,
     recovery_next_command: Option<&str>,
@@ -868,6 +940,9 @@ fn format_go_summary(
     let mut rendered = format!(
         "Goal: {goal}\nProject: {project}\nApproved contract: {contract_id}\nRun: {run_id} ({receipt_status})\nSummary: {receipt_summary}\nOutcome: {outcome}\nGate: {decision}\nBasis: {basis_summary}\nProof: {proof_id}\nNext: {next_command}"
     );
+    if let Some(auto_chain_note) = auto_chain_note {
+        rendered.push_str(&format!("\nAuto-chain: {auto_chain_note}"));
+    }
     if let Some(recovery_command) = recovery_command {
         rendered.push_str(&format!("\nRecovery: {recovery_command}"));
     }
@@ -1747,6 +1822,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(rendered.contains("Goal: add interview feedback summary endpoint"));
         assert!(rendered.contains("Project: interviewcoach"));
@@ -2058,6 +2134,105 @@ mod tests {
     }
 
     #[test]
+    fn auto_chain_requires_bootstrap_success_and_implementation_goal() {
+        let cycle = GoCycleResult {
+            contract: punk_domain::Contract {
+                id: "ct_123".into(),
+                feature_id: "feat_123".into(),
+                version: 1,
+                status: punk_domain::ContractStatus::Approved,
+                prompt_source: "scaffold and implement".into(),
+                entry_points: vec!["Cargo.toml".into()],
+                import_paths: vec![],
+                expected_interfaces: vec![],
+                behavior_requirements: vec![],
+                allowed_scope: vec!["Cargo.toml".into()],
+                target_checks: vec![],
+                integrity_checks: vec![],
+                risk_level: "low".into(),
+                created_at: "now".into(),
+                approved_at: Some("now".into()),
+            },
+            run: punk_domain::Run {
+                id: "run_123".into(),
+                task_id: "task_123".into(),
+                feature_id: "feat_123".into(),
+                contract_id: "ct_123".into(),
+                attempt: 1,
+                status: punk_domain::RunStatus::Finished,
+                mode_origin: punk_domain::ModeId::Cut,
+                started_at: "now".into(),
+                ended_at: Some("now".into()),
+                vcs: punk_domain::RunVcs {
+                    backend: punk_domain::VcsKind::Git,
+                    workspace_ref: ".".into(),
+                    change_ref: "change".into(),
+                    base_ref: None,
+                },
+            },
+            receipt: punk_domain::Receipt {
+                id: "rcpt_123".into(),
+                run_id: "run_123".into(),
+                task_id: "task_123".into(),
+                status: "success".into(),
+                executor_name: "codex-cli".into(),
+                changed_files: vec![],
+                artifacts: punk_domain::ReceiptArtifacts {
+                    stdout_ref: "stdout".into(),
+                    stderr_ref: "stderr".into(),
+                },
+                checks_run: vec![],
+                duration_ms: 1,
+                cost_usd: None,
+                summary: "PUNK_EXECUTION_COMPLETE: controller bootstrap scaffold created and checks passed".into(),
+                created_at: "now".into(),
+            },
+            decision: punk_domain::DecisionObject {
+                id: "dec_123".into(),
+                run_id: "run_123".into(),
+                contract_id: "ct_123".into(),
+                decision: punk_domain::Decision::Accept,
+                deterministic_status: punk_domain::DeterministicStatus::Pass,
+                target_status: punk_domain::CheckStatus::Pass,
+                integrity_status: punk_domain::CheckStatus::Pass,
+                confidence_estimate: 0.99,
+                decision_basis: vec![],
+                contract_ref: "ct_123".into(),
+                receipt_ref: "rcpt_123".into(),
+                check_refs: vec![],
+                command_evidence: vec![],
+                declared_harness_evidence: vec![],
+                harness_evidence: vec![],
+                created_at: "now".into(),
+            },
+            proof: punk_domain::Proofpack {
+                id: "proof_123".into(),
+                decision_id: "dec_123".into(),
+                run_id: "run_123".into(),
+                contract_ref: "ct_123".into(),
+                receipt_ref: "rcpt_123".into(),
+                decision_ref: "dec_123".into(),
+                check_refs: vec![],
+                command_evidence: vec![],
+                declared_harness_evidence: vec![],
+                harness_evidence: vec![],
+                hashes: Default::default(),
+                summary: "bootstrap".into(),
+                created_at: "now".into(),
+            },
+        };
+
+        assert!(should_auto_chain_after_bootstrap(
+            "scaffold Rust workspace and implement pubpunk init command with tests",
+            &cycle
+        ));
+        assert!(!should_auto_chain_after_bootstrap(
+            "scaffold Rust workspace for pubpunk",
+            &cycle
+        ));
+    }
+
+    #[test]
     fn go_summary_includes_prepared_staged_recovery() {
         let rendered = format_go_summary(
             "interviewcoach",
@@ -2071,10 +2246,12 @@ mod tests {
             "target checks failed",
             "proof_789",
             "punk inspect proof_789 --json",
+            Some("bootstrap proof proof_111 triggered follow-up implementation cycle proof_789"),
             Some("punk start \"ship feature\""),
             Some("ct_999"),
             Some("punk plot approve ct_999"),
         );
+        assert!(rendered.contains("Auto-chain: bootstrap proof proof_111 triggered follow-up implementation cycle proof_789"));
         assert!(rendered.contains("Recovery: punk start \"ship feature\""));
         assert!(rendered.contains("Recovery contract: ct_999"));
         assert!(rendered.contains("Recovery next: punk plot approve ct_999"));
