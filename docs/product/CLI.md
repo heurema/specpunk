@@ -351,6 +351,7 @@ Timeout expectation:
 - for bootstrapped greenfield Go and Python scaffold goals, timeout fallback should preserve their manifest-first scaffold scope (`go.mod`/`pyproject.toml` plus ecosystem directories) instead of collapsing into docs/archive candidates
 - for a bootstrapped greenfield TypeScript/Node scaffold goal, timeout fallback should preserve manifest-first scaffold scope (`package.json`, optional `tsconfig.json`, plus `src`/`tests` or workspace directories) instead of collapsing into docs/archive candidates
 - that same timeout fallback should keep scaffold-oriented `expected_interfaces` / `behavior_requirements` derived from the prompt and manifest kind instead of generic `approve-ready bounded contract` placeholder text
+- when timeout fallback keeps or recovers file-level `entry_points`, it must re-add any missing entry points into `allowed_scope` before validation so recovery does not fail on self-inconsistent scope coverage
 - non-timeout drafter failures should still fail closed
 
 Writes:

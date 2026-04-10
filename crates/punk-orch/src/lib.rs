@@ -2397,6 +2397,7 @@ fn finalize_timeout_fallback_proposal(
     if let Some(guidance) = guidance {
         apply_explicit_prompt_overrides(repo_root, guidance, &mut proposal);
     }
+    ensure_timeout_fallback_scope_covers_entry_points(&mut proposal);
     let mut errors = validate_draft_proposal(repo_root, &proposal);
     if errors.is_empty() {
         return Ok(proposal);
@@ -2409,6 +2410,7 @@ fn finalize_timeout_fallback_proposal(
         if let Some(guidance) = guidance {
             apply_explicit_prompt_overrides(repo_root, guidance, &mut fallback);
         }
+        ensure_timeout_fallback_scope_covers_entry_points(&mut fallback);
         errors = validate_draft_proposal(repo_root, &fallback);
         if errors.is_empty() {
             return Ok(fallback);
@@ -2419,6 +2421,30 @@ fn finalize_timeout_fallback_proposal(
         "timed-out drafter proposal could not be recovered: {}",
         format_validation_guidance(&errors)
     ))
+}
+
+fn ensure_timeout_fallback_scope_covers_entry_points(proposal: &mut DraftProposal) {
+    let missing_entry_points = proposal
+        .entry_points
+        .iter()
+        .filter(|entry_point| {
+            !timeout_fallback_scope_covers_entry_point(&proposal.allowed_scope, entry_point)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for entry_point in missing_entry_points {
+        if !proposal.allowed_scope.iter().any(|existing| existing == &entry_point) {
+            proposal.allowed_scope.push(entry_point);
+        }
+    }
+}
+
+fn timeout_fallback_scope_covers_entry_point(allowed_scope: &[String], entry_point: &str) -> bool {
+    let entry = entry_point.trim().trim_matches('/');
+    allowed_scope.iter().any(|scope| {
+        let scope = scope.trim().trim_matches('/');
+        entry == scope || entry.starts_with(&format!("{scope}/"))
+    })
 }
 
 fn timeout_seed_proposal(prompt: &str, scan: &punk_domain::RepoScanSummary) -> DraftProposal {
@@ -4415,6 +4441,127 @@ mod tests {
             contract.integrity_checks,
             vec!["cargo test --workspace".to_string()]
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeout_fallback_scope_readds_missing_entry_points_before_validation() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-entry-point-coverage-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname = \"pubpunk-cli\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname = \"pubpunk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/pubpunk-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "tests\n").unwrap();
+
+        let mut proposal = DraftProposal {
+            title: "Implement pubpunk init".to_string(),
+            summary: "Timeout fallback draft".to_string(),
+            entry_points: vec![
+                "crates/pubpunk-cli/Cargo.toml".to_string(),
+                "crates/pubpunk-core/Cargo.toml".to_string(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["pubpunk init".to_string()],
+            behavior_requirements: vec!["implement pubpunk init".to_string()],
+            allowed_scope: vec![
+                "crates/pubpunk-cli/src/main.rs".to_string(),
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/README.md".to_string(),
+            ],
+            target_checks: vec!["cargo test --workspace".to_string()],
+            integrity_checks: vec!["cargo test --workspace".to_string()],
+            risk_level: "medium".to_string(),
+        };
+
+        ensure_timeout_fallback_scope_covers_entry_points(&mut proposal);
+
+        assert!(proposal
+            .allowed_scope
+            .contains(&"crates/pubpunk-cli/Cargo.toml".to_string()));
+        assert!(proposal
+            .allowed_scope
+            .contains(&"crates/pubpunk-core/Cargo.toml".to_string()));
+        assert!(validate_draft_proposal(&root, &proposal).is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_timeout_fallback_keeps_entry_points_covered_for_pubpunk_init_prompt() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-pubpunk-init-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname = \"pubpunk-cli\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname = \"pubpunk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/pubpunk-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "tests\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let prompt = "implement pubpunk init command in crates/pubpunk-cli and crates/pubpunk-core with tests: when run, it creates the canonical .pubpunk skeleton and returns JSON for --json; keep cargo test --workspace green";
+        let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
+
+        assert!(!contract.entry_points.is_empty());
+        for entry_point in &contract.entry_points {
+            assert!(
+                contract.allowed_scope.iter().any(|scope| {
+                    let scope = scope.trim_matches('/');
+                    let entry = entry_point.trim_matches('/');
+                    entry == scope || entry.starts_with(&format!("{scope}/"))
+                }),
+                "entry point {} must be covered by allowed_scope {:?}",
+                entry_point,
+                contract.allowed_scope
+            );
+        }
 
         let _ = fs::remove_dir_all(&root);
     }
