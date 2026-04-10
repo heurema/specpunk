@@ -1795,20 +1795,20 @@ fn rust_workspace_bootstrap_crate_dirs(contract: &Contract) -> Vec<String> {
 
 fn infer_rust_bootstrap_app_slug(contract: &Contract) -> Option<String> {
     let mut candidates = Vec::new();
+    candidates.extend(extract_prompt_bootstrap_targets(&contract.prompt_source));
     candidates.extend(extract_backticked_identifiers(&contract.prompt_source));
     for item in &contract.expected_interfaces {
-        candidates.extend(extract_backticked_identifiers(item));
         if let Some(cli_name) = extract_cli_name(item) {
             candidates.push(cli_name);
         }
+        candidates.extend(extract_backticked_identifiers(item));
     }
     for item in &contract.behavior_requirements {
-        candidates.extend(extract_backticked_identifiers(item));
         if let Some(cli_name) = extract_cli_name(item) {
             candidates.push(cli_name);
         }
+        candidates.extend(extract_backticked_identifiers(item));
     }
-    candidates.extend(extract_prompt_bootstrap_targets(&contract.prompt_source));
     candidates
         .into_iter()
         .find(|candidate| is_viable_bootstrap_app_slug(candidate))
@@ -1843,7 +1843,11 @@ fn extract_cli_name(text: &str) -> Option<String> {
     let tokens = tokenize_ascii_words(text);
     tokens
         .windows(2)
-        .find(|window| window[1] == "cli" && is_viable_bootstrap_app_slug(&window[0]))
+        .find(|window| {
+            window[1] == "cli"
+                && !matches!(window[0].as_str(), "a" | "an" | "the")
+                && is_viable_bootstrap_app_slug(&window[0])
+        })
         .map(|window| window[0].clone())
 }
 
@@ -1892,6 +1896,9 @@ fn is_viable_bootstrap_app_slug(value: &str) -> bool {
         || normalized == "core"
         || normalized == "init"
         || normalized == "validate"
+        || normalized == "a"
+        || normalized == "an"
+        || normalized == "the"
     {
         return false;
     }
@@ -7165,6 +7172,63 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn materialize_rust_workspace_bootstrap_scaffold_ignores_article_cli_phrase_when_inferring_slug()
+    {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-greenfield-bootstrap-article-cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let contract = Contract {
+            id: "ct_manifest".into(),
+            feature_id: "feat_manifest".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source:
+                "scaffold Rust workspace and implement pubpunk init command with --json output and tests"
+                    .into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "A Rust workspace manifest at Cargo.toml.".into(),
+                "A CLI binary exposing pubpunk init.".into(),
+                "A --json output mode for pubpunk init.".into(),
+                "Workspace tests validating init behavior and JSON output.".into(),
+            ],
+            behavior_requirements: vec![
+                "Scaffold a minimal Rust workspace rooted at Cargo.toml for the pubpunk repository."
+                    .into(),
+                "Implement a pubpunk init command conservatively, keeping scope limited to workspace bootstrap and init behavior only."
+                    .into(),
+            ],
+            allowed_scope: vec!["Cargo.toml".into(), "crates".into(), "tests".into()],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let created = materialize_rust_workspace_bootstrap_scaffold(&root, &contract).unwrap();
+        assert!(created
+            .iter()
+            .any(|path| path == "crates/pubpunk-cli/Cargo.toml"));
+        assert!(created
+            .iter()
+            .any(|path| path == "crates/pubpunk-core/Cargo.toml"));
+        assert!(!created.iter().any(|path| path.contains("crates/a-cli")));
+        assert!(!created.iter().any(|path| path.contains("crates/a-core")));
 
         let _ = fs::remove_dir_all(&root);
     }
