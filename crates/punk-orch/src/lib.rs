@@ -2401,6 +2401,9 @@ fn sync_present_isolated_changes_to_repo_root(
     workspace_root: &Path,
     changed_files: &[String],
 ) -> Result<()> {
+    if repo_root == workspace_root {
+        return Ok(());
+    }
     for path in changed_files.iter().filter(|path| {
         !path.starts_with(".punk/")
             && !path.starts_with("target/")
@@ -2411,6 +2414,9 @@ fn sync_present_isolated_changes_to_repo_root(
             continue;
         }
         let destination = repo_root.join(path);
+        if source == destination {
+            continue;
+        }
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -2424,6 +2430,9 @@ fn sync_present_repo_root_changes_to_isolated_workspace(
     workspace_root: &Path,
     changed_files: &[String],
 ) -> Result<()> {
+    if repo_root == workspace_root {
+        return Ok(());
+    }
     for path in changed_files.iter().filter(|path| {
         !path.starts_with(".punk/")
             && !path.starts_with("target/")
@@ -2434,6 +2443,9 @@ fn sync_present_repo_root_changes_to_isolated_workspace(
             continue;
         }
         let destination = workspace_root.join(path);
+        if source == destination {
+            continue;
+        }
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -5387,6 +5399,74 @@ mod tests {
         assert!(!workspace
             .join(".playwright-mcp/state/session.json")
             .exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_present_repo_root_changes_to_isolated_workspace_skips_self_copy() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-sync-self-root-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn keep() {}
+",
+        )
+        .unwrap();
+
+        sync_present_repo_root_changes_to_isolated_workspace(
+            &root,
+            &root,
+            &["crates/pubpunk-core/src/lib.rs".into()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("crates/pubpunk-core/src/lib.rs")).unwrap(),
+            "pub fn keep() {}
+"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_present_isolated_changes_to_repo_root_skips_self_copy() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-sync-self-workspace-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("tests/init_json.rs"), "#[test]
+fn ok() {}
+").unwrap();
+
+        sync_present_isolated_changes_to_repo_root(
+            &root,
+            &root,
+            &["tests/init_json.rs".into()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("tests/init_json.rs")).unwrap(),
+            "#[test]
+fn ok() {}
+"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
