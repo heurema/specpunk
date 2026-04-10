@@ -308,7 +308,12 @@ impl Executor for CodexCliExecutor {
         } else {
             Vec::new()
         };
-        let mut attempt = self.run_execution_attempt(&input, &created_entry_points, false)?;
+        let created_bootstrap_scaffold =
+            materialize_rust_workspace_bootstrap_scaffold(&input.repo_root, &input.contract)?;
+        let bootstrap_scaffold_paths = controller_bootstrap_scaffold_paths(&input.contract);
+        let mut created_scaffold_paths = created_entry_points.clone();
+        extend_unique_paths(&mut created_scaffold_paths, &created_bootstrap_scaffold);
+        let mut attempt = self.run_execution_attempt(&input, &created_scaffold_paths, false)?;
         if !attempt.restored_paths.is_empty() {
             return Ok(ExecuteOutput {
                 success: false,
@@ -332,7 +337,7 @@ impl Executor for CodexCliExecutor {
                 &stdout,
                 &stderr,
             ) {
-                attempt = self.run_execution_attempt(&input, &created_entry_points, true)?;
+                attempt = self.run_execution_attempt(&input, &created_scaffold_paths, true)?;
                 if !attempt.restored_paths.is_empty() {
                     return Ok(ExecuteOutput {
                         success: false,
@@ -350,6 +355,42 @@ impl Executor for CodexCliExecutor {
         let timed_output = attempt.timed_output;
         fs::write(&input.stdout_path, &timed_output.output.stdout)?;
         fs::write(&input.stderr_path, &timed_output.output.stderr)?;
+        if !bootstrap_scaffold_paths.is_empty()
+            && no_progress_only_in_controller_scaffold(
+                &timed_output.no_progress_paths,
+                &bootstrap_scaffold_paths,
+            )
+        {
+            let checks = merged_contract_checks(&input.contract);
+            match run_contract_checks(
+                &input.repo_root,
+                &input.contract,
+                &checks,
+                &input.stdout_path,
+                &input.stderr_path,
+            ) {
+                Ok(checks_run) => {
+                    return Ok(ExecuteOutput {
+                        success: true,
+                        summary: "PUNK_EXECUTION_COMPLETE: controller bootstrap scaffold created and checks passed".to_string(),
+                        checks_run,
+                        cost_usd: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
+                Err(err) => {
+                    return Ok(ExecuteOutput {
+                        success: false,
+                        summary: format!(
+                            "controller bootstrap scaffold created but verification failed: {err}"
+                        ),
+                        checks_run: Vec::new(),
+                        cost_usd: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
+            }
+        }
         let stdout = String::from_utf8_lossy(&timed_output.output.stdout);
         let stderr = String::from_utf8_lossy(&timed_output.output.stderr);
         let (success, summary) = if !timed_output.no_progress_paths.is_empty() {
@@ -902,7 +943,7 @@ impl CodexCliExecutor {
     fn run_execution_attempt(
         &self,
         input: &ExecuteInput,
-        created_entry_points: &[String],
+        created_scaffold_paths: &[String],
         retry_mode: bool,
     ) -> Result<AttemptOutcome> {
         let context_pack = if is_fail_closed_scope_task(&input.contract) {
@@ -923,8 +964,19 @@ impl CodexCliExecutor {
         } else {
             None
         };
-        let entry_point_snapshots = if is_fail_closed_scope_task(&input.contract) {
-            capture_entry_point_snapshots(&input.repo_root, &input.contract)?
+        let mut progress_probe_paths = created_scaffold_paths.to_vec();
+        extend_unique_paths(
+            &mut progress_probe_paths,
+            &controller_bootstrap_scaffold_paths(&input.contract),
+        );
+        let entry_point_snapshots = if is_fail_closed_scope_task(&input.contract)
+            || !progress_probe_paths.is_empty()
+        {
+            capture_entry_point_snapshots(
+                &input.repo_root,
+                &input.contract,
+                &progress_probe_paths,
+            )?
         } else {
             Vec::new()
         };
@@ -932,7 +984,7 @@ impl CodexCliExecutor {
         let prompt = build_exec_prompt_with_mode(
             &input.contract,
             context_pack.as_ref(),
-            created_entry_points,
+            created_scaffold_paths,
             retry_mode,
         );
         let git_guard = if is_fail_closed_scope_task(&input.contract) {
@@ -986,7 +1038,12 @@ impl CodexCliExecutor {
                 let _ = restore_missing_materialized_entry_points(
                     &input.repo_root,
                     &input.contract,
-                    created_entry_points,
+                    created_scaffold_paths,
+                );
+                let _ = restore_rust_workspace_bootstrap_scaffold(
+                    &input.repo_root,
+                    &input.contract,
+                    created_scaffold_paths,
                 );
                 return Err(err);
             }
@@ -995,8 +1052,15 @@ impl CodexCliExecutor {
         let restored_paths = restore_missing_materialized_entry_points(
             &input.repo_root,
             &input.contract,
-            created_entry_points,
+            created_scaffold_paths,
         )?;
+        let restored_bootstrap_paths = restore_rust_workspace_bootstrap_scaffold(
+            &input.repo_root,
+            &input.contract,
+            created_scaffold_paths,
+        )?;
+        let mut restored_paths = restored_paths;
+        extend_unique_paths(&mut restored_paths, &restored_bootstrap_paths);
         Ok(AttemptOutcome {
             timed_output,
             restored_paths,
@@ -1008,26 +1072,26 @@ impl CodexCliExecutor {
 fn build_exec_prompt(
     contract: &Contract,
     context_pack: Option<&ContextPack>,
-    created_entry_points: &[String],
+    created_scaffold_paths: &[String],
 ) -> String {
-    build_exec_prompt_with_mode(contract, context_pack, created_entry_points, false)
+    build_exec_prompt_with_mode(contract, context_pack, created_scaffold_paths, false)
 }
 
 fn build_exec_prompt_with_mode(
     contract: &Contract,
     context_pack: Option<&ContextPack>,
-    created_entry_points: &[String],
+    created_scaffold_paths: &[String],
     retry_mode: bool,
 ) -> String {
     let scope_rule = fail_closed_scope_rule(contract);
     let meta_workflow_rule = forbid_meta_workflow_rule();
     let vcs_restore_rule = forbid_vcs_restore_rule();
-    let created_entry_points_section = if created_entry_points.is_empty() {
+    let created_entry_points_section = if created_scaffold_paths.is_empty() {
         String::new()
     } else {
         format!(
-            "The following entry-point files were materialized for this run and must remain present: {}. Edit those paths in place and do not delete or rename them.\n",
-            created_entry_points.join(", ")
+            "The following controller-owned scaffold files were materialized for this run and must remain present: {}. Edit those paths in place and do not delete or rename them.\n",
+            created_scaffold_paths.join(", ")
         )
     };
     let context_pack_section = context_pack
@@ -1306,6 +1370,192 @@ fn codex_patch_lane_timeout() -> Duration {
         .filter(|value| *value > 0)
         .unwrap_or(90);
     Duration::from_secs(seconds)
+}
+
+fn materialize_rust_workspace_bootstrap_scaffold(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Result<Vec<String>> {
+    let Some(files) = rust_workspace_bootstrap_templates(contract) else {
+        return Ok(Vec::new());
+    };
+    let mut created = Vec::new();
+    for (path, contents) in files {
+        if !path_is_in_allowed_scope(&path, &contract.allowed_scope) {
+            continue;
+        }
+        let file_path = repo_root.join(&path);
+        if file_path.exists() {
+            continue;
+        }
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create bootstrap scaffold parent {}", path))?;
+        }
+        fs::write(&file_path, contents)
+            .with_context(|| format!("materialize bootstrap scaffold {}", path))?;
+        created.push(path);
+    }
+    Ok(created)
+}
+
+fn restore_rust_workspace_bootstrap_scaffold(
+    repo_root: &Path,
+    contract: &Contract,
+    created_paths: &[String],
+) -> Result<Vec<String>> {
+    let Some(files) = rust_workspace_bootstrap_templates(contract) else {
+        return Ok(Vec::new());
+    };
+    let template_map = files.into_iter().collect::<std::collections::BTreeMap<_, _>>();
+    let mut restored = Vec::new();
+    for path in created_paths {
+        let Some(contents) = template_map.get(path) else {
+            continue;
+        };
+        let file_path = repo_root.join(path);
+        if file_path.exists() {
+            continue;
+        }
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create restored bootstrap scaffold parent {}", path))?;
+        }
+        fs::write(&file_path, contents)
+            .with_context(|| format!("restore bootstrap scaffold {}", path))?;
+        restored.push(path.clone());
+    }
+    Ok(restored)
+}
+
+fn rust_workspace_bootstrap_templates(contract: &Contract) -> Option<Vec<(String, String)>> {
+    if contract.entry_points != vec!["Cargo.toml".to_string()] {
+        return None;
+    }
+    if !contract
+        .target_checks
+        .iter()
+        .chain(contract.integrity_checks.iter())
+        .any(|check| check.trim() == "cargo test --workspace")
+    {
+        return None;
+    }
+    let crate_dirs = contract
+        .allowed_scope
+        .iter()
+        .filter(|scope| scope.starts_with("crates/") && !is_file_like_scope(scope))
+        .cloned()
+        .collect::<Vec<_>>();
+    if crate_dirs.is_empty() {
+        return None;
+    }
+
+    let core_crate = crate_dirs
+        .iter()
+        .map(|dir| rust_crate_name_from_scope(dir))
+        .find(|name| name.contains("core"));
+    let mut files = vec![(
+        "Cargo.toml".to_string(),
+        render_rust_workspace_manifest(&crate_dirs),
+    )];
+
+    for crate_dir in &crate_dirs {
+        let crate_name = rust_crate_name_from_scope(crate_dir);
+        let is_binary = crate_name.contains("cli");
+        files.push((
+            format!("{crate_dir}/Cargo.toml"),
+            render_rust_member_manifest(&crate_name, is_binary, core_crate.as_deref()),
+        ));
+        let source_path = if is_binary {
+            format!("{crate_dir}/src/main.rs")
+        } else {
+            format!("{crate_dir}/src/lib.rs")
+        };
+        files.push((
+            source_path,
+            render_rust_member_source(&crate_name, is_binary, core_crate.as_deref()),
+        ));
+    }
+
+    if contract
+        .allowed_scope
+        .iter()
+        .any(|scope| scope == "tests" || scope.starts_with("tests/"))
+    {
+        files.push((
+            "tests/README.md".to_string(),
+            "# Controller-owned bootstrap placeholder\n".to_string(),
+        ));
+    }
+
+    Some(files)
+}
+
+fn controller_bootstrap_scaffold_paths(contract: &Contract) -> Vec<String> {
+    rust_workspace_bootstrap_templates(contract)
+        .map(|files| files.into_iter().map(|(path, _)| path).collect())
+        .unwrap_or_default()
+}
+
+fn rust_crate_name_from_scope(scope: &str) -> String {
+    scope.rsplit('/').next().unwrap_or(scope).to_string()
+}
+
+fn render_rust_workspace_manifest(crate_dirs: &[String]) -> String {
+    let members = crate_dirs
+        .iter()
+        .map(|dir| format!("    \"{dir}\","))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "[workspace]\nresolver = \"2\"\nmembers = [\n{members}\n]\n"
+    )
+}
+
+fn render_rust_member_manifest(
+    crate_name: &str,
+    is_binary: bool,
+    core_crate: Option<&str>,
+) -> String {
+    let mut manifest = format!(
+        "[package]\nname = \"{crate_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+    );
+    if is_binary {
+        if let Some(core_crate) = core_crate.filter(|core| *core != crate_name) {
+            manifest.push_str("\n[dependencies]\n");
+            manifest.push_str(&format!(
+                "{core_crate} = {{ path = \"../{core_crate}\" }}\n"
+            ));
+        }
+    }
+    manifest
+}
+
+fn render_rust_member_source(
+    crate_name: &str,
+    is_binary: bool,
+    core_crate: Option<&str>,
+) -> String {
+    if is_binary {
+        if let Some(core_crate) = core_crate.filter(|core| *core != crate_name) {
+            let crate_ref = core_crate.replace('-', "_");
+            return format!(
+                "fn main() {{\n    let _ = {crate_ref}::init();\n    let _ = {crate_ref}::validate();\n}}\n"
+            );
+        }
+        return "fn main() {}\n".to_string();
+    }
+
+    "pub fn init() -> &'static str {\n    \"pubpunk initialized\"\n}\n\npub fn validate() -> bool {\n    true\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn bootstrap_smoke() {\n        assert_eq!(init(), \"pubpunk initialized\");\n        assert!(validate());\n    }\n}\n"
+        .to_string()
+}
+
+fn extend_unique_paths(target: &mut Vec<String>, extra: &[String]) {
+    for path in extra {
+        if !target.iter().any(|existing| existing == path) {
+            target.push(path.clone());
+        }
+    }
 }
 
 fn codex_plan_prepass_timeout() -> Duration {
@@ -1694,6 +1944,26 @@ fn greenfield_manifest_blocked_summary(repo_root: &Path, contract: &Contract) ->
         missing_surfaces.join(", "),
         check
     ))
+}
+
+fn no_progress_only_in_controller_scaffold(
+    no_progress_paths: &[String],
+    created_scaffold_paths: &[String],
+) -> bool {
+    !no_progress_paths.is_empty()
+        && no_progress_paths
+            .iter()
+            .all(|path| created_scaffold_paths.iter().any(|created| created == path))
+}
+
+fn merged_contract_checks(contract: &Contract) -> Vec<String> {
+    let mut checks = contract.target_checks.clone();
+    for check in &contract.integrity_checks {
+        if !checks.iter().any(|existing| existing == check) {
+            checks.push(check.clone());
+        }
+    }
+    checks
 }
 
 fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<TimedOutput> {
@@ -2559,9 +2829,12 @@ fn write_executor_pid(path: &std::path::Path, child_pid: u32) -> Result<()> {
 fn capture_entry_point_snapshots(
     repo_root: &std::path::Path,
     contract: &Contract,
+    extra_paths: &[String],
 ) -> Result<Vec<EntryPointSnapshot>> {
     let mut snapshots = Vec::new();
-    for entry_point in &contract.entry_points {
+    let mut paths = contract.entry_points.clone();
+    extend_unique_paths(&mut paths, extra_paths);
+    for entry_point in &paths {
         if !is_file_like_scope(entry_point) {
             continue;
         }
@@ -5708,6 +5981,169 @@ mod tests {
         assert!(summary.contains("cargo test --workspace"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn materialize_rust_workspace_bootstrap_scaffold_creates_compile_ready_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-greenfield-bootstrap-materialize-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let contract = Contract {
+            id: "ct_manifest".into(),
+            feature_id: "feat_manifest".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "bootstrap initial Rust workspace for pubpunk".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+            ],
+            expected_interfaces: vec!["initial Rust scaffold".into()],
+            behavior_requirements: vec!["bootstrap project".into()],
+            allowed_scope: vec![
+                "Cargo.toml".into(),
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let created = materialize_rust_workspace_bootstrap_scaffold(&root, &contract).unwrap();
+        assert!(created.iter().any(|path| path == "Cargo.toml"));
+        assert!(created.iter().any(|path| path == "crates/pubpunk-cli/Cargo.toml"));
+        assert!(created.iter().any(|path| path == "crates/pubpunk-cli/src/main.rs"));
+        assert!(created.iter().any(|path| path == "crates/pubpunk-core/Cargo.toml"));
+        assert!(created.iter().any(|path| path == "crates/pubpunk-core/src/lib.rs"));
+        assert!(created.iter().any(|path| path == "tests/README.md"));
+
+        let status = Command::new("cargo")
+            .args(["test", "--workspace"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn capture_entry_point_snapshots_includes_created_bootstrap_files() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-greenfield-bootstrap-snapshots-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let contract = Contract {
+            id: "ct_manifest".into(),
+            feature_id: "feat_manifest".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "bootstrap initial Rust workspace for pubpunk".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+            ],
+            expected_interfaces: vec!["initial Rust scaffold".into()],
+            behavior_requirements: vec!["bootstrap project".into()],
+            allowed_scope: vec![
+                "Cargo.toml".into(),
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let created = materialize_rust_workspace_bootstrap_scaffold(&root, &contract).unwrap();
+        let snapshots = capture_entry_point_snapshots(&root, &contract, &created).unwrap();
+        let paths = snapshots
+            .iter()
+            .map(|snapshot| snapshot.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"Cargo.toml"));
+        assert!(paths.contains(&"crates/pubpunk-cli/Cargo.toml"));
+        assert!(paths.contains(&"crates/pubpunk-cli/src/main.rs"));
+        assert!(paths.contains(&"crates/pubpunk-core/Cargo.toml"));
+        assert!(paths.contains(&"crates/pubpunk-core/src/lib.rs"));
+        assert!(paths.contains(&"tests/README.md"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_progress_only_in_controller_scaffold_matches_created_paths() {
+        assert!(no_progress_only_in_controller_scaffold(
+            &[
+                "Cargo.toml".to_string(),
+                "crates/pubpunk-cli/Cargo.toml".to_string(),
+            ],
+            &[
+                "Cargo.toml".to_string(),
+                "crates/pubpunk-cli/Cargo.toml".to_string(),
+                "crates/pubpunk-cli/src/main.rs".to_string(),
+            ],
+        ));
+        assert!(!no_progress_only_in_controller_scaffold(
+            &["Cargo.toml".to_string(), "README.md".to_string()],
+            &["Cargo.toml".to_string()],
+        ));
+    }
+
+    #[test]
+    fn merged_contract_checks_dedupes_target_and_integrity_lists() {
+        let contract = Contract {
+            id: "ct_manifest".into(),
+            feature_id: "feat_manifest".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "bootstrap".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec![],
+            behavior_requirements: vec![],
+            allowed_scope: vec!["Cargo.toml".into()],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec![
+                "cargo test --workspace".into(),
+                "cargo test -p pubpunk-core".into(),
+            ],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert_eq!(
+            merged_contract_checks(&contract),
+            vec![
+                "cargo test --workspace".to_string(),
+                "cargo test -p pubpunk-core".to_string(),
+            ]
+        );
     }
 
     #[test]

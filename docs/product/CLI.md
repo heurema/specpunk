@@ -427,6 +427,7 @@ Behavior notes:
 - if file-level entry points like `Cargo.toml`, `go.mod`, `pyproject.toml`, or `package.json` were missing at baseline and remain missing after bounded dispatch, `cut run` should still fail closed as no-progress instead of hanging indefinitely on executor noise
 - manifest-only greenfield bootstrap runs should use a short executor timeout budget instead of waiting for the full generic execution timeout before normalizing to blocked/no-progress
 - if that same greenfield missing-manifest bootstrap case later degrades into timeout, stall, or orphan classification, `cut run` should still collapse it into the same deterministic blocked summary instead of flapping between blocked and stall-style failures
+- for an approved Rust workspace bootstrap contract that explicitly names crate directories under `crates/...`, `cut run` may materialize a minimal controller-owned workspace scaffold inside `allowed_scope` before dispatch so execution starts from concrete files instead of immediately blocking on an empty layout
 - `gate` and `proof` remain authoritative; this cut-time success does not replace verification
 
 ### `punk gate run <run-id>`
