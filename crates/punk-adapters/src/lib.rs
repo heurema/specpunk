@@ -59,6 +59,7 @@ struct TimedOutput {
 struct PatchLaneTimedOutput {
     output: std::process::Output,
     timed_out: bool,
+    stalled: bool,
     orphaned: bool,
     response: Option<PatchLaneResponse>,
 }
@@ -619,14 +620,32 @@ impl CodexCliExecutor {
     fn execute_patch_apply_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
         let start = Instant::now();
         restore_stale_entry_point_masks(&input.repo_root)?;
-        let _materialized_entry_points = if is_fail_closed_scope_task(&input.contract) {
+        let materialized_entry_points = if is_fail_closed_scope_task(&input.contract) {
             materialize_missing_entry_points(&input.repo_root, &input.contract)?
         } else {
             Vec::new()
         };
+        let mut patch_progress_probe_paths = materialized_entry_points.clone();
+        extend_unique_paths(
+            &mut patch_progress_probe_paths,
+            &controller_bootstrap_scaffold_paths(&input.contract),
+        );
+        let patch_entry_point_snapshots =
+            if should_capture_progress_snapshots(&input.contract, &patch_progress_probe_paths) {
+                capture_entry_point_snapshots(
+                    &input.repo_root,
+                    &input.contract,
+                    &patch_progress_probe_paths,
+                )?
+            } else {
+                Vec::new()
+            };
         let mut retry_feedback = None;
+        let mut slow_patch_retry_used = false;
+        let max_attempts = patch_apply_max_attempts(&input.contract);
 
-        for retry_mode in [false, true] {
+        for attempt_index in 0..max_attempts {
+            let retry_mode = attempt_index > 0;
             let mut context_pack = build_context_pack(&input.repo_root, &input.contract)?;
             if retry_mode {
                 ensure_retry_patch_seed(&input.repo_root, &input.contract, &mut context_pack);
@@ -715,7 +734,8 @@ impl CodexCliExecutor {
             let prompt = build_patch_apply_prompt(
                 &input.contract,
                 &context_pack,
-                retry_mode,
+                attempt_index,
+                max_attempts,
                 retry_feedback.as_deref(),
             );
 
@@ -743,6 +763,7 @@ impl CodexCliExecutor {
             let timed_output = match run_patch_lane_command_with_timeout(
                 &mut command,
                 codex_patch_lane_timeout(),
+                codex_executor_stall_timeout(),
                 input.stdout_path.clone(),
                 input.stderr_path.clone(),
                 input.executor_pid_path.clone(),
@@ -766,10 +787,58 @@ impl CodexCliExecutor {
                 .response
                 .clone()
                 .or_else(|| load_patch_lane_response(&stdout, &stderr).ok());
-            if timed_output.timed_out && response.is_none() {
+            if (timed_output.timed_out || timed_output.stalled) && response.is_none() {
+                let summary = if timed_output.stalled {
+                    stall_summary(codex_executor_stall_timeout(), &stdout, &stderr)
+                } else {
+                    timeout_summary(codex_patch_lane_timeout(), &stdout, &stderr)
+                };
+                if !slow_patch_retry_used {
+                    slow_patch_retry_used = true;
+                    retry_feedback = Some(patch_apply_retry_feedback(
+                        &summary,
+                        &input.repo_root,
+                        &input.contract.allowed_scope,
+                        &input.stdout_path,
+                        &input.stderr_path,
+                    )?);
+                    append_log_text(
+                        &input.stderr_path,
+                        &format!(
+                            "\n[punk patch/apply] retrying after {} with bounded repair context (pass {} of {})\n",
+                            if timed_output.stalled {
+                                "no-output stall"
+                            } else {
+                                "timeout"
+                            },
+                            attempt_index + 2,
+                            max_attempts
+                        ),
+                    )?;
+                    continue;
+                }
+                if !patch_entry_point_snapshots.is_empty() {
+                    let unchanged_paths =
+                        unchanged_entry_point_paths(&input.repo_root, &patch_entry_point_snapshots)?;
+                    if !unchanged_paths.is_empty()
+                        && unchanged_paths.len() == patch_entry_point_snapshots.len()
+                    {
+                        return Ok(ExecuteOutput {
+                            success: false,
+                            summary: no_progress_after_dispatch_summary(
+                                &unchanged_paths,
+                                &stdout,
+                                &stderr,
+                            ),
+                            checks_run: Vec::new(),
+                            cost_usd: None,
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        });
+                    }
+                }
                 return Ok(ExecuteOutput {
                     success: false,
-                    summary: timeout_summary(codex_patch_lane_timeout(), &stdout, &stderr),
+                    summary,
                     checks_run: Vec::new(),
                     cost_usd: None,
                     duration_ms: start.elapsed().as_millis() as u64,
@@ -881,9 +950,12 @@ impl CodexCliExecutor {
             ) {
                 Ok(checks_run) => checks_run,
                 Err(summary) => {
-                    if !retry_mode
-                        && should_retry_patch_apply_after_check_failure(&input.contract, &summary)
-                    {
+                    if should_retry_patch_apply_after_check_failure(
+                        &input.contract,
+                        &summary,
+                        attempt_index,
+                        max_attempts,
+                    ) {
                         retry_feedback = Some(patch_apply_retry_feedback(
                             &summary,
                             &input.repo_root,
@@ -893,7 +965,11 @@ impl CodexCliExecutor {
                         )?);
                         append_log_text(
                             &input.stderr_path,
-                            "\n[punk patch/apply] retrying once after failed checks with bounded repair context\n",
+                            &format!(
+                                "\n[punk patch/apply] retrying with bounded repair context (pass {} of {})\n",
+                                attempt_index + 2,
+                                max_attempts
+                            ),
                         )?;
                         continue;
                     }
@@ -921,7 +997,9 @@ impl CodexCliExecutor {
 
         Ok(ExecuteOutput {
             success: false,
-            summary: "patch/apply lane exhausted repair attempts".to_string(),
+            summary: format!(
+                "patch/apply lane exhausted repair attempts after {max_attempts} passes"
+            ),
             checks_run: Vec::new(),
             cost_usd: None,
             duration_ms: start.elapsed().as_millis() as u64,
@@ -1230,7 +1308,8 @@ fn build_exec_prompt_with_mode_and_visible_files(
 fn build_patch_apply_prompt(
     contract: &Contract,
     context_pack: &ContextPack,
-    retry_mode: bool,
+    attempt_index: usize,
+    max_attempts: usize,
     retry_feedback: Option<&str>,
 ) -> String {
     let context_pack_section = format_patch_context_pack(context_pack);
@@ -1239,17 +1318,20 @@ fn build_patch_apply_prompt(
     } else {
         ""
     };
-    let retry_rule = if retry_mode {
-        "- this is the second and final patch/apply pass after failed checks; repair the current in-scope files in place instead of restarting from scratch\n\
-- repair only the concrete failed-check errors from the feedback below; keep the patch surgical and do not re-add modules, tests, or helpers that already exist in the current file state\n\
+    let retry_rule = if attempt_index > 0 {
+        let repair_pass = attempt_index + 1;
+        format!(
+            "- this is patch/apply repair pass {repair_pass} of {max_attempts} after a failed prior pass; repair the current in-scope files in place instead of restarting from scratch\n\
+- repair only the concrete issue described in the feedback below; keep the patch surgical and do not re-add modules, tests, or helpers that already exist in the current file state\n\
 - if the feedback reports duplicate definitions or duplicate test modules, remove or merge the duplicate instead of adding another copy\n\
 - if the feedback includes current file snippets around failing lines, treat those snippets as the authoritative current state over any earlier baseline excerpt\n"
+        )
     } else {
-        ""
+        String::new()
     };
     let retry_feedback_section = retry_feedback
         .filter(|value| !value.trim().is_empty())
-        .map(|value| format!("Latest failed-check feedback to repair:\n```text\n{}\n```\n", value.trim()))
+        .map(|value| format!("Latest repair feedback:\n```text\n{}\n```\n", value.trim()))
         .unwrap_or_default();
     format!(
         "Produce plain text only for a controller-owned patch/apply lane.\n\
@@ -1295,8 +1377,18 @@ Requirements:\n\
     )
 }
 
-fn should_retry_patch_apply_after_check_failure(contract: &Contract, summary: &str) -> bool {
+fn patch_apply_max_attempts(contract: &Contract) -> usize {
+    1 + merged_contract_checks(contract).len().min(2)
+}
+
+fn should_retry_patch_apply_after_check_failure(
+    contract: &Contract,
+    summary: &str,
+    attempt_index: usize,
+    max_attempts: usize,
+) -> bool {
     is_fail_closed_scope_task(contract)
+        && attempt_index + 1 < max_attempts
         && summary
             .trim_start()
             .starts_with("patch/apply lane check failed:")
@@ -1366,8 +1458,16 @@ fn log_tail(text: &str, max_lines: usize, max_chars: usize) -> String {
 
 fn patch_apply_repair_directives(summary: &str, stderr: &str) -> Vec<String> {
     let mut directives =
-        vec!["Repair only the reported failed-check errors in the current in-scope files.".into()];
+        vec!["Repair only the reported issue in the current in-scope files.".into()];
     let lower = format!("{summary}\n{stderr}").to_ascii_lowercase();
+    if (lower.contains("timed out") && lower.contains("before emitting a patch"))
+        || (lower.contains("timed out") && lower.contains("apply_patch"))
+    {
+        directives.push(
+            "Emit the smallest valid apply_patch response immediately; do not spend this pass rereading context or reformulating the task."
+                .into(),
+        );
+    }
     if lower.contains("defined multiple times") || lower.contains("error[e0428]") {
         directives.push(
             "Keep exactly one definition for the reported item; remove or merge the duplicate instead of adding another copy."
@@ -2572,6 +2672,7 @@ fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<
 fn run_patch_lane_command_with_timeout(
     command: &mut Command,
     timeout: Duration,
+    stall_timeout: Duration,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     executor_pid_path: PathBuf,
@@ -2606,15 +2707,15 @@ fn run_patch_lane_command_with_timeout(
     let stderr_handle = spawn_stream_tee_with_live_capture(
         stderr,
         stderr_path.clone(),
-        progress,
+        progress.clone(),
         false,
         Some(stderr_live.clone()),
     );
     let start = Instant::now();
-    let (timed_out, orphaned, response) = loop {
+    let (timed_out, stalled, orphaned, response) = loop {
         if let Some(response) = detect_patch_lane_response(&stdout_live, &stderr_live) {
             terminate_process_tree(&mut child, child_pid);
-            break (false, false, Some(response));
+            break (false, false, false, Some(response));
         }
         if child.try_wait()?.is_some() {
             if !wait_for_stream_completion(
@@ -2623,14 +2724,19 @@ fn run_patch_lane_command_with_timeout(
                 codex_executor_orphan_grace_timeout(),
             ) {
                 terminate_process_tree(&mut child, child_pid);
-                break (false, true, None);
+                break (false, false, true, None);
             }
-            break (false, false, None);
+            break (false, false, false, None);
+        }
+        if progress.stalled_for(stall_timeout) {
+            let response = detect_patch_lane_response(&stdout_live, &stderr_live);
+            terminate_process_tree(&mut child, child_pid);
+            break (false, response.is_none(), false, response);
         }
         if start.elapsed() >= timeout {
             let response = detect_patch_lane_response(&stdout_live, &stderr_live);
             terminate_process_tree(&mut child, child_pid);
-            break (response.is_none(), false, response);
+            break (response.is_none(), false, false, response);
         }
         thread::sleep(Duration::from_millis(200));
     };
@@ -2652,6 +2758,7 @@ fn run_patch_lane_command_with_timeout(
             stderr,
         },
         timed_out,
+        stalled,
         orphaned,
         response,
     })
@@ -4857,7 +4964,7 @@ mod tests {
             created_at: "now".into(),
             approved_at: Some("now".into()),
         };
-        let prompt = build_patch_apply_prompt(&contract, &ContextPack::default(), false, None);
+        let prompt = build_patch_apply_prompt(&contract, &ContextPack::default(), 0, 2, None);
         assert!(prompt.contains("single apply_patch-style patch"));
         assert!(prompt.contains("do not output JSON"));
         assert!(prompt.contains("do not run `rg`, `grep`, `sed`, `cat`, `find`, `ls`, or any other shell command for orientation"));
@@ -5584,14 +5691,61 @@ mod tests {
         let prompt = build_patch_apply_prompt(
             &contract,
             &pack,
-            true,
+            1,
+            3,
             Some("Summary: patch/apply lane check failed: cargo test -p pubpunk-cli"),
         );
-        assert!(prompt.contains("second and final patch/apply pass after failed checks"));
-        assert!(prompt.contains("Latest failed-check feedback to repair:"));
+        assert!(prompt.contains("patch/apply repair pass 2 of 3 after a failed prior pass"));
+        assert!(prompt.contains("Latest repair feedback:"));
         assert!(prompt.contains("cargo test -p pubpunk-cli"));
-        assert!(prompt.contains("repair only the concrete failed-check errors"));
+        assert!(prompt.contains("repair only the concrete issue described in the feedback below"));
         assert!(prompt.contains("duplicate definitions or duplicate test modules"));
+    }
+
+    #[test]
+    fn patch_apply_max_attempts_allows_sequential_failed_checks() {
+        let one_check = Contract {
+            id: "ct_one".into(),
+            feature_id: "feat_one".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement".into(),
+            entry_points: vec!["src/lib.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["iface".into()],
+            behavior_requirements: vec!["behavior".into()],
+            allowed_scope: vec!["src/lib.rs".into()],
+            target_checks: vec!["cargo test -p one".into()],
+            integrity_checks: vec![],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let two_checks = Contract {
+            integrity_checks: vec!["cargo test --workspace".into()],
+            ..one_check.clone()
+        };
+
+        assert_eq!(patch_apply_max_attempts(&one_check), 2);
+        assert_eq!(patch_apply_max_attempts(&two_checks), 3);
+        assert!(should_retry_patch_apply_after_check_failure(
+            &two_checks,
+            "patch/apply lane check failed: cargo test -p one: compile failed",
+            0,
+            patch_apply_max_attempts(&two_checks),
+        ));
+        assert!(should_retry_patch_apply_after_check_failure(
+            &two_checks,
+            "patch/apply lane check failed: cargo test --workspace: compile failed",
+            1,
+            patch_apply_max_attempts(&two_checks),
+        ));
+        assert!(!should_retry_patch_apply_after_check_failure(
+            &two_checks,
+            "patch/apply lane check failed: cargo test --workspace: compile failed",
+            2,
+            patch_apply_max_attempts(&two_checks),
+        ));
     }
 
     #[test]
@@ -5633,6 +5787,40 @@ mod tests {
         assert!(feedback.contains("Current source near reported failures:"));
         assert!(feedback.contains("crates/pubpunk-cli/src/main.rs around line 6"));
         assert!(feedback.contains("mod tests {}"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn patch_apply_retry_feedback_adds_timeout_directive() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-patch-timeout-feedback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let stdout = root.join("stdout.log");
+        let stderr = root.join("stderr.log");
+        fs::write(&stdout, "").unwrap();
+        fs::write(
+            &stderr,
+            "- if implementation is blocked inside allowed scope, output exactly one `PUNK_EXECUTION_BLOCKED: <reason>` line and nothing else\n",
+        )
+        .unwrap();
+
+        let feedback = patch_apply_retry_feedback(
+            "codex command timed out after 90s before emitting a patch",
+            &root,
+            &["crates/pubpunk-core/src/lib.rs".into()],
+            &stdout,
+            &stderr,
+        )
+        .unwrap();
+        assert!(feedback.contains("Emit the smallest valid apply_patch response immediately"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -5757,6 +5945,7 @@ mod tests {
         let output = run_patch_lane_command_with_timeout(
             &mut command,
             Duration::from_secs(1),
+            Duration::from_secs(1),
             stdout_path,
             stderr_path,
             executor_pid,
@@ -5764,8 +5953,48 @@ mod tests {
         .unwrap();
 
         assert!(!output.timed_out);
+        assert!(!output.stalled);
         assert!(!output.orphaned);
         assert!(matches!(output.response, Some(PatchLaneResponse::Patch(_))));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn run_patch_lane_command_with_timeout_marks_no_output_stall() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-patch-stall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        let executor_pid = root.join("executor.json");
+
+        let mut command = Command::new("/bin/zsh");
+        command
+            .arg("-lc")
+            .arg("printf 'controller prompt\\n'; sleep 5");
+
+        let output = run_patch_lane_command_with_timeout(
+            &mut command,
+            Duration::from_secs(5),
+            Duration::from_millis(400),
+            stdout_path,
+            stderr_path,
+            executor_pid,
+        )
+        .unwrap();
+
+        assert!(!output.timed_out);
+        assert!(output.stalled);
+        assert!(!output.orphaned);
+        assert!(output.response.is_none());
 
         let _ = fs::remove_dir_all(&root);
     }
