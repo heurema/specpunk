@@ -113,6 +113,8 @@ Bootstrap also ensures safe default ignore coverage for:
 - `.punk/`
 - `target/`
 
+Successful `cut run` receipts also backfill the same safe ignore coverage if a repo was bootstrapped without a `.gitignore`.
+
 Inspect the current derived project-intelligence view with:
 
 ```bash

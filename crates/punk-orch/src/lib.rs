@@ -943,6 +943,12 @@ impl OrchService {
                 &changed_files,
             )?;
         }
+        if status == "success" {
+            ensure_default_gitignore_coverage(&workspace_root)?;
+            if workspace_root != self.paths.repo_root {
+                ensure_default_gitignore_coverage(&self.paths.repo_root)?;
+            }
+        }
         run.ended_at = Some(now_rfc3339());
         run_finalizer.sync(&run);
         write_json(&run_path, &run)?;
@@ -2447,6 +2453,51 @@ fn sync_present_repo_root_changes_to_isolated_workspace(
     Ok(())
 }
 
+fn ensure_default_gitignore_coverage(project_root: &Path) -> Result<()> {
+    let gitignore_path = project_root.join(".gitignore");
+    let existing = if gitignore_path.exists() {
+        fs::read_to_string(&gitignore_path)?
+    } else {
+        String::new()
+    };
+    let merged = merge_default_gitignore_entries(&existing);
+    if merged != existing {
+        fs::write(gitignore_path, merged)?;
+    }
+    Ok(())
+}
+
+fn merge_default_gitignore_entries(existing: &str) -> String {
+    let mut lines = if existing.is_empty() {
+        Vec::new()
+    } else {
+        existing.lines().map(str::to_string).collect::<Vec<_>>()
+    };
+    if !gitignore_covers_pattern(&lines, ".punk/") {
+        lines.push(".punk/".to_string());
+    }
+    if !gitignore_covers_pattern(&lines, "target/") {
+        lines.push("target/".to_string());
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+fn gitignore_covers_pattern(lines: &[String], required: &str) -> bool {
+    let aliases: &[&str] = match required {
+        ".punk/" => &[".punk/", ".punk"],
+        "target/" => &["target/", "target"],
+        _ => &[required],
+    };
+    lines.iter().any(|line| {
+        let trimmed = line.trim();
+        aliases.iter().any(|alias| trimmed == *alias)
+    })
+}
+
 fn contract_implies_generated_cargo_lock(contract: &Contract) -> bool {
     !contract
         .allowed_scope
@@ -3917,6 +3968,66 @@ mod tests {
             .iter()
             .any(|path| path == "Cargo.lock"));
         assert!(!root.join("Cargo.lock").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn merge_default_gitignore_entries_adds_punk_and_target_when_missing() {
+        let merged = merge_default_gitignore_entries("");
+        assert_eq!(merged, ".punk/\ntarget/\n");
+
+        let already_covered = merge_default_gitignore_entries("target\n.punk\n");
+        assert_eq!(already_covered, "target\n.punk\n");
+    }
+
+    #[test]
+    fn cut_run_success_ensures_default_gitignore_coverage_without_receipt_noise() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-success-gitignore-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&FakeDrafter, "add file").unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (_run, receipt) = service.cut_run(&FakeExecutor, &contract.id).unwrap();
+        assert_eq!(receipt.status, "success");
+        assert!(!receipt.changed_files.iter().any(|path| path == ".gitignore"));
+        assert_eq!(
+            fs::read_to_string(root.join(".gitignore")).unwrap(),
+            ".punk/\ntarget/\n"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

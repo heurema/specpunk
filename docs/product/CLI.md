@@ -275,6 +275,7 @@ Creates or refreshes:
 - bootstrap guidance
 - repo-local agent instructions
 - default `.gitignore` coverage for `.punk/` and `target/`
+- successful `cut run` receipts should also backfill the same safe `.gitignore` coverage without surfacing `.gitignore` itself as bounded user work
 
 Verifies:
 
