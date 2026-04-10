@@ -283,9 +283,18 @@ impl Executor for CodexCliExecutor {
     }
 
     fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
-        match execution_lane_for_contract(&input.repo_root, &input.contract) {
+        let effective_contract = effective_execution_contract(&input.repo_root, &input.contract)?;
+        let effective_input = ExecuteInput {
+            repo_root: input.repo_root.clone(),
+            contract: effective_contract,
+            stdout_path: input.stdout_path.clone(),
+            stderr_path: input.stderr_path.clone(),
+            executor_pid_path: input.executor_pid_path.clone(),
+        };
+
+        match execution_lane_for_contract(&effective_input.repo_root, &effective_input.contract) {
             ExecutionLane::Manual => {
-                let summary = manual_mode_block_summary(&input.contract)
+                let summary = manual_mode_block_summary(&effective_input.contract)
                     .unwrap_or_else(|| "PUNK_EXECUTION_BLOCKED: manual lane required".to_string());
                 return Ok(ExecuteOutput {
                     success: false,
@@ -296,24 +305,28 @@ impl Executor for CodexCliExecutor {
                 });
             }
             ExecutionLane::PatchApply => {
-                return self.execute_patch_apply_contract(input);
+                return self.execute_patch_apply_contract(effective_input);
             }
             ExecutionLane::Exec => {}
         }
         let start = Instant::now();
-        let executor_timeout = effective_codex_executor_timeout(&input.contract);
-        restore_stale_entry_point_masks(&input.repo_root)?;
-        let created_entry_points = if is_fail_closed_scope_task(&input.contract) {
-            materialize_missing_entry_points(&input.repo_root, &input.contract)?
+        let executor_timeout = effective_codex_executor_timeout(&effective_input.contract);
+        restore_stale_entry_point_masks(&effective_input.repo_root)?;
+        let created_entry_points = if is_fail_closed_scope_task(&effective_input.contract) {
+            materialize_missing_entry_points(&effective_input.repo_root, &effective_input.contract)?
         } else {
             Vec::new()
         };
-        let created_bootstrap_scaffold =
-            materialize_rust_workspace_bootstrap_scaffold(&input.repo_root, &input.contract)?;
-        let bootstrap_scaffold_paths = controller_bootstrap_scaffold_paths(&input.contract);
+        let created_bootstrap_scaffold = materialize_rust_workspace_bootstrap_scaffold(
+            &effective_input.repo_root,
+            &effective_input.contract,
+        )?;
+        let bootstrap_scaffold_paths =
+            controller_bootstrap_scaffold_paths(&effective_input.contract);
         let mut created_scaffold_paths = created_entry_points.clone();
         extend_unique_paths(&mut created_scaffold_paths, &created_bootstrap_scaffold);
-        let mut attempt = self.run_execution_attempt(&input, &created_scaffold_paths, false)?;
+        let mut attempt =
+            self.run_execution_attempt(&effective_input, &created_scaffold_paths, false)?;
         if !attempt.restored_paths.is_empty() {
             return Ok(ExecuteOutput {
                 success: false,
@@ -327,17 +340,18 @@ impl Executor for CodexCliExecutor {
             });
         }
         if !attempt.timed_output.no_progress_paths.is_empty()
-            && is_fail_closed_scope_task(&input.contract)
+            && is_fail_closed_scope_task(&effective_input.contract)
         {
             let stdout = String::from_utf8_lossy(&attempt.timed_output.output.stdout);
             let stderr = String::from_utf8_lossy(&attempt.timed_output.output.stderr);
             if should_retry_after_no_progress(
-                &input.contract,
+                &effective_input.contract,
                 &attempt.timed_output.no_progress_paths,
                 &stdout,
                 &stderr,
             ) {
-                attempt = self.run_execution_attempt(&input, &created_scaffold_paths, true)?;
+                attempt =
+                    self.run_execution_attempt(&effective_input, &created_scaffold_paths, true)?;
                 if !attempt.restored_paths.is_empty() {
                     return Ok(ExecuteOutput {
                         success: false,
@@ -353,8 +367,8 @@ impl Executor for CodexCliExecutor {
             }
         }
         let timed_output = attempt.timed_output;
-        fs::write(&input.stdout_path, &timed_output.output.stdout)?;
-        fs::write(&input.stderr_path, &timed_output.output.stderr)?;
+        fs::write(&effective_input.stdout_path, &timed_output.output.stdout)?;
+        fs::write(&effective_input.stderr_path, &timed_output.output.stderr)?;
         if !bootstrap_scaffold_paths.is_empty()
             && no_progress_only_in_controller_scaffold(
                 &timed_output.no_progress_paths,
@@ -977,11 +991,18 @@ impl CodexCliExecutor {
             Vec::new()
         };
 
-        let prompt = build_exec_prompt_with_mode(
+        let mut visible_allowed_files = entry_point_snapshots
+            .iter()
+            .map(|snapshot| snapshot.path.clone())
+            .collect::<Vec<_>>();
+        visible_allowed_files.dedup();
+
+        let prompt = build_exec_prompt_with_mode_and_visible_files(
             &input.contract,
             context_pack.as_ref(),
             created_scaffold_paths,
             retry_mode,
+            visible_allowed_files.as_slice(),
         );
         let git_guard = if is_fail_closed_scope_task(&input.contract) {
             GitGuardEnv::install()?
@@ -1079,14 +1100,21 @@ fn build_exec_prompt(
     context_pack: Option<&ContextPack>,
     created_scaffold_paths: &[String],
 ) -> String {
-    build_exec_prompt_with_mode(contract, context_pack, created_scaffold_paths, false)
+    build_exec_prompt_with_mode_and_visible_files(
+        contract,
+        context_pack,
+        created_scaffold_paths,
+        false,
+        &[],
+    )
 }
 
-fn build_exec_prompt_with_mode(
+fn build_exec_prompt_with_mode_and_visible_files(
     contract: &Contract,
     context_pack: Option<&ContextPack>,
     created_scaffold_paths: &[String],
     retry_mode: bool,
+    visible_allowed_files: &[String],
 ) -> String {
     let scope_rule = fail_closed_scope_rule(contract);
     let meta_workflow_rule = forbid_meta_workflow_rule();
@@ -1097,6 +1125,14 @@ fn build_exec_prompt_with_mode(
         format!(
             "The following controller-owned scaffold files were materialized for this run and must remain present: {}. Edit those paths in place and do not delete or rename them.\n",
             created_scaffold_paths.join(", ")
+        )
+    };
+    let visible_allowed_files_section = if visible_allowed_files.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Current allowed files available for direct edit: {}.\nFor this directory-scoped slice, treat these listed files as the initial bounded edit set before doing any more orientation.\n",
+            visible_allowed_files.join(", ")
         )
     };
     let context_pack_section = context_pack
@@ -1115,10 +1151,11 @@ fn build_exec_prompt_with_mode(
     };
     if contract.allowed_scope.is_empty() {
         return format!(
-            "Implement the approved contract in the current repo. Contract id: {}. Behavior requirements: {}. Stay narrowly scoped to the contract and do not perform broad repo-wide search unless a concrete compile or verification blocker requires it. {}{} {} {} {} If you are blocked by scope, missing manifest wiring, or a similar execution blocker, do not ask the operator a question. Instead emit exactly one single-line sentinel in the form `{}` and stop without claiming success. When implementation is complete and all required checks are done, emit exactly one single-line sentinel in the form `{}`. If scope is unclear but not blocked, make the smallest safe change and explain what remains unspecified.",
+            "Implement the approved contract in the current repo. Contract id: {}. Original goal: {}. Treat the original goal as authoritative if the behavior requirements below are abbreviated. Behavior requirements: {}. Stay narrowly scoped to the contract and do not perform broad repo-wide search unless a concrete compile or verification blocker requires it. {}{} {} {} {} If you are blocked by scope, missing manifest wiring, or a similar execution blocker, do not ask the operator a question. Instead emit exactly one single-line sentinel in the form `{}` and stop without claiming success. When implementation is complete and all required checks are done, emit exactly one single-line sentinel in the form `{}`. If scope is unclear but not blocked, make the smallest safe change and explain what remains unspecified.",
             contract.id,
+            contract.prompt_source,
             contract.behavior_requirements.join("; "),
-            context_pack_section,
+            format!("{created_entry_points_section}{visible_allowed_files_section}{context_pack_section}"),
             retry_section,
             scope_rule,
             meta_workflow_rule,
@@ -1128,15 +1165,18 @@ fn build_exec_prompt_with_mode(
         );
     }
     format!(
-        "Implement the approved contract in the current repo.\nContract id: {}\nBehavior requirements: {}\nAllowed scope: {}\nEntry points: {}\nExpected interfaces: {}\nTarget checks to satisfy: {}\nIntegrity checks to keep passing: {}\n{}{}\nStart by inspecting only the listed entry points and other files inside allowed scope.\nDo not perform broad repo-wide search.\n{}\n{}\n{}\nIf you are blocked by scope, missing manifest wiring, or a similar execution blocker, do not ask the operator a question. Instead emit exactly one single-line sentinel in the form `{}` and stop without claiming success.\nWhen implementation is complete and all required checks are done, emit exactly one single-line sentinel in the form `{}`.\nOnly modify files inside allowed scope.",
+        "Implement the approved contract in the current repo.\nContract id: {}\nOriginal goal: {}\nTreat the original goal as authoritative if the behavior requirements below are abbreviated.\nBehavior requirements: {}\nAllowed scope: {}\nEntry points: {}\nExpected interfaces: {}\nTarget checks to satisfy: {}\nIntegrity checks to keep passing: {}\n{}{}\nStart by inspecting only the listed entry points and other files inside allowed scope.\nDo not perform broad repo-wide search.\n{}\n{}\n{}\nIf you are blocked by scope, missing manifest wiring, or a similar execution blocker, do not ask the operator a question. Instead emit exactly one single-line sentinel in the form `{}` and stop without claiming success.\nWhen implementation is complete and all required checks are done, emit exactly one single-line sentinel in the form `{}`.\nOnly modify files inside allowed scope.",
         contract.id,
+        contract.prompt_source,
         contract.behavior_requirements.join("; "),
         contract.allowed_scope.join(", "),
         contract.entry_points.join(", "),
         contract.expected_interfaces.join("; "),
         contract.target_checks.join("; "),
         contract.integrity_checks.join("; "),
-        format!("{created_entry_points_section}{context_pack_section}"),
+        format!(
+            "{created_entry_points_section}{visible_allowed_files_section}{context_pack_section}"
+        ),
         retry_section,
         scope_rule,
         meta_workflow_rule,
@@ -1821,6 +1861,46 @@ fn should_capture_progress_snapshots(contract: &Contract, progress_probe_paths: 
             && contract.entry_points.len() <= 5)
 }
 
+fn effective_execution_contract(repo_root: &Path, contract: &Contract) -> Result<Contract> {
+    if is_bounded_execution_task(contract)
+        || contract.allowed_scope.is_empty()
+        || contract.allowed_scope.len() > 5
+        || contract.entry_points.is_empty()
+        || contract.entry_points.len() > 5
+    {
+        return Ok(contract.clone());
+    }
+
+    let mut remaining_scope_files = 16usize;
+    let mut expanded_scope = Vec::new();
+    for scope in &contract.allowed_scope {
+        if is_explicit_repo_file_scope(scope) {
+            expanded_scope.push(scope.clone());
+            continue;
+        }
+        let discovered =
+            collect_existing_allowed_scope_files(repo_root, scope, &mut remaining_scope_files)?;
+        extend_unique_paths(&mut expanded_scope, &discovered);
+        if remaining_scope_files == 0 {
+            break;
+        }
+    }
+    if expanded_scope.is_empty()
+        || expanded_scope.len() > 8
+        || expanded_scope
+            .iter()
+            .any(|path| !is_explicit_repo_file_scope(path))
+    {
+        return Ok(contract.clone());
+    }
+
+    let mut effective = contract.clone();
+    effective.allowed_scope = expanded_scope.clone();
+    effective.entry_points = contract.entry_points.clone();
+    extend_unique_paths(&mut effective.entry_points, &expanded_scope);
+    Ok(effective)
+}
+
 fn fail_closed_scope_rule(contract: &Contract) -> &'static str {
     if is_fail_closed_scope_task(contract) {
         "Do not read any file outside allowed scope or entry points. Prioritize production code paths first. When an allowed entry-point file contains a `#[cfg(test)]` module or a clear test-only section, treat everything below that boundary as off-limits by default unless a concrete compile error or required check output points directly to those test lines. Avoid reading `#[cfg(test)]` modules or long test sections in allowed-scope files unless that explicit signal exists. Do not create temporary type-introspection tests, debug-print probes, or `--nocapture` discovery loops just to infer Rust type shapes inside the bounded task. Implement the approved contract directly inside the allowed scope instead. If you need any out-of-scope file for compile or verification reasons, emit exactly one single-line sentinel in the form `PUNK_EXECUTION_BLOCKED: need out-of-scope file <repo-relative-path> because <reason>` before reading it, then stop immediately. If a required Rust type shape still cannot be derived safely from the in-scope source files, or direct implementation is not possible without reading past the test boundary or inventing an alternate workflow, emit exactly one single-line sentinel in the form `PUNK_EXECUTION_BLOCKED: <reason>` and stop immediately instead of adding temporary discovery code or meta-workflow artifacts."
@@ -1849,7 +1929,7 @@ fn is_patch_apply_lane_candidate(repo_root: &Path, contract: &Contract) -> bool 
     if !is_fail_closed_scope_task(contract) {
         return false;
     }
-    if contract.allowed_scope.len() > 2 || contract.entry_points.len() > 2 {
+    if contract.allowed_scope.len() > 5 || contract.entry_points.len() > 5 {
         return false;
     }
     if contract.allowed_scope.is_empty() || contract.entry_points.is_empty() {
@@ -1891,6 +1971,10 @@ fn is_patch_apply_lane_candidate(repo_root: &Path, contract: &Contract) -> bool 
         "cli",
         "output",
         "surface",
+        "init",
+        "validate",
+        "json",
+        "skeleton",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -3958,10 +4042,53 @@ mod tests {
         };
         let prompt = build_exec_prompt(&contract, None, &[]);
         assert!(prompt.contains("Allowed scope: src"));
+        assert!(prompt.contains("Original goal: x"));
+        assert!(prompt.contains(
+            "Treat the original goal as authoritative if the behavior requirements below are abbreviated."
+        ));
         assert!(prompt.contains("Start by inspecting only the listed entry points"));
         assert!(prompt.contains("Do not perform broad repo-wide search."));
         assert!(prompt.contains(blocked_execution_template()));
         assert!(prompt.contains(successful_execution_template()));
+    }
+
+    #[test]
+    fn build_exec_prompt_mentions_visible_allowed_files_for_directory_scope() {
+        let contract = Contract {
+            id: "ct_dir".into(),
+            feature_id: "feat_dir".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init".into(),
+            entry_points: vec!["crates/pubpunk-cli/Cargo.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["bounded implementation slice".into()],
+            behavior_requirements: vec!["implement pubpunk init".into()],
+            allowed_scope: vec!["crates/pubpunk-cli".into(), "tests".into()],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let prompt = build_exec_prompt_with_mode_and_visible_files(
+            &contract,
+            None,
+            &[],
+            false,
+            &[
+                "crates/pubpunk-cli/Cargo.toml".into(),
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "tests/init.rs".into(),
+            ],
+        );
+        assert!(prompt.contains(
+            "Current allowed files available for direct edit: crates/pubpunk-cli/Cargo.toml, crates/pubpunk-cli/src/main.rs, tests/init.rs."
+        ));
+        assert!(prompt.contains(
+            "For this directory-scoped slice, treat these listed files as the initial bounded edit set before doing any more orientation."
+        ));
     }
 
     #[test]
@@ -4919,6 +5046,68 @@ mod tests {
 
         assert_eq!(
             execution_lane_for_contract(&root, &contract),
+            ExecutionLane::PatchApply
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn execution_lane_uses_patch_apply_for_small_existing_file_init_slice() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-patch-lane-init-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("crates/pubpunk-cli/Cargo.toml"), "[package]\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/pubpunk-core/Cargo.toml"), "[package]\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "# tests\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_init".into(),
+            feature_id: "feat_init".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init command".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/Cargo.toml".into(),
+                "crates/pubpunk-core/Cargo.toml".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["bounded implementation slice".into()],
+            behavior_requirements: vec!["implement pubpunk init".into()],
+            allowed_scope: vec![
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let effective = effective_execution_contract(&root, &contract).unwrap();
+        assert_eq!(
+            execution_lane_for_contract(&root, &effective),
             ExecutionLane::PatchApply
         );
 
@@ -6748,6 +6937,84 @@ mod tests {
         };
 
         assert!(should_capture_progress_snapshots(&contract, &[]));
+    }
+
+    #[test]
+    fn effective_execution_contract_expands_directory_scope_to_existing_files() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-effective-contract-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("crates/pubpunk-cli/Cargo.toml"), "[package]\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/pubpunk-core/Cargo.toml"), "[package]\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "# tests\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_init".into(),
+            feature_id: "feat_init".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/Cargo.toml".into(),
+                "crates/pubpunk-core/Cargo.toml".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["bounded implementation slice".into()],
+            behavior_requirements: vec!["implement pubpunk init".into()],
+            allowed_scope: vec![
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let effective = effective_execution_contract(&root, &contract).unwrap();
+        assert!(is_bounded_execution_task(&effective));
+        assert_eq!(
+            effective.allowed_scope,
+            vec![
+                "crates/pubpunk-cli/Cargo.toml".to_string(),
+                "crates/pubpunk-cli/src/main.rs".to_string(),
+                "crates/pubpunk-core/Cargo.toml".to_string(),
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/README.md".to_string(),
+            ]
+        );
+        assert!(effective
+            .entry_points
+            .contains(&"crates/pubpunk-cli/src/main.rs".to_string()));
+        assert!(effective
+            .entry_points
+            .contains(&"crates/pubpunk-core/src/lib.rs".to_string()));
+        assert!(effective
+            .entry_points
+            .contains(&"tests/README.md".to_string()));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

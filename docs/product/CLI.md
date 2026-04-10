@@ -431,6 +431,9 @@ Behavior notes:
 - for generic Rust workspace bootstrap contracts whose scope is only `Cargo.toml`, `crates`, and `tests`, `cut run` may infer bounded crate members from the contract semantics (for example a named CLI like `pubpunk`) and materialize the corresponding minimal workspace scaffold inside `allowed_scope`
 - when Rust bootstrap or cargo-based bounded execution would generate a new `Cargo.lock` outside `allowed_scope`, `cut run` should prune that generated side effect before writing the receipt so the project is not left with avoidable out-of-scope dirt
 - when bounded execution only performs inspection/check commands inside allowed scope, makes no product-file changes, and then stalls without emitting a sentinel, `cut run` should normalize that case into deterministic no-progress failure instead of surfacing raw noisy stall tails like `mcp: ...` or `succeeded in ...`
+- executor prompts should include the original approved goal text alongside condensed behavior requirements so bounded slices do not lose critical implementation details when drafter requirements are abbreviated
+- when `allowed_scope` is directory-scoped but bounded, executor prompts should also enumerate the current in-scope files available for direct edit so the model does not stall on ambiguous directory-level scope
+- executor may narrow a small directory-scoped bounded contract to the currently existing in-scope files for execution only, which allows fail-closed context packing and patch-apply routing without mutating the persisted approved contract
 - `gate` and `proof` remain authoritative; this cut-time success does not replace verification
 
 ### `punk gate run <run-id>`
