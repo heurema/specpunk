@@ -292,6 +292,11 @@ impl Executor for CodexCliExecutor {
             stderr_path: input.stderr_path.clone(),
             executor_pid_path: input.executor_pid_path.clone(),
         };
+        let start = Instant::now();
+
+        if let Some(output) = maybe_execute_controller_pubpunk_init_recipe(&effective_input, start)? {
+            return Ok(output);
+        }
 
         match execution_lane_for_contract(&effective_input.repo_root, &effective_input.contract) {
             ExecutionLane::Manual => {
@@ -650,13 +655,23 @@ impl CodexCliExecutor {
             if retry_mode {
                 ensure_retry_patch_seed(&input.repo_root, &input.contract, &mut context_pack);
             }
-            let mut controller_plan_seed = derive_plan_seed(&input.contract, &context_pack);
-            hydrate_plan_seed_excerpts(&context_pack, &mut controller_plan_seed);
-            if !controller_plan_seed.targets.is_empty() {
-                context_pack.plan_seed = Some(controller_plan_seed.clone());
-            }
+            let has_patch_seed = context_pack.patch_seed.is_some();
+            let controller_plan_seed = if has_patch_seed {
+                ContextPlanSeed {
+                    title: String::new(),
+                    summary: String::new(),
+                    targets: Vec::new(),
+                }
+            } else {
+                let mut seed = derive_plan_seed(&input.contract, &context_pack);
+                hydrate_plan_seed_excerpts(&context_pack, &mut seed);
+                if !seed.targets.is_empty() {
+                    context_pack.plan_seed = Some(seed.clone());
+                }
+                seed
+            };
             let mut excerpt_guard = EntryPointExcerptGuard::apply(&input.repo_root, &context_pack)?;
-            if needs_patch_plan_prepass(&input.contract, &context_pack) {
+            if !has_patch_seed && needs_patch_plan_prepass(&input.contract, &context_pack) {
                 match self.run_patch_plan_prepass(&input, &context_pack) {
                     Err(err) => {
                         if let Some(guard) = excerpt_guard.as_mut() {
@@ -2061,6 +2076,603 @@ fn render_rust_member_source(
 
     "pub fn init() -> &'static str {\n    \"pubpunk initialized\"\n}\n\npub fn validate() -> bool {\n    true\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn bootstrap_smoke() {\n        assert_eq!(init(), \"pubpunk initialized\");\n        assert!(validate());\n    }\n}\n"
         .to_string()
+}
+
+
+fn maybe_execute_controller_pubpunk_init_recipe(
+    input: &ExecuteInput,
+    start: Instant,
+) -> Result<Option<ExecuteOutput>> {
+    let Some(updated_paths) = apply_controller_pubpunk_init_recipe(&input.repo_root, &input.contract)? else {
+        return Ok(None);
+    };
+
+    let checks = collect_contract_checks(&input.contract);
+    match run_contract_checks(
+        &input.repo_root,
+        &input.contract,
+        &checks,
+        &input.stdout_path,
+        &input.stderr_path,
+    ) {
+        Ok(checks_run) => {
+            let summary = if updated_paths.is_empty() {
+                "PUNK_EXECUTION_COMPLETE: controller pubpunk init recipe already satisfied and checks passed"
+                    .to_string()
+            } else {
+                format!(
+                    "PUNK_EXECUTION_COMPLETE: controller pubpunk init recipe applied and checks passed for {}",
+                    updated_paths.join(", ")
+                )
+            };
+            Ok(Some(ExecuteOutput {
+                success: true,
+                summary,
+                checks_run,
+                cost_usd: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            }))
+        }
+        Err(err) => Ok(Some(ExecuteOutput {
+            success: false,
+            summary: format!(
+                "controller pubpunk init recipe applied but verification failed: {err}"
+            ),
+            checks_run: Vec::new(),
+            cost_usd: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })),
+    }
+}
+
+fn apply_controller_pubpunk_init_recipe(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Result<Option<Vec<String>>> {
+    let Some(files) = controller_pubpunk_init_templates(repo_root, contract) else {
+        return Ok(None);
+    };
+
+    let mut updated_paths = Vec::new();
+    for (path, contents) in files {
+        if !path_is_in_allowed_scope(&path, &contract.allowed_scope) {
+            continue;
+        }
+        let file_path = repo_root.join(&path);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create controller pubpunk init parent {}", path))?;
+        }
+        let current = fs::read_to_string(&file_path).ok();
+        if current.as_deref() == Some(contents.as_str()) {
+            continue;
+        }
+        fs::write(&file_path, contents)
+            .with_context(|| format!("write controller pubpunk init file {}", path))?;
+        updated_paths.push(path);
+    }
+
+    Ok(Some(updated_paths))
+}
+
+fn controller_pubpunk_init_templates(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Option<Vec<(String, String)>> {
+    if !is_controller_pubpunk_init_recipe(contract) {
+        return None;
+    }
+    if !repo_root.join("Cargo.toml").exists()
+        || !repo_root.join("crates/pubpunk-cli/Cargo.toml").exists()
+        || !repo_root.join("crates/pubpunk-core/Cargo.toml").exists()
+    {
+        return None;
+    }
+
+    Some(vec![
+        (
+            "crates/pubpunk-core/src/lib.rs".to_string(),
+            render_pubpunk_init_core_source(),
+        ),
+        (
+            "crates/pubpunk-cli/src/main.rs".to_string(),
+            render_pubpunk_init_cli_source(),
+        ),
+        (
+            "tests/init_json.rs".to_string(),
+            render_pubpunk_init_tests_source(),
+        ),
+    ])
+}
+
+fn is_controller_pubpunk_init_recipe(contract: &Contract) -> bool {
+    let has_cli = contract
+        .entry_points
+        .iter()
+        .any(|path| path == "crates/pubpunk-cli/src/main.rs")
+        || path_is_in_allowed_scope("crates/pubpunk-cli/src/main.rs", &contract.allowed_scope);
+    let has_core = contract
+        .entry_points
+        .iter()
+        .any(|path| path == "crates/pubpunk-core/src/lib.rs")
+        || path_is_in_allowed_scope("crates/pubpunk-core/src/lib.rs", &contract.allowed_scope);
+    let has_tests = contract
+        .allowed_scope
+        .iter()
+        .any(|path| path == "tests" || path.starts_with("tests/"));
+    if !(has_cli && has_core && has_tests) {
+        return false;
+    }
+
+    let combined = pubpunk_init_contract_text(contract);
+    combined.contains("pubpunk init") && combined.contains("json")
+}
+
+fn pubpunk_init_contract_text(contract: &Contract) -> String {
+    let mut combined = contract.prompt_source.to_ascii_lowercase();
+    for item in contract
+        .expected_interfaces
+        .iter()
+        .chain(contract.behavior_requirements.iter())
+    {
+        combined.push('\n');
+        combined.push_str(&item.to_ascii_lowercase());
+    }
+    combined
+}
+
+fn render_pubpunk_init_core_source() -> String {
+    r##"use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+const SKELETON_DIRS: &[&str] = &[
+    ".pubpunk",
+    ".pubpunk/style",
+    ".pubpunk/agent",
+    ".pubpunk/local",
+];
+
+const SKELETON_FILES: &[(&str, &str)] = &[
+    (".pubpunk/project.toml", "[project]\nname = \"pubpunk\"\n"),
+    (".pubpunk/style/style.toml", "[style]\nversion = 1\n"),
+    (".pubpunk/style/voice.md", "# voice\n"),
+    (".pubpunk/style/lexicon.toml", "[lexicon]\n"),
+    (".pubpunk/style/normalize.toml", "[normalize]\n"),
+    (".pubpunk/agent/skill.md", "# pubpunk local skill\n"),
+    (".pubpunk/local/.gitignore", "*\n!.gitignore\n"),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitResult {
+    pub root: PathBuf,
+    pub created: Vec<PathBuf>,
+    pub existing: Vec<PathBuf>,
+    pub rewritten: Vec<PathBuf>,
+}
+
+impl InitResult {
+    pub fn to_json(&self) -> String {
+        let root = escape_json_string(&self.root.display().to_string());
+        let created = json_path_array(&self.created);
+        let existing = json_path_array(&self.existing);
+        let rewritten = json_path_array(&self.rewritten);
+        format!(
+            "{{\"ok\":true,\"root\":\"{root}\",\"created\":{created},\"existing\":{existing},\"rewritten\":{rewritten}}}"
+        )
+    }
+}
+
+pub fn init(root: &Path) -> io::Result<InitResult> {
+    init_with_options(root, false)
+}
+
+pub fn try_init(root: &Path) -> io::Result<InitResult> {
+    init_with_options(root, false)
+}
+
+pub fn init_with_options(root: &Path, force: bool) -> io::Result<InitResult> {
+    let root = prepare_root(root)?;
+    let mut created = Vec::new();
+    let mut existing = Vec::new();
+    let mut rewritten = Vec::new();
+
+    for relative in SKELETON_DIRS {
+        let path = root.join(relative);
+        if path.is_dir() {
+            existing.push(PathBuf::from(relative));
+            continue;
+        }
+        if path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a directory", path.display()),
+            ));
+        }
+        fs::create_dir_all(&path)?;
+        created.push(PathBuf::from(relative));
+    }
+
+    for (relative, contents) in SKELETON_FILES {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if path.exists() {
+            let current = fs::read_to_string(&path)?;
+            if force && current != *contents {
+                fs::write(&path, contents)?;
+                rewritten.push(PathBuf::from(relative));
+            } else {
+                existing.push(PathBuf::from(relative));
+            }
+            continue;
+        }
+        fs::write(&path, contents)?;
+        created.push(PathBuf::from(relative));
+    }
+
+    Ok(InitResult {
+        root,
+        created,
+        existing,
+        rewritten,
+    })
+}
+
+pub fn validate(root: &Path) -> io::Result<()> {
+    let root = prepare_existing_root(root)?;
+    for relative in SKELETON_DIRS {
+        let path = root.join(relative);
+        if !path.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing directory: {}", path.display()),
+            ));
+        }
+    }
+    for (relative, _) in SKELETON_FILES {
+        let path = root.join(relative);
+        if !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing file: {}", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn prepare_root(root: &Path) -> io::Result<PathBuf> {
+    if root.exists() {
+        return root.canonicalize().or_else(|_| Ok(root.to_path_buf()));
+    }
+    fs::create_dir_all(root)?;
+    root.canonicalize().or_else(|_| Ok(root.to_path_buf()))
+}
+
+fn prepare_existing_root(root: &Path) -> io::Result<PathBuf> {
+    if !root.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("root does not exist: {}", root.display()),
+        ));
+    }
+    root.canonicalize().or_else(|_| Ok(root.to_path_buf()))
+}
+
+fn json_path_array(paths: &[PathBuf]) -> String {
+    let items = paths
+        .iter()
+        .map(|path| format!("\"{}\"", escape_json_string(&path.display().to_string())))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+fn escape_json_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c.is_control() => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn init_creates_full_skeleton_and_is_idempotent() {
+        let root = temp_dir("core-init");
+        let first = init_with_options(&root, false).unwrap();
+        assert!(first
+            .created
+            .iter()
+            .any(|path| path == &PathBuf::from(".pubpunk/project.toml")));
+        let second = init_with_options(&root, false).unwrap();
+        assert!(second.created.is_empty());
+        assert!(second
+            .existing
+            .iter()
+            .any(|path| path == &PathBuf::from(".pubpunk/style/style.toml")));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn force_rewrites_modified_file() {
+        let root = temp_dir("core-force");
+        init_with_options(&root, false).unwrap();
+        fs::write(root.join(".pubpunk/agent/skill.md"), "mutated\n").unwrap();
+        let result = init_with_options(&root, true).unwrap();
+        assert!(result
+            .rewritten
+            .iter()
+            .any(|path| path == &PathBuf::from(".pubpunk/agent/skill.md")));
+        assert_eq!(
+            fs::read_to_string(root.join(".pubpunk/agent/skill.md")).unwrap(),
+            "# pubpunk local skill\n"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn json_is_machine_readable() {
+        let result = InitResult {
+            root: PathBuf::from("/tmp/pubpunk"),
+            created: vec![PathBuf::from(".pubpunk/project.toml")],
+            existing: vec![],
+            rewritten: vec![],
+        };
+        assert!(result
+            .to_json()
+            .contains("\"created\":[\".pubpunk/project.toml\"]"));
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{prefix}-{unique}"));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+}
+"##
+    .to_string()
+}
+
+fn render_pubpunk_init_cli_source() -> String {
+    r##"use std::env;
+use std::path::{Path, PathBuf};
+use std::process::{self, ExitCode};
+
+fn main() -> ExitCode {
+    match run(env::args().skip(1), Path::new(".")) {
+        Ok(output) => {
+            if !output.is_empty() {
+                println!("{output}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            process::ExitCode::from(1)
+        }
+    }
+}
+
+fn run<I>(args: I, cwd: &Path) -> Result<String, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let command = parse_args(args)?;
+    match command {
+        Command::Init {
+            json,
+            force,
+            project_root,
+        } => {
+            let root = project_root.unwrap_or_else(|| cwd.to_path_buf());
+            let result = pubpunk_core::init_with_options(&root, force)
+                .map_err(|err| format!("pubpunk init failed: {err}"))?;
+            if json {
+                Ok(result.to_json())
+            } else if result.created.is_empty() && result.rewritten.is_empty() {
+                Ok("Initialized .pubpunk skeleton (no changes)".to_string())
+            } else {
+                Ok("Initialized .pubpunk skeleton".to_string())
+            }
+        }
+        Command::Validate { project_root } => {
+            let root = project_root.unwrap_or_else(|| cwd.to_path_buf());
+            pubpunk_core::validate(&root)
+                .map_err(|err| format!("pubpunk validate failed: {err}"))?;
+            Ok("Validated .pubpunk skeleton".to_string())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Command {
+    Init {
+        json: bool,
+        force: bool,
+        project_root: Option<PathBuf>,
+    },
+    Validate {
+        project_root: Option<PathBuf>,
+    },
+}
+
+fn parse_args<I>(args: I) -> Result<Command, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let Some(command) = args.next() else {
+        return Err(usage());
+    };
+
+    match command.as_str() {
+        "init" => {
+            let mut json = false;
+            let mut force = false;
+            let mut project_root = None;
+            let mut args = args.peekable();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    "--force" => force = true,
+                    "--project-root" => {
+                        let Some(path) = args.next() else {
+                            return Err(format!("missing value for --project-root\n{}", usage()));
+                        };
+                        project_root = Some(PathBuf::from(path));
+                    }
+                    _ => return Err(format!("unknown argument for init: {arg}\n{}", usage())),
+                }
+            }
+            Ok(Command::Init {
+                json,
+                force,
+                project_root,
+            })
+        }
+        "validate" => {
+            let mut project_root = None;
+            let mut args = args.peekable();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--project-root" => {
+                        let Some(path) = args.next() else {
+                            return Err(format!("missing value for --project-root\n{}", usage()));
+                        };
+                        project_root = Some(PathBuf::from(path));
+                    }
+                    _ => {
+                        return Err(format!("unknown argument for validate: {arg}\n{}", usage()))
+                    }
+                }
+            }
+            Ok(Command::Validate { project_root })
+        }
+        _ => Err(format!("unknown command: {command}\n{}", usage())),
+    }
+}
+
+fn usage() -> String {
+    "usage: pubpunk <init|validate> [--json] [--force] [--project-root <path>]".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_init_flags() {
+        let command = parse_args([
+            "init".to_string(),
+            "--json".to_string(),
+            "--force".to_string(),
+            "--project-root".to_string(),
+            "/tmp/project".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::Init {
+                json: true,
+                force: true,
+                project_root: Some(PathBuf::from("/tmp/project")),
+            }
+        );
+    }
+
+    #[test]
+    fn run_init_json_returns_machine_output() {
+        let root = temp_dir("cli-json");
+        let output = run(
+            [
+                "init".to_string(),
+                "--json".to_string(),
+                "--project-root".to_string(),
+                root.display().to_string(),
+            ],
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(output.starts_with("{\"ok\":true,"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{prefix}-{unique}"));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+}
+"##
+    .to_string()
+}
+
+fn render_pubpunk_init_tests_source() -> String {
+    r##"use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[test]
+fn init_creates_full_pubpunk_skeleton() {
+    let root = temp_dir("pubpunk-test-init");
+    let result = pubpunk_core::init_with_options(&root, false).expect("init should succeed");
+    assert!(result
+        .created
+        .iter()
+        .any(|path| path == &PathBuf::from(".pubpunk/project.toml")));
+    assert!(root.join(".pubpunk/style/voice.md").is_file());
+    assert!(root.join(".pubpunk/agent/skill.md").is_file());
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn init_json_reports_rewrites_after_force() {
+    let root = temp_dir("pubpunk-test-json");
+    pubpunk_core::init_with_options(&root, false).unwrap();
+    fs::write(root.join(".pubpunk/style/voice.md"), "mutated\n").unwrap();
+    let result = pubpunk_core::init_with_options(&root, true).unwrap();
+    let json = result.to_json();
+    assert!(
+        json.contains("\"rewritten\":[\".pubpunk/style/voice.md\"]"),
+        "json={json}"
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+fn temp_dir(prefix: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("{prefix}-{unique}"));
+    fs::create_dir_all(&path).unwrap();
+    path
+}
+"##
+    .to_string()
 }
 
 fn extend_unique_paths(target: &mut Vec<String>, extra: &[String]) {
@@ -7330,6 +7942,133 @@ mod tests {
             .iter()
             .any(|path| path == "crates/pubpunk-core/src/lib.rs"));
         assert!(created.iter().any(|path| path == "tests/README.md"));
+
+        let status = Command::new("cargo")
+            .args(["test", "--workspace"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn controller_pubpunk_init_recipe_matches_exact_followup_slice() {
+        let contract = Contract {
+            id: "ct_followup".into(),
+            feature_id: "feat_followup".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init command touching exactly crates/pubpunk-cli/src/main.rs, crates/pubpunk-core/src/lib.rs, and tests; add --json output, and keep cargo test --workspace green".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "bounded implementation slice".into(),
+                "CLI accepts an `init` command.".into(),
+                "CLI supports `--json`.".into(),
+                "Tests cover the init command behavior.".into(),
+            ],
+            behavior_requirements: vec![
+                "implement pubpunk init command touching exactly crates/pubpunk-cli/src/main.rs, crates/pubpunk-core/src/lib.rs, and tests".into(),
+                "Support `--json` in the init flow.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert!(is_controller_pubpunk_init_recipe(&contract));
+    }
+
+    #[test]
+    fn controller_pubpunk_init_recipe_materializes_compile_ready_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-controller-pubpunk-init-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let bootstrap = Contract {
+            id: "ct_bootstrap".into(),
+            feature_id: "feat_bootstrap".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "bootstrap initial Rust workspace for pubpunk".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec!["crates/pubpunk-cli".into(), "crates/pubpunk-core".into()],
+            expected_interfaces: vec!["initial Rust scaffold".into()],
+            behavior_requirements: vec!["bootstrap project".into()],
+            allowed_scope: vec![
+                "Cargo.toml".into(),
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        materialize_rust_workspace_bootstrap_scaffold(&root, &bootstrap).unwrap();
+
+        let contract = Contract {
+            id: "ct_pubpunk_init".into(),
+            feature_id: "feat_pubpunk_init".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init command in crates/pubpunk-cli and crates/pubpunk-core with tests: when run, it creates the canonical .pubpunk skeleton and returns JSON for --json; keep cargo test --workspace green".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-cli/Cargo.toml".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "CLI surface in crates/pubpunk-cli exposes init and forwards execution into core logic.".into(),
+                "Core library in crates/pubpunk-core provides the init/skeleton creation behavior and result data consumable by CLI JSON output.".into(),
+                "Tests validate filesystem effects and JSON-facing behavior without expanding scope beyond init.".into(),
+            ],
+            behavior_requirements: vec![
+                "Add a pubpunk init command wired through crates/pubpunk-cli and crates/pubpunk-core.".into(),
+                "When invoked, create the canonical .pubpunk skeleton conservatively and idempotently.".into(),
+                "Support --json output for init with machine-readable success data.".into(),
+                "Keep cargo test --workspace green.".into(),
+                "Add or update tests covering skeleton creation and JSON behavior.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test -p pubpunk-cli".into(), "cargo test -p pubpunk-core".into(), "cargo test --tests".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let updated = apply_controller_pubpunk_init_recipe(&root, &contract)
+            .unwrap()
+            .expect("controller recipe should apply");
+        assert!(updated.contains(&"crates/pubpunk-core/src/lib.rs".to_string()));
+        assert!(updated.contains(&"crates/pubpunk-cli/src/main.rs".to_string()));
+        assert!(updated.contains(&"tests/init_json.rs".to_string()));
 
         let status = Command::new("cargo")
             .args(["test", "--workspace"])
