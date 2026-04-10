@@ -459,6 +459,7 @@ Checks:
 Behavior notes:
 
 - controller-owned runtime artifacts written under `.punk/runs/<run-id>/...` should not count as user scope violations during `gate run`; scope validation should judge only repo changes attributable to the bounded work itself
+- when a run executed inside an isolated VCS workspace (for example a git worktree in degraded git-only mode), `gate run` must execute trusted target and integrity checks inside that recorded `workspace_ref`, not back on the original repo root
 - if `gate run` executes cargo-based trusted checks for a contract whose scope includes `Cargo.toml` but not `Cargo.lock`, a newly generated `Cargo.lock` should be pruned after the check rather than left behind as avoidable project litter
 
 Target and integrity checks must be validated and executed as direct trusted runners, not interpolated through `/bin/sh -lc` or other shell-fragment execution.

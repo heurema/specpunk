@@ -51,6 +51,7 @@ impl GateService {
         if contract.status != ContractStatus::Approved {
             return Err(anyhow!("gate requires an approved contract"));
         }
+        let check_root = gate_check_root(&self.repo_root, &run);
         let declared_harness_evidence = load_declared_harness_evidence(&self.repo_root);
         let harness = run_harness_recipes(&self.repo_root)?;
 
@@ -62,6 +63,7 @@ impl GateService {
             decision_basis.push("scope violation: changed files outside allowed_scope".to_string());
         }
         let target = run_checks(
+            &check_root,
             &self.repo_root,
             &run.id,
             "target",
@@ -69,6 +71,7 @@ impl GateService {
             &contract.allowed_scope,
         )?;
         let integrity = run_checks(
+            &check_root,
             &self.repo_root,
             &run.id,
             "integrity",
@@ -154,7 +157,7 @@ fn is_controller_runtime_artifact(path: &str) -> bool {
 }
 
 fn prune_generated_cargo_lock_if_out_of_scope(
-    repo_root: &Path,
+    check_root: &Path,
     allowed_scope: &[String],
     command: &str,
     cargo_lock_existed_before_check: bool,
@@ -166,14 +169,24 @@ fn prune_generated_cargo_lock_if_out_of_scope(
     {
         return Ok(());
     }
-    let cargo_lock = repo_root.join("Cargo.lock");
+    let cargo_lock = check_root.join("Cargo.lock");
     if cargo_lock.exists() {
         fs::remove_file(cargo_lock)?;
     }
     Ok(())
 }
 
+fn gate_check_root(repo_root: &Path, run: &punk_domain::Run) -> PathBuf {
+    let workspace = PathBuf::from(&run.vcs.workspace_ref);
+    if workspace.exists() {
+        workspace
+    } else {
+        repo_root.to_path_buf()
+    }
+}
+
 fn run_checks(
+    check_root: &Path,
     repo_root: &Path,
     run_id: &str,
     kind: &str,
@@ -215,7 +228,7 @@ fn run_checks(
             continue;
         }
 
-        if let Err(msg) = validate_check_command(repo_root, command_str) {
+        if let Err(msg) = validate_check_command(check_root, command_str) {
             failed = true;
             let summary = format!("{kind} check failed: invalid command: {msg}");
             reasons.push(summary.clone());
@@ -231,13 +244,13 @@ fn run_checks(
             continue;
         }
 
-        let cargo_lock_existed_before_check = repo_root.join("Cargo.lock").exists();
+        let cargo_lock_existed_before_check = check_root.join("Cargo.lock").exists();
         let output = std::process::Command::new(&args[0])
             .args(&args[1..])
-            .current_dir(repo_root)
+            .current_dir(check_root)
             .output()?;
         prune_generated_cargo_lock_if_out_of_scope(
-            repo_root,
+            check_root,
             allowed_scope,
             command_str,
             cargo_lock_existed_before_check,
@@ -923,6 +936,115 @@ mod tests {
             .decision_basis
             .iter()
             .any(|reason| reason.contains("scope violation")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gate_runs_trusted_checks_in_run_workspace_ref_when_present() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-workspace-ref-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let workspace = root.join("isolated-workspace");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        fs::create_dir_all(workspace.join("crates/demo-cli/src")).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"crates/demo-cli\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("crates/demo-cli/Cargo.toml"),
+            "[package]\nname = \"demo-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join("crates/demo-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "bootstrap".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["workspace scaffold".into()],
+            behavior_requirements: vec!["bootstrap project".into()],
+            allowed_scope: vec!["Cargo.toml".into(), "crates/demo-cli".into()],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
+
+        let run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: workspace.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "success".into(),
+            executor_name: "fake".into(),
+            changed_files: vec![
+                "Cargo.toml".into(),
+                "crates/demo-cli/Cargo.toml".into(),
+                "crates/demo-cli/src/main.rs".into(),
+            ],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec![],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "bootstrap succeeded".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+
+        let gate = GateService::new(&root, &global);
+        let decision = gate.gate_run("run_1").unwrap();
+
+        assert_eq!(decision.decision, Decision::Accept);
+        assert!(decision
+            .decision_basis
+            .iter()
+            .all(|reason| !reason.contains("failed")));
 
         let _ = fs::remove_dir_all(&root);
     }
