@@ -108,6 +108,11 @@ Bootstrap creates repo-local agent guidance:
 - `AGENTS.md`
 - `.punk/AGENT_START.md`
 
+Bootstrap also ensures safe default ignore coverage for:
+
+- `.punk/`
+- `target/`
+
 Inspect the current derived project-intelligence view with:
 
 ```bash

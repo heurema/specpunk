@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
@@ -553,6 +554,7 @@ fn run_project_bootstrap(project_root: &Path, project_id: &str, json: bool) -> R
     }
 
     if output.status.success() {
+        ensure_default_gitignore_coverage(project_root)?;
         return Ok(());
     }
 
@@ -576,6 +578,51 @@ fn format_bootstrap_skip_note(project_id: &str, reason: &str) -> String {
     )
 }
 
+fn ensure_default_gitignore_coverage(project_root: &Path) -> Result<()> {
+    let gitignore_path = project_root.join(".gitignore");
+    let existing = if gitignore_path.exists() {
+        fs::read_to_string(&gitignore_path)?
+    } else {
+        String::new()
+    };
+    let merged = merge_default_gitignore_entries(&existing);
+    if merged != existing {
+        fs::write(gitignore_path, merged)?;
+    }
+    Ok(())
+}
+
+fn merge_default_gitignore_entries(existing: &str) -> String {
+    let mut lines = if existing.is_empty() {
+        Vec::new()
+    } else {
+        existing.lines().map(str::to_string).collect::<Vec<_>>()
+    };
+    if !gitignore_covers_pattern(&lines, ".punk/") {
+        lines.push(".punk/".to_string());
+    }
+    if !gitignore_covers_pattern(&lines, "target/") {
+        lines.push("target/".to_string());
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+fn gitignore_covers_pattern(lines: &[String], required: &str) -> bool {
+    let aliases: &[&str] = match required {
+        ".punk/" => &[".punk/", ".punk"],
+        "target/" => &["target/", "target"],
+        _ => &[required],
+    };
+    lines.iter().any(|line| {
+        let trimmed = line.trim();
+        aliases.iter().any(|alias| trimmed == *alias)
+    })
+}
+
 fn cmd_init(
     repo_root: &Path,
     explicit_project: Option<&str>,
@@ -594,6 +641,7 @@ fn cmd_init(
     }
 
     if output.status.success() {
+        ensure_default_gitignore_coverage(&project_root)?;
         return Ok(());
     }
 
@@ -1582,6 +1630,34 @@ mod tests {
         let message = format_bootstrap_error("interviewcoach", "failed to execute punk-run");
         assert!(message.contains("project bootstrap failed"));
         assert!(message.contains("punk-run init --project interviewcoach --enable-jj --verify"));
+    }
+
+    #[test]
+    fn merge_default_gitignore_entries_adds_punk_and_target_when_missing() {
+        let merged = merge_default_gitignore_entries("");
+        assert_eq!(merged, ".punk/\ntarget/\n");
+    }
+
+    #[test]
+    fn merge_default_gitignore_entries_preserves_existing_lines_without_duplication() {
+        let merged = merge_default_gitignore_entries("node_modules/\n.punk/\n");
+        assert_eq!(merged, "node_modules/\n.punk/\ntarget/\n");
+
+        let already_covered = merge_default_gitignore_entries("target\n.punk\n");
+        assert_eq!(already_covered, "target\n.punk\n");
+    }
+
+    #[test]
+    fn ensure_default_gitignore_coverage_writes_missing_defaults() {
+        let root = temp_test_dir("gitignore-defaults");
+        fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+
+        ensure_default_gitignore_coverage(&root).unwrap();
+
+        let gitignore = fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert_eq!(gitignore, "node_modules/\n.punk/\ntarget/\n");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -274,6 +274,7 @@ Creates or refreshes:
 - project pin / resolver entry
 - bootstrap guidance
 - repo-local agent instructions
+- default `.gitignore` coverage for `.punk/` and `target/`
 
 Verifies:
 
