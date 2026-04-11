@@ -300,6 +300,12 @@ impl Executor for CodexCliExecutor {
             return Ok(output);
         }
 
+        if let Some(output) =
+            maybe_execute_controller_pubpunk_validate_recipe(&effective_input, start)?
+        {
+            return Ok(output);
+        }
+
         if let Some(output) = maybe_execute_controller_pubpunk_init_recipe(&effective_input, start)?
         {
             return Ok(output);
@@ -2270,6 +2276,54 @@ fn maybe_execute_controller_pubpunk_cleanup_recipe(
     }
 }
 
+fn maybe_execute_controller_pubpunk_validate_recipe(
+    input: &ExecuteInput,
+    start: Instant,
+) -> Result<Option<ExecuteOutput>> {
+    let Some(updated_paths) =
+        apply_controller_pubpunk_validate_recipe(&input.repo_root, &input.contract)?
+    else {
+        return Ok(None);
+    };
+
+    let checks = collect_contract_checks(&input.contract);
+    match run_contract_checks(
+        &input.repo_root,
+        &input.contract,
+        &checks,
+        &input.stdout_path,
+        &input.stderr_path,
+    ) {
+        Ok(checks_run) => {
+            let summary = if updated_paths.is_empty() {
+                "PUNK_EXECUTION_COMPLETE: controller pubpunk validate recipe already satisfied and checks passed"
+                    .to_string()
+            } else {
+                format!(
+                    "PUNK_EXECUTION_COMPLETE: controller pubpunk validate recipe applied and checks passed for {}",
+                    updated_paths.join(", ")
+                )
+            };
+            Ok(Some(ExecuteOutput {
+                success: true,
+                summary,
+                checks_run,
+                cost_usd: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            }))
+        }
+        Err(err) => Ok(Some(ExecuteOutput {
+            success: false,
+            summary: format!(
+                "controller pubpunk validate recipe applied but verification failed: {err}"
+            ),
+            checks_run: Vec::new(),
+            cost_usd: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })),
+    }
+}
+
 fn apply_controller_pubpunk_init_recipe(
     repo_root: &Path,
     contract: &Contract,
@@ -2324,6 +2378,36 @@ fn apply_controller_pubpunk_cleanup_recipe(
         }
         fs::write(&file_path, contents)
             .with_context(|| format!("write controller pubpunk cleanup file {}", path))?;
+        updated_paths.push(path);
+    }
+
+    Ok(Some(updated_paths))
+}
+
+fn apply_controller_pubpunk_validate_recipe(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Result<Option<Vec<String>>> {
+    let Some(files) = controller_pubpunk_validate_templates(repo_root, contract) else {
+        return Ok(None);
+    };
+
+    let mut updated_paths = Vec::new();
+    for (path, contents) in files {
+        if !path_is_in_allowed_scope(&path, &contract.allowed_scope) {
+            continue;
+        }
+        let file_path = repo_root.join(&path);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create controller pubpunk validate parent {}", path))?;
+        }
+        let current = fs::read_to_string(&file_path).ok();
+        if current.as_deref() == Some(contents.as_str()) {
+            continue;
+        }
+        fs::write(&file_path, contents)
+            .with_context(|| format!("write controller pubpunk validate file {}", path))?;
         updated_paths.push(path);
     }
 
@@ -2385,6 +2469,38 @@ fn controller_pubpunk_cleanup_templates(
     ])
 }
 
+fn controller_pubpunk_validate_templates(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Option<Vec<(String, String)>> {
+    if !is_controller_pubpunk_validate_recipe(contract) {
+        return None;
+    }
+    if !repo_root.join("Cargo.toml").exists()
+        || !repo_root.join("crates/pubpunk-cli/Cargo.toml").exists()
+        || !repo_root.join("crates/pubpunk-core/Cargo.toml").exists()
+        || !repo_root.join("crates/pubpunk-core/src/lib.rs").exists()
+        || !repo_root.join("crates/pubpunk-cli/src/main.rs").exists()
+    {
+        return None;
+    }
+
+    Some(vec![
+        (
+            "crates/pubpunk-core/src/lib.rs".to_string(),
+            render_pubpunk_validate_core_source(),
+        ),
+        (
+            "crates/pubpunk-cli/src/main.rs".to_string(),
+            render_pubpunk_validate_cli_source(),
+        ),
+        (
+            "tests/validate_json.rs".to_string(),
+            render_pubpunk_validate_tests_source(),
+        ),
+    ])
+}
+
 fn is_controller_pubpunk_cleanup_recipe(contract: &Contract) -> bool {
     let has_core = contract
         .entry_points
@@ -2406,6 +2522,38 @@ fn is_controller_pubpunk_cleanup_recipe(contract: &Contract) -> bool {
     let combined = pubpunk_init_contract_text(contract);
     (combined.contains("style/examples") || combined.contains("style examples"))
         && (combined.contains("remove") || combined.contains("cleanup"))
+}
+
+fn is_controller_pubpunk_validate_recipe(contract: &Contract) -> bool {
+    let has_cli = contract
+        .entry_points
+        .iter()
+        .any(|path| path == "crates/pubpunk-cli/src/main.rs")
+        || path_is_in_allowed_scope("crates/pubpunk-cli/src/main.rs", &contract.allowed_scope);
+    let has_core = contract
+        .entry_points
+        .iter()
+        .any(|path| path == "crates/pubpunk-core/src/lib.rs")
+        || path_is_in_allowed_scope("crates/pubpunk-core/src/lib.rs", &contract.allowed_scope);
+    let has_tests = contract
+        .entry_points
+        .iter()
+        .any(|path| path == "tests/validate_json.rs")
+        || path_is_in_allowed_scope("tests/validate_json.rs", &contract.allowed_scope)
+        || contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "tests" || path.starts_with("tests/"));
+    if !(has_cli && has_core && has_tests) {
+        return false;
+    }
+
+    let combined = pubpunk_init_contract_text(contract);
+    combined.contains("pubpunk validate")
+        && combined.contains("json")
+        && (combined.contains("project-root")
+            || combined.contains("project_root")
+            || combined.contains("project root"))
 }
 
 fn is_controller_pubpunk_init_recipe(contract: &Contract) -> bool {
@@ -2455,6 +2603,381 @@ fn render_pubpunk_cleanup_core_source() -> String {
 
 fn render_pubpunk_cleanup_tests_source() -> String {
     render_pubpunk_init_tests_source().replace("        \".pubpunk/style/examples\",\n", "")
+}
+
+fn render_pubpunk_validate_core_source() -> String {
+    let source = render_pubpunk_cleanup_core_source();
+    let source = source.replace(
+        "use std::fs;\nuse std::io;\nuse std::path::{Path, PathBuf};\n",
+        "use std::collections::BTreeMap;\nuse std::fs;\nuse std::io;\nuse std::path::{Path, PathBuf};\n",
+    );
+    let source = source.replace(
+        "pub fn validate(root: &Path) -> io::Result<()> {\n    let root = prepare_existing_root(root)?;\n    for relative in SKELETON_DIRS {\n        let path = root.join(relative);\n        if !path.is_dir() {\n            return Err(io::Error::new(\n                io::ErrorKind::NotFound,\n                format!(\"missing directory: {}\", path.display()),\n            ));\n        }\n    }\n    for (relative, _) in SKELETON_FILES {\n        let path = root.join(relative);\n        if !path.is_file() {\n            return Err(io::Error::new(\n                io::ErrorKind::NotFound,\n                format!(\"missing file: {}\", path.display()),\n            ));\n        }\n    }\n\n    let project_toml = fs::read_to_string(root.join(\".pubpunk/project.toml\"))?;\n    validate_project_toml(&project_toml)?;\n    Ok(())\n}\n\nfn validate_project_toml(contents: &str) -> io::Result<()> {\n    for required in REQUIRED_PROJECT_LINES {\n        if !contents.contains(required) {\n            return Err(io::Error::new(\n                io::ErrorKind::InvalidData,\n                format!(\"missing required project.toml line: {required}\"),\n            ));\n        }\n    }\n\n    let project_id = assignment_value(contents, \"project_id\").ok_or_else(|| {\n        io::Error::new(io::ErrorKind::InvalidData, \"missing required project_id\")\n    })?;\n    if !is_slug_safe(project_id) {\n        return Err(io::Error::new(\n            io::ErrorKind::InvalidData,\n            format!(\"project_id is not slug-safe: {project_id}\"),\n        ));\n    }\n\n    for key in PATH_KEYS {\n        let value = assignment_value(contents, key).ok_or_else(|| {\n            io::Error::new(io::ErrorKind::InvalidData, format!(\"missing required key: {key}\"))\n        })?;\n        if Path::new(value).is_absolute() {\n            return Err(io::Error::new(\n                io::ErrorKind::InvalidData,\n                format!(\"{key} must stay relative under .pubpunk: {value}\"),\n            ));\n        }\n    }\n\n    for key in LOCAL_KEYS {\n        let value = assignment_value(contents, key).ok_or_else(|| {\n            io::Error::new(io::ErrorKind::InvalidData, format!(\"missing required key: {key}\"))\n        })?;\n        if !value.starts_with(\"local/\") || Path::new(value).is_absolute() {\n            return Err(io::Error::new(\n                io::ErrorKind::InvalidData,\n                format!(\"{key} must stay under local/: {value}\"),\n            ));\n        }\n    }\n\n    let lowered = contents.to_ascii_lowercase();\n    for secret_like in [\"token\", \"secret\", \"password\", \"api_key\"] {\n        if lowered.contains(secret_like) {\n            return Err(io::Error::new(\n                io::ErrorKind::InvalidData,\n                format!(\"project.toml contains obvious secret-like field: {secret_like}\"),\n            ));\n        }\n    }\n\n    Ok(())\n}\n\nfn assignment_value<'a>(contents: &'a str, key: &str) -> Option<&'a str> {\n    for line in contents.lines() {\n        let trimmed = line.trim();\n        let prefix = format!(\"{key} = \");\n        let Some(value) = trimmed.strip_prefix(&prefix) else {\n            continue;\n        };\n        let value = value.trim();\n        if value.starts_with('\"') && value.ends_with('\"') && value.len() >= 2 {\n            return Some(&value[1..value.len() - 1]);\n        }\n    }\n    None\n}\n",
+        "#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidateIssue {\n    pub code: &'static str,\n    pub path: Option<PathBuf>,\n    pub message: String,\n}\n\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct ValidateReport {\n    pub root: PathBuf,\n    pub issues: Vec<ValidateIssue>,\n}\n\nimpl ValidateReport {\n    pub fn ok(&self) -> bool {\n        self.issues.is_empty()\n    }\n\n    pub fn to_json(&self) -> String {\n        let root = escape_json_string(&self.root.display().to_string());\n        let issues = self\n            .issues\n            .iter()\n            .map(|issue| {\n                let code = escape_json_string(issue.code);\n                let message = escape_json_string(&issue.message);\n                let path = issue\n                    .path\n                    .as_ref()\n                    .map(|path| format!(\"\\\"{}\\\"\", escape_json_string(&path.display().to_string())))\n                    .unwrap_or_else(|| \"null\".to_string());\n                format!(\n                    \"{{\\\"code\\\":\\\"{code}\\\",\\\"path\\\":{path},\\\"message\\\":\\\"{message}\\\"}}\"\n                )\n            })\n            .collect::<Vec<_>>()\n            .join(\",\");\n        format!(\n            \"{{\\\"ok\\\":{},\\\"root\\\":\\\"{root}\\\",\\\"issues\\\":[{issues}]}}\",\n            if self.ok() { \"true\" } else { \"false\" }\n        )\n    }\n\n    pub fn summary_message(&self) -> String {\n        self.issues\n            .first()\n            .map(|issue| issue.message.clone())\n            .unwrap_or_else(|| \"Validated .pubpunk skeleton\".to_string())\n    }\n\n    pub fn into_result(self) -> io::Result<()> {\n        if self.ok() {\n            Ok(())\n        } else {\n            Err(io::Error::new(io::ErrorKind::InvalidData, self.summary_message()))\n        }\n    }\n}\n\npub fn validate(root: &Path) -> io::Result<()> {\n    validate_report(root).into_result()\n}\n\npub fn validate_report(root: &Path) -> ValidateReport {\n    let root = match prepare_existing_root(root) {\n        Ok(root) => root,\n        Err(err) => {\n            return ValidateReport {\n                root: root.to_path_buf(),\n                issues: vec![ValidateIssue {\n                    code: \"root_missing\",\n                    path: None,\n                    message: err.to_string(),\n                }],\n            };\n        }\n    };\n\n    let mut issues = Vec::new();\n    for relative in SKELETON_DIRS {\n        let path = root.join(relative);\n        if !path.is_dir() {\n            issues.push(ValidateIssue {\n                code: \"missing_directory\",\n                path: Some(PathBuf::from(relative)),\n                message: format!(\"missing directory: {}\", path.display()),\n            });\n        }\n    }\n    for (relative, _) in SKELETON_FILES {\n        let path = root.join(relative);\n        if !path.is_file() {\n            issues.push(ValidateIssue {\n                code: \"missing_file\",\n                path: Some(PathBuf::from(relative)),\n                message: format!(\"missing file: {}\", path.display()),\n            });\n        }\n    }\n\n    let project_relative = PathBuf::from(\".pubpunk/project.toml\");\n    let project_path = root.join(&project_relative);\n    if project_path.is_file() {\n        match fs::read_to_string(&project_path) {\n            Ok(contents) => issues.extend(validate_project_toml(&contents)),\n            Err(err) => issues.push(ValidateIssue {\n                code: \"unreadable_project_toml\",\n                path: Some(project_relative),\n                message: format!(\"unable to read {}: {err}\", project_path.display()),\n            }),\n        }\n    }\n\n    ValidateReport { root, issues }\n}\n\nfn validate_project_toml(contents: &str) -> Vec<ValidateIssue> {\n    let mut issues = Vec::new();\n    let parsed = match parse_project_toml(contents) {\n        Ok(parsed) => parsed,\n        Err(message) => {\n            issues.push(ValidateIssue {\n                code: \"unparseable_project_toml\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message,\n            });\n            return issues;\n        }\n    };\n\n    for required in REQUIRED_PROJECT_LINES {\n        if !contents.contains(required) {\n            issues.push(ValidateIssue {\n                code: \"missing_required_line\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"missing required project.toml line: {required}\"),\n            });\n        }\n    }\n\n    match parsed.get(\"project_id\") {\n        Some(project_id) if is_slug_safe(project_id) => {}\n        Some(project_id) => issues.push(ValidateIssue {\n            code: \"invalid_project_id\",\n            path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n            message: format!(\"project_id is not slug-safe: {project_id}\"),\n        }),\n        None => issues.push(ValidateIssue {\n            code: \"missing_project_id\",\n            path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n            message: \"missing required project_id\".to_string(),\n        }),\n    }\n\n    match parsed.get(\"schema_version\") {\n        Some(value) if value == \"pubpunk.project.v1\" => {}\n        Some(value) => issues.push(ValidateIssue {\n            code: \"invalid_schema_version\",\n            path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n            message: format!(\"schema_version must be pubpunk.project.v1, got: {value}\"),\n        }),\n        None => issues.push(ValidateIssue {\n            code: \"missing_schema_version\",\n            path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n            message: \"missing required schema_version\".to_string(),\n        }),\n    }\n\n    for key in PATH_KEYS {\n        let full_key = format!(\"paths.{key}\");\n        match parsed.get(&full_key) {\n            Some(value) if !Path::new(value).is_absolute() => {}\n            Some(value) => issues.push(ValidateIssue {\n                code: \"absolute_path\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"{key} must stay relative under .pubpunk: {value}\"),\n            }),\n            None => issues.push(ValidateIssue {\n                code: \"missing_path_key\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"missing required key: {key}\"),\n            }),\n        }\n    }\n\n    for key in LOCAL_KEYS {\n        let full_key = format!(\"local.{key}\");\n        match parsed.get(&full_key) {\n            Some(value) if value.starts_with(\"local/\") && !Path::new(value).is_absolute() => {}\n            Some(value) => issues.push(ValidateIssue {\n                code: \"invalid_local_path\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"{key} must stay under local/: {value}\"),\n            }),\n            None => issues.push(ValidateIssue {\n                code: \"missing_local_key\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"missing required key: {key}\"),\n            }),\n        }\n    }\n\n    for key in parsed.keys() {\n        let lowered = key.to_ascii_lowercase();\n        let leaf = lowered.rsplit('.').next().unwrap_or(lowered.as_str());\n        if [\"token\", \"secret\", \"password\", \"api_key\"]\n            .iter()\n            .any(|needle| leaf.contains(needle) || lowered.contains(needle))\n        {\n            issues.push(ValidateIssue {\n                code: \"secret_like_key\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"project.toml contains obvious secret-like field: {key}\"),\n            });\n        }\n    }\n\n    issues\n}\n\nfn parse_project_toml(contents: &str) -> Result<BTreeMap<String, String>, String> {\n    let mut values = BTreeMap::new();\n    let mut current_section: Option<String> = None;\n\n    for (index, raw_line) in contents.lines().enumerate() {\n        let trimmed = raw_line.trim();\n        if trimmed.is_empty() || trimmed.starts_with('#') {\n            continue;\n        }\n        if trimmed.starts_with('[') {\n            if !trimmed.ends_with(']') || trimmed.len() < 3 {\n                return Err(format!(\"project.toml is not parseable near line {}\", index + 1));\n            }\n            current_section = Some(trimmed[1..trimmed.len() - 1].trim().to_string());\n            continue;\n        }\n        let Some((key, value)) = trimmed.split_once('=') else {\n            return Err(format!(\"project.toml is not parseable near line {}\", index + 1));\n        };\n        let key = key.trim();\n        if key.is_empty() {\n            return Err(format!(\"project.toml is not parseable near line {}\", index + 1));\n        }\n        let value = parse_project_toml_value(value.trim())\n            .map_err(|_| format!(\"project.toml is not parseable near line {}\", index + 1))?;\n        let full_key = current_section\n            .as_ref()\n            .map(|section| format!(\"{section}.{key}\"))\n            .unwrap_or_else(|| key.to_string());\n        values.insert(full_key, value);\n    }\n\n    Ok(values)\n}\n\nfn parse_project_toml_value(value: &str) -> Result<String, ()> {\n    if value.len() >= 2\n        && ((value.starts_with('\"') && value.ends_with('\"'))\n            || (value.starts_with('\\'') && value.ends_with('\\'')))\n    {\n        return Ok(value[1..value.len() - 1].to_string());\n    }\n    Err(())\n}\n",
+    );
+    source
+}
+
+fn render_pubpunk_validate_cli_source() -> String {
+    r##"use std::env;
+use std::path::{Path, PathBuf};
+use std::process::{self, ExitCode};
+
+fn main() -> ExitCode {
+    match run(env::args().skip(1), Path::new(".")) {
+        Ok(output) => {
+            if !output.text.is_empty() {
+                println!("{}", output.text);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(output) => {
+            if !output.text.is_empty() {
+                if output.prefer_stdout {
+                    println!("{}", output.text);
+                } else {
+                    eprintln!("{}", output.text);
+                }
+            }
+            process::ExitCode::from(1)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunOutput {
+    pub text: String,
+    pub prefer_stdout: bool,
+}
+
+impl RunOutput {
+    fn stdout(text: String) -> Self {
+        Self {
+            text,
+            prefer_stdout: true,
+        }
+    }
+
+    fn stderr(text: String) -> Self {
+        Self {
+            text,
+            prefer_stdout: false,
+        }
+    }
+}
+
+pub fn run<I>(args: I, cwd: &Path) -> Result<RunOutput, RunOutput>
+where
+    I: IntoIterator<Item = String>,
+{
+    let command = parse_args(args).map_err(RunOutput::stderr)?;
+    match command {
+        Command::Init {
+            json,
+            force,
+            project_root,
+        } => {
+            let root = project_root.unwrap_or_else(|| cwd.to_path_buf());
+            let result = pubpunk_core::init_with_options(&root, force)
+                .map_err(|err| RunOutput::stderr(format!("pubpunk init failed: {err}")))?;
+            if json {
+                Ok(RunOutput::stdout(result.to_json()))
+            } else if result.created.is_empty() && result.rewritten.is_empty() {
+                Ok(RunOutput::stdout(
+                    "Initialized .pubpunk skeleton (no changes)".to_string(),
+                ))
+            } else {
+                Ok(RunOutput::stdout("Initialized .pubpunk skeleton".to_string()))
+            }
+        }
+        Command::Validate { json, project_root } => {
+            let root = project_root.unwrap_or_else(|| cwd.to_path_buf());
+            let report = pubpunk_core::validate_report(&root);
+            if json {
+                if report.ok() {
+                    Ok(RunOutput::stdout(report.to_json()))
+                } else {
+                    Err(RunOutput::stdout(report.to_json()))
+                }
+            } else {
+                report
+                    .clone()
+                    .into_result()
+                    .map_err(|err| RunOutput::stderr(format!("pubpunk validate failed: {err}")))?;
+                Ok(RunOutput::stdout("Validated .pubpunk skeleton".to_string()))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Command {
+    Init {
+        json: bool,
+        force: bool,
+        project_root: Option<PathBuf>,
+    },
+    Validate {
+        json: bool,
+        project_root: Option<PathBuf>,
+    },
+}
+
+fn parse_args<I>(args: I) -> Result<Command, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let Some(command) = args.next() else {
+        return Err(usage());
+    };
+
+    match command.as_str() {
+        "init" => {
+            let mut json = false;
+            let mut force = false;
+            let mut project_root = None;
+            let mut args = args.peekable();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    "--force" => force = true,
+                    "--project-root" => {
+                        let Some(path) = args.next() else {
+                            return Err(format!("missing value for --project-root\n{}", usage()));
+                        };
+                        project_root = Some(PathBuf::from(path));
+                    }
+                    _ => return Err(format!("unknown argument for init: {arg}\n{}", usage())),
+                }
+            }
+            Ok(Command::Init {
+                json,
+                force,
+                project_root,
+            })
+        }
+        "validate" => {
+            let mut json = false;
+            let mut project_root = None;
+            let mut args = args.peekable();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    "--project-root" => {
+                        let Some(path) = args.next() else {
+                            return Err(format!("missing value for --project-root\n{}", usage()));
+                        };
+                        project_root = Some(PathBuf::from(path));
+                    }
+                    _ => {
+                        return Err(format!("unknown argument for validate: {arg}\n{}", usage()))
+                    }
+                }
+            }
+            Ok(Command::Validate { json, project_root })
+        }
+        _ => Err(format!("unknown command: {command}\n{}", usage())),
+    }
+}
+
+fn usage() -> String {
+    "usage: pubpunk <init|validate> [--json] [--force] [--project-root <path>]".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_init_flags() {
+        let command = parse_args([
+            "init".to_string(),
+            "--json".to_string(),
+            "--force".to_string(),
+            "--project-root".to_string(),
+            "/tmp/project".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::Init {
+                json: true,
+                force: true,
+                project_root: Some(PathBuf::from("/tmp/project")),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_validate_flags() {
+        let command = parse_args([
+            "validate".to_string(),
+            "--json".to_string(),
+            "--project-root".to_string(),
+            "/tmp/project".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Command::Validate {
+                json: true,
+                project_root: Some(PathBuf::from("/tmp/project")),
+            }
+        );
+    }
+
+    #[test]
+    fn run_init_json_returns_machine_output() {
+        let root = temp_dir("cli-json");
+        let output = run(
+            [
+                "init".to_string(),
+                "--json".to_string(),
+                "--project-root".to_string(),
+                root.display().to_string(),
+            ],
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(output.text.starts_with("{\"ok\":true,"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{prefix}-{unique}"));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+}
+"##
+    .to_string()
+}
+
+fn render_pubpunk_validate_tests_source() -> String {
+    r####"use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "../crates/pubpunk-cli/src/main.rs"]
+mod cli;
+
+#[test]
+fn validate_json_reports_success_for_initialized_tree() {
+    let root = temp_dir("pubpunk-validate-json-ok");
+    pubpunk_core::init_with_options(&root, false).unwrap();
+
+    let output = cli::run(
+        [
+            "validate".to_string(),
+            "--json".to_string(),
+            "--project-root".to_string(),
+            root.display().to_string(),
+        ],
+        Path::new("."),
+    )
+    .expect("validate json should succeed");
+
+    assert!(output.text.contains("\"ok\":true"), "json={}", output.text);
+    assert!(output.text.contains("\"issues\":[]"), "json={}", output.text);
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn validate_json_reports_missing_directory_issue() {
+    let root = temp_dir("pubpunk-validate-json-missing");
+    pubpunk_core::init_with_options(&root, false).unwrap();
+    fs::remove_dir_all(root.join(".pubpunk/targets")).unwrap();
+
+    let output = cli::run(
+        [
+            "validate".to_string(),
+            "--json".to_string(),
+            "--project-root".to_string(),
+            root.display().to_string(),
+        ],
+        Path::new("."),
+    )
+    .expect_err("validate json should fail");
+
+    assert!(output.text.contains("\"ok\":false"), "json={}", output.text);
+    assert!(
+        output.text.contains("\"code\":\"missing_directory\""),
+        "json={}",
+        output.text
+    );
+    assert!(output.text.contains(".pubpunk/targets"), "json={}", output.text);
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn validate_json_rejects_unparseable_project_toml() {
+    let root = temp_dir("pubpunk-validate-json-parse");
+    pubpunk_core::init_with_options(&root, false).unwrap();
+    fs::write(root.join(".pubpunk/project.toml"), "[defaults\nbroken").unwrap();
+
+    let output = cli::run(
+        [
+            "validate".to_string(),
+            "--json".to_string(),
+            "--project-root".to_string(),
+            root.display().to_string(),
+        ],
+        Path::new("."),
+    )
+    .expect_err("validate json should fail");
+
+    assert!(
+        output.text.contains("\"code\":\"unparseable_project_toml\""),
+        "json={}",
+        output.text
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn validate_json_rejects_secret_like_keys() {
+    let root = temp_dir("pubpunk-validate-json-secret");
+    pubpunk_core::init_with_options(&root, false).unwrap();
+    let project_toml = root.join(".pubpunk/project.toml");
+    let current = fs::read_to_string(&project_toml).unwrap();
+    fs::write(project_toml, format!("{current}api_key = \"secret\"\n")).unwrap();
+
+    let output = cli::run(
+        [
+            "validate".to_string(),
+            "--json".to_string(),
+            "--project-root".to_string(),
+            root.display().to_string(),
+        ],
+        Path::new("."),
+    )
+    .expect_err("validate json should fail");
+
+    assert!(
+        output.text.contains("\"code\":\"secret_like_key\""),
+        "json={}",
+        output.text
+    );
+    fs::remove_dir_all(&root).unwrap();
+}
+
+fn temp_dir(prefix: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("{prefix}-{unique}"));
+    fs::create_dir_all(&path).unwrap();
+    path
+}
+"####
+    .to_string()
 }
 
 fn render_pubpunk_init_core_source() -> String {
@@ -9006,6 +9529,195 @@ mod tests {
         let tests = fs::read_to_string(root.join("tests/init_json.rs")).unwrap();
         assert!(!core.contains(".pubpunk/style/examples"));
         assert!(!tests.contains(".pubpunk/style/examples"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn controller_pubpunk_validate_recipe_matches_exact_slice() {
+        let contract = Contract {
+            id: "ct_validate".into(),
+            feature_id: "feat_validate".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "draft a bounded validate-only rust change. Entry points must be exactly crates/pubpunk-cli/src/main.rs, crates/pubpunk-core/src/lib.rs, and tests/validate_json.rs. Allowed scope should cover only those surfaces and the tests directory if needed. No Cargo.toml, no local/, no init work. Implement pubpunk validate with --json and --project-root, structured JSON envelope.".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/validate_json.rs".into(),
+            ],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            expected_interfaces: vec![
+                "`pubpunk validate --json --project-root <path>` is exposed from the CLI.".into(),
+                "Core library exposes validation logic consumable by the CLI.".into(),
+                "JSON output uses a stable structured envelope suitable for tests.".into(),
+            ],
+            behavior_requirements: vec![
+                "Add a validate-only Rust change for `pubpunk validate`.".into(),
+                "Support `--json` and `--project-root`.".into(),
+                "Do not add init behavior or init-side effects.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/validate_json.rs".into(),
+                "tests".into(),
+                "Cargo.toml".into(),
+            ],
+            target_checks: vec!["cargo test --tests".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert!(is_controller_pubpunk_validate_recipe(&contract));
+    }
+
+    #[test]
+    fn controller_pubpunk_validate_recipe_materializes_compile_ready_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-controller-pubpunk-validate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let bootstrap = Contract {
+            id: "ct_bootstrap".into(),
+            feature_id: "feat_bootstrap".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "bootstrap initial Rust workspace for pubpunk".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec!["crates/pubpunk-cli".into(), "crates/pubpunk-core".into()],
+            expected_interfaces: vec!["initial Rust scaffold".into()],
+            behavior_requirements: vec!["bootstrap project".into()],
+            allowed_scope: vec![
+                "Cargo.toml".into(),
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        materialize_rust_workspace_bootstrap_scaffold(&root, &bootstrap).unwrap();
+
+        let init_contract = Contract {
+            id: "ct_pubpunk_init".into(),
+            feature_id: "feat_pubpunk_init".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init command in crates/pubpunk-cli and crates/pubpunk-core with tests".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["bounded implementation slice".into()],
+            behavior_requirements: vec!["Add a pubpunk init command.".into(), "Support --json.".into()],
+            allowed_scope: vec![
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        apply_controller_pubpunk_init_recipe(&root, &init_contract)
+            .unwrap()
+            .expect("controller init recipe should apply");
+
+        let cleanup_contract = Contract {
+            id: "ct_cleanup".into(),
+            feature_id: "feat_cleanup".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "remove style examples cleanup".into(),
+            entry_points: vec![
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/init_json.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["cleanup slice".into()],
+            behavior_requirements: vec!["remove style examples".into()],
+            allowed_scope: vec![
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/init_json.rs".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        apply_controller_pubpunk_cleanup_recipe(&root, &cleanup_contract)
+            .unwrap()
+            .expect("controller cleanup recipe should apply");
+
+        let validate_contract = Contract {
+            id: "ct_validate".into(),
+            feature_id: "feat_validate".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "draft a bounded validate-only rust change. Implement pubpunk validate with --json and --project-root, structured JSON envelope, and checks for required .pubpunk tree/files, parseable project.toml, exact schema_version pubpunk.project.v1, slug-safe project_id, no absolute paths in paths.*, local.* under local/, and obvious secret-like keys token/secret/password/api_key.".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/validate_json.rs".into(),
+            ],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            expected_interfaces: vec![
+                "`pubpunk validate --json --project-root <path>` is exposed from the CLI.".into(),
+                "Core library exposes validation logic consumable by the CLI.".into(),
+                "JSON output uses a stable structured envelope suitable for tests.".into(),
+            ],
+            behavior_requirements: vec![
+                "Add a validate-only Rust change for `pubpunk validate`.".into(),
+                "Support `--json` and `--project-root`.".into(),
+                "Do not add init behavior or init-side effects.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/validate_json.rs".into(),
+                "tests".into(),
+            ],
+            target_checks: vec![
+                "cargo test -p pubpunk-cli".into(),
+                "cargo test -p pubpunk-core".into(),
+                "cargo test --tests".into(),
+            ],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let updated = apply_controller_pubpunk_validate_recipe(&root, &validate_contract)
+            .unwrap()
+            .expect("controller validate recipe should apply");
+        assert!(updated.contains(&"crates/pubpunk-core/src/lib.rs".to_string()));
+        assert!(updated.contains(&"crates/pubpunk-cli/src/main.rs".to_string()));
+        assert!(updated.contains(&"tests/validate_json.rs".to_string()));
+
+        let status = Command::new("cargo")
+            .args(["test", "--workspace"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
 
         let _ = fs::remove_dir_all(&root);
     }
