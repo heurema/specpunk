@@ -2336,14 +2336,14 @@ fn should_treat_cut_run_as_already_satisfied(
     preexisting_changed_files: &[String],
 ) -> bool {
     contract_is_file_bounded(contract)
-        && is_cut_run_noop_summary(summary)
+        && is_explicit_already_satisfied_summary(summary)
         && entry_points_already_changed_before_dispatch(contract, preexisting_changed_files)
 }
 
-fn is_cut_run_noop_summary(summary: &str) -> bool {
+fn is_explicit_already_satisfied_summary(summary: &str) -> bool {
     summary
         .trim()
-        .starts_with("no implementation progress after bounded context dispatch")
+        .starts_with("PUNK_EXECUTION_ALREADY_SATISFIED:")
 }
 
 fn entry_points_already_changed_before_dispatch(
@@ -5034,6 +5034,31 @@ mod tests {
         }
     }
 
+    struct ExplicitAlreadySatisfiedExecutor;
+
+    impl Executor for ExplicitAlreadySatisfiedExecutor {
+        fn name(&self) -> &'static str {
+            "explicit-already-satisfied"
+        }
+
+        fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+            fs::write(
+                &input.stdout_path,
+                b"PUNK_EXECUTION_ALREADY_SATISFIED: src/lib.rs already contains the requested implementation\n",
+            )?;
+            fs::write(&input.stderr_path, b"")?;
+            Ok(ExecuteOutput {
+                success: false,
+                summary:
+                    "PUNK_EXECUTION_ALREADY_SATISFIED: src/lib.rs already contains the requested implementation"
+                        .into(),
+                checks_run: vec![],
+                cost_usd: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
     struct BlockedNoOpExecutor;
 
     impl Executor for BlockedNoOpExecutor {
@@ -5888,7 +5913,7 @@ mod tests {
         service.approve_contract(&contract.id).unwrap();
 
         let (run, receipt) = service
-            .cut_run(&NoProgressNoOpExecutor, &contract.id)
+            .cut_run(&ExplicitAlreadySatisfiedExecutor, &contract.id)
             .unwrap();
         assert_eq!(run.status, RunStatus::Finished);
         assert_eq!(receipt.status, "success");
@@ -5897,6 +5922,70 @@ mod tests {
             .summary
             .contains("already satisfied in allowed scope before bounded dispatch"));
         assert!(receipt.summary.contains("src/lib.rs"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_does_not_upgrade_generic_no_progress_summary_even_if_entry_points_are_dirty() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-no-progress-not-already-satisfied-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn demo() { println!(\"done\"); }\n",
+        )
+        .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&AlreadySatisfiedDrafter, "demo already satisfied")
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (run, receipt) = service.cut_run(&NoProgressNoOpExecutor, &contract.id).unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(receipt.status, "failure");
+        assert!(receipt
+            .summary
+            .starts_with("no implementation progress after bounded context dispatch"));
+        assert!(!receipt
+            .summary
+            .contains("already satisfied in allowed scope before bounded dispatch"));
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -608,12 +608,7 @@ fn prompt_explicitly_requests_greenfield_rust_scaffold(tokens: &[String]) -> boo
             "rust" | "cargo" | "crate" | "crates" | "workspace"
         )
     });
-    let requests_scaffold = tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "scaffold" | "bootstrap" | "greenfield" | "init" | "initialize"
-        )
-    });
+    let requests_scaffold = prompt_explicitly_requests_scaffold(tokens);
     requests_rust && requests_scaffold
 }
 
@@ -621,12 +616,7 @@ fn prompt_explicitly_requests_greenfield_go_scaffold(tokens: &[String]) -> bool 
     let requests_go = tokens
         .iter()
         .any(|token| matches!(token.as_str(), "go" | "golang" | "module"));
-    let requests_scaffold = tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "scaffold" | "bootstrap" | "greenfield" | "init" | "initialize"
-        )
-    });
+    let requests_scaffold = prompt_explicitly_requests_scaffold(tokens);
     requests_go && requests_scaffold
 }
 
@@ -634,12 +624,7 @@ fn prompt_explicitly_requests_greenfield_python_scaffold(tokens: &[String]) -> b
     let requests_python = tokens
         .iter()
         .any(|token| matches!(token.as_str(), "python" | "pytest" | "pyproject" | "poetry"));
-    let requests_scaffold = tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "scaffold" | "bootstrap" | "greenfield" | "init" | "initialize"
-        )
-    });
+    let requests_scaffold = prompt_explicitly_requests_scaffold(tokens);
     requests_python && requests_scaffold
 }
 
@@ -658,13 +643,14 @@ fn prompt_explicitly_requests_greenfield_node_scaffold(tokens: &[String]) -> boo
                 | "vite"
         )
     });
-    let requests_scaffold = tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "scaffold" | "bootstrap" | "greenfield" | "init" | "initialize"
-        )
-    });
+    let requests_scaffold = prompt_explicitly_requests_scaffold(tokens);
     requests_node && requests_scaffold
+}
+
+fn prompt_explicitly_requests_scaffold(tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "scaffold" | "bootstrap" | "greenfield"))
 }
 
 fn greenfield_scaffold_kind(repo_root: &Path, tokens: &[String]) -> Option<GreenfieldScaffoldKind> {
@@ -2997,6 +2983,40 @@ mod tests {
         let summary = scan_repo(&root, "write launch copy for landing page").unwrap();
         assert!(summary.candidate_target_checks.is_empty());
         assert!(summary.candidate_integrity_checks.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_generic_init_verbs_do_not_trigger_greenfield_scaffold() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-generic-init-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+
+        let rust_summary = scan_repo(&root, "initialize config loading in Rust").unwrap();
+        assert!(rust_summary.candidate_target_checks.is_empty());
+        assert!(rust_summary.candidate_integrity_checks.is_empty());
+        assert!(!rust_summary
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "Cargo.toml"));
+
+        let go_summary = scan_repo(&root, "implement a Go init helper").unwrap();
+        assert!(go_summary.candidate_target_checks.is_empty());
+        assert!(go_summary.candidate_integrity_checks.is_empty());
+        assert!(!go_summary
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "go.mod"));
 
         let _ = fs::remove_dir_all(&root);
     }

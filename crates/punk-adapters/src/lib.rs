@@ -2549,8 +2549,11 @@ fn is_controller_pubpunk_validate_recipe(contract: &Contract) -> bool {
     }
 
     let combined = pubpunk_init_contract_text(contract);
-    combined.contains("pubpunk validate")
-        && combined.contains("json")
+    contract_looks_like_stable_pubpunk_recipe_scope(contract)
+        && combined.contains("pubpunk validate")
+        && combined.contains("validate-only")
+        && combined.contains("structured json envelope")
+        && (combined.contains("do not add init behavior") || combined.contains("no init work"))
         && (combined.contains("project-root")
             || combined.contains("project_root")
             || combined.contains("project root"))
@@ -2576,7 +2579,13 @@ fn is_controller_pubpunk_init_recipe(contract: &Contract) -> bool {
     }
 
     let combined = pubpunk_init_contract_text(contract);
-    combined.contains("pubpunk init") && combined.contains("json")
+    contract_looks_like_stable_pubpunk_recipe_scope(contract)
+        && combined.contains("pubpunk init")
+        && combined.contains("json")
+        && (combined.contains("canonical .pubpunk skeleton")
+            || combined.contains("canonical .pubpunk tree")
+            || combined.contains("canonical starter files"))
+        && (combined.contains("create") || combined.contains("creates") || combined.contains("materialize"))
 }
 
 fn pubpunk_init_contract_text(contract: &Contract) -> String {
@@ -2590,6 +2599,28 @@ fn pubpunk_init_contract_text(contract: &Contract) -> String {
         combined.push_str(&item.to_ascii_lowercase());
     }
     combined
+}
+
+fn contract_looks_like_stable_pubpunk_recipe_scope(contract: &Contract) -> bool {
+    let allowed_prefixes = [
+        "Cargo.toml",
+        "crates",
+        "crates/pubpunk-cli",
+        "crates/pubpunk-core",
+        "tests",
+        "local/",
+    ];
+    contract
+        .entry_points
+        .iter()
+        .chain(contract.allowed_scope.iter())
+        .all(|path| {
+            allowed_prefixes.iter().any(|prefix| {
+                path == prefix
+                    || path.starts_with(&format!("{prefix}/"))
+                    || (prefix.ends_with('/') && path.starts_with(prefix))
+            })
+        })
 }
 
 fn render_pubpunk_cleanup_core_source() -> String {
@@ -6931,7 +6962,7 @@ mod tests {
             "If the context pack lists missing entry-point files at baseline, treat those paths as approved new files and create them directly inside allowed scope instead of probing for them."
         ));
         assert!(prompt.contains(
-            "The following entry-point files were materialized for this run and must remain present"
+            "The following controller-owned scaffold files were materialized for this run and must remain present"
         ));
         assert!(prompt.contains("pub fn score_reviews() {}"));
     }
@@ -9337,27 +9368,66 @@ mod tests {
     }
 
     #[test]
-    fn controller_pubpunk_init_recipe_matches_exact_followup_slice() {
+    fn controller_pubpunk_init_recipe_matches_stable_canonical_slice() {
         let contract = Contract {
             id: "ct_followup".into(),
             feature_id: "feat_followup".into(),
             version: 1,
             status: punk_domain::ContractStatus::Approved,
-            prompt_source: "implement pubpunk init command touching exactly crates/pubpunk-cli/src/main.rs, crates/pubpunk-core/src/lib.rs, and tests; add --json output, and keep cargo test --workspace green".into(),
+            prompt_source: "implement pubpunk init command in crates/pubpunk-cli and crates/pubpunk-core with tests: when run, it creates the canonical .pubpunk skeleton and returns JSON for --json; keep cargo test --workspace green".into(),
             entry_points: vec![
                 "crates/pubpunk-cli/src/main.rs".into(),
                 "crates/pubpunk-core/src/lib.rs".into(),
             ],
             import_paths: vec![],
             expected_interfaces: vec![
-                "bounded implementation slice".into(),
-                "CLI accepts an `init` command.".into(),
-                "CLI supports `--json`.".into(),
-                "Tests cover the init command behavior.".into(),
+                "CLI surface in crates/pubpunk-cli exposes init and forwards execution into core logic.".into(),
+                "Core library in crates/pubpunk-core provides the init/skeleton creation behavior and result data consumable by CLI JSON output.".into(),
+                "Tests validate filesystem effects and JSON-facing behavior without expanding scope beyond init.".into(),
             ],
             behavior_requirements: vec![
-                "implement pubpunk init command touching exactly crates/pubpunk-cli/src/main.rs, crates/pubpunk-core/src/lib.rs, and tests".into(),
-                "Support `--json` in the init flow.".into(),
+                "Add a pubpunk init command wired through crates/pubpunk-cli and crates/pubpunk-core.".into(),
+                "When invoked, create the canonical .pubpunk skeleton conservatively and idempotently.".into(),
+                "Support --json output for init with machine-readable success data.".into(),
+                "Add or update tests covering skeleton creation and JSON behavior.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert!(is_controller_pubpunk_init_recipe(&contract));
+    }
+
+    #[test]
+    fn controller_pubpunk_init_recipe_does_not_match_incremental_json_tweak() {
+        let contract = Contract {
+            id: "ct_followup_incremental".into(),
+            feature_id: "feat_followup_incremental".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source:
+                "add a version field to pubpunk init --json without changing filesystem behavior"
+                    .into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "CLI supports `pubpunk init --json`.".into(),
+                "JSON output includes a version field.".into(),
+            ],
+            behavior_requirements: vec![
+                "Add a version field to init JSON output.".into(),
+                "Do not rewrite the canonical starter files.".into(),
             ],
             allowed_scope: vec![
                 "crates/pubpunk-cli/src/main.rs".into(),
@@ -9371,7 +9441,7 @@ mod tests {
             approved_at: Some("now".into()),
         };
 
-        assert!(is_controller_pubpunk_init_recipe(&contract));
+        assert!(!is_controller_pubpunk_init_recipe(&contract));
     }
 
     #[test]
@@ -9575,6 +9645,44 @@ mod tests {
     }
 
     #[test]
+    fn controller_pubpunk_validate_recipe_does_not_match_wording_tweak() {
+        let contract = Contract {
+            id: "ct_validate_wording".into(),
+            feature_id: "feat_validate_wording".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source:
+                "change pubpunk validate --json wording for project-root errors in the CLI"
+                    .into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "`pubpunk validate --json --project-root <path>` is exposed from the CLI.".into(),
+                "Error wording should be clearer.".into(),
+            ],
+            behavior_requirements: vec![
+                "Change only the JSON wording for validate failures.".into(),
+                "Do not add new validation rules or new tests.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert!(!is_controller_pubpunk_validate_recipe(&contract));
+    }
+
+    #[test]
     fn controller_pubpunk_validate_recipe_materializes_compile_ready_workspace() {
         let root = std::env::temp_dir().join(format!(
             "punk-adapters-controller-pubpunk-validate-{}-{}",
@@ -9616,14 +9724,23 @@ mod tests {
             feature_id: "feat_pubpunk_init".into(),
             version: 1,
             status: punk_domain::ContractStatus::Approved,
-            prompt_source: "implement pubpunk init command in crates/pubpunk-cli and crates/pubpunk-core with tests".into(),
+            prompt_source: "implement pubpunk init command in crates/pubpunk-cli and crates/pubpunk-core with tests: when run, it creates the canonical .pubpunk skeleton and returns JSON for --json; keep cargo test --workspace green".into(),
             entry_points: vec![
                 "crates/pubpunk-cli/src/main.rs".into(),
                 "crates/pubpunk-core/src/lib.rs".into(),
             ],
             import_paths: vec![],
-            expected_interfaces: vec!["bounded implementation slice".into()],
-            behavior_requirements: vec!["Add a pubpunk init command.".into(), "Support --json.".into()],
+            expected_interfaces: vec![
+                "CLI surface in crates/pubpunk-cli exposes init and forwards execution into core logic.".into(),
+                "Core library in crates/pubpunk-core provides the init/skeleton creation behavior and result data consumable by CLI JSON output.".into(),
+                "Tests validate filesystem effects and JSON-facing behavior without expanding scope beyond init.".into(),
+            ],
+            behavior_requirements: vec![
+                "Add a pubpunk init command wired through crates/pubpunk-cli and crates/pubpunk-core.".into(),
+                "When invoked, create the canonical .pubpunk skeleton conservatively and idempotently.".into(),
+                "Support --json output for init with machine-readable success data.".into(),
+                "Add or update tests covering skeleton creation and JSON behavior.".into(),
+            ],
             allowed_scope: vec![
                 "crates/pubpunk-cli".into(),
                 "crates/pubpunk-core".into(),
