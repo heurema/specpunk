@@ -370,7 +370,7 @@ impl OrchService {
         }
         .0;
         canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
-        normalize_proposal_scope(trimmed_prompt, &scan, &mut proposal);
+        normalize_proposal_scope(&self.paths.repo_root, trimmed_prompt, &scan, &mut proposal);
         let mut errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
         if errors.is_empty() {
             if let Some(mut fallback) = build_bounded_fallback_proposal(
@@ -380,7 +380,7 @@ impl OrchService {
                 &scan,
                 &errors,
             ) {
-                normalize_proposal_scope(trimmed_prompt, &scan, &mut fallback);
+                normalize_proposal_scope(&self.paths.repo_root, trimmed_prompt, &scan, &mut fallback);
                 proposal = fallback;
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
@@ -413,7 +413,7 @@ impl OrchService {
             }
             .0;
             canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
-            normalize_proposal_scope(trimmed_prompt, &scan, &mut proposal);
+            normalize_proposal_scope(&self.paths.repo_root, trimmed_prompt, &scan, &mut proposal);
             errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             if errors.is_empty() {
                 if let Some(mut fallback) = build_bounded_fallback_proposal(
@@ -423,7 +423,7 @@ impl OrchService {
                     &scan,
                     &errors,
                 ) {
-                    normalize_proposal_scope(trimmed_prompt, &scan, &mut fallback);
+                    normalize_proposal_scope(&self.paths.repo_root, trimmed_prompt, &scan, &mut fallback);
                     proposal = fallback;
                     errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
                 }
@@ -437,7 +437,7 @@ impl OrchService {
                 &scan,
                 &errors,
             ) {
-                normalize_proposal_scope(trimmed_prompt, &scan, &mut fallback);
+                normalize_proposal_scope(&self.paths.repo_root, trimmed_prompt, &scan, &mut fallback);
                 proposal = fallback;
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
@@ -542,7 +542,7 @@ impl OrchService {
             &mut proposal,
         );
         apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
-        normalize_proposal_scope(&combined_guidance, &scan, &mut proposal);
+        normalize_proposal_scope(&self.paths.repo_root, &combined_guidance, &scan, &mut proposal);
         let mut errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
         if errors.is_empty() {
             if let Some(mut fallback) = build_bounded_fallback_proposal(
@@ -552,10 +552,10 @@ impl OrchService {
                 &scan,
                 &errors,
             ) {
-                normalize_proposal_scope(&combined_guidance, &scan, &mut fallback);
+                normalize_proposal_scope(&self.paths.repo_root, &combined_guidance, &scan, &mut fallback);
                 proposal = fallback;
                 apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
-                normalize_proposal_scope(&combined_guidance, &scan, &mut proposal);
+                normalize_proposal_scope(&self.paths.repo_root, &combined_guidance, &scan, &mut proposal);
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
         }
@@ -567,10 +567,10 @@ impl OrchService {
                 &scan,
                 &errors,
             ) {
-                normalize_proposal_scope(&combined_guidance, &scan, &mut fallback);
+                normalize_proposal_scope(&self.paths.repo_root, &combined_guidance, &scan, &mut fallback);
                 proposal = fallback;
                 apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
-                normalize_proposal_scope(&combined_guidance, &scan, &mut proposal);
+                normalize_proposal_scope(&self.paths.repo_root, &combined_guidance, &scan, &mut proposal);
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
         }
@@ -2686,7 +2686,10 @@ fn apply_prompt_targeting_bias(
     prompt: &str,
     scan: &mut punk_domain::RepoScanSummary,
 ) {
+    apply_baseline_targeting_profile(repo_root, prompt, None, scan);
+    augment_backend_service_candidates(repo_root, prompt, scan);
     augment_mixed_service_backend_candidates(repo_root, prompt, scan);
+    prefer_backend_service_checks(repo_root, prompt, scan);
     prefer_mixed_service_checks(repo_root, prompt, scan);
     prune_generated_noise_candidates(prompt, scan);
     if !prompt_prefers_backend_data(prompt) || prompt_prefers_ui(prompt) {
@@ -2731,6 +2734,237 @@ fn apply_prompt_targeting_bias(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BaselineTargetMode {
+    Service,
+    MixedRuntime,
+}
+
+#[derive(Default)]
+struct BaselineTargetingProfile {
+    entry_points: Vec<String>,
+    allowed_scope: Vec<String>,
+    target_checks: Vec<String>,
+    integrity_checks: Vec<String>,
+}
+
+fn apply_baseline_targeting_profile(
+    repo_root: &Path,
+    prompt: &str,
+    proposal: Option<&DraftProposal>,
+    scan: &mut punk_domain::RepoScanSummary,
+) {
+    let Some(mode) = detect_baseline_target_mode(repo_root, prompt, proposal) else {
+        return;
+    };
+    let profile = build_baseline_targeting_profile(repo_root, mode);
+    if profile.entry_points.is_empty() || profile.allowed_scope.is_empty() {
+        return;
+    }
+
+    prepend_candidate_paths(&mut scan.candidate_entry_points, &profile.entry_points, 10);
+    prepend_candidate_paths(&mut scan.candidate_file_scope_paths, &profile.allowed_scope, 20);
+    prepend_candidate_paths(&mut scan.candidate_scope_paths, &profile.allowed_scope, 20);
+    prepend_candidate_paths(&mut scan.candidate_directory_scope_paths, &profile.allowed_scope, 20);
+    if !profile.target_checks.is_empty() && !profile.integrity_checks.is_empty() {
+        scan.candidate_target_checks = profile.target_checks;
+        scan.candidate_integrity_checks = profile.integrity_checks;
+    }
+    push_unique_string(
+        &mut scan.notes,
+        "applied structured baseline targeting profile".to_string(),
+    );
+}
+
+fn detect_baseline_target_mode(
+    repo_root: &Path,
+    prompt: &str,
+    proposal: Option<&DraftProposal>,
+) -> Option<BaselineTargetMode> {
+    let has_node = repo_root.join("baseline-site/package.json").exists();
+    let has_rust = repo_root.join("crates/baseline-cli/Cargo.toml").exists();
+    if !has_node || !has_rust || prompt_prefers_ui(prompt) {
+        return None;
+    }
+    let lowered = prompt.to_ascii_lowercase();
+    let service_intent = prompt_has_service_intent(prompt)
+        || lowered.contains("report")
+        || lowered.contains("success")
+        || lowered.contains("activation");
+    if !service_intent {
+        return None;
+    }
+
+    let proposal_has_backend = proposal.is_some_and(proposal_looks_backend_service_slice);
+    let proposal_has_mixed = proposal.is_some_and(proposal_looks_mixed_service_slice);
+    let rust_signal = proposal_has_mixed
+        || ["rust", "cargo", "crate", "crates", "cli", "baseline-cli"]
+            .iter()
+            .any(|needle| lowered.contains(needle));
+
+    if rust_signal || lowered.contains("cli layer") || lowered.contains("rust cli layer") {
+        Some(BaselineTargetMode::MixedRuntime)
+    } else if proposal_has_backend || lowered.contains("astro server") || lowered.contains("backend")
+    {
+        Some(BaselineTargetMode::Service)
+    } else {
+        Some(BaselineTargetMode::Service)
+    }
+}
+
+fn build_baseline_targeting_profile(
+    repo_root: &Path,
+    mode: BaselineTargetMode,
+) -> BaselineTargetingProfile {
+    let mut profile = BaselineTargetingProfile::default();
+    let node_root = repo_root.join("baseline-site");
+    let rust_root = repo_root.join("crates/baseline-cli");
+
+    let mut node_entry_files =
+        collect_existing_files_under(repo_root, &node_root.join("src/pages/api"), 2);
+    node_entry_files.extend(collect_existing_files_under(
+        repo_root,
+        &node_root.join("src/lib/services"),
+        2,
+    ));
+    node_entry_files.extend(collect_existing_files_under(
+        repo_root,
+        &node_root.join("src/lib/session"),
+        2,
+    ));
+    for path in node_entry_files {
+        push_unique_string(&mut profile.entry_points, path);
+    }
+    if profile.entry_points.is_empty() && node_root.join("package.json").exists() {
+        profile.entry_points.push("baseline-site/package.json".to_string());
+    }
+
+    for path in [
+        "baseline-site/package.json",
+        "baseline-site/src/lib/services",
+        "baseline-site/src/lib/session",
+        "baseline-site/src/pages/api",
+    ] {
+        push_unique_string(&mut profile.allowed_scope, path.to_string());
+    }
+
+    match mode {
+        BaselineTargetMode::Service => {
+            if let Some((integrity, target)) = preferred_baseline_root_node_checks(repo_root) {
+                profile.integrity_checks = vec![integrity.clone()];
+                profile.target_checks = vec![target.unwrap_or(integrity)];
+            } else {
+                profile.integrity_checks = vec!["npm --prefix baseline-site run check".to_string()];
+                profile.target_checks = vec!["npm --prefix baseline-site run build:web".to_string()];
+            }
+        }
+        BaselineTargetMode::MixedRuntime => {
+            if rust_root.join("src/main.rs").exists() {
+                profile
+                    .entry_points
+                    .insert(0, "crates/baseline-cli/src/main.rs".to_string());
+            }
+            for path in [
+                "Cargo.toml",
+                "crates/baseline-cli",
+                "crates/baseline-cli/Cargo.toml",
+                "crates/baseline-cli/src/main.rs",
+            ] {
+                if repo_root.join(path).exists() || path == "crates/baseline-cli" {
+                    push_unique_string(&mut profile.allowed_scope, path.to_string());
+                }
+            }
+            if let Some((integrity, target)) = preferred_baseline_root_node_checks(repo_root) {
+                profile.target_checks = vec!["cargo check -p baseline-cli".to_string()];
+                if let Some(target) = target {
+                    profile.target_checks.push(target);
+                }
+                profile.integrity_checks = vec![integrity];
+            } else {
+                profile.target_checks = vec![
+                    "cargo check -p baseline-cli".to_string(),
+                    "npm --prefix baseline-site run build:web".to_string(),
+                ];
+                profile.integrity_checks = vec!["npm --prefix baseline-site run check".to_string()];
+            }
+        }
+    }
+
+    profile
+}
+
+fn preferred_baseline_root_node_checks(repo_root: &Path) -> Option<(String, Option<String>)> {
+    let root_package = repo_root.join("package.json");
+    let scripts = read_package_scripts(&root_package).ok()?;
+    if !scripts.contains_key("check") {
+        return None;
+    }
+    let integrity = "npm run check".to_string();
+    let target = if scripts.contains_key("build:web") {
+        Some("npm run build:web".to_string())
+    } else if scripts.contains_key("build") {
+        Some("npm run build".to_string())
+    } else {
+        None
+    };
+    Some((integrity, target))
+}
+
+fn collect_existing_files_under(repo_root: &Path, root: &Path, limit: usize) -> Vec<String> {
+    if !root.exists() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Ok(relative) = path.strip_prefix(repo_root) {
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                push_unique_string(&mut files, relative);
+            }
+        }
+        if files.len() >= limit {
+            break;
+        }
+    }
+    files
+}
+
+fn augment_backend_service_candidates(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &mut punk_domain::RepoScanSummary,
+) {
+    if !prompt_requests_backend_service_scope(prompt, scan) {
+        return;
+    }
+    let Ok(anchors) = collect_backend_service_anchors(repo_root, false) else {
+        return;
+    };
+    if anchors.files.is_empty() && anchors.directories.is_empty() {
+        return;
+    }
+
+    let mut files = anchors.files;
+    let mut directories = anchors.directories;
+    files.sort_by_key(|path| mixed_service_file_anchor_rank(path));
+    directories.sort_by_key(|path| mixed_service_directory_anchor_rank(path));
+
+    prepend_candidate_paths(&mut scan.candidate_entry_points, &files, 10);
+    prepend_candidate_paths(&mut scan.candidate_file_scope_paths, &files, 20);
+    prepend_candidate_paths(&mut scan.candidate_scope_paths, &files, 20);
+    prepend_candidate_paths(&mut scan.candidate_directory_scope_paths, &directories, 20);
+    prepend_candidate_paths(&mut scan.candidate_scope_paths, &directories, 20);
+    push_unique_string(
+        &mut scan.notes,
+        "augmented candidate targeting with backend service anchors from the repo tree"
+            .to_string(),
+    );
+}
+
 fn augment_mixed_service_backend_candidates(
     repo_root: &Path,
     prompt: &str,
@@ -2770,15 +3004,23 @@ struct MixedServiceBackendAnchors {
 }
 
 fn collect_mixed_service_backend_anchors(repo_root: &Path) -> Result<MixedServiceBackendAnchors> {
+    collect_backend_service_anchors(repo_root, true)
+}
+
+fn collect_backend_service_anchors(
+    repo_root: &Path,
+    include_rust: bool,
+) -> Result<MixedServiceBackendAnchors> {
     let mut anchors = MixedServiceBackendAnchors::default();
-    collect_mixed_service_backend_anchors_inner(repo_root, repo_root, &mut anchors)?;
+    collect_backend_service_anchors_inner(repo_root, repo_root, &mut anchors, include_rust)?;
     Ok(anchors)
 }
 
-fn collect_mixed_service_backend_anchors_inner(
+fn collect_backend_service_anchors_inner(
     repo_root: &Path,
     current: &Path,
     anchors: &mut MixedServiceBackendAnchors,
+    include_rust: bool,
 ) -> Result<()> {
     for entry in fs::read_dir(current)? {
         let entry = entry?;
@@ -2795,20 +3037,27 @@ fn collect_mixed_service_backend_anchors_inner(
         }
         if path.is_dir() {
             let relative_str = relative.to_string_lossy().replace('\\', "/");
-            if path_looks_mixed_service_directory_anchor(&relative_str) {
+            if path_looks_backend_service_directory_anchor(&relative_str)
+                || (include_rust && path_looks_rust_service_directory_anchor(&relative_str))
+            {
                 push_unique_string(&mut anchors.directories, relative_str);
             }
-            collect_mixed_service_backend_anchors_inner(repo_root, &path, anchors)?;
+            collect_backend_service_anchors_inner(repo_root, &path, anchors, include_rust)?;
             continue;
         }
 
         let relative_str = relative.to_string_lossy().replace('\\', "/");
-        if path_looks_mixed_service_file_anchor(&relative_str) {
+        if path_looks_backend_service_file_anchor(&relative_str)
+            || (include_rust && path_looks_rust_service_file_anchor(&relative_str))
+        {
             push_unique_string(&mut anchors.files, relative_str.clone());
         }
         if let Some(parent) = Path::new(&relative_str).parent() {
             let parent = parent.to_string_lossy().replace('\\', "/");
-            if !parent.is_empty() && path_looks_mixed_service_directory_anchor(&parent) {
+            if !parent.is_empty()
+                && (path_looks_backend_service_directory_anchor(&parent)
+                    || (include_rust && path_looks_rust_service_directory_anchor(&parent)))
+            {
                 push_unique_string(&mut anchors.directories, parent);
             }
         }
@@ -2856,6 +3105,29 @@ fn prefer_mixed_service_checks(
     push_unique_string(
         &mut scan.notes,
         "preferred mixed service checks for combined Node and Rust service work".to_string(),
+    );
+}
+
+fn prefer_backend_service_checks(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &mut punk_domain::RepoScanSummary,
+) {
+    if !prompt_requests_backend_service_scope(prompt, scan)
+        || prompt_requests_mixed_service_scope(prompt, scan)
+    {
+        return;
+    }
+
+    let Some((integrity, target)) = preferred_mixed_service_node_checks(repo_root, scan) else {
+        return;
+    };
+
+    scan.candidate_integrity_checks = vec![integrity.clone()];
+    scan.candidate_target_checks = vec![target.unwrap_or(integrity)];
+    push_unique_string(
+        &mut scan.notes,
+        "preferred backend service checks for nested Node service work".to_string(),
     );
 }
 
@@ -3042,7 +3314,7 @@ fn prompt_tokens(prompt: &str) -> Vec<String> {
 }
 
 fn prompt_prefers_backend_data(prompt: &str) -> bool {
-    let lowered = prompt.to_ascii_lowercase();
+    let lowered = prompt_intent_lower(prompt);
     [
         " db",
         "db ",
@@ -3080,7 +3352,7 @@ fn prompt_prefers_backend_data(prompt: &str) -> bool {
 }
 
 fn prompt_prefers_ui(prompt: &str) -> bool {
-    let lowered = prompt.to_ascii_lowercase();
+    let lowered = prompt_intent_lower(prompt);
     [
         " ui",
         "frontend",
@@ -3103,7 +3375,7 @@ fn prompt_prefers_ui(prompt: &str) -> bool {
 }
 
 fn prompt_mentions_generated_surface(prompt: &str) -> bool {
-    let lowered = prompt.to_ascii_lowercase();
+    let lowered = prompt_intent_lower(prompt);
     lowered.contains("dist")
         || lowered.contains("pack")
         || lowered.contains("bundle")
@@ -3144,6 +3416,9 @@ fn path_looks_ui_surface(path: &str) -> bool {
 
 fn path_looks_backend_data(path: &str) -> bool {
     let lowered = path.to_ascii_lowercase();
+    if path_looks_ui_surface(path) {
+        return false;
+    }
     lowered.ends_with("package.json")
         || lowered.contains("drizzle.config")
         || lowered.ends_with(".sql")
@@ -3275,7 +3550,7 @@ fn recover_timeout_draft_proposal(
         repo_root,
         prompt,
         None,
-        timeout_seed_proposal(prompt, scan),
+        timeout_seed_proposal(repo_root, prompt, scan),
         scan,
     )
 }
@@ -3301,9 +3576,7 @@ fn finalize_timeout_fallback_proposal(
     if let Some(guidance) = guidance {
         apply_explicit_prompt_overrides(repo_root, guidance, &mut proposal);
     }
-    preserve_greenfield_scaffold_scope(prompt, scan, &mut proposal);
-    preserve_mixed_service_scope(prompt, scan, &mut proposal);
-    ensure_proposal_scope_covers_entry_points(&mut proposal);
+    normalize_proposal_scope(repo_root, prompt, scan, &mut proposal);
     let mut errors = validate_draft_proposal(repo_root, &proposal);
     if errors.is_empty() {
         return Ok(proposal);
@@ -3316,9 +3589,7 @@ fn finalize_timeout_fallback_proposal(
         if let Some(guidance) = guidance {
             apply_explicit_prompt_overrides(repo_root, guidance, &mut fallback);
         }
-        preserve_greenfield_scaffold_scope(prompt, scan, &mut fallback);
-        preserve_mixed_service_scope(prompt, scan, &mut fallback);
-        ensure_proposal_scope_covers_entry_points(&mut fallback);
+        normalize_proposal_scope(repo_root, prompt, scan, &mut fallback);
         errors = validate_draft_proposal(repo_root, &fallback);
         if errors.is_empty() {
             return Ok(fallback);
@@ -3366,14 +3637,136 @@ fn preserve_greenfield_scaffold_scope(
 }
 
 fn normalize_proposal_scope(
+    repo_root: &Path,
     prompt: &str,
     scan: &punk_domain::RepoScanSummary,
     proposal: &mut DraftProposal,
 ) {
+    apply_baseline_profile_to_proposal(repo_root, prompt, proposal);
     preserve_greenfield_scaffold_scope(prompt, scan, proposal);
+    preserve_backend_service_scope(prompt, scan, proposal);
     preserve_mixed_service_scope(prompt, scan, proposal);
+    preserve_service_checks(prompt, scan, proposal);
     apply_prompt_exclusion_pruning(prompt, proposal);
+    finalize_baseline_profile(repo_root, prompt, proposal);
     ensure_proposal_scope_covers_entry_points(proposal);
+}
+
+fn apply_baseline_profile_to_proposal(repo_root: &Path, prompt: &str, proposal: &mut DraftProposal) {
+    let Some(mode) = detect_baseline_target_mode(repo_root, prompt, Some(proposal)) else {
+        return;
+    };
+    let profile = build_baseline_targeting_profile(repo_root, mode);
+    if profile.entry_points.is_empty() || profile.allowed_scope.is_empty() {
+        return;
+    }
+
+    proposal.entry_points.retain(|path| !path_looks_ui_surface(path));
+    proposal.allowed_scope.retain(|path| !path_looks_ui_surface(path));
+
+    match mode {
+        BaselineTargetMode::Service => {
+            proposal.entry_points.retain(|path| !path_looks_rust_service_file_anchor(path));
+            proposal.allowed_scope.retain(|path| {
+                !path_looks_rust_service_file_anchor(path)
+                    && !path_looks_rust_service_directory_anchor(path)
+            });
+        }
+        BaselineTargetMode::MixedRuntime => {}
+    }
+
+    for path in profile.entry_points {
+        push_unique_string(&mut proposal.entry_points, path);
+    }
+    for path in profile.allowed_scope {
+        push_unique_string(&mut proposal.allowed_scope, path);
+    }
+    if !prompt_declares_explicit_check_set(prompt) {
+        proposal.target_checks = profile.target_checks;
+        proposal.integrity_checks = profile.integrity_checks;
+    }
+}
+
+fn finalize_baseline_profile(repo_root: &Path, prompt: &str, proposal: &mut DraftProposal) {
+    let Some(mode) = detect_baseline_target_mode(repo_root, prompt, Some(proposal)) else {
+        return;
+    };
+    proposal.entry_points.retain(|path| path != "package.json");
+    proposal.allowed_scope.retain(|path| path != "package.json");
+
+    if prompt_declares_explicit_check_set(prompt) {
+        return;
+    }
+
+    let profile = build_baseline_targeting_profile(repo_root, mode);
+    if !profile.integrity_checks.is_empty() {
+        proposal.integrity_checks = profile.integrity_checks;
+    }
+    if !profile.target_checks.is_empty() {
+        proposal.target_checks = profile.target_checks;
+    }
+}
+
+fn preserve_backend_service_scope(
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+    proposal: &mut DraftProposal,
+) {
+    let looks_mixed = prompt_requests_mixed_service_scope(prompt, scan)
+        || proposal_looks_mixed_service_slice(proposal);
+    let wants_backend = prompt_requests_backend_service_scope(prompt, scan)
+        || proposal_looks_backend_service_slice(proposal);
+    if prompt_declares_explicit_touch_set(prompt) || !wants_backend || looks_mixed
+    {
+        return;
+    }
+
+    let preferred_entry_files = collect_service_scope_files(
+        &scan.candidate_entry_points,
+        &proposal.import_paths,
+        path_looks_backend_service_file_anchor,
+    );
+    let preferred_scope_files = collect_service_scope_files(
+        &scan.candidate_file_scope_paths,
+        &proposal.import_paths,
+        path_looks_backend_service_file_anchor,
+    );
+    let preferred_scope_dirs = collect_service_scope_dirs(
+        &scan.candidate_directory_scope_paths,
+        &proposal.import_paths,
+        path_looks_backend_service_directory_anchor,
+    );
+    let synthesized_scope_dirs = conventional_backend_service_dirs(scan);
+
+    if preferred_entry_files.is_empty()
+        && preferred_scope_files.is_empty()
+        && preferred_scope_dirs.is_empty()
+        && synthesized_scope_dirs.is_empty()
+    {
+        return;
+    }
+
+    proposal
+        .entry_points
+        .retain(|path| !path_looks_ui_surface(path) && !path_looks_rust_service_file_anchor(path));
+    proposal.allowed_scope.retain(|path| {
+        !path_looks_ui_surface(path)
+            && !path_looks_rust_service_file_anchor(path)
+            && !path_looks_rust_service_directory_anchor(path)
+    });
+
+    for path in preferred_entry_files.into_iter().take(3) {
+        push_unique_string(&mut proposal.entry_points, path);
+    }
+    for path in preferred_scope_files.into_iter().take(8) {
+        push_unique_string(&mut proposal.allowed_scope, path);
+    }
+    for path in preferred_scope_dirs.into_iter().take(4) {
+        push_unique_string(&mut proposal.allowed_scope, path);
+    }
+    for path in synthesized_scope_dirs.into_iter().take(4) {
+        push_unique_string(&mut proposal.allowed_scope, path);
+    }
 }
 
 fn preserve_mixed_service_scope(
@@ -3381,31 +3774,50 @@ fn preserve_mixed_service_scope(
     scan: &punk_domain::RepoScanSummary,
     proposal: &mut DraftProposal,
 ) {
-    if prompt_declares_explicit_touch_set(prompt)
-        || !prompt_requests_mixed_service_scope(prompt, scan)
+    let wants_mixed = prompt_requests_mixed_service_scope(prompt, scan)
+        || proposal_looks_mixed_service_slice(proposal);
+    if prompt_declares_explicit_touch_set(prompt) || !wants_mixed
     {
         return;
     }
 
-    let mut preferred_files = scan
-        .candidate_file_scope_paths
-        .iter()
-        .filter(|path| path_looks_mixed_service_file_anchor(path))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut preferred_dirs = scan
-        .candidate_directory_scope_paths
-        .iter()
-        .filter(|path| path_looks_mixed_service_directory_anchor(path))
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut preferred_entry_files = collect_service_scope_files(
+        &scan.candidate_entry_points,
+        &proposal.import_paths,
+        path_looks_mixed_service_file_anchor,
+    );
+    let mut preferred_files = collect_service_scope_files(
+        &scan.candidate_file_scope_paths,
+        &proposal.import_paths,
+        path_looks_mixed_service_file_anchor,
+    );
+    let mut preferred_dirs = collect_service_scope_dirs(
+        &scan.candidate_directory_scope_paths,
+        &proposal.import_paths,
+        path_looks_mixed_service_directory_anchor,
+    );
+    let synthesized_scope_dirs = conventional_mixed_service_dirs(scan);
 
-    if preferred_files.is_empty() && preferred_dirs.is_empty() {
+    if preferred_entry_files.is_empty()
+        && preferred_files.is_empty()
+        && preferred_dirs.is_empty()
+        && synthesized_scope_dirs.is_empty()
+    {
         return;
     }
 
+    proposal.entry_points.retain(|path| !path_looks_ui_surface(path));
+    proposal.allowed_scope.retain(|path| !path_looks_ui_surface(path));
+
+    preferred_entry_files.sort_by_key(|path| mixed_service_file_anchor_rank(path));
     preferred_files.sort_by_key(|path| mixed_service_file_anchor_rank(path));
     preferred_dirs.sort_by_key(|path| mixed_service_directory_anchor_rank(path));
+
+    for path in preferred_entry_files.into_iter().take(4) {
+        if !proposal.entry_points.iter().any(|existing| existing == &path) {
+            proposal.entry_points.push(path);
+        }
+    }
 
     for path in preferred_files.into_iter().take(8) {
         if !proposal
@@ -3426,14 +3838,203 @@ fn preserve_mixed_service_scope(
             proposal.allowed_scope.push(path);
         }
     }
+    for path in synthesized_scope_dirs.into_iter().take(4) {
+        if !proposal
+            .allowed_scope
+            .iter()
+            .any(|existing| existing == &path)
+        {
+            proposal.allowed_scope.push(path);
+        }
+    }
+}
+
+fn collect_service_scope_files(
+    scan_paths: &[String],
+    import_paths: &[String],
+    predicate: fn(&str) -> bool,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    for path in scan_paths {
+        if predicate(path) {
+            push_unique_string(&mut files, path.clone());
+        }
+    }
+    for path in import_paths {
+        if predicate(path) {
+            push_unique_string(&mut files, path.clone());
+        }
+    }
+    files
+}
+
+fn collect_service_scope_dirs(
+    scan_paths: &[String],
+    import_paths: &[String],
+    predicate: fn(&str) -> bool,
+) -> Vec<String> {
+    let mut directories = Vec::new();
+    for path in scan_paths {
+        if predicate(path) {
+            push_unique_string(&mut directories, path.clone());
+        }
+    }
+    for path in import_paths {
+        let Some(parent) = Path::new(path).parent() else {
+            continue;
+        };
+        let parent = parent.to_string_lossy().replace('\\', "/");
+        if !parent.is_empty() && predicate(&parent) {
+            push_unique_string(&mut directories, parent);
+        }
+    }
+    directories
+}
+
+fn conventional_backend_service_dirs(scan: &punk_domain::RepoScanSummary) -> Vec<String> {
+    let mut directories = Vec::new();
+    for package_json in scan
+        .candidate_file_scope_paths
+        .iter()
+        .filter(|path| path.ends_with("package.json") && path.contains('/'))
+    {
+        let Some(root) = Path::new(package_json).parent() else {
+            continue;
+        };
+        for suffix in ["src/lib/services", "src/lib/session", "src/pages/api"] {
+            let path = root.join(suffix).to_string_lossy().replace('\\', "/");
+            push_unique_string(&mut directories, path);
+        }
+    }
+    directories
+}
+
+fn conventional_mixed_service_dirs(scan: &punk_domain::RepoScanSummary) -> Vec<String> {
+    let mut directories = conventional_backend_service_dirs(scan);
+    for path in scan
+        .candidate_directory_scope_paths
+        .iter()
+        .filter(|path| path_looks_rust_service_directory_anchor(path))
+    {
+        push_unique_string(&mut directories, path.clone());
+    }
+    directories
+}
+
+fn proposal_looks_backend_service_slice(proposal: &DraftProposal) -> bool {
+    proposal
+        .import_paths
+        .iter()
+        .any(|path| path_looks_backend_service_file_anchor(path))
+        || proposal
+            .allowed_scope
+            .iter()
+            .any(|path| path_looks_backend_service_directory_anchor(path))
+}
+
+fn proposal_looks_mixed_service_slice(proposal: &DraftProposal) -> bool {
+    let has_backend = proposal
+        .import_paths
+        .iter()
+        .any(|path| path_looks_backend_service_file_anchor(path))
+        || proposal
+            .allowed_scope
+            .iter()
+            .any(|path| path_looks_backend_service_directory_anchor(path));
+    let has_rust = proposal
+        .entry_points
+        .iter()
+        .chain(proposal.allowed_scope.iter())
+        .any(|path| {
+            path_looks_rust_service_file_anchor(path) || path_looks_rust_service_directory_anchor(path)
+        });
+    has_backend && has_rust
+}
+
+fn preserve_service_checks(
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+    proposal: &mut DraftProposal,
+) {
+    if prompt_declares_explicit_check_set(prompt) {
+        return;
+    }
+
+    if prompt_requests_mixed_service_scope(prompt, scan)
+        && candidate_checks_look_mixed_service(scan)
+    {
+        proposal.target_checks = scan.candidate_target_checks.clone();
+        proposal.integrity_checks = scan.candidate_integrity_checks.clone();
+        return;
+    }
+
+    if prompt_requests_backend_service_scope(prompt, scan)
+        && !prompt_requests_mixed_service_scope(prompt, scan)
+        && candidate_checks_look_backend_service(scan)
+    {
+        proposal.target_checks = scan.candidate_target_checks.clone();
+        proposal.integrity_checks = scan.candidate_integrity_checks.clone();
+    }
+}
+
+fn prompt_declares_explicit_check_set(prompt: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    lowered.contains("target_checks")
+        || lowered.contains("integrity_checks")
+        || lowered.contains("target checks")
+        || lowered.contains("integrity checks")
+        || lowered.contains("exactly one command")
+}
+
+fn candidate_checks_look_backend_service(scan: &punk_domain::RepoScanSummary) -> bool {
+    !scan.candidate_integrity_checks.is_empty()
+        && scan
+            .candidate_integrity_checks
+            .iter()
+            .all(|check| check.contains("npm ") || check.contains("pnpm ") || check.contains("yarn "))
+}
+
+fn candidate_checks_look_mixed_service(scan: &punk_domain::RepoScanSummary) -> bool {
+    candidate_checks_look_backend_service(scan)
+        && scan
+            .candidate_target_checks
+            .iter()
+            .any(|check| check.starts_with("cargo check -p "))
 }
 
 fn prompt_requests_mixed_service_scope(prompt: &str, scan: &punk_domain::RepoScanSummary) -> bool {
     if !prompt_prefers_backend_data(prompt) || prompt_prefers_ui(prompt) {
         return false;
     }
+    if !prompt_has_service_intent(prompt) {
+        return false;
+    }
+
     let lowered = prompt.to_ascii_lowercase();
-    let service_intent = [
+    let mentions_rust = ["rust", "cargo", "crate", "crates", "cli"]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+        || (lowered.contains("cli layer") && scan_has_rust_service_surface(scan));
+    let mentions_node = ["node", "npm", "package.json", "astro", "typescript", "ts", "server layer"]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+        || (lowered.contains("server") && scan_has_node_service_surface(scan));
+
+    mentions_rust && mentions_node
+}
+
+fn prompt_requests_backend_service_scope(
+    prompt: &str,
+    _scan: &punk_domain::RepoScanSummary,
+) -> bool {
+    prompt_prefers_backend_data(prompt)
+        && !prompt_prefers_ui(prompt)
+        && prompt_has_service_intent(prompt)
+}
+
+fn prompt_has_service_intent(prompt: &str) -> bool {
+    let lowered = prompt_intent_lower(prompt);
+    [
         "session",
         "dispatch",
         "handoff",
@@ -3451,21 +4052,45 @@ fn prompt_requests_mixed_service_scope(prompt: &str, scan: &punk_domain::RepoSca
         "probe_state",
     ]
     .iter()
-    .any(|needle| lowered.contains(needle));
-    if !service_intent {
-        return false;
+    .any(|needle| lowered.contains(needle))
+}
+
+fn prompt_intent_lower(prompt: &str) -> String {
+    prompt_positive_intent_text(prompt).to_ascii_lowercase()
+}
+
+fn prompt_positive_intent_text(prompt: &str) -> String {
+    const EXCLUSION_MARKERS: &[&str] = &[
+        "do not touch",
+        "don't touch",
+        "must not touch",
+        "avoid ",
+        "avoid,",
+        "avoid:",
+        "exclude",
+        "excluding",
+        "not in scope",
+        "out of scope",
+        "without touching",
+        "without modifying",
+    ];
+
+    let mut parts = Vec::new();
+    for clause in prompt.split(['\n', ';']) {
+        let lowered = clause.to_ascii_lowercase();
+        let truncate_at = EXCLUSION_MARKERS
+            .iter()
+            .filter_map(|marker| lowered.find(marker))
+            .min();
+        let kept = match truncate_at {
+            Some(idx) => clause[..idx].trim(),
+            None => clause.trim(),
+        };
+        if !kept.is_empty() {
+            parts.push(kept.to_string());
+        }
     }
-
-    let mentions_rust = ["rust", "cargo", "crate", "crates"]
-        .iter()
-        .any(|needle| lowered.contains(needle))
-        || scan_has_rust_service_surface(scan);
-    let mentions_node = ["node", "npm", "package.json", "astro", "typescript", "ts"]
-        .iter()
-        .any(|needle| lowered.contains(needle))
-        || scan_has_node_service_surface(scan);
-
-    mentions_rust && mentions_node
+    parts.join(" ")
 }
 
 fn scan_has_rust_service_surface(scan: &punk_domain::RepoScanSummary) -> bool {
@@ -3484,9 +4109,12 @@ fn scan_has_node_service_surface(scan: &punk_domain::RepoScanSummary) -> bool {
 }
 
 fn path_looks_mixed_service_file_anchor(path: &str) -> bool {
+    path_looks_backend_service_file_anchor(path) || path_looks_rust_service_file_anchor(path)
+}
+
+fn path_looks_backend_service_file_anchor(path: &str) -> bool {
     let lowered = path.to_ascii_lowercase();
     lowered.ends_with("package.json")
-        || lowered.ends_with("cargo.toml")
         || lowered.contains("drizzle.config")
         || lowered.contains("/lib/services/")
         || lowered.contains("/lib/session/")
@@ -3496,7 +4124,11 @@ fn path_looks_mixed_service_file_anchor(path: &str) -> bool {
         || lowered.contains("/pages/api/")
         || lowered.contains("/api/")
         || lowered.contains("/server/")
-        || (lowered.starts_with("crates/") && lowered.ends_with(".rs"))
+}
+
+fn path_looks_rust_service_file_anchor(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered.ends_with("cargo.toml") || (lowered.starts_with("crates/") && lowered.ends_with(".rs"))
 }
 
 fn mixed_service_file_anchor_rank(path: &str) -> u8 {
@@ -3528,10 +4160,12 @@ fn mixed_service_file_anchor_rank(path: &str) -> u8 {
 }
 
 fn path_looks_mixed_service_directory_anchor(path: &str) -> bool {
+    path_looks_backend_service_directory_anchor(path) || path_looks_rust_service_directory_anchor(path)
+}
+
+fn path_looks_backend_service_directory_anchor(path: &str) -> bool {
     let lowered = path.to_ascii_lowercase();
-    lowered == "crates"
-        || lowered.starts_with("crates/")
-        || lowered.contains("/lib/services")
+    lowered.contains("/lib/services")
         || lowered.contains("/lib/session")
         || lowered.contains("/lib/db")
         || lowered.contains("/lib/persistence")
@@ -3539,6 +4173,11 @@ fn path_looks_mixed_service_directory_anchor(path: &str) -> bool {
         || lowered.contains("/pages/api")
         || lowered.contains("/api")
         || lowered.contains("/server")
+}
+
+fn path_looks_rust_service_directory_anchor(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered == "crates" || lowered.starts_with("crates/")
 }
 
 fn mixed_service_directory_anchor_rank(path: &str) -> u8 {
@@ -3572,26 +4211,33 @@ fn apply_prompt_exclusion_pruning(prompt: &str, proposal: &mut DraftProposal) {
 }
 
 fn extract_prompt_excluded_scope_prefixes(prompt: &str) -> Vec<String> {
+    const EXCLUSION_MARKERS: &[&str] = &[
+        "exclude",
+        "excluding",
+        "do not touch",
+        "don't touch",
+        "must not touch",
+        "not in scope",
+        "out of scope",
+        "without touching",
+        "without modifying",
+        "avoid ",
+        "avoid,",
+        "avoid:",
+    ];
     let mut prefixes = Vec::new();
     for line in prompt.lines() {
         let lowered = line.to_ascii_lowercase();
-        if ![
-            "exclude",
-            "excluding",
-            "do not touch",
-            "don't touch",
-            "must not touch",
-            "not in scope",
-            "out of scope",
-            "without touching",
-            "without modifying",
-        ]
-        .iter()
-        .any(|marker| lowered.contains(marker))
-        {
+        let Some(start) = EXCLUSION_MARKERS
+            .iter()
+            .filter_map(|marker| lowered.find(marker).map(|idx| (idx, marker.len())))
+            .map(|(idx, len)| idx + len)
+            .min()
+        else {
             continue;
-        }
-        for token in line.split_whitespace() {
+        };
+        let excluded_segment = line[start..].trim();
+        for token in excluded_segment.split_whitespace() {
             let Some(prefix) = normalize_prompt_scope_token(token) else {
                 continue;
             };
@@ -3677,7 +4323,15 @@ fn proposal_scope_covers_entry_point(allowed_scope: &[String], entry_point: &str
     })
 }
 
-fn timeout_seed_proposal(prompt: &str, scan: &punk_domain::RepoScanSummary) -> DraftProposal {
+fn timeout_seed_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+) -> DraftProposal {
+    if let Some(seed) = timeout_service_seed_proposal(repo_root, prompt, scan) {
+        return seed;
+    }
+
     let greenfield_scaffold_scope = timeout_greenfield_scaffold_scope(prompt, scan);
     let entry_points: Vec<String> = if let Some((entry_points, _)) = &greenfield_scaffold_scope {
         entry_points.clone()
@@ -3725,6 +4379,121 @@ fn timeout_seed_proposal(prompt: &str, scan: &punk_domain::RepoScanSummary) -> D
         integrity_checks: scan.candidate_integrity_checks.clone(),
         risk_level: "medium".to_string(),
     }
+}
+
+fn timeout_service_seed_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+) -> Option<DraftProposal> {
+    if let Some(mode) = detect_baseline_target_mode(repo_root, prompt, None) {
+        let profile = build_baseline_targeting_profile(repo_root, mode);
+        if !profile.entry_points.is_empty() && !profile.allowed_scope.is_empty() {
+            let (expected_interfaces, behavior_requirements) =
+                timeout_seed_semantics(prompt, &profile.entry_points);
+            return Some(DraftProposal {
+                title: summarize_prompt(prompt),
+                summary: summarize_prompt(prompt),
+                entry_points: profile.entry_points,
+                import_paths: Vec::new(),
+                expected_interfaces,
+                behavior_requirements,
+                allowed_scope: profile.allowed_scope,
+                target_checks: profile.target_checks,
+                integrity_checks: profile.integrity_checks,
+                risk_level: "medium".to_string(),
+            });
+        }
+    }
+
+    let is_mixed = prompt_requests_mixed_service_scope(prompt, scan);
+    let is_backend_only = prompt_requests_backend_service_scope(prompt, scan) && !is_mixed;
+    if !is_mixed && !is_backend_only {
+        return None;
+    }
+
+    let file_predicate: fn(&str) -> bool = if is_mixed {
+        path_looks_mixed_service_file_anchor
+    } else {
+        path_looks_backend_service_file_anchor
+    };
+    let dir_predicate: fn(&str) -> bool = if is_mixed {
+        path_looks_mixed_service_directory_anchor
+    } else {
+        path_looks_backend_service_directory_anchor
+    };
+
+    let mut entry_points = scan
+        .candidate_entry_points
+        .iter()
+        .filter(|path| file_predicate(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if entry_points.is_empty() {
+        entry_points = scan
+            .candidate_file_scope_paths
+            .iter()
+            .filter(|path| file_predicate(path))
+            .take(4)
+            .cloned()
+            .collect();
+    }
+    if entry_points.is_empty() && is_backend_only {
+        entry_points = scan
+            .candidate_file_scope_paths
+            .iter()
+            .filter(|path| path.ends_with("package.json") && path.contains('/'))
+            .take(1)
+            .cloned()
+            .collect();
+    }
+    if entry_points.is_empty() {
+        return None;
+    }
+
+    let mut allowed_scope = scan
+        .candidate_file_scope_paths
+        .iter()
+        .filter(|path| file_predicate(path))
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>();
+    allowed_scope.extend(
+        scan.candidate_directory_scope_paths
+            .iter()
+            .filter(|path| dir_predicate(path))
+            .take(4)
+            .cloned(),
+    );
+    if is_backend_only {
+        allowed_scope.extend(conventional_backend_service_dirs(scan));
+    } else if is_mixed {
+        allowed_scope.extend(conventional_mixed_service_dirs(scan));
+    }
+    let mut deduped_entry_points = Vec::new();
+    for path in entry_points {
+        push_unique_string(&mut deduped_entry_points, path);
+    }
+    let mut deduped_allowed_scope = Vec::new();
+    for path in allowed_scope {
+        push_unique_string(&mut deduped_allowed_scope, path);
+    }
+
+    let (expected_interfaces, behavior_requirements) =
+        timeout_seed_semantics(prompt, &deduped_entry_points);
+
+    Some(DraftProposal {
+        title: summarize_prompt(prompt),
+        summary: summarize_prompt(prompt),
+        entry_points: deduped_entry_points,
+        import_paths: Vec::new(),
+        expected_interfaces,
+        behavior_requirements,
+        allowed_scope: deduped_allowed_scope,
+        target_checks: scan.candidate_target_checks.clone(),
+        integrity_checks: scan.candidate_integrity_checks.clone(),
+        risk_level: "medium".to_string(),
+    })
 }
 
 fn timeout_seed_semantics(prompt: &str, entry_points: &[String]) -> (Vec<String>, Vec<String>) {
@@ -4642,6 +5411,75 @@ mod tests {
                 target_checks: input.scan.candidate_target_checks,
                 integrity_checks: input.scan.candidate_integrity_checks,
                 risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct RustOnlyServiceDrafter;
+
+    impl ContractDrafter for RustOnlyServiceDrafter {
+        fn name(&self) -> &'static str {
+            "rust-only-service"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "service slice".into(),
+                summary: input.prompt,
+                entry_points: vec!["crates/baseline-cli/src/main.rs".into()],
+                import_paths: vec![
+                    "baseline-site/src/lib/services/dispatch.ts".into(),
+                    "baseline-site/src/lib/services/enrollments.ts".into(),
+                    "baseline-site/src/lib/session/operator.ts".into(),
+                    "baseline-site/src/lib/session/cookies.ts".into(),
+                ],
+                expected_interfaces: vec!["service layer".into()],
+                behavior_requirements: vec!["implement service/runtime work".into()],
+                allowed_scope: vec!["crates/baseline-cli/src/main.rs".into()],
+                target_checks: vec!["cargo test -p baseline-cli".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "medium".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct MixedReportPageDrafter;
+
+    impl ContractDrafter for MixedReportPageDrafter {
+        fn name(&self) -> &'static str {
+            "mixed-report-page"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "mixed slice".into(),
+                summary: input.prompt,
+                entry_points: vec![
+                    "crates/baseline-cli/src/main.rs".into(),
+                    "baseline-site/src/pages/report.astro".into(),
+                ],
+                import_paths: vec![
+                    "baseline-site/src/pages/api/cli/enroll.ts".into(),
+                    "baseline-site/src/lib/services/enrollments.ts".into(),
+                    "baseline-site/src/lib/session/operator.ts".into(),
+                ],
+                expected_interfaces: vec!["mixed runtime".into()],
+                behavior_requirements: vec!["implement mixed service/runtime work".into()],
+                allowed_scope: vec![
+                    "crates/baseline-cli".into(),
+                    "baseline-site/src/pages/report.astro".into(),
+                ],
+                target_checks: vec!["cargo test -p baseline-cli".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "medium".into(),
             })
         }
 
@@ -5805,6 +6643,135 @@ mod tests {
     }
 
     #[test]
+    fn draft_contract_prefers_backend_service_anchors_over_astro_pages_for_nested_node_repo() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-backend-service-anchors-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/components")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "build:web": "echo build"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/dispatch.astro"),
+            "---\n---\n<div>dispatch</div>\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/components/SiteHeader.astro"),
+            "---\n---\n<header />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/components/SiteFooter.astro"),
+            "---\n---\n<footer />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/dispatch.ts"),
+            "export async function dispatch() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/cookies.ts"),
+            "export function readCookies() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let prompt =
+            "implement services/session/runtime handshake around enrollment activation in the Astro server backend";
+
+        let mut scan = scan_repo(&root, prompt).unwrap();
+        apply_prompt_targeting_bias(&root, prompt, &mut scan);
+
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api/cli/enroll.ts"));
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/services/enrollments.ts"));
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/session/operator.ts"));
+        assert!(scan
+            .candidate_file_scope_paths
+            .iter()
+            .any(|path| path == "baseline-site/package.json"));
+        assert!(!scan.candidate_entry_points.iter().any(|path| {
+            path.ends_with("dispatch.astro")
+                || path.ends_with("SiteHeader.astro")
+                || path.ends_with("SiteFooter.astro")
+        }));
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&FakeDrafter, prompt).unwrap();
+
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/services"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+                || path == "baseline-site/src/lib/services/dispatch.ts"
+        }));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/session"
+                || path == "baseline-site/src/lib/session/operator.ts"
+        }));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api"
+                || path == "baseline-site/src/pages/api/cli/enroll.ts"));
+        assert!(!contract.allowed_scope.iter().any(|path| {
+            path.ends_with("dispatch.astro")
+                || path.ends_with("SiteHeader.astro")
+                || path.ends_with("SiteFooter.astro")
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn draft_contract_prefers_mixed_service_checks_for_nested_node_rust_repo() {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5876,6 +6843,248 @@ mod tests {
             )
             .unwrap();
 
+        assert_eq!(
+            contract.target_checks,
+            vec![
+                "cargo check -p baseline-cli".to_string(),
+                "npm --prefix baseline-site run build:web".to_string()
+            ]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_preserves_backend_service_scope_when_drafter_collapses_to_rust_only() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-backend-service-scope-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "build:web": "echo build"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/dispatch.ts"),
+            "export async function dispatch() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/cookies.ts"),
+            "export function readCookies() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &RustOnlyServiceDrafter,
+                "implement backend services/session activation flow for enrollment handoff",
+            )
+            .unwrap();
+
+        assert!(contract.entry_points.iter().any(|path| {
+            path == "baseline-site/src/lib/services/dispatch.ts"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+                || path == "baseline-site/src/pages/api/cli/enroll.ts"
+        }));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path == "crates/baseline-cli/src/main.rs"));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/package.json"
+                || path == "baseline-site/src/lib/services"
+                || path == "baseline-site/src/lib/services/dispatch.ts"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+        }));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/session"
+                || path == "baseline-site/src/lib/session/operator.ts"
+        }));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/pages/api"
+                || path == "baseline-site/src/pages/api/cli/enroll.ts"
+        }));
+        assert_eq!(
+            contract.target_checks,
+            vec!["npm --prefix baseline-site run build:web".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_replaces_report_page_anchor_with_backend_node_scope_for_mixed_slice() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-mixed-report-page-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "build:web": "echo build"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/report.astro"),
+            "---\n---\n<section />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &MixedReportPageDrafter,
+                "mixed service/session/runtime handshake around enrollment activation across Astro server layer and Rust CLI layer",
+            )
+            .unwrap();
+
+        assert!(contract
+            .entry_points
+            .iter()
+            .any(|path| path == "crates/baseline-cli/src/main.rs"));
+        assert!(contract.entry_points.iter().any(|path| {
+            path == "baseline-site/src/pages/api/cli/enroll.ts"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+                || path == "baseline-site/src/lib/session/operator.ts"
+        }));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/report.astro"));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "crates/baseline-cli" || path == "crates/baseline-cli/src/main.rs"
+        }));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/services"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+        }));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/session"
+                || path == "baseline-site/src/lib/session/operator.ts"
+        }));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/pages/api"
+                || path == "baseline-site/src/pages/api/cli/enroll.ts"
+        }));
+        assert!(!contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/report.astro"));
         assert_eq!(
             contract.target_checks,
             vec![
@@ -6005,6 +7214,473 @@ mod tests {
             contract.allowed_scope
         );
         assert!(!contract.allowed_scope.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeout_fallback_preserves_backend_service_seed_scope_for_baseline_repo() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-backend-service-{suffix}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{"name":"baseline-site","scripts":{"check":"echo check","build:web":"echo build"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"baseline","scripts":{"check":"npm --prefix baseline-site run check","build:web":"npm --prefix baseline-site run build:web"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/baseline-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let mut scan = scan_repo(
+            &root,
+            "implement services/session/runtime handshake around enrollment activation in the Astro server backend",
+        )
+        .unwrap();
+        enrich_scan_with_nested_integrity_fallback(&root, &mut scan).unwrap();
+        apply_prompt_targeting_bias(
+            &root,
+            "implement services/session/runtime handshake around enrollment activation in the Astro server backend",
+            &mut scan,
+        );
+        let fallback = recover_timeout_draft_proposal(
+            &root,
+            "implement services/session/runtime handshake around enrollment activation in the Astro server backend",
+            &scan,
+        )
+        .unwrap();
+
+        assert!(fallback.entry_points.iter().any(|path| {
+            path == "baseline-site/src/lib/services/enrollments.ts"
+                || path == "baseline-site/src/lib/session/operator.ts"
+                || path == "baseline-site/src/pages/api/cli/enroll.ts"
+        }));
+        assert!(fallback.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/services"
+                || path == "baseline-site/src/lib/session"
+                || path == "baseline-site/src/pages/api"
+        }));
+        assert_eq!(
+            fallback.target_checks,
+            vec!["npm --prefix baseline-site run build:web".to_string()]
+        );
+        assert_eq!(
+            fallback.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeout_fallback_uses_nested_package_root_when_backend_service_files_are_missing() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-backend-package-root-{suffix}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{"name":"baseline-site","scripts":{"check":"echo check","build:web":"echo build"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"baseline","scripts":{"check":"npm --prefix baseline-site run check","build:web":"npm --prefix baseline-site run build:web"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/baseline-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let prompt = "services/session layer for enrollment activation in the backend";
+        let mut scan = scan_repo(&root, prompt).unwrap();
+        enrich_scan_with_nested_integrity_fallback(&root, &mut scan).unwrap();
+        apply_prompt_targeting_bias(&root, prompt, &mut scan);
+        let fallback = recover_timeout_draft_proposal(&root, prompt, &scan).unwrap();
+
+        assert!(fallback
+            .entry_points
+            .iter()
+            .any(|path| path == "baseline-site/package.json"));
+        assert!(fallback.allowed_scope.iter().any(|path| path == "baseline-site/src/lib/services"));
+        assert!(fallback.allowed_scope.iter().any(|path| path == "baseline-site/src/lib/session"));
+        assert!(fallback.allowed_scope.iter().any(|path| path == "baseline-site/src/pages/api"));
+        assert_eq!(
+            fallback.target_checks,
+            vec!["npm --prefix baseline-site run build:web".to_string()]
+        );
+        assert_eq!(
+            fallback.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeout_fallback_preserves_mixed_service_seed_scope_for_baseline_repo() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-mixed-service-{suffix}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{"name":"baseline-site","scripts":{"check":"echo check","build:web":"echo build"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"baseline","scripts":{"check":"npm --prefix baseline-site run check","build:web":"npm --prefix baseline-site run build:web"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/baseline-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/report.astro"),
+            "---\\n---\\n<section />\\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let prompt =
+            "mixed service/session/runtime handshake around enrollment activation across Astro server layer and Rust CLI layer";
+        let mut scan = scan_repo(&root, prompt).unwrap();
+        enrich_scan_with_nested_integrity_fallback(&root, &mut scan).unwrap();
+        apply_prompt_targeting_bias(&root, prompt, &mut scan);
+        let fallback = recover_timeout_draft_proposal(&root, prompt, &scan).unwrap();
+
+        assert!(fallback
+            .entry_points
+            .iter()
+            .any(|path| path == "crates/baseline-cli/src/main.rs"));
+        assert!(fallback.entry_points.iter().any(|path| {
+            path == "baseline-site/src/lib/services/enrollments.ts"
+                || path == "baseline-site/src/lib/session/operator.ts"
+                || path == "baseline-site/src/pages/api/cli/enroll.ts"
+        }));
+        assert!(!fallback
+            .entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/report.astro"));
+        assert_eq!(
+            fallback.target_checks,
+            vec![
+                "cargo check -p baseline-cli".to_string(),
+                "npm --prefix baseline-site run build:web".to_string()
+            ]
+        );
+        assert_eq!(
+            fallback.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exact_services_prompt_with_exclusions_still_routes_to_baseline_backend_profile() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-exact-baseline-services-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{"name":"baseline-site","scripts":{"check":"echo check","build:web":"echo build"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"baseline","scripts":{"check":"npm --prefix baseline-site run check","build:web":"npm --prefix baseline-site run build:web"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/baseline-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let prompt = "Services phase only for Dispatch MVP. Goal: add server-side services in baseline-site/src/lib for operator session resolution, track catalog reads, latest baseline recommendation lookup, profile CRUD-lite, enrollment creation with draft-to-ready semantics, one-time enrollment token generation, support thread/message persistence, and a deterministic tutor behind a future-compatible interface. Keep scope bounded to backend/service/session/API surfaces; do not touch SiteHeader.astro, SiteFooter.astro, dispatch.astro, layouts, design assets, dist, .astro, or playwright artifacts.";
+
+        assert_eq!(
+            preferred_baseline_root_node_checks(&root),
+            Some(("npm run check".to_string(), Some("npm run build:web".to_string())))
+        );
+        assert_eq!(
+            build_baseline_targeting_profile(&root, BaselineTargetMode::Service).target_checks,
+            vec!["npm run build:web".to_string()]
+        );
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
+        eprintln!("services contract entry_points={:?} allowed_scope={:?} target_checks={:?} integrity_checks={:?}", contract.entry_points, contract.allowed_scope, contract.target_checks, contract.integrity_checks);
+
+        assert!(contract
+            .entry_points
+            .iter()
+            .any(|path| path == "baseline-site/package.json"));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path == "package.json"));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/services"));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/session"));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api"));
+        assert!(!contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "package.json"));
+        assert_eq!(
+            contract.target_checks,
+            vec!["npm run build:web".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["npm run check".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exact_mixed_prompt_with_exclusions_still_routes_to_baseline_mixed_profile() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-exact-baseline-mixed-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{"name":"baseline-site","scripts":{"check":"echo check","build:web":"echo build"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"baseline","scripts":{"check":"npm --prefix baseline-site run check","build:web":"npm --prefix baseline-site run build:web"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/baseline-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/report.astro"),
+            "---\\n---\\n<section />\\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let prompt = "Mixed Node+Rust service/session/runtime integration slice for baseline. Goal: implement or refine the service/session/runtime handshake around enrollment activation across the Astro server layer and the Rust CLI layer. The change should naturally span runtime Node code in baseline-site and Rust CLI code in crates/baseline-cli. Keep scope bounded to backend/service/session/API/CLI surfaces and avoid UI pages, components, layouts, design assets, dist, .astro, and playwright artifacts. Prefer checks grounded in the current repo such as cargo check for the CLI and npm run check for the Astro app.";
+
+        assert_eq!(
+            preferred_baseline_root_node_checks(&root),
+            Some(("npm run check".to_string(), Some("npm run build:web".to_string())))
+        );
+        assert_eq!(
+            build_baseline_targeting_profile(&root, BaselineTargetMode::MixedRuntime)
+                .target_checks,
+            vec![
+                "cargo check -p baseline-cli".to_string(),
+                "npm run build:web".to_string()
+            ]
+        );
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
+
+        assert!(contract
+            .entry_points
+            .iter()
+            .any(|path| path == "crates/baseline-cli/src/main.rs"));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/services"
+                || path == "baseline-site/src/pages/api"
+        }));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path == "package.json"));
+        assert!(!contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "package.json"));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/report.astro"));
+        assert!(!contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/report.astro"));
+        assert_eq!(
+            contract.target_checks,
+            vec![
+                "cargo check -p baseline-cli".to_string(),
+                "npm run build:web".to_string()
+            ]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["npm run check".to_string()]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
