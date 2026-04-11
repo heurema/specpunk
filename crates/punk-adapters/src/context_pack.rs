@@ -1149,6 +1149,7 @@ fn contract_target_lines(contract: &Contract) -> Vec<String> {
 fn highest_confidence_symbols(contract: &Contract, file: &ContextFileExcerpt) -> Vec<SymbolAnchor> {
     let contract_terms = contract_terms(contract);
     let contract_surface = contract_surface(contract);
+    let explicit_symbols = explicit_contract_symbol_mentions(contract);
     let mut anchors: Vec<_> = file
         .content
         .lines()
@@ -1158,7 +1159,13 @@ fn highest_confidence_symbols(contract: &Contract, file: &ContextFileExcerpt) ->
             if !looks_like_symbol_anchor(signature) {
                 return None;
             }
-            let score = anchor_score(signature, &contract_terms, &contract_surface, &file.path);
+            let score = anchor_score(
+                signature,
+                &contract_terms,
+                &contract_surface,
+                &explicit_symbols,
+                &file.path,
+            );
             Some(SymbolAnchor {
                 line_number: idx + file.start_line,
                 signature: signature.to_string(),
@@ -1191,6 +1198,34 @@ fn contract_terms(contract: &Contract) -> Vec<String> {
         .collect()
 }
 
+fn explicit_contract_symbol_mentions(contract: &Contract) -> Vec<String> {
+    let mut symbols = Vec::new();
+    for surface in contract_target_lines(contract)
+        .into_iter()
+        .chain(std::iter::once(contract.prompt_source.clone()))
+    {
+        collect_explicit_symbol_mentions(&surface, &mut symbols);
+    }
+    symbols
+}
+
+fn collect_explicit_symbol_mentions(surface: &str, symbols: &mut Vec<String>) {
+    let mut current = String::new();
+    for ch in surface.chars().chain(std::iter::once(' ')) {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch.to_ascii_lowercase());
+            continue;
+        }
+        if current.len() >= 4
+            && current.contains('_')
+            && !symbols.iter().any(|existing| existing == &current)
+        {
+            symbols.push(current.clone());
+        }
+        current.clear();
+    }
+}
+
 fn contract_surface(contract: &Contract) -> String {
     format!(
         "{}\n{}\n{}\n{}",
@@ -1218,6 +1253,7 @@ fn anchor_score(
     signature: &str,
     contract_terms: &[String],
     contract_surface: &str,
+    explicit_symbols: &[String],
     path: &str,
 ) -> usize {
     let signature_lc = signature.to_ascii_lowercase();
@@ -1232,8 +1268,26 @@ fn anchor_score(
             score += 1;
         }
     }
+    let exact_symbol_name = anchor_symbol_name(signature);
+    let matches_explicit_symbol_exactly =
+        exact_symbol_name.is_some_and(|name| explicit_symbols.iter().any(|symbol| symbol == name));
+    let mentions_explicit_symbol = matches_explicit_symbol_exactly
+        || explicit_symbols
+            .iter()
+            .any(|symbol| signature_lc.contains(symbol));
+    for symbol in explicit_symbols {
+        if signature_lc.contains(symbol) {
+            score += 8;
+        }
+    }
+    if matches_explicit_symbol_exactly {
+        score += 12;
+    }
     if signature.starts_with("pub fn ") || signature.starts_with("fn ") {
         score += 1;
+        if mentions_explicit_symbol {
+            score += 4;
+        }
     }
     if signature.starts_with("impl ") {
         score += 1;
@@ -1333,6 +1387,28 @@ fn anchor_score(
         score = score.saturating_sub(6);
     }
     score
+}
+
+fn anchor_symbol_name(signature: &str) -> Option<&str> {
+    for prefix in [
+        "pub fn ",
+        "fn ",
+        "pub struct ",
+        "struct ",
+        "pub enum ",
+        "enum ",
+    ] {
+        if let Some(rest) = signature.strip_prefix(prefix) {
+            let name = rest
+                .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .next()
+                .unwrap_or_default();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 fn render_anchor_excerpt(file: &ContextFileExcerpt, anchor: &SymbolAnchor) -> String {
@@ -1662,8 +1738,7 @@ fn restore_masked_files(repo_root: &Path, files: &[MaskedEntryPointFile]) -> Res
             Ok(current) => current,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("read masked entry point {}", file.path));
+                return Err(err).with_context(|| format!("read masked entry point {}", file.path));
             }
         };
         let expected = format!("{}{}", file.original_head, file.original_tail);
@@ -2136,6 +2211,71 @@ mod tests {
     }
 
     #[test]
+    fn derive_plan_seed_prefers_explicit_validate_report_host_function() {
+        let contract = Contract {
+            id: "ct_pubpunk_validate_parseability".into(),
+            feature_id: "feat_pubpunk_validate_parseability".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Core-only validate parseability helper slice for pubpunk. Goal: keep validate_report JSON envelope unchanged while extending TOML surface parseability review so invalid style/targets/review/lint inputs become explicit issue strings instead of silent omissions. Edit only crates/pubpunk-core/src/lib.rs.".into(),
+            entry_points: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            expected_interfaces: vec![
+                "validate_report keeps the structured JSON envelope unchanged.".into(),
+                "extend_toml_surface_issues(...) is invoked from validate_report so invalid style/targets/review/lint TOML surfaces produce explicit issues.".into(),
+            ],
+            behavior_requirements: vec![
+                "Call extend_toml_surface_issues(...) from validate_report without changing the JSON envelope.".into(),
+            ],
+            allowed_scope: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            target_checks: vec!["cargo test -p pubpunk-core".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let pack = ContextPack {
+            files: vec![ContextFileExcerpt {
+                path: "crates/pubpunk-core/src/lib.rs".into(),
+                start_line: 239,
+                end_line: 431,
+                truncated_at_test_boundary: false,
+                content: r#"pub fn validate_report(root: &Path) -> ValidateReport {
+    let mut issues = Vec::new();
+    issues.extend(validate_project_toml(""));
+    ValidateReport { root: root.to_path_buf(), issues }
+}
+
+fn validate_project_toml(contents: &str) -> Vec<ValidateIssue> {
+    let parsed = parse_project_toml(contents).unwrap();
+    parsed.into_iter().map(|_| ValidateIssue { code: "x", path: None, message: String::new() }).collect()
+}
+
+fn parse_project_toml(contents: &str) -> Result<BTreeMap<String, String>, String> {
+    let value = parse_project_toml_value(contents)?;
+    Ok(BTreeMap::from([(String::from("project_id"), value)]))
+}
+
+fn parse_project_toml_value(value: &str) -> Result<String, ()> {
+    Ok(value.to_string())
+}
+"#
+                .into(),
+            }],
+            missing_paths: vec![],
+            recipe_seed: None,
+            patch_seed: None,
+            plan_seed: None,
+        };
+
+        let seed = derive_plan_seed(&contract, &pack);
+
+        assert!(!seed.targets.is_empty());
+        assert_eq!(seed.targets[0].path, "crates/pubpunk-core/src/lib.rs");
+        assert!(seed.targets[0].symbol.contains("validate_report"));
+        assert!(seed.targets[0].anchor_excerpt.contains("validate_report"));
+    }
+
     fn derive_plan_seed_prefers_resolver_and_cli_ambiguity_surfaces() {
         let contract = Contract {
             id: "ct_resolver_ambiguity".into(),

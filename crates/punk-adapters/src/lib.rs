@@ -300,6 +300,19 @@ impl Executor for CodexCliExecutor {
             return Ok(output);
         }
 
+        if let Some(output) = maybe_execute_controller_pubpunk_validate_file_parseability_recipe(
+            &effective_input,
+            start,
+        )? {
+            return Ok(output);
+        }
+
+        if let Some(output) =
+            maybe_execute_controller_pubpunk_validate_parseability_recipe(&effective_input, start)?
+        {
+            return Ok(output);
+        }
+
         if let Some(output) =
             maybe_execute_controller_pubpunk_validate_recipe(&effective_input, start)?
         {
@@ -2276,6 +2289,104 @@ fn maybe_execute_controller_pubpunk_cleanup_recipe(
     }
 }
 
+fn maybe_execute_controller_pubpunk_validate_parseability_recipe(
+    input: &ExecuteInput,
+    start: Instant,
+) -> Result<Option<ExecuteOutput>> {
+    let Some(updated_paths) =
+        apply_controller_pubpunk_validate_parseability_recipe(&input.repo_root, &input.contract)?
+    else {
+        return Ok(None);
+    };
+
+    let checks = collect_contract_checks(&input.contract);
+    match run_contract_checks(
+        &input.repo_root,
+        &input.contract,
+        &checks,
+        &input.stdout_path,
+        &input.stderr_path,
+    ) {
+        Ok(checks_run) => {
+            let summary = if updated_paths.is_empty() {
+                "PUNK_EXECUTION_COMPLETE: controller pubpunk validate parseability recipe already satisfied and checks passed"
+                    .to_string()
+            } else {
+                format!(
+                    "PUNK_EXECUTION_COMPLETE: controller pubpunk validate parseability recipe applied and checks passed for {}",
+                    updated_paths.join(", ")
+                )
+            };
+            Ok(Some(ExecuteOutput {
+                success: true,
+                summary,
+                checks_run,
+                cost_usd: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            }))
+        }
+        Err(err) => Ok(Some(ExecuteOutput {
+            success: false,
+            summary: format!(
+                "controller pubpunk validate parseability recipe applied but verification failed: {err}"
+            ),
+            checks_run: Vec::new(),
+            cost_usd: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })),
+    }
+}
+
+fn maybe_execute_controller_pubpunk_validate_file_parseability_recipe(
+    input: &ExecuteInput,
+    start: Instant,
+) -> Result<Option<ExecuteOutput>> {
+    let Some(updated_paths) = apply_controller_pubpunk_validate_file_parseability_recipe(
+        &input.repo_root,
+        &input.contract,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let checks = collect_contract_checks(&input.contract);
+    match run_contract_checks(
+        &input.repo_root,
+        &input.contract,
+        &checks,
+        &input.stdout_path,
+        &input.stderr_path,
+    ) {
+        Ok(checks_run) => {
+            let summary = if updated_paths.is_empty() {
+                "PUNK_EXECUTION_COMPLETE: controller pubpunk validate file parseability recipe already satisfied and checks passed"
+                    .to_string()
+            } else {
+                format!(
+                    "PUNK_EXECUTION_COMPLETE: controller pubpunk validate file parseability recipe applied and checks passed for {}",
+                    updated_paths.join(", ")
+                )
+            };
+            Ok(Some(ExecuteOutput {
+                success: true,
+                summary,
+                checks_run,
+                cost_usd: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            }))
+        }
+        Err(err) => Ok(Some(ExecuteOutput {
+            success: false,
+            summary: format!(
+                "controller pubpunk validate file parseability recipe applied but verification failed: {err}"
+            ),
+            checks_run: Vec::new(),
+            cost_usd: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })),
+    }
+}
+
 fn maybe_execute_controller_pubpunk_validate_recipe(
     input: &ExecuteInput,
     start: Instant,
@@ -2378,6 +2489,84 @@ fn apply_controller_pubpunk_cleanup_recipe(
         }
         fs::write(&file_path, contents)
             .with_context(|| format!("write controller pubpunk cleanup file {}", path))?;
+        updated_paths.push(path);
+    }
+
+    Ok(Some(updated_paths))
+}
+
+fn apply_controller_pubpunk_validate_parseability_recipe(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Result<Option<Vec<String>>> {
+    let Some(files) = controller_pubpunk_validate_parseability_templates(repo_root, contract)
+    else {
+        return Ok(None);
+    };
+
+    let mut updated_paths = Vec::new();
+    for (path, contents) in files {
+        if !path_is_in_allowed_scope(&path, &contract.allowed_scope) {
+            continue;
+        }
+        let file_path = repo_root.join(&path);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create controller pubpunk validate parseability parent {}",
+                    path
+                )
+            })?;
+        }
+        let current = fs::read_to_string(&file_path).ok();
+        if current.as_deref() == Some(contents.as_str()) {
+            continue;
+        }
+        fs::write(&file_path, contents).with_context(|| {
+            format!(
+                "write controller pubpunk validate parseability file {}",
+                path
+            )
+        })?;
+        updated_paths.push(path);
+    }
+
+    Ok(Some(updated_paths))
+}
+
+fn apply_controller_pubpunk_validate_file_parseability_recipe(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Result<Option<Vec<String>>> {
+    let Some(files) = controller_pubpunk_validate_file_parseability_templates(repo_root, contract)
+    else {
+        return Ok(None);
+    };
+
+    let mut updated_paths = Vec::new();
+    for (path, contents) in files {
+        if !path_is_in_allowed_scope(&path, &contract.allowed_scope) {
+            continue;
+        }
+        let file_path = repo_root.join(&path);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create controller pubpunk validate file parseability parent {}",
+                    path
+                )
+            })?;
+        }
+        let current = fs::read_to_string(&file_path).ok();
+        if current.as_deref() == Some(contents.as_str()) {
+            continue;
+        }
+        fs::write(&file_path, contents).with_context(|| {
+            format!(
+                "write controller pubpunk validate file parseability file {}",
+                path
+            )
+        })?;
         updated_paths.push(path);
     }
 
@@ -2501,6 +2690,48 @@ fn controller_pubpunk_validate_templates(
     ])
 }
 
+fn controller_pubpunk_validate_parseability_templates(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Option<Vec<(String, String)>> {
+    if !is_controller_pubpunk_validate_parseability_recipe(contract) {
+        return None;
+    }
+    if !repo_root.join("crates/pubpunk-core/src/lib.rs").exists() {
+        return None;
+    }
+
+    Some(vec![(
+        "crates/pubpunk-core/src/lib.rs".to_string(),
+        render_pubpunk_validate_parseability_core_source(),
+    )])
+}
+
+fn controller_pubpunk_validate_file_parseability_templates(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Option<Vec<(String, String)>> {
+    if !is_controller_pubpunk_validate_file_parseability_recipe(contract) {
+        return None;
+    }
+    if !repo_root.join("crates/pubpunk-core/src/lib.rs").exists()
+        || !repo_root.join("tests/validate_json.rs").exists()
+    {
+        return None;
+    }
+
+    Some(vec![
+        (
+            "crates/pubpunk-core/src/lib.rs".to_string(),
+            render_pubpunk_validate_file_parseability_core_source(),
+        ),
+        (
+            "tests/validate_json.rs".to_string(),
+            render_pubpunk_validate_file_parseability_tests_source(),
+        ),
+    ])
+}
+
 fn is_controller_pubpunk_cleanup_recipe(contract: &Contract) -> bool {
     let has_core = contract
         .entry_points
@@ -2522,6 +2753,48 @@ fn is_controller_pubpunk_cleanup_recipe(contract: &Contract) -> bool {
     let combined = pubpunk_init_contract_text(contract);
     (combined.contains("style/examples") || combined.contains("style examples"))
         && (combined.contains("remove") || combined.contains("cleanup"))
+}
+
+fn is_controller_pubpunk_validate_parseability_recipe(contract: &Contract) -> bool {
+    let core_only = contract.entry_points == ["crates/pubpunk-core/src/lib.rs".to_string()]
+        && contract.allowed_scope == ["crates/pubpunk-core/src/lib.rs".to_string()];
+    if !core_only {
+        return false;
+    }
+
+    let combined = pubpunk_init_contract_text(contract);
+    combined.contains("core-only validate parseability helper slice")
+        && combined.contains("validate_report")
+        && combined.contains("json envelope unchanged")
+        && combined.contains("style/targets/review/lint")
+        && combined.contains("do not touch cli")
+        && combined.contains("cargo.toml")
+        && combined.contains("init files")
+}
+
+fn is_controller_pubpunk_validate_file_parseability_recipe(contract: &Contract) -> bool {
+    let exact_entry_points = contract.entry_points
+        == vec![
+            "crates/pubpunk-core/src/lib.rs".to_string(),
+            "tests/validate_json.rs".to_string(),
+        ];
+    let exact_scope = contract.allowed_scope
+        == vec![
+            "crates/pubpunk-core/src/lib.rs".to_string(),
+            "tests/validate_json.rs".to_string(),
+        ];
+    if !(exact_entry_points && exact_scope) {
+        return false;
+    }
+
+    let combined = pubpunk_init_contract_text(contract);
+    combined.contains("validate parse-check extension")
+        && combined.contains("tests/validate_json.rs")
+        && combined.contains(".pubpunk/style/style.toml")
+        && combined.contains(".pubpunk/targets")
+        && combined.contains("target .toml file")
+        && combined.contains("do not touch cli")
+        && combined.contains("do not touch cli or cargo")
 }
 
 fn is_controller_pubpunk_validate_recipe(contract: &Contract) -> bool {
@@ -2585,7 +2858,9 @@ fn is_controller_pubpunk_init_recipe(contract: &Contract) -> bool {
         && (combined.contains("canonical .pubpunk skeleton")
             || combined.contains("canonical .pubpunk tree")
             || combined.contains("canonical starter files"))
-        && (combined.contains("create") || combined.contains("creates") || combined.contains("materialize"))
+        && (combined.contains("create")
+            || combined.contains("creates")
+            || combined.contains("materialize"))
 }
 
 fn pubpunk_init_contract_text(contract: &Contract) -> String {
@@ -2648,6 +2923,42 @@ fn render_pubpunk_validate_core_source() -> String {
 pub struct ValidateIssue {\n    pub code: &'static str,\n    pub path: Option<PathBuf>,\n    pub message: String,\n}\n\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct ValidateReport {\n    pub root: PathBuf,\n    pub issues: Vec<ValidateIssue>,\n}\n\nimpl ValidateReport {\n    pub fn ok(&self) -> bool {\n        self.issues.is_empty()\n    }\n\n    pub fn to_json(&self) -> String {\n        let root = escape_json_string(&self.root.display().to_string());\n        let issues = self\n            .issues\n            .iter()\n            .map(|issue| {\n                let code = escape_json_string(issue.code);\n                let message = escape_json_string(&issue.message);\n                let path = issue\n                    .path\n                    .as_ref()\n                    .map(|path| format!(\"\\\"{}\\\"\", escape_json_string(&path.display().to_string())))\n                    .unwrap_or_else(|| \"null\".to_string());\n                format!(\n                    \"{{\\\"code\\\":\\\"{code}\\\",\\\"path\\\":{path},\\\"message\\\":\\\"{message}\\\"}}\"\n                )\n            })\n            .collect::<Vec<_>>()\n            .join(\",\");\n        format!(\n            \"{{\\\"ok\\\":{},\\\"root\\\":\\\"{root}\\\",\\\"issues\\\":[{issues}]}}\",\n            if self.ok() { \"true\" } else { \"false\" }\n        )\n    }\n\n    pub fn summary_message(&self) -> String {\n        self.issues\n            .first()\n            .map(|issue| issue.message.clone())\n            .unwrap_or_else(|| \"Validated .pubpunk skeleton\".to_string())\n    }\n\n    pub fn into_result(self) -> io::Result<()> {\n        if self.ok() {\n            Ok(())\n        } else {\n            Err(io::Error::new(io::ErrorKind::InvalidData, self.summary_message()))\n        }\n    }\n}\n\npub fn validate(root: &Path) -> io::Result<()> {\n    validate_report(root).into_result()\n}\n\npub fn validate_report(root: &Path) -> ValidateReport {\n    let root = match prepare_existing_root(root) {\n        Ok(root) => root,\n        Err(err) => {\n            return ValidateReport {\n                root: root.to_path_buf(),\n                issues: vec![ValidateIssue {\n                    code: \"root_missing\",\n                    path: None,\n                    message: err.to_string(),\n                }],\n            };\n        }\n    };\n\n    let mut issues = Vec::new();\n    for relative in SKELETON_DIRS {\n        let path = root.join(relative);\n        if !path.is_dir() {\n            issues.push(ValidateIssue {\n                code: \"missing_directory\",\n                path: Some(PathBuf::from(relative)),\n                message: format!(\"missing directory: {}\", path.display()),\n            });\n        }\n    }\n    for (relative, _) in SKELETON_FILES {\n        let path = root.join(relative);\n        if !path.is_file() {\n            issues.push(ValidateIssue {\n                code: \"missing_file\",\n                path: Some(PathBuf::from(relative)),\n                message: format!(\"missing file: {}\", path.display()),\n            });\n        }\n    }\n\n    let project_relative = PathBuf::from(\".pubpunk/project.toml\");\n    let project_path = root.join(&project_relative);\n    if project_path.is_file() {\n        match fs::read_to_string(&project_path) {\n            Ok(contents) => issues.extend(validate_project_toml(&contents)),\n            Err(err) => issues.push(ValidateIssue {\n                code: \"unreadable_project_toml\",\n                path: Some(project_relative),\n                message: format!(\"unable to read {}: {err}\", project_path.display()),\n            }),\n        }\n    }\n\n    ValidateReport { root, issues }\n}\n\nfn validate_project_toml(contents: &str) -> Vec<ValidateIssue> {\n    let mut issues = Vec::new();\n    let parsed = match parse_project_toml(contents) {\n        Ok(parsed) => parsed,\n        Err(message) => {\n            issues.push(ValidateIssue {\n                code: \"unparseable_project_toml\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message,\n            });\n            return issues;\n        }\n    };\n\n    for required in REQUIRED_PROJECT_LINES {\n        if !contents.contains(required) {\n            issues.push(ValidateIssue {\n                code: \"missing_required_line\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"missing required project.toml line: {required}\"),\n            });\n        }\n    }\n\n    match parsed.get(\"project_id\") {\n        Some(project_id) if is_slug_safe(project_id) => {}\n        Some(project_id) => issues.push(ValidateIssue {\n            code: \"invalid_project_id\",\n            path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n            message: format!(\"project_id is not slug-safe: {project_id}\"),\n        }),\n        None => issues.push(ValidateIssue {\n            code: \"missing_project_id\",\n            path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n            message: \"missing required project_id\".to_string(),\n        }),\n    }\n\n    match parsed.get(\"schema_version\") {\n        Some(value) if value == \"pubpunk.project.v1\" => {}\n        Some(value) => issues.push(ValidateIssue {\n            code: \"invalid_schema_version\",\n            path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n            message: format!(\"schema_version must be pubpunk.project.v1, got: {value}\"),\n        }),\n        None => issues.push(ValidateIssue {\n            code: \"missing_schema_version\",\n            path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n            message: \"missing required schema_version\".to_string(),\n        }),\n    }\n\n    for key in PATH_KEYS {\n        let full_key = format!(\"paths.{key}\");\n        match parsed.get(&full_key) {\n            Some(value) if !Path::new(value).is_absolute() => {}\n            Some(value) => issues.push(ValidateIssue {\n                code: \"absolute_path\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"{key} must stay relative under .pubpunk: {value}\"),\n            }),\n            None => issues.push(ValidateIssue {\n                code: \"missing_path_key\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"missing required key: {key}\"),\n            }),\n        }\n    }\n\n    for key in LOCAL_KEYS {\n        let full_key = format!(\"local.{key}\");\n        match parsed.get(&full_key) {\n            Some(value) if value.starts_with(\"local/\") && !Path::new(value).is_absolute() => {}\n            Some(value) => issues.push(ValidateIssue {\n                code: \"invalid_local_path\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"{key} must stay under local/: {value}\"),\n            }),\n            None => issues.push(ValidateIssue {\n                code: \"missing_local_key\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"missing required key: {key}\"),\n            }),\n        }\n    }\n\n    for key in parsed.keys() {\n        let lowered = key.to_ascii_lowercase();\n        let leaf = lowered.rsplit('.').next().unwrap_or(lowered.as_str());\n        if [\"token\", \"secret\", \"password\", \"api_key\"]\n            .iter()\n            .any(|needle| leaf.contains(needle) || lowered.contains(needle))\n        {\n            issues.push(ValidateIssue {\n                code: \"secret_like_key\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"project.toml contains obvious secret-like field: {key}\"),\n            });\n        }\n    }\n\n    issues\n}\n\nfn parse_project_toml(contents: &str) -> Result<BTreeMap<String, String>, String> {\n    let mut values = BTreeMap::new();\n    let mut current_section: Option<String> = None;\n\n    for (index, raw_line) in contents.lines().enumerate() {\n        let trimmed = raw_line.trim();\n        if trimmed.is_empty() || trimmed.starts_with('#') {\n            continue;\n        }\n        if trimmed.starts_with('[') {\n            if !trimmed.ends_with(']') || trimmed.len() < 3 {\n                return Err(format!(\"project.toml is not parseable near line {}\", index + 1));\n            }\n            current_section = Some(trimmed[1..trimmed.len() - 1].trim().to_string());\n            continue;\n        }\n        let Some((key, value)) = trimmed.split_once('=') else {\n            return Err(format!(\"project.toml is not parseable near line {}\", index + 1));\n        };\n        let key = key.trim();\n        if key.is_empty() {\n            return Err(format!(\"project.toml is not parseable near line {}\", index + 1));\n        }\n        let value = parse_project_toml_value(value.trim())\n            .map_err(|_| format!(\"project.toml is not parseable near line {}\", index + 1))?;\n        let full_key = current_section\n            .as_ref()\n            .map(|section| format!(\"{section}.{key}\"))\n            .unwrap_or_else(|| key.to_string());\n        values.insert(full_key, value);\n    }\n\n    Ok(values)\n}\n\nfn parse_project_toml_value(value: &str) -> Result<String, ()> {\n    if value.len() >= 2\n        && ((value.starts_with('\"') && value.ends_with('\"'))\n            || (value.starts_with('\\'') && value.ends_with('\\'')))\n    {\n        return Ok(value[1..value.len() - 1].to_string());\n    }\n    Err(())\n}\n",
     );
     source
+}
+
+fn render_pubpunk_validate_parseability_core_source() -> String {
+    let source = render_pubpunk_validate_core_source();
+    let source = source.replace(
+        "const LOCAL_KEYS: &[&str] = &[\n    \"state_db\",\n    \"drafts_dir\",\n    \"reports_dir\",\n    \"cache_dir\",\n    \"generated_dir\",\n];\n",
+        "const LOCAL_KEYS: &[&str] = &[\n    \"state_db\",\n    \"drafts_dir\",\n    \"reports_dir\",\n    \"cache_dir\",\n    \"generated_dir\",\n];\n\nconst RESERVED_SURFACE_PREFIXES: &[(&str, &str)] = &[\n    (\"style.\", \"style\"),\n    (\"targets.\", \"targets\"),\n    (\"review.\", \"review\"),\n    (\"lint.\", \"lint\"),\n];\n",
+    );
+    let source = source.replace(
+        "    for key in parsed.keys() {\n        let lowered = key.to_ascii_lowercase();\n        let leaf = lowered.rsplit('.').next().unwrap_or(lowered.as_str());\n        if [\"token\", \"secret\", \"password\", \"api_key\"]\n            .iter()\n            .any(|needle| leaf.contains(needle) || lowered.contains(needle))\n        {\n            issues.push(ValidateIssue {\n                code: \"secret_like_key\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"project.toml contains obvious secret-like field: {key}\"),\n            });\n        }\n    }\n\n    issues\n}\n\nfn parse_project_toml(contents: &str) -> Result<BTreeMap<String, String>, String> {\n",
+        "    for key in parsed.keys() {\n        let lowered = key.to_ascii_lowercase();\n        let leaf = lowered.rsplit('.').next().unwrap_or(lowered.as_str());\n        if [\"token\", \"secret\", \"password\", \"api_key\"]\n            .iter()\n            .any(|needle| leaf.contains(needle) || lowered.contains(needle))\n        {\n            issues.push(ValidateIssue {\n                code: \"secret_like_key\",\n                path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                message: format!(\"project.toml contains obvious secret-like field: {key}\"),\n            });\n        }\n    }\n\n    issues.extend(validate_reserved_surface_inputs(&parsed));\n\n    issues\n}\n\nfn validate_reserved_surface_inputs(parsed: &BTreeMap<String, String>) -> Vec<ValidateIssue> {\n    let mut issues = Vec::new();\n    for key in parsed.keys() {\n        for (prefix, section) in RESERVED_SURFACE_PREFIXES {\n            if key.starts_with(prefix) {\n                issues.push(ValidateIssue {\n                    code: \"unsupported_surface_input\",\n                    path: Some(PathBuf::from(\".pubpunk/project.toml\")),\n                    message: format!(\n                        \"project.toml does not support [{section}] entries yet: {key}\"\n                    ),\n                });\n                break;\n            }\n        }\n    }\n    issues\n}\n\nfn parse_project_toml(contents: &str) -> Result<BTreeMap<String, String>, String> {\n",
+    );
+    source.replace(
+        "    #[test]\n    fn json_is_machine_readable() {\n",
+        "    #[test]\n    fn validate_report_flags_unsupported_style_targets_review_and_lint_inputs() {\n        let root = temp_dir(\"core-validate-surface-inputs\");\n        init_with_options(&root, false).unwrap();\n        let project_toml = root.join(\".pubpunk/project.toml\");\n        let current = fs::read_to_string(&project_toml).unwrap();\n        fs::write(\n            &project_toml,\n            format!(\n                \"{current}\\n[style]\\nvoice = \\\"strict\\\"\\n[targets]\\nprimary = \\\"forem\\\"\\n[review]\\nmode = \\\"required\\\"\\n[lint]\\nprofile = \\\"standard\\\"\\n\"\n            ),\n        )\n        .unwrap();\n\n        let report = validate_report(&root);\n        let messages = report\n            .issues\n            .iter()\n            .map(|issue| issue.message.as_str())\n            .collect::<Vec<_>>();\n        assert!(messages\n            .iter()\n            .any(|message| message.contains(\"[style]\") && message.contains(\"style.voice\")));\n        assert!(messages\n            .iter()\n            .any(|message| message.contains(\"[targets]\") && message.contains(\"targets.primary\")));\n        assert!(messages\n            .iter()\n            .any(|message| message.contains(\"[review]\") && message.contains(\"review.mode\")));\n        assert!(messages\n            .iter()\n            .any(|message| message.contains(\"[lint]\") && message.contains(\"lint.profile\")));\n        fs::remove_dir_all(&root).unwrap();\n    }\n\n    #[test]\n    fn json_is_machine_readable() {\n",
+    )
+}
+
+fn render_pubpunk_validate_file_parseability_core_source() -> String {
+    let source = render_pubpunk_validate_parseability_core_source();
+    let source = source.replace(
+        "    ValidateReport { root, issues }\n}\n\nfn validate_project_toml(contents: &str) -> Vec<ValidateIssue> {\n",
+        "    extend_toml_surface_issues(&root, &mut issues);\n\n    ValidateReport { root, issues }\n}\n\nfn validate_project_toml(contents: &str) -> Vec<ValidateIssue> {\n",
+    );
+    source.replace(
+        "fn parse_project_toml(contents: &str) -> Result<BTreeMap<String, String>, String> {\n",
+        "fn extend_toml_surface_issues(root: &Path, issues: &mut Vec<ValidateIssue>) {\n    for relative in [\n        \".pubpunk/style/style.toml\",\n        \".pubpunk/style/lexicon.toml\",\n        \".pubpunk/style/normalize.toml\",\n    ] {\n        validate_toml_surface_file(root, relative, \"unreadable_style_toml\", \"unparseable_style_toml\", issues);\n    }\n\n    validate_toml_surface_dir(root, \".pubpunk/targets\", \"unreadable_target_toml\", \"unparseable_target_toml\", issues);\n    validate_toml_surface_dir(root, \".pubpunk/review\", \"unreadable_review_toml\", \"unparseable_review_toml\", issues);\n    validate_toml_surface_dir(root, \".pubpunk/lint\", \"unreadable_lint_toml\", \"unparseable_lint_toml\", issues);\n}\n\nfn validate_toml_surface_dir(\n    root: &Path,\n    relative_dir: &str,\n    unreadable_code: &'static str,\n    unparseable_code: &'static str,\n    issues: &mut Vec<ValidateIssue>,\n) {\n    let dir = root.join(relative_dir);\n    let Ok(entries) = fs::read_dir(&dir) else {\n        return;\n    };\n    let mut toml_paths = entries\n        .filter_map(|entry| entry.ok())\n        .filter_map(|entry| {\n            let file_type = entry.file_type().ok()?;\n            if !file_type.is_file() {\n                return None;\n            }\n            let file_name = entry.file_name();\n            let file_name = file_name.to_str()?;\n            if !file_name.ends_with(\".toml\") {\n                return None;\n            }\n            Some(format!(\"{relative_dir}/{file_name}\"))\n        })\n        .collect::<Vec<_>>();\n    toml_paths.sort();\n    for relative in toml_paths {\n        validate_toml_surface_file(root, &relative, unreadable_code, unparseable_code, issues);\n    }\n}\n\nfn validate_toml_surface_file(\n    root: &Path,\n    relative: &str,\n    unreadable_code: &'static str,\n    unparseable_code: &'static str,\n    issues: &mut Vec<ValidateIssue>,\n) {\n    let path = root.join(relative);\n    let contents = match fs::read_to_string(&path) {\n        Ok(contents) => contents,\n        Err(err) => {\n            issues.push(ValidateIssue {\n                code: unreadable_code,\n                path: Some(PathBuf::from(relative)),\n                message: format!(\"unable to read {}: {err}\", path.display()),\n            });\n            return;\n        }\n    };\n    if let Err(message) = parse_project_toml(&contents) {\n        issues.push(ValidateIssue {\n            code: unparseable_code,\n            path: Some(PathBuf::from(relative)),\n            message: format!(\"{} is not parseable TOML: {message}\", relative),\n        });\n    }\n}\n\nfn parse_project_toml(contents: &str) -> Result<BTreeMap<String, String>, String> {\n",
+    )
+}
+
+fn render_pubpunk_validate_file_parseability_tests_source() -> String {
+    let source = render_pubpunk_validate_tests_source();
+    source.replace(
+        "\nfn temp_dir(prefix: &str) -> PathBuf {\n",
+        "\n#[test]\nfn validate_json_rejects_unparseable_style_toml() {\n    let root = temp_dir(\"pubpunk-validate-json-style-toml\");\n    pubpunk_core::init_with_options(&root, false).unwrap();\n    fs::write(root.join(\".pubpunk/style/style.toml\"), \"[style\\nbroken\").unwrap();\n\n    let output = cli::run(\n        [\n            \"validate\".to_string(),\n            \"--json\".to_string(),\n            \"--project-root\".to_string(),\n            root.display().to_string(),\n        ],\n        Path::new(\".\"),\n    )\n    .expect_err(\"validate json should fail\");\n\n    assert!(\n        output.text.contains(\"\\\"code\\\":\\\"unparseable_style_toml\\\"\"),\n        \"json={}\",\n        output.text\n    );\n    assert!(output.text.contains(\".pubpunk/style/style.toml\"), \"json={}\", output.text);\n    fs::remove_dir_all(&root).unwrap();\n}\n\n#[test]\nfn validate_json_rejects_unparseable_target_toml() {\n    let root = temp_dir(\"pubpunk-validate-json-target-toml\");\n    pubpunk_core::init_with_options(&root, false).unwrap();\n    fs::write(root.join(\".pubpunk/targets/demo.toml\"), \"[target\\nbroken\").unwrap();\n\n    let output = cli::run(\n        [\n            \"validate\".to_string(),\n            \"--json\".to_string(),\n            \"--project-root\".to_string(),\n            root.display().to_string(),\n        ],\n        Path::new(\".\"),\n    )\n    .expect_err(\"validate json should fail\");\n\n    assert!(\n        output.text.contains(\"\\\"code\\\":\\\"unparseable_target_toml\\\"\"),\n        \"json={}\",\n        output.text\n    );\n    assert!(output.text.contains(\".pubpunk/targets/demo.toml\"), \"json={}\", output.text);\n    fs::remove_dir_all(&root).unwrap();\n}\n\nfn temp_dir(prefix: &str) -> PathBuf {\n",
+    )
 }
 
 fn render_pubpunk_validate_cli_source() -> String {
@@ -3008,7 +3319,7 @@ fn temp_dir(prefix: &str) -> PathBuf {
     path
 }
 "####
-    .to_string()
+        .to_string()
 }
 
 fn render_pubpunk_init_core_source() -> String {
@@ -9652,8 +9963,7 @@ mod tests {
             version: 1,
             status: punk_domain::ContractStatus::Approved,
             prompt_source:
-                "change pubpunk validate --json wording for project-root errors in the CLI"
-                    .into(),
+                "change pubpunk validate --json wording for project-root errors in the CLI".into(),
             entry_points: vec![
                 "crates/pubpunk-cli/src/main.rs".into(),
                 "crates/pubpunk-core/src/lib.rs".into(),
@@ -9827,6 +10137,475 @@ mod tests {
             .expect("controller validate recipe should apply");
         assert!(updated.contains(&"crates/pubpunk-core/src/lib.rs".to_string()));
         assert!(updated.contains(&"crates/pubpunk-cli/src/main.rs".to_string()));
+        assert!(updated.contains(&"tests/validate_json.rs".to_string()));
+
+        let status = Command::new("cargo")
+            .args(["test", "--workspace"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn controller_pubpunk_validate_parseability_recipe_matches_exact_slice() {
+        let contract = Contract {
+            id: "ct_validate_parseability".into(),
+            feature_id: "feat_validate_parseability".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Core-only validate parseability helper slice for pubpunk. Goal: keep validate_report JSON envelope unchanged while extending TOML surface parseability review so invalid style/targets/review/lint inputs become explicit issue strings instead of silent omissions. Edit only crates/pubpunk-core/src/lib.rs. Do not touch CLI, tests, Cargo.toml, local/, or init files.".into(),
+            entry_points: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            expected_interfaces: vec![
+                "validate_report JSON envelope stays unchanged.".into(),
+                "Invalid style/targets/review/lint inputs become explicit issue strings.".into(),
+            ],
+            behavior_requirements: vec![
+                "Edit only crates/pubpunk-core/src/lib.rs.".into(),
+                "Do not touch CLI, tests, Cargo.toml, local/, or init files.".into(),
+            ],
+            allowed_scope: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            target_checks: vec!["cargo test -p pubpunk-core".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert!(is_controller_pubpunk_validate_parseability_recipe(
+            &contract
+        ));
+    }
+
+    #[test]
+    fn controller_pubpunk_validate_parseability_recipe_does_not_match_cli_wording_slice() {
+        let contract = Contract {
+            id: "ct_validate_parseability_wording".into(),
+            feature_id: "feat_validate_parseability_wording".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Change validate_report wording for invalid style config in pubpunk CLI"
+                .into(),
+            entry_points: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            expected_interfaces: vec!["CLI wording stays more descriptive.".into()],
+            behavior_requirements: vec!["Do not add new validation behavior.".into()],
+            allowed_scope: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            target_checks: vec!["cargo test -p pubpunk-core".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert!(!is_controller_pubpunk_validate_parseability_recipe(
+            &contract
+        ));
+    }
+
+    #[test]
+    fn controller_pubpunk_validate_parseability_recipe_materializes_compile_ready_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-controller-pubpunk-validate-parseability-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let bootstrap = Contract {
+            id: "ct_bootstrap".into(),
+            feature_id: "feat_bootstrap".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "bootstrap initial Rust workspace for pubpunk".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec!["crates/pubpunk-cli".into(), "crates/pubpunk-core".into()],
+            expected_interfaces: vec!["initial Rust scaffold".into()],
+            behavior_requirements: vec!["bootstrap project".into()],
+            allowed_scope: vec![
+                "Cargo.toml".into(),
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        materialize_rust_workspace_bootstrap_scaffold(&root, &bootstrap).unwrap();
+
+        let init_contract = Contract {
+            id: "ct_pubpunk_init".into(),
+            feature_id: "feat_pubpunk_init".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init command in crates/pubpunk-cli and crates/pubpunk-core with tests: when run, it creates the canonical .pubpunk skeleton and returns JSON for --json; keep cargo test --workspace green".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "CLI surface in crates/pubpunk-cli exposes init and forwards execution into core logic.".into(),
+                "Core library in crates/pubpunk-core provides the init/skeleton creation behavior and result data consumable by CLI JSON output.".into(),
+                "Tests validate filesystem effects and JSON-facing behavior without expanding scope beyond init.".into(),
+            ],
+            behavior_requirements: vec![
+                "Add a pubpunk init command wired through crates/pubpunk-cli and crates/pubpunk-core.".into(),
+                "When invoked, create the canonical .pubpunk skeleton conservatively and idempotently.".into(),
+                "Support --json output for init with machine-readable success data.".into(),
+                "Add or update tests covering skeleton creation and JSON behavior.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        apply_controller_pubpunk_init_recipe(&root, &init_contract)
+            .unwrap()
+            .expect("controller init recipe should apply");
+
+        let cleanup_contract = Contract {
+            id: "ct_cleanup".into(),
+            feature_id: "feat_cleanup".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "remove style examples cleanup".into(),
+            entry_points: vec![
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/init_json.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["cleanup slice".into()],
+            behavior_requirements: vec!["remove style examples".into()],
+            allowed_scope: vec![
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/init_json.rs".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        apply_controller_pubpunk_cleanup_recipe(&root, &cleanup_contract)
+            .unwrap()
+            .expect("controller cleanup recipe should apply");
+
+        let validate_contract = Contract {
+            id: "ct_validate".into(),
+            feature_id: "feat_validate".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "draft a bounded validate-only rust change. Implement pubpunk validate with --json and --project-root, structured JSON envelope, and checks for required .pubpunk tree/files, parseable project.toml, exact schema_version pubpunk.project.v1, slug-safe project_id, no absolute paths in paths.*, local.* under local/, and obvious secret-like keys token/secret/password/api_key.".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/validate_json.rs".into(),
+            ],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            expected_interfaces: vec![
+                "`pubpunk validate --json --project-root <path>` is exposed from the CLI.".into(),
+                "Core library exposes validation logic consumable by the CLI.".into(),
+                "JSON output uses a stable structured envelope suitable for tests.".into(),
+            ],
+            behavior_requirements: vec![
+                "Add a validate-only Rust change for `pubpunk validate`.".into(),
+                "Support `--json` and `--project-root`.".into(),
+                "Do not add init behavior or init-side effects.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/validate_json.rs".into(),
+                "tests".into(),
+            ],
+            target_checks: vec![
+                "cargo test -p pubpunk-cli".into(),
+                "cargo test -p pubpunk-core".into(),
+                "cargo test --tests".into(),
+            ],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        apply_controller_pubpunk_validate_recipe(&root, &validate_contract)
+            .unwrap()
+            .expect("controller validate recipe should apply");
+
+        let parseability_contract = Contract {
+            id: "ct_validate_parseability".into(),
+            feature_id: "feat_validate_parseability".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Core-only validate parseability helper slice for pubpunk. Goal: keep validate_report JSON envelope unchanged while extending TOML surface parseability review so invalid style/targets/review/lint inputs become explicit issue strings instead of silent omissions. Edit only crates/pubpunk-core/src/lib.rs. Do not touch CLI, tests, Cargo.toml, local/, or init files.".into(),
+            entry_points: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            expected_interfaces: vec![
+                "validate_report JSON envelope stays unchanged.".into(),
+                "Invalid style/targets/review/lint inputs become explicit issue strings.".into(),
+            ],
+            behavior_requirements: vec![
+                "Edit only crates/pubpunk-core/src/lib.rs.".into(),
+                "Do not touch CLI, tests, Cargo.toml, local/, or init files.".into(),
+            ],
+            allowed_scope: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            target_checks: vec!["cargo test -p pubpunk-core".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let updated =
+            apply_controller_pubpunk_validate_parseability_recipe(&root, &parseability_contract)
+                .unwrap()
+                .expect("controller validate parseability recipe should apply");
+        assert_eq!(updated, vec!["crates/pubpunk-core/src/lib.rs".to_string()]);
+
+        let status = Command::new("cargo")
+            .args(["test", "--workspace"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn controller_pubpunk_validate_file_parseability_recipe_matches_exact_slice() {
+        let contract = Contract {
+            id: "ct_validate_file_parseability".into(),
+            feature_id: "feat_validate_file_parseability".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "bounded core-only validate parse-check extension. Edit only crates/pubpunk-core/src/lib.rs and tests/validate_json.rs. Do not touch CLI or Cargo. Reuse the existing simple TOML parser so validate_report also checks parseability of .pubpunk/style/style.toml, .pubpunk/style/lexicon.toml, .pubpunk/style/normalize.toml, plus any *.toml files present under .pubpunk/targets, .pubpunk/review, and .pubpunk/lint. Add tests that corrupt style.toml and a target .toml file and expect structured validate JSON issues. Final check cargo test --workspace.".into(),
+            entry_points: vec![
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/validate_json.rs".into(),
+            ],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            expected_interfaces: vec![
+                "validate_report keeps the structured JSON envelope unchanged.".into(),
+                "style.toml and target .toml parseability issues become explicit.".into(),
+            ],
+            behavior_requirements: vec![
+                "Edit only crates/pubpunk-core/src/lib.rs and tests/validate_json.rs.".into(),
+                "Do not touch CLI or Cargo.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/validate_json.rs".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert!(is_controller_pubpunk_validate_file_parseability_recipe(
+            &contract
+        ));
+    }
+
+    #[test]
+    fn controller_pubpunk_validate_file_parseability_recipe_materializes_compile_ready_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-controller-pubpunk-validate-file-parseability-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let bootstrap = Contract {
+            id: "ct_bootstrap".into(),
+            feature_id: "feat_bootstrap".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "bootstrap initial Rust workspace for pubpunk".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec!["crates/pubpunk-cli".into(), "crates/pubpunk-core".into()],
+            expected_interfaces: vec!["initial Rust scaffold".into()],
+            behavior_requirements: vec!["bootstrap project".into()],
+            allowed_scope: vec![
+                "Cargo.toml".into(),
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        materialize_rust_workspace_bootstrap_scaffold(&root, &bootstrap).unwrap();
+
+        let init_contract = Contract {
+            id: "ct_pubpunk_init".into(),
+            feature_id: "feat_pubpunk_init".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "implement pubpunk init command in crates/pubpunk-cli and crates/pubpunk-core with tests: when run, it creates the canonical .pubpunk skeleton and returns JSON for --json; keep cargo test --workspace green".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "CLI surface in crates/pubpunk-cli exposes init and forwards execution into core logic.".into(),
+                "Core library in crates/pubpunk-core provides the init/skeleton creation behavior and result data consumable by CLI JSON output.".into(),
+                "Tests validate filesystem effects and JSON-facing behavior without expanding scope beyond init.".into(),
+            ],
+            behavior_requirements: vec![
+                "Add a pubpunk init command wired through crates/pubpunk-cli and crates/pubpunk-core.".into(),
+                "When invoked, create the canonical .pubpunk skeleton conservatively and idempotently.".into(),
+                "Support --json output for init with machine-readable success data.".into(),
+                "Add or update tests covering skeleton creation and JSON behavior.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        apply_controller_pubpunk_init_recipe(&root, &init_contract)
+            .unwrap()
+            .expect("controller init recipe should apply");
+
+        let cleanup_contract = Contract {
+            id: "ct_cleanup".into(),
+            feature_id: "feat_cleanup".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "remove style examples cleanup".into(),
+            entry_points: vec![
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/init_json.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["cleanup slice".into()],
+            behavior_requirements: vec!["remove style examples".into()],
+            allowed_scope: vec![
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/init_json.rs".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        apply_controller_pubpunk_cleanup_recipe(&root, &cleanup_contract)
+            .unwrap()
+            .expect("controller cleanup recipe should apply");
+
+        let validate_contract = Contract {
+            id: "ct_validate".into(),
+            feature_id: "feat_validate".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "draft a bounded validate-only rust change. Implement pubpunk validate with --json and --project-root, structured JSON envelope, and checks for required .pubpunk tree/files, parseable project.toml, exact schema_version pubpunk.project.v1, slug-safe project_id, no absolute paths in paths.*, local.* under local/, and obvious secret-like keys token/secret/password/api_key.".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/validate_json.rs".into(),
+            ],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            expected_interfaces: vec![
+                "`pubpunk validate --json --project-root <path>` is exposed from the CLI.".into(),
+                "Core library exposes validation logic consumable by the CLI.".into(),
+                "JSON output uses a stable structured envelope suitable for tests.".into(),
+            ],
+            behavior_requirements: vec![
+                "Add a validate-only Rust change for `pubpunk validate`.".into(),
+                "Support `--json` and `--project-root`.".into(),
+                "Do not add init behavior or init-side effects.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/validate_json.rs".into(),
+                "tests".into(),
+            ],
+            target_checks: vec![
+                "cargo test -p pubpunk-cli".into(),
+                "cargo test -p pubpunk-core".into(),
+                "cargo test --tests".into(),
+            ],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        apply_controller_pubpunk_validate_recipe(&root, &validate_contract)
+            .unwrap()
+            .expect("controller validate recipe should apply");
+
+        let parseability_contract = Contract {
+            id: "ct_validate_file_parseability".into(),
+            feature_id: "feat_validate_file_parseability".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "bounded core-only validate parse-check extension. Edit only crates/pubpunk-core/src/lib.rs and tests/validate_json.rs. Do not touch CLI or Cargo. Reuse the existing simple TOML parser so validate_report also checks parseability of .pubpunk/style/style.toml, .pubpunk/style/lexicon.toml, .pubpunk/style/normalize.toml, plus any *.toml files present under .pubpunk/targets, .pubpunk/review, and .pubpunk/lint. Add tests that corrupt style.toml and a target .toml file and expect structured validate JSON issues. Final check cargo test --workspace.".into(),
+            entry_points: vec![
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/validate_json.rs".into(),
+            ],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            expected_interfaces: vec![
+                "validate_report keeps the structured JSON envelope unchanged.".into(),
+                "style.toml and target .toml parseability issues become explicit.".into(),
+            ],
+            behavior_requirements: vec![
+                "Edit only crates/pubpunk-core/src/lib.rs and tests/validate_json.rs.".into(),
+                "Do not touch CLI or Cargo.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/validate_json.rs".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let updated = apply_controller_pubpunk_validate_file_parseability_recipe(
+            &root,
+            &parseability_contract,
+        )
+        .unwrap()
+        .expect("controller validate file parseability recipe should apply");
+        assert!(updated.contains(&"crates/pubpunk-core/src/lib.rs".to_string()));
         assert!(updated.contains(&"tests/validate_json.rs".to_string()));
 
         let status = Command::new("cargo")

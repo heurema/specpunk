@@ -380,7 +380,12 @@ impl OrchService {
                 &scan,
                 &errors,
             ) {
-                normalize_proposal_scope(&self.paths.repo_root, trimmed_prompt, &scan, &mut fallback);
+                normalize_proposal_scope(
+                    &self.paths.repo_root,
+                    trimmed_prompt,
+                    &scan,
+                    &mut fallback,
+                );
                 proposal = fallback;
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
@@ -423,7 +428,12 @@ impl OrchService {
                     &scan,
                     &errors,
                 ) {
-                    normalize_proposal_scope(&self.paths.repo_root, trimmed_prompt, &scan, &mut fallback);
+                    normalize_proposal_scope(
+                        &self.paths.repo_root,
+                        trimmed_prompt,
+                        &scan,
+                        &mut fallback,
+                    );
                     proposal = fallback;
                     errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
                 }
@@ -437,7 +447,12 @@ impl OrchService {
                 &scan,
                 &errors,
             ) {
-                normalize_proposal_scope(&self.paths.repo_root, trimmed_prompt, &scan, &mut fallback);
+                normalize_proposal_scope(
+                    &self.paths.repo_root,
+                    trimmed_prompt,
+                    &scan,
+                    &mut fallback,
+                );
                 proposal = fallback;
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
@@ -542,7 +557,12 @@ impl OrchService {
             &mut proposal,
         );
         apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
-        normalize_proposal_scope(&self.paths.repo_root, &combined_guidance, &scan, &mut proposal);
+        normalize_proposal_scope(
+            &self.paths.repo_root,
+            &combined_guidance,
+            &scan,
+            &mut proposal,
+        );
         let mut errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
         if errors.is_empty() {
             if let Some(mut fallback) = build_bounded_fallback_proposal(
@@ -552,10 +572,20 @@ impl OrchService {
                 &scan,
                 &errors,
             ) {
-                normalize_proposal_scope(&self.paths.repo_root, &combined_guidance, &scan, &mut fallback);
+                normalize_proposal_scope(
+                    &self.paths.repo_root,
+                    &combined_guidance,
+                    &scan,
+                    &mut fallback,
+                );
                 proposal = fallback;
                 apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
-                normalize_proposal_scope(&self.paths.repo_root, &combined_guidance, &scan, &mut proposal);
+                normalize_proposal_scope(
+                    &self.paths.repo_root,
+                    &combined_guidance,
+                    &scan,
+                    &mut proposal,
+                );
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
         }
@@ -567,10 +597,20 @@ impl OrchService {
                 &scan,
                 &errors,
             ) {
-                normalize_proposal_scope(&self.paths.repo_root, &combined_guidance, &scan, &mut fallback);
+                normalize_proposal_scope(
+                    &self.paths.repo_root,
+                    &combined_guidance,
+                    &scan,
+                    &mut fallback,
+                );
                 proposal = fallback;
                 apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
-                normalize_proposal_scope(&self.paths.repo_root, &combined_guidance, &scan, &mut proposal);
+                normalize_proposal_scope(
+                    &self.paths.repo_root,
+                    &combined_guidance,
+                    &scan,
+                    &mut proposal,
+                );
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
         }
@@ -2740,6 +2780,12 @@ enum BaselineTargetMode {
     MixedRuntime,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PubpunkTargetMode {
+    ValidateParseabilityCoreAndTests,
+    ValidateCoreOnly,
+}
+
 #[derive(Default)]
 struct BaselineTargetingProfile {
     entry_points: Vec<String>,
@@ -2763,9 +2809,17 @@ fn apply_baseline_targeting_profile(
     }
 
     prepend_candidate_paths(&mut scan.candidate_entry_points, &profile.entry_points, 10);
-    prepend_candidate_paths(&mut scan.candidate_file_scope_paths, &profile.allowed_scope, 20);
+    prepend_candidate_paths(
+        &mut scan.candidate_file_scope_paths,
+        &profile.allowed_scope,
+        20,
+    );
     prepend_candidate_paths(&mut scan.candidate_scope_paths, &profile.allowed_scope, 20);
-    prepend_candidate_paths(&mut scan.candidate_directory_scope_paths, &profile.allowed_scope, 20);
+    prepend_candidate_paths(
+        &mut scan.candidate_directory_scope_paths,
+        &profile.allowed_scope,
+        20,
+    );
     if !profile.target_checks.is_empty() && !profile.integrity_checks.is_empty() {
         scan.candidate_target_checks = profile.target_checks;
         scan.candidate_integrity_checks = profile.integrity_checks;
@@ -2804,7 +2858,9 @@ fn detect_baseline_target_mode(
 
     if rust_signal || lowered.contains("cli layer") || lowered.contains("rust cli layer") {
         Some(BaselineTargetMode::MixedRuntime)
-    } else if proposal_has_backend || lowered.contains("astro server") || lowered.contains("backend")
+    } else if proposal_has_backend
+        || lowered.contains("astro server")
+        || lowered.contains("backend")
     {
         Some(BaselineTargetMode::Service)
     } else {
@@ -2836,7 +2892,9 @@ fn build_baseline_targeting_profile(
         push_unique_string(&mut profile.entry_points, path);
     }
     if profile.entry_points.is_empty() && node_root.join("package.json").exists() {
-        profile.entry_points.push("baseline-site/package.json".to_string());
+        profile
+            .entry_points
+            .push("baseline-site/package.json".to_string());
     }
 
     for path in [
@@ -2855,7 +2913,8 @@ fn build_baseline_targeting_profile(
                 profile.target_checks = vec![target.unwrap_or(integrity)];
             } else {
                 profile.integrity_checks = vec!["npm --prefix baseline-site run check".to_string()];
-                profile.target_checks = vec!["npm --prefix baseline-site run build:web".to_string()];
+                profile.target_checks =
+                    vec!["npm --prefix baseline-site run build:web".to_string()];
             }
         }
         BaselineTargetMode::MixedRuntime => {
@@ -2960,8 +3019,7 @@ fn augment_backend_service_candidates(
     prepend_candidate_paths(&mut scan.candidate_scope_paths, &directories, 20);
     push_unique_string(
         &mut scan.notes,
-        "augmented candidate targeting with backend service anchors from the repo tree"
-            .to_string(),
+        "augmented candidate targeting with backend service anchors from the repo tree".to_string(),
     );
 }
 
@@ -3643,6 +3701,7 @@ fn normalize_proposal_scope(
     proposal: &mut DraftProposal,
 ) {
     apply_baseline_profile_to_proposal(repo_root, prompt, proposal);
+    apply_pubpunk_targeting_profile_to_proposal(repo_root, prompt, proposal);
     preserve_greenfield_scaffold_scope(prompt, scan, proposal);
     preserve_backend_service_scope(prompt, scan, proposal);
     preserve_mixed_service_scope(prompt, scan, proposal);
@@ -3652,7 +3711,11 @@ fn normalize_proposal_scope(
     ensure_proposal_scope_covers_entry_points(proposal);
 }
 
-fn apply_baseline_profile_to_proposal(repo_root: &Path, prompt: &str, proposal: &mut DraftProposal) {
+fn apply_baseline_profile_to_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    proposal: &mut DraftProposal,
+) {
     let Some(mode) = detect_baseline_target_mode(repo_root, prompt, Some(proposal)) else {
         return;
     };
@@ -3661,12 +3724,18 @@ fn apply_baseline_profile_to_proposal(repo_root: &Path, prompt: &str, proposal: 
         return;
     }
 
-    proposal.entry_points.retain(|path| !path_looks_ui_surface(path));
-    proposal.allowed_scope.retain(|path| !path_looks_ui_surface(path));
+    proposal
+        .entry_points
+        .retain(|path| !path_looks_ui_surface(path));
+    proposal
+        .allowed_scope
+        .retain(|path| !path_looks_ui_surface(path));
 
     match mode {
         BaselineTargetMode::Service => {
-            proposal.entry_points.retain(|path| !path_looks_rust_service_file_anchor(path));
+            proposal
+                .entry_points
+                .retain(|path| !path_looks_rust_service_file_anchor(path));
             proposal.allowed_scope.retain(|path| {
                 !path_looks_rust_service_file_anchor(path)
                     && !path_looks_rust_service_directory_anchor(path)
@@ -3707,6 +3776,220 @@ fn finalize_baseline_profile(repo_root: &Path, prompt: &str, proposal: &mut Draf
     }
 }
 
+fn detect_pubpunk_target_mode(
+    repo_root: &Path,
+    prompt: &str,
+    proposal: Option<&DraftProposal>,
+) -> Option<PubpunkTargetMode> {
+    let has_core = repo_root.join("crates/pubpunk-core/src/lib.rs").exists();
+    let has_cli = repo_root.join("crates/pubpunk-cli/src/main.rs").exists();
+    if !has_core || !has_cli {
+        return None;
+    }
+
+    let lowered = prompt_intent_lower(prompt);
+    if !lowered.contains("pubpunk") || !lowered.contains("validate") {
+        return None;
+    }
+    if lowered.contains("scaffold") || lowered.contains("bootstrap") {
+        return None;
+    }
+    if lowered.contains(" init ")
+        || lowered.starts_with("init ")
+        || lowered.contains("init command")
+    {
+        return None;
+    }
+
+    let parseability_prompt = (lowered.contains("parse-check")
+        || lowered.contains("parseability")
+        || lowered.contains("style.toml")
+        || lowered.contains("targets, .pubpunk/review, and .pubpunk/lint")
+        || lowered.contains(".pubpunk/targets")
+        || lowered.contains(".pubpunk/review")
+        || lowered.contains(".pubpunk/lint"))
+        && (lowered.contains("tests/validate_json.rs")
+            || lowered.contains("add tests")
+            || lowered.contains("target .toml file"));
+    let parseability_proposal = proposal.is_some_and(|proposal| {
+        proposal
+            .entry_points
+            .iter()
+            .chain(proposal.allowed_scope.iter())
+            .any(|path| path == "tests/validate_json.rs" || path == "tests")
+            || proposal.expected_interfaces.iter().any(|line| {
+                let lowered = line.to_ascii_lowercase();
+                lowered.contains("style.toml")
+                    || lowered.contains("target .toml")
+                    || lowered.contains("validate_json")
+            })
+            || proposal.behavior_requirements.iter().any(|line| {
+                let lowered = line.to_ascii_lowercase();
+                lowered.contains("style.toml")
+                    || lowered.contains("target .toml")
+                    || lowered.contains("tests/validate_json.rs")
+            })
+    });
+
+    if parseability_prompt || parseability_proposal {
+        return Some(PubpunkTargetMode::ValidateParseabilityCoreAndTests);
+    }
+
+    let core_only_prompt = lowered.contains("core-only")
+        || lowered.contains("edit only crates/pubpunk-core/src/lib.rs")
+        || lowered.contains("crates/pubpunk-core/src/lib.rs");
+    let core_only_proposal = proposal.is_some_and(|proposal| {
+        proposal
+            .entry_points
+            .iter()
+            .chain(proposal.import_paths.iter())
+            .any(|path| path == "crates/pubpunk-core/src/lib.rs")
+    });
+
+    if core_only_prompt || core_only_proposal {
+        Some(PubpunkTargetMode::ValidateCoreOnly)
+    } else {
+        None
+    }
+}
+
+fn apply_pubpunk_targeting_profile_to_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    proposal: &mut DraftProposal,
+) {
+    let Some(mode) = detect_pubpunk_target_mode(repo_root, prompt, Some(proposal)) else {
+        return;
+    };
+    match mode {
+        PubpunkTargetMode::ValidateParseabilityCoreAndTests => {
+            proposal.entry_points = vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string(),
+            ];
+            proposal.allowed_scope = vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string(),
+            ];
+            proposal.import_paths.retain(|path| {
+                path == "crates/pubpunk-core/src/lib.rs" || path == "tests/validate_json.rs"
+            });
+            if !proposal
+                .import_paths
+                .iter()
+                .any(|path| path == "crates/pubpunk-core/src/lib.rs")
+            {
+                proposal
+                    .import_paths
+                    .insert(0, "crates/pubpunk-core/src/lib.rs".to_string());
+            }
+            proposal
+                .expected_interfaces
+                .retain(|item| !pubpunk_validate_line_looks_init_noise(item));
+            proposal
+                .behavior_requirements
+                .retain(|item| !pubpunk_validate_line_looks_init_noise(item));
+            if proposal.expected_interfaces.is_empty() {
+                proposal.expected_interfaces = vec![
+                    "validate_report keeps the structured JSON envelope unchanged.".to_string(),
+                    "Validate parseability checks surface explicit issues for unreadable or unparseable style/targets/review/lint TOML without widening scope into CLI or init flows.".to_string(),
+                ];
+            }
+            if proposal.behavior_requirements.is_empty() {
+                proposal.behavior_requirements =
+                    vec![summarize_prompt(&prompt_positive_intent_text(prompt))];
+            }
+            if !prompt_declares_explicit_check_set(prompt) {
+                proposal.target_checks = vec!["cargo test --workspace".to_string()];
+                proposal.integrity_checks = vec!["cargo test --workspace".to_string()];
+            }
+        }
+        PubpunkTargetMode::ValidateCoreOnly => {
+            proposal.entry_points = vec!["crates/pubpunk-core/src/lib.rs".to_string()];
+            proposal.allowed_scope = vec!["crates/pubpunk-core/src/lib.rs".to_string()];
+            proposal
+                .import_paths
+                .retain(|path| path == "crates/pubpunk-core/src/lib.rs");
+            proposal
+                .expected_interfaces
+                .retain(|item| !pubpunk_validate_line_looks_init_noise(item));
+            proposal
+                .behavior_requirements
+                .retain(|item| !pubpunk_validate_line_looks_init_noise(item));
+            if proposal.expected_interfaces.is_empty() {
+                proposal.expected_interfaces = vec![
+                    "validate_report keeps the structured JSON envelope unchanged.".to_string(),
+                    "Validate-only parseability checks surface explicit issues from crates/pubpunk-core/src/lib.rs without widening scope into CLI or init flows.".to_string(),
+                ];
+            }
+            if proposal.behavior_requirements.is_empty() {
+                proposal.behavior_requirements =
+                    vec![summarize_prompt(&prompt_positive_intent_text(prompt))];
+            }
+            if !prompt_declares_explicit_check_set(prompt) {
+                proposal.target_checks = vec!["cargo test -p pubpunk-core".to_string()];
+                proposal.integrity_checks = vec!["cargo test --workspace".to_string()];
+            }
+        }
+    }
+}
+
+fn timeout_pubpunk_validate_seed_proposal(repo_root: &Path, prompt: &str) -> Option<DraftProposal> {
+    let mode = detect_pubpunk_target_mode(repo_root, prompt, None)?;
+    match mode {
+        PubpunkTargetMode::ValidateParseabilityCoreAndTests => Some(DraftProposal {
+            title: summarize_prompt(prompt),
+            summary: summarize_prompt(prompt),
+            entry_points: vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string(),
+            ],
+            import_paths: vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string(),
+            ],
+            expected_interfaces: vec![
+                "validate_report keeps the structured JSON envelope unchanged.".to_string(),
+                "Validate parseability checks surface explicit issues for unreadable or unparseable style/targets/review/lint TOML without widening scope into CLI or init flows.".to_string(),
+            ],
+            behavior_requirements: vec![summarize_prompt(&prompt_positive_intent_text(prompt))],
+            allowed_scope: vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string(),
+            ],
+            target_checks: vec!["cargo test --workspace".to_string()],
+            integrity_checks: vec!["cargo test --workspace".to_string()],
+            risk_level: "medium".to_string(),
+        }),
+        PubpunkTargetMode::ValidateCoreOnly => Some(DraftProposal {
+            title: summarize_prompt(prompt),
+            summary: summarize_prompt(prompt),
+            entry_points: vec!["crates/pubpunk-core/src/lib.rs".to_string()],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".to_string()],
+            expected_interfaces: vec![
+                "validate_report keeps the structured JSON envelope unchanged.".to_string(),
+                "Validate-only parseability checks surface explicit issues from crates/pubpunk-core/src/lib.rs without widening scope into CLI or init flows.".to_string(),
+            ],
+            behavior_requirements: vec![summarize_prompt(&prompt_positive_intent_text(prompt))],
+            allowed_scope: vec!["crates/pubpunk-core/src/lib.rs".to_string()],
+            target_checks: vec!["cargo test -p pubpunk-core".to_string()],
+            integrity_checks: vec!["cargo test --workspace".to_string()],
+            risk_level: "medium".to_string(),
+        }),
+    }
+}
+
+fn pubpunk_validate_line_looks_init_noise(line: &str) -> bool {
+    let lowered = line.to_ascii_lowercase();
+    lowered.contains("init")
+        || lowered.contains("scaffold")
+        || lowered.contains("bootstrap")
+        || lowered.contains("starter files")
+        || lowered.contains("cargo.toml")
+        || lowered.contains("crates/pubpunk-cli")
+        || lowered.contains("tests cover the init command behavior")
+}
+
 fn preserve_backend_service_scope(
     prompt: &str,
     scan: &punk_domain::RepoScanSummary,
@@ -3716,8 +3999,7 @@ fn preserve_backend_service_scope(
         || proposal_looks_mixed_service_slice(proposal);
     let wants_backend = prompt_requests_backend_service_scope(prompt, scan)
         || proposal_looks_backend_service_slice(proposal);
-    if prompt_declares_explicit_touch_set(prompt) || !wants_backend || looks_mixed
-    {
+    if prompt_declares_explicit_touch_set(prompt) || !wants_backend || looks_mixed {
         return;
     }
 
@@ -3776,8 +4058,7 @@ fn preserve_mixed_service_scope(
 ) {
     let wants_mixed = prompt_requests_mixed_service_scope(prompt, scan)
         || proposal_looks_mixed_service_slice(proposal);
-    if prompt_declares_explicit_touch_set(prompt) || !wants_mixed
-    {
+    if prompt_declares_explicit_touch_set(prompt) || !wants_mixed {
         return;
     }
 
@@ -3806,15 +4087,23 @@ fn preserve_mixed_service_scope(
         return;
     }
 
-    proposal.entry_points.retain(|path| !path_looks_ui_surface(path));
-    proposal.allowed_scope.retain(|path| !path_looks_ui_surface(path));
+    proposal
+        .entry_points
+        .retain(|path| !path_looks_ui_surface(path));
+    proposal
+        .allowed_scope
+        .retain(|path| !path_looks_ui_surface(path));
 
     preferred_entry_files.sort_by_key(|path| mixed_service_file_anchor_rank(path));
     preferred_files.sort_by_key(|path| mixed_service_file_anchor_rank(path));
     preferred_dirs.sort_by_key(|path| mixed_service_directory_anchor_rank(path));
 
     for path in preferred_entry_files.into_iter().take(4) {
-        if !proposal.entry_points.iter().any(|existing| existing == &path) {
+        if !proposal
+            .entry_points
+            .iter()
+            .any(|existing| existing == &path)
+        {
             proposal.entry_points.push(path);
         }
     }
@@ -3946,7 +4235,8 @@ fn proposal_looks_mixed_service_slice(proposal: &DraftProposal) -> bool {
         .iter()
         .chain(proposal.allowed_scope.iter())
         .any(|path| {
-            path_looks_rust_service_file_anchor(path) || path_looks_rust_service_directory_anchor(path)
+            path_looks_rust_service_file_anchor(path)
+                || path_looks_rust_service_directory_anchor(path)
         });
     has_backend && has_rust
 }
@@ -3988,10 +4278,9 @@ fn prompt_declares_explicit_check_set(prompt: &str) -> bool {
 
 fn candidate_checks_look_backend_service(scan: &punk_domain::RepoScanSummary) -> bool {
     !scan.candidate_integrity_checks.is_empty()
-        && scan
-            .candidate_integrity_checks
-            .iter()
-            .all(|check| check.contains("npm ") || check.contains("pnpm ") || check.contains("yarn "))
+        && scan.candidate_integrity_checks.iter().all(|check| {
+            check.contains("npm ") || check.contains("pnpm ") || check.contains("yarn ")
+        })
 }
 
 fn candidate_checks_look_mixed_service(scan: &punk_domain::RepoScanSummary) -> bool {
@@ -4015,9 +4304,17 @@ fn prompt_requests_mixed_service_scope(prompt: &str, scan: &punk_domain::RepoSca
         .iter()
         .any(|needle| lowered.contains(needle))
         || (lowered.contains("cli layer") && scan_has_rust_service_surface(scan));
-    let mentions_node = ["node", "npm", "package.json", "astro", "typescript", "ts", "server layer"]
-        .iter()
-        .any(|needle| lowered.contains(needle))
+    let mentions_node = [
+        "node",
+        "npm",
+        "package.json",
+        "astro",
+        "typescript",
+        "ts",
+        "server layer",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
         || (lowered.contains("server") && scan_has_node_service_surface(scan));
 
     mentions_rust && mentions_node
@@ -4160,7 +4457,8 @@ fn mixed_service_file_anchor_rank(path: &str) -> u8 {
 }
 
 fn path_looks_mixed_service_directory_anchor(path: &str) -> bool {
-    path_looks_backend_service_directory_anchor(path) || path_looks_rust_service_directory_anchor(path)
+    path_looks_backend_service_directory_anchor(path)
+        || path_looks_rust_service_directory_anchor(path)
 }
 
 fn path_looks_backend_service_directory_anchor(path: &str) -> bool {
@@ -4328,6 +4626,9 @@ fn timeout_seed_proposal(
     prompt: &str,
     scan: &punk_domain::RepoScanSummary,
 ) -> DraftProposal {
+    if let Some(seed) = timeout_pubpunk_validate_seed_proposal(repo_root, prompt) {
+        return seed;
+    }
     if let Some(seed) = timeout_service_seed_proposal(repo_root, prompt, scan) {
         return seed;
     }
@@ -4497,6 +4798,12 @@ fn timeout_service_seed_proposal(
 }
 
 fn timeout_seed_semantics(prompt: &str, entry_points: &[String]) -> (Vec<String>, Vec<String>) {
+    let semantic_prompt = prompt_positive_intent_text(prompt);
+    let semantic_prompt = if semantic_prompt.trim().is_empty() {
+        prompt.trim()
+    } else {
+        semantic_prompt.trim()
+    };
     let expected_interface = match entry_points.first().map(String::as_str) {
         Some("Cargo.toml") => "initial Rust scaffold",
         Some("go.mod") => "initial Go scaffold",
@@ -4505,8 +4812,8 @@ fn timeout_seed_semantics(prompt: &str, entry_points: &[String]) -> (Vec<String>
         _ => "bounded implementation slice",
     };
     let mut expected_interfaces = vec![expected_interface.to_string()];
-    let mut behavior_requirements = vec![summarize_prompt(prompt)];
-    let lowered = prompt.to_ascii_lowercase();
+    let mut behavior_requirements = vec![summarize_prompt(semantic_prompt)];
+    let lowered = semantic_prompt.to_ascii_lowercase();
 
     if lowered.contains(" init ")
         || lowered.starts_with("init ")
@@ -5733,6 +6040,51 @@ mod tests {
         }
     }
 
+    struct ContaminatedPubpunkValidateDrafter;
+
+    impl ContractDrafter for ContaminatedPubpunkValidateDrafter {
+        fn name(&self) -> &'static str {
+            "contaminated-pubpunk-validate-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "contaminated pubpunk validate".into(),
+                summary: input.prompt,
+                entry_points: vec![
+                    "Cargo.toml".into(),
+                    "crates/pubpunk-cli/src/main.rs".into(),
+                    "crates/pubpunk-core/src/lib.rs".into(),
+                ],
+                import_paths: vec![
+                    "crates/pubpunk-cli/src/main.rs".into(),
+                    "crates/pubpunk-core/src/lib.rs".into(),
+                ],
+                expected_interfaces: vec![
+                    "CLI accepts an `init` command.".into(),
+                    "Init creates canonical starter files: project.toml, style/style.toml.".into(),
+                ],
+                behavior_requirements: vec![
+                    "Support `--project-root` in the init flow.".into(),
+                    "Add validate parseability helper in crates/pubpunk-core/src/lib.rs.".into(),
+                ],
+                allowed_scope: vec![
+                    "Cargo.toml".into(),
+                    "crates/pubpunk-cli/src/main.rs".into(),
+                    "crates/pubpunk-core/src/lib.rs".into(),
+                    "tests".into(),
+                ],
+                target_checks: vec!["cargo test -p pubpunk-cli".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "medium".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
     struct TimeoutDrafter;
 
     impl ContractDrafter for TimeoutDrafter {
@@ -5977,7 +6329,9 @@ mod tests {
             .unwrap();
         service.approve_contract(&contract.id).unwrap();
 
-        let (run, receipt) = service.cut_run(&NoProgressNoOpExecutor, &contract.id).unwrap();
+        let (run, receipt) = service
+            .cut_run(&NoProgressNoOpExecutor, &contract.id)
+            .unwrap();
         assert_eq!(run.status, RunStatus::Failed);
         assert_eq!(receipt.status, "failure");
         assert!(receipt
@@ -7342,7 +7696,11 @@ mod tests {
             "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         )
         .unwrap();
-        fs::write(root.join("crates/baseline-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
         fs::write(
             root.join("baseline-site/src/lib/services/enrollments.ts"),
             "export async function enroll() {}\n",
@@ -7437,7 +7795,11 @@ mod tests {
             "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         )
         .unwrap();
-        fs::write(root.join("crates/baseline-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(&root)
@@ -7454,9 +7816,18 @@ mod tests {
             .entry_points
             .iter()
             .any(|path| path == "baseline-site/package.json"));
-        assert!(fallback.allowed_scope.iter().any(|path| path == "baseline-site/src/lib/services"));
-        assert!(fallback.allowed_scope.iter().any(|path| path == "baseline-site/src/lib/session"));
-        assert!(fallback.allowed_scope.iter().any(|path| path == "baseline-site/src/pages/api"));
+        assert!(fallback
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/services"));
+        assert!(fallback
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/session"));
+        assert!(fallback
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api"));
         assert_eq!(
             fallback.target_checks,
             vec!["npm --prefix baseline-site run build:web".to_string()]
@@ -7505,7 +7876,11 @@ mod tests {
             "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         )
         .unwrap();
-        fs::write(root.join("crates/baseline-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
         fs::write(
             root.join("baseline-site/src/lib/services/enrollments.ts"),
             "export async function enroll() {}\n",
@@ -7601,7 +7976,11 @@ mod tests {
             "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         )
         .unwrap();
-        fs::write(root.join("crates/baseline-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(&root)
@@ -7612,7 +7991,10 @@ mod tests {
 
         assert_eq!(
             preferred_baseline_root_node_checks(&root),
-            Some(("npm run check".to_string(), Some("npm run build:web".to_string())))
+            Some((
+                "npm run check".to_string(),
+                Some("npm run build:web".to_string())
+            ))
         );
         assert_eq!(
             build_baseline_targeting_profile(&root, BaselineTargetMode::Service).target_checks,
@@ -7651,10 +8033,7 @@ mod tests {
             contract.target_checks,
             vec!["npm run build:web".to_string()]
         );
-        assert_eq!(
-            contract.integrity_checks,
-            vec!["npm run check".to_string()]
-        );
+        assert_eq!(contract.integrity_checks, vec!["npm run check".to_string()]);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -7695,7 +8074,11 @@ mod tests {
             "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
         )
         .unwrap();
-        fs::write(root.join("crates/baseline-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
         fs::write(
             root.join("baseline-site/src/lib/services/enrollments.ts"),
             "export async function enroll() {}\n",
@@ -7721,11 +8104,13 @@ mod tests {
 
         assert_eq!(
             preferred_baseline_root_node_checks(&root),
-            Some(("npm run check".to_string(), Some("npm run build:web".to_string())))
+            Some((
+                "npm run check".to_string(),
+                Some("npm run build:web".to_string())
+            ))
         );
         assert_eq!(
-            build_baseline_targeting_profile(&root, BaselineTargetMode::MixedRuntime)
-                .target_checks,
+            build_baseline_targeting_profile(&root, BaselineTargetMode::MixedRuntime).target_checks,
             vec![
                 "cargo check -p baseline-cli".to_string(),
                 "npm run build:web".to_string()
@@ -7740,8 +8125,7 @@ mod tests {
             .iter()
             .any(|path| path == "crates/baseline-cli/src/main.rs"));
         assert!(contract.allowed_scope.iter().any(|path| {
-            path == "baseline-site/src/lib/services"
-                || path == "baseline-site/src/pages/api"
+            path == "baseline-site/src/lib/services" || path == "baseline-site/src/pages/api"
         }));
         assert!(!contract
             .entry_points
@@ -7766,10 +8150,7 @@ mod tests {
                 "npm run build:web".to_string()
             ]
         );
-        assert_eq!(
-            contract.integrity_checks,
-            vec!["npm run check".to_string()]
-        );
+        assert_eq!(contract.integrity_checks, vec!["npm run check".to_string()]);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -9203,6 +9584,239 @@ fn ok() {}
 
         assert!(contract.entry_points.contains(&"src/lib.rs".to_string()));
         assert!(contract.allowed_scope.contains(&"src/lib.rs".to_string()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_exact_pubpunk_validate_core_prompt_stays_core_only() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-pubpunk-validate-core-only-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname=\"pubpunk-cli\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname=\"pubpunk-core\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn validate_report() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tests/validate_json.rs"),
+            "#[test]\nfn validate_json() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let prompt = "Core-only validate parseability helper slice for pubpunk. Goal: keep validate_report JSON envelope unchanged while extending TOML surface parseability review so invalid style/targets/review/lint inputs become explicit issue strings instead of silent omissions. Edit only crates/pubpunk-core/src/lib.rs. Do not touch CLI, tests, Cargo.toml, local/, or init files.";
+        let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
+
+        assert_eq!(
+            contract.entry_points,
+            vec!["crates/pubpunk-core/src/lib.rs".to_string()]
+        );
+        assert_eq!(
+            contract.allowed_scope,
+            vec!["crates/pubpunk-core/src/lib.rs".to_string()]
+        );
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test -p pubpunk-core".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert!(contract
+            .expected_interfaces
+            .iter()
+            .all(|line| !line.to_ascii_lowercase().contains("init")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_pubpunk_validate_core_prompt_prunes_cli_and_cargo_noise() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-pubpunk-validate-prune-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname=\"pubpunk-cli\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname=\"pubpunk-core\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn validate_report() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tests/validate_json.rs"),
+            "#[test]\nfn validate_json() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let prompt = "Core-only validate parseability helper slice for pubpunk. Goal: keep validate_report JSON envelope unchanged while extending TOML surface parseability review so invalid style/targets/review/lint inputs become explicit issue strings instead of silent omissions. Edit only crates/pubpunk-core/src/lib.rs. Do not touch CLI, tests, Cargo.toml, local/, or init files.";
+        let contract = service
+            .draft_contract(&ContaminatedPubpunkValidateDrafter, prompt)
+            .unwrap();
+
+        assert_eq!(
+            contract.entry_points,
+            vec!["crates/pubpunk-core/src/lib.rs".to_string()]
+        );
+        assert_eq!(
+            contract.allowed_scope,
+            vec!["crates/pubpunk-core/src/lib.rs".to_string()]
+        );
+        assert!(contract
+            .import_paths
+            .iter()
+            .all(|path| path == "crates/pubpunk-core/src/lib.rs"));
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test -p pubpunk-core".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert!(contract
+            .expected_interfaces
+            .iter()
+            .all(|line| !line.to_ascii_lowercase().contains("init")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_exact_pubpunk_validate_parseability_prompt_keeps_core_and_tests_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-pubpunk-validate-parseability-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname=\"pubpunk-cli\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname=\"pubpunk-core\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn validate_report() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tests/validate_json.rs"),
+            "#[test]\nfn validate_json() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let prompt = "bounded core-only validate parse-check extension. Edit only crates/pubpunk-core/src/lib.rs and tests/validate_json.rs. Do not touch CLI or Cargo. Reuse the existing simple TOML parser so validate_report also checks parseability of .pubpunk/style/style.toml, .pubpunk/style/lexicon.toml, .pubpunk/style/normalize.toml, plus any *.toml files present under .pubpunk/targets, .pubpunk/review, and .pubpunk/lint. Add tests that corrupt style.toml and a target .toml file and expect structured validate JSON issues. Final check cargo test --workspace.";
+        let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
+
+        assert_eq!(
+            contract.entry_points,
+            vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string()
+            ]
+        );
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string()
+            ]
+        );
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
