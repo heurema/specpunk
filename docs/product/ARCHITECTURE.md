@@ -36,6 +36,38 @@ The critical rule is:
 
 > Keep the kernel stable. Let model integrations, skills, councils, and research protocols evolve at the edges.
 
+### Provider-alignment rule
+
+`punk` should evolve as a **correctness and stewardship layer**, not as a parallel general-purpose agent platform.
+
+Build in the kernel only what is local-trust-critical:
+
+- bounded scope and safety policy
+- repo scan and source anchors
+- VCS-aware isolation and rollback
+- gate truth
+- receipts and proof artifacts
+
+Wrap rather than rebuild when providers offer stable primitives for:
+
+- agent runtimes
+- tool calling and built-in tools
+- tracing and observability
+- session, memory, caching, or compaction
+- structured output controls
+
+Avoid adding kernel complexity that duplicates provider direction, especially:
+
+- a custom universal agent runtime
+- a large internal memory platform
+- free-text-heavy orchestration magic
+- a parallel tracing/eval stack
+
+Reference note:
+
+- `docs/research/2026-04-11-provider-alignment-build-wrap-avoid.md`
+- `docs/product/ADR-provider-alignment.md`
+
 ### Inner-loop second-opinion rule
 
 When the system needs a second opinion inside the autonomous loop, the default escalation target is:

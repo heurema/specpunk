@@ -1,8 +1,66 @@
-# Specpunk v2 Roadmap — Agent Orchestration Platform
+# Specpunk v2 Roadmap — historical implementation roadmap
 
-Last updated: 2026-03-27
+Last updated: 2026-04-11
 Owner: Vitaly
-Status: active
+Status: partially superseded by current architecture direction
+
+> **Important:** this document contains older implementation framing from the `agent orchestration platform` phase.
+> Read it together with:
+>
+> - `docs/product/VISION.md`
+> - `docs/product/ARCHITECTURE.md`
+> - `docs/product/NORTH-ROADMAP.md`
+> - `docs/product/ADR-provider-alignment.md`
+>
+> Current rule: `specpunk` should stay a **bounded correctness and stewardship layer**, not grow into a large parallel agent platform.
+
+## Provider-aligned pruning note (2026-04-11)
+
+Interpret the phases below through this filter:
+
+- **keep**: local correctness substrate, VCS-aware execution, proofs/receipts, simple shell, reliability harnesses
+- **downgrade**: autonomy, council, research, and project intelligence when they can stay derived and bounded
+- **cut / avoid**: provider-zoo product framing, custom universal runtime growth, large internal memory platform, and default multi-model complexity
+
+Practical consequence:
+
+- old roadmap items that imply a daemon-first orchestration platform, default multi-model divergence, or large self-improvement subsystems are no longer default-forward
+- they require separate justification against the provider-alignment ADR before implementation
+
+## Concrete pruning pass (2026-04-11)
+
+Use this section as the current interpretation of the historical phases below.
+
+| Historical phase / idea | Decision | Keep | Downgrade / Cut |
+|---|---|---|---|
+| Mission framing: `agent orchestration platform` | **downgrade** | local-first engineering runtime, one CLI, multi-provider portability | platform-style framing that suggests `specpunk` should become a giant runtime of its own |
+| Phase 0: receipt/status foundation | **keep** | receipts, append-only state, status, config defaults, typed artifacts | none, as long as the work strengthens current primitives instead of reviving `punk-run` split-brain |
+| Phase 1: typed daemon | **cut as default path** | process lifecycle ideas may be reused if a bounded local need appears | daemon-first architecture, queue-first rebuild, shadow-mode migration as default roadmap |
+| Phase 2: operations layer | **keep in reduced form** | `status`, `doctor`, concise operator summaries, bounded control surfaces | CRM-style pipeline expansion, broad ops surface area that does not improve correctness or shell clarity |
+| Phase 3: goal system | **downgrade** | goal intake normalization, bounded goal-to-result loop, pause/resume where needed | heavy planner-agent hierarchy, large autonomous planning subsystem, deep task-tree machinery as default |
+| Phase 4: multi-model + self-improvement | **cut / highly selective** | selective second-opinion councils, bounded provider routing, budget backpressure if it protects reliability | default `diverge`, always-on panel mode, automatic skill self-authoring, broad self-improvement subsystem |
+| Phase 5: zero-config and polish | **keep** | zero-config bootstrap, project resolution, optional overrides, safe defaults | central-orchestrator assumptions that fight the current per-repo/product-shell model |
+| `punk-run` as new product / binary strategy | **cut** | none | split product identity, daemon-centric rename path, frozen `punk` vs new runtime product split |
+| “CLI smart, daemon dumb” | **downgrade** | smart shell, clear operator-facing defaults | daemon-oriented architecture premise as the main product shape |
+| “Scale to N projects from one place” | **downgrade** | provider-portable and repo-portable primitives | product direction that optimizes first for cross-project control-plane behavior over in-repo correctness |
+
+## Current implementation bias
+
+When choosing between two historical roadmap ideas, prefer the one that strengthens:
+
+- bounded execution
+- deterministic verification
+- VCS-aware rollback and recovery
+- proof-bearing artifacts
+- one-face shell simplicity
+
+Prefer not to build ideas whose main value is:
+
+- more orchestration depth
+- more runtime abstraction
+- more autonomy layers
+- more internal memory/state machinery
+- more provider-specific product surface area
 
 ## Related strategic roadmap
 

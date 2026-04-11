@@ -1,8 +1,45 @@
 # Open Questions
 
-Last updated: 2026-03-14
+Last updated: 2026-04-11
 Owner: Vitaly
-Status: paused pending research
+Status: historical wedge questions with current carry-forward notes
+
+> **Important:** the questions below come from the older wedge-validation phase.
+> They are still useful context, but they do not define the current product frontier.
+>
+> Current frontier is:
+>
+> - keep `specpunk` as a bounded correctness/stewardship layer
+> - simplify shell and reliability
+> - wrap provider-native runtimes, tools, traces, and session primitives
+
+## Current carry-forward questions (2026-04-11)
+
+These are the questions that still matter after provider alignment:
+
+### CQ-001
+
+Question:
+- what kernel behavior still relies too much on free-text heuristics instead of structured repo anchors and typed evidence?
+
+Why it matters:
+- this is the main source of reliability and targeting drift
+
+### CQ-002
+
+Question:
+- which provider-native runtime, tracing, or session primitives are mature enough that `specpunk` should wrap them instead of extending custom logic?
+
+Why it matters:
+- this is the main anti-complexity lever
+
+### CQ-003
+
+Question:
+- which derived mechanisms should remain intentionally small so they do not become a second platform inside `specpunk`?
+
+Why it matters:
+- autonomy, council, project intelligence, and research can easily outgrow the kernel if left unbounded
 
 ## Rule
 

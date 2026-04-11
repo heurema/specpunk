@@ -1,9 +1,37 @@
 # Current Cycle
 
-Last updated: 2026-03-14
+Last updated: 2026-04-11
 Owner: Vitaly
-Cycle: 2026-03-12 to 2026-03-26
-Status: paused
+Cycle: historical
+Status: superseded by current strategic direction
+
+> **Important:** this cycle plan belongs to the earlier wedge/pause phase.
+> It is no longer the default execution plan.
+>
+> For current prioritization, use:
+>
+> - `docs/product/NORTH-ROADMAP.md`
+> - `docs/product/queued-next-tasks.md`
+> - `docs/product/ADR-provider-alignment.md`
+> - `docs/product/CURRENT-ROADMAP.md`
+
+## Current execution bias (2026-04-11)
+
+When choosing a new bounded slice, prefer work that strengthens:
+
+- bounded execution and rollback safety
+- deterministic verification and proof integrity
+- repo fixture coverage for real dogfood repos
+- simple operator shell behavior
+- structured source targeting over free-text contract heuristics
+
+Deprioritize work whose main effect is:
+
+- more orchestration depth
+- more runtime abstraction
+- more autonomy layers
+- more internal memory/state machinery
+- more provider-facing product surface
 
 ## Cycle Rule
 

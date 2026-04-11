@@ -21,6 +21,21 @@ This repo is in a **design reset / rebuild** phase.
 
 No backward compatibility is required. The project has not launched, so the repo is being reshaped toward the cleanest final design.
 
+## Read this first
+
+If you are orienting in the repo or choosing the next bounded slice, read in this order:
+
+1. `docs/product/CURRENT-ROADMAP.md`
+2. `docs/product/ADR-provider-alignment.md`
+3. `docs/product/ARCHITECTURE.md`
+4. `docs/product/NORTH-ROADMAP.md`
+
+Short version:
+
+- `specpunk` should stay a **bounded correctness and stewardship layer**
+- provider-native runtimes, tools, tracing, and session primitives should usually be **wrapped**, not rebuilt
+- roadmap work that increases platform complexity without improving boundedness, reliability, inspectability, or operator simplicity should be downgraded or cut
+
 ## Product thesis
 
 `punk` is a local-first runtime for AI-driven engineering work across repositories.
@@ -199,6 +214,8 @@ What is explicitly out of scope for v0:
 
 ## Docs
 
+- `docs/product/CURRENT-ROADMAP.md` — short active roadmap for current-forward work
+- `docs/product/ADR-provider-alignment.md` — accepted build/wrap/avoid rule for provider alignment
 - `docs/product/VISION.md` — product boundary and laws
 - `docs/product/ARCHITECTURE.md` — kernel, stewardship, council, skills/eval architecture
 - `docs/product/COUNCIL.md` — advisory multi-model deliberation protocols
