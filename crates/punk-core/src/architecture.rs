@@ -308,7 +308,7 @@ enum DependencyTargetScan {
 fn dependency_targets_for_file(
     repo_root: &Path,
     from_path: &str,
-    rust_source_roots: &BTreeMap<String, String>,
+    rust_source_roots: &BTreeMap<String, Vec<String>>,
 ) -> Result<DependencyTargetScan> {
     let absolute = repo_root.join(from_path);
     if !absolute.exists() || absolute.is_dir() {
@@ -340,7 +340,7 @@ fn rust_dependency_targets(
     repo_root: &Path,
     from_path: &str,
     contents: &str,
-    rust_source_roots: &BTreeMap<String, String>,
+    rust_source_roots: &BTreeMap<String, Vec<String>>,
 ) -> Vec<String> {
     let mut targets = BTreeSet::new();
     let mut current = String::new();
@@ -360,7 +360,7 @@ fn rust_dependency_targets(
 
         if let Some(use_clause) = rust_use_clause(&current) {
             for path in expand_rust_use_paths(use_clause) {
-                if let Some(target) =
+                for target in
                     resolve_rust_module_reference(repo_root, from_path, &path, rust_source_roots)
                 {
                     targets.insert(target);
@@ -529,11 +529,11 @@ fn resolve_rust_module_reference(
     repo_root: &Path,
     from_path: &str,
     reference: &str,
-    rust_source_roots: &BTreeMap<String, String>,
-) -> Option<String> {
+    rust_source_roots: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
     let reference = reference.trim().trim_start_matches("::").trim();
     if reference.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     let segments = reference
@@ -542,31 +542,51 @@ fn resolve_rust_module_reference(
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
     if segments.is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    let (base, start_index) = match segments[0] {
-        "crate" => (crate_source_root(from_path)?, 1usize),
-        "self" => (current_rust_module_dir(from_path)?, 1usize),
+    let (bases, start_index) = match segments[0] {
+        "crate" => match crate_source_root(from_path) {
+            Some(base) => (vec![base], 1usize),
+            None => return Vec::new(),
+        },
+        "self" => match current_rust_module_dir(from_path) {
+            Some(base) => (vec![base], 1usize),
+            None => return Vec::new(),
+        },
         "super" => {
-            let mut base = current_rust_module_dir(from_path)?;
+            let Some(mut base) = current_rust_module_dir(from_path) else {
+                return Vec::new();
+            };
             let mut index = 0usize;
             while index < segments.len() && segments[index] == "super" {
-                base = base.parent()?.to_path_buf();
+                let Some(parent) = base.parent() else {
+                    return Vec::new();
+                };
+                base = parent.to_path_buf();
                 index += 1;
             }
-            (base, index)
+            (vec![base], index)
         }
         segment => {
-            if let Some(root) = rust_source_roots.get(segment) {
-                (PathBuf::from(root), 1usize)
+            if let Some(roots) = rust_source_roots.get(segment) {
+                (roots.iter().map(PathBuf::from).collect::<Vec<_>>(), 1usize)
             } else {
-                (crate_source_root(from_path)?, 0usize)
+                match crate_source_root(from_path) {
+                    Some(base) => (vec![base], 0usize),
+                    None => return Vec::new(),
+                }
             }
         }
     };
 
-    resolve_module_reference(repo_root, &base, &segments[start_index..])
+    let mut resolved = BTreeSet::new();
+    for base in bases {
+        if let Some(target) = resolve_module_reference(repo_root, &base, &segments[start_index..]) {
+            resolved.insert(target);
+        }
+    }
+    resolved.into_iter().collect()
 }
 
 fn resolve_relative_module(
@@ -595,7 +615,7 @@ fn resolve_module_reference(repo_root: &Path, base: &Path, segments: &[&str]) ->
         }
     }
 
-    relative_repo_path(repo_root, &repo_root.join(base))
+    None
 }
 
 fn resolve_module_candidate(
@@ -661,11 +681,11 @@ fn crate_source_root(from_path: &str) -> Option<PathBuf> {
     Some(root)
 }
 
-fn workspace_rust_source_roots(repo_root: &Path) -> Result<BTreeMap<String, String>> {
+fn workspace_rust_source_roots(repo_root: &Path) -> Result<BTreeMap<String, Vec<String>>> {
     let mut manifests = Vec::new();
     collect_cargo_manifests(repo_root, repo_root, &mut manifests)?;
 
-    let mut roots = BTreeMap::new();
+    let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for manifest in manifests {
         let Some(package_name) = cargo_package_name(&manifest) else {
             continue;
@@ -676,8 +696,18 @@ fn workspace_rust_source_roots(repo_root: &Path) -> Result<BTreeMap<String, Stri
         let Some(relative_src) = relative_repo_path(repo_root, &manifest_dir.join("src")) else {
             continue;
         };
-        roots.insert(package_name.clone(), relative_src.clone());
-        roots.insert(package_name.replace('-', "_"), relative_src);
+        roots
+            .entry(package_name.clone())
+            .or_default()
+            .push(relative_src.clone());
+        roots
+            .entry(package_name.replace('-', "_"))
+            .or_default()
+            .push(relative_src);
+    }
+    for paths in roots.values_mut() {
+        paths.sort();
+        paths.dedup();
     }
     Ok(roots)
 }
@@ -1131,6 +1161,60 @@ mod tests {
             vec![ForbiddenPathDependencyViolation {
                 from_path: "src/ui/view.ts".into(),
                 to_path: "src/data/query.ts".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn scan_forbidden_path_dependency_uses_all_matching_package_roots() {
+        let root = temp_repo_root("duplicate-package-roots");
+        fs::create_dir_all(root.join("crates/app/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("punk/punk-cli/src")).unwrap();
+        fs::write(
+            root.join("crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-cli/Cargo.toml"),
+            "[package]\nname = \"punk-cli\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("punk/punk-cli/Cargo.toml"),
+            "[package]\nname = \"punk-cli\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/app/src/lib.rs"),
+            "use punk_cli::commands::run;\npub fn call() { run(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-cli/src/commands.rs"),
+            "pub fn run() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("punk/punk-cli/src/lib.rs"),
+            "pub fn shadow() {}\n",
+        )
+        .unwrap();
+
+        let scan = scan_forbidden_path_dependency(
+            &root,
+            &["crates/app/src/lib.rs".into()],
+            "crates/app/**",
+            "crates/punk-cli/**",
+        )
+        .unwrap();
+
+        assert_eq!(
+            scan.violating_edges,
+            vec![ForbiddenPathDependencyViolation {
+                from_path: "crates/app/src/lib.rs".into(),
+                to_path: "crates/punk-cli/src/commands.rs".into(),
             }]
         );
     }

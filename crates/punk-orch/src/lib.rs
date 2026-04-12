@@ -425,54 +425,162 @@ fn read_persisted_contract_doc(path: &Path) -> Result<PersistedContract> {
     read_json(path)
 }
 
-fn build_contract_architecture_integrity(
+fn default_architecture_touched_roots_max(signals: &ArchitectureSignals) -> Option<usize> {
+    Some(signals.distinct_scope_roots.max(1))
+}
+
+fn default_architecture_file_loc_budgets(
     signals: &ArchitectureSignals,
+) -> Vec<ArchitectureFileLocBudget> {
+    signals
+        .oversized_files
+        .iter()
+        .map(|file| ArchitectureFileLocBudget {
+            path: file.path.clone(),
+            max_after_loc: file.loc,
+        })
+        .collect()
+}
+
+fn contract_scope_paths(contract: &Contract) -> Vec<String> {
+    contract
+        .allowed_scope
+        .iter()
+        .chain(contract.entry_points.iter())
+        .chain(contract.import_paths.iter())
+        .map(|path| path.trim())
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn path_within_contract_scope(scope_paths: &[String], candidate: &str) -> bool {
+    scope_paths
+        .iter()
+        .any(|scope| candidate == scope || candidate.starts_with(&format!("{scope}/")))
+}
+
+fn filter_architecture_file_loc_budgets_to_scope(
+    budgets: &[ArchitectureFileLocBudget],
+    scope_paths: &[String],
+) -> Vec<ArchitectureFileLocBudget> {
+    budgets
+        .iter()
+        .filter(|budget| path_within_contract_scope(scope_paths, &budget.path))
+        .cloned()
+        .collect()
+}
+
+fn architecture_file_loc_budgets_equal(
+    left: &[ArchitectureFileLocBudget],
+    right: &[ArchitectureFileLocBudget],
+) -> bool {
+    let normalize = |budgets: &[ArchitectureFileLocBudget]| {
+        let mut items = budgets
+            .iter()
+            .map(|budget| (budget.path.clone(), budget.max_after_loc))
+            .collect::<Vec<_>>();
+        items.sort();
+        items
+    };
+    normalize(left) == normalize(right)
+}
+
+fn merge_architecture_file_loc_budgets(
+    preserved: Vec<ArchitectureFileLocBudget>,
+    defaults: &[ArchitectureFileLocBudget],
+) -> Vec<ArchitectureFileLocBudget> {
+    let mut merged = BTreeMap::new();
+    for budget in defaults {
+        merged.insert(budget.path.clone(), budget.max_after_loc);
+    }
+    for budget in preserved {
+        merged.insert(budget.path.clone(), budget.max_after_loc);
+    }
+    merged
+        .into_iter()
+        .map(|(path, max_after_loc)| ArchitectureFileLocBudget {
+            path,
+            max_after_loc,
+        })
+        .collect()
+}
+
+fn build_contract_architecture_integrity(
+    contract: &Contract,
+    signals: &ArchitectureSignals,
+    previous_signals: Option<&ArchitectureSignals>,
     brief_ref: &str,
     existing: Option<&ContractArchitectureIntegrity>,
     mode: ArchitectureMode,
 ) -> Option<ContractArchitectureIntegrity> {
-    let should_attach = existing.is_some()
-        || matches!(signals.severity, ArchitectureSeverity::Critical)
-        || matches!(mode, ArchitectureMode::On);
+    let scope_paths = contract_scope_paths(contract);
+    let current_default_touched_roots_max = default_architecture_touched_roots_max(signals);
+    let current_default_file_loc_budgets = default_architecture_file_loc_budgets(signals);
+    let previous_default_touched_roots_max =
+        previous_signals.and_then(default_architecture_touched_roots_max);
+    let previous_default_file_loc_budgets = previous_signals
+        .map(default_architecture_file_loc_budgets)
+        .unwrap_or_default();
+
+    let existing_integrity = existing
+        .cloned()
+        .unwrap_or_else(|| ContractArchitectureIntegrity {
+            review_required: false,
+            brief_ref: brief_ref.to_string(),
+            touched_roots_max: None,
+            file_loc_budgets: Vec::new(),
+            forbidden_path_dependencies: Vec::new(),
+        });
+
+    let existing_touched_roots_is_auto = previous_signals.is_some()
+        && existing_integrity.touched_roots_max == previous_default_touched_roots_max;
+    let existing_file_loc_budgets_are_auto = previous_signals.is_some()
+        && architecture_file_loc_budgets_equal(
+            &existing_integrity.file_loc_budgets,
+            &previous_default_file_loc_budgets,
+        );
+
+    let preserved_touched_roots_max = if existing_touched_roots_is_auto {
+        None
+    } else {
+        existing_integrity.touched_roots_max
+    };
+    let preserved_file_loc_budgets = if existing_file_loc_budgets_are_auto {
+        Vec::new()
+    } else {
+        filter_architecture_file_loc_budgets_to_scope(
+            &existing_integrity.file_loc_budgets,
+            &scope_paths,
+        )
+    };
+    let preserved_forbidden_path_dependencies = existing_integrity.forbidden_path_dependencies;
+
+    let has_preserved_constraints = preserved_touched_roots_max.is_some()
+        || !preserved_file_loc_budgets.is_empty()
+        || !preserved_forbidden_path_dependencies.is_empty();
+    let should_attach = matches!(signals.severity, ArchitectureSeverity::Critical)
+        || matches!(mode, ArchitectureMode::On)
+        || has_preserved_constraints;
     if !should_attach {
         return None;
     }
 
-    let mut integrity = existing
-        .cloned()
-        .unwrap_or_else(|| ContractArchitectureIntegrity {
-            review_required: true,
-            brief_ref: brief_ref.to_string(),
-            touched_roots_max: Some(signals.distinct_scope_roots.max(1)),
-            file_loc_budgets: signals
-                .oversized_files
-                .iter()
-                .map(|file| ArchitectureFileLocBudget {
-                    path: file.path.clone(),
-                    max_after_loc: file.loc,
-                })
-                .collect(),
-            forbidden_path_dependencies: Vec::new(),
-        });
-
-    integrity.review_required = integrity.review_required
-        || matches!(signals.severity, ArchitectureSeverity::Critical)
-        || matches!(mode, ArchitectureMode::On);
+    let mut integrity = ContractArchitectureIntegrity {
+        review_required: matches!(signals.severity, ArchitectureSeverity::Critical)
+            || matches!(mode, ArchitectureMode::On)
+            || has_preserved_constraints,
+        brief_ref: brief_ref.to_string(),
+        touched_roots_max: preserved_touched_roots_max.or(current_default_touched_roots_max),
+        file_loc_budgets: merge_architecture_file_loc_budgets(
+            preserved_file_loc_budgets,
+            &current_default_file_loc_budgets,
+        ),
+        forbidden_path_dependencies: preserved_forbidden_path_dependencies,
+    };
     integrity.brief_ref = brief_ref.to_string();
-    if integrity.touched_roots_max.is_none() {
-        integrity.touched_roots_max = Some(signals.distinct_scope_roots.max(1));
-    }
-    if integrity.file_loc_budgets.is_empty() {
-        integrity.file_loc_budgets = signals
-            .oversized_files
-            .iter()
-            .map(|file| ArchitectureFileLocBudget {
-                path: file.path.clone(),
-                max_after_loc: file.loc,
-            })
-            .collect();
-    }
-
     Some(integrity)
 }
 
@@ -680,6 +788,11 @@ impl OrchService {
         architecture_mode: ArchitectureMode,
         existing: Option<&PersistedContract>,
     ) -> Result<()> {
+        let previous_signals = existing
+            .and_then(|doc| doc.architecture_signals_ref.as_ref())
+            .and_then(|reference| {
+                read_json::<ArchitectureSignals>(&self.paths.repo_root.join(reference)).ok()
+            });
         let signals = compute_architecture_signals(
             &self.paths.repo_root,
             ArchitectureSignalInput {
@@ -700,7 +813,9 @@ impl OrchService {
         let brief_path = architecture_brief_artifact_path(contract_path);
         let brief_ref = relative_ref(&self.paths.repo_root, &brief_path)?;
         let integrity = build_contract_architecture_integrity(
+            contract,
             &signals,
+            previous_signals.as_ref(),
             &brief_ref,
             existing.and_then(|doc| doc.architecture_integrity.as_ref()),
             architecture_mode,
@@ -6408,6 +6523,7 @@ fn file_len(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use punk_adapters::{ContractDrafter, ExecuteInput, ExecuteOutput};
+    use punk_core::DEFAULT_ARCHITECTURE_THRESHOLDS;
     use punk_domain::{
         DraftInput, RefineInput, ResearchArtifactInput, ResearchBudget, ResearchStartInput,
         ResearchSynthesisInput, RunVcs,
@@ -7416,6 +7532,85 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn build_contract_architecture_integrity_drops_stale_auto_constraints() {
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Draft,
+            prompt_source: "narrow the slice".into(),
+            entry_points: vec!["src/small.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["small interface".into()],
+            behavior_requirements: vec!["keep bounded".into()],
+            allowed_scope: vec!["src/small.rs".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "medium".into(),
+            created_at: now_rfc3339(),
+            approved_at: None,
+        };
+        let previous_signals = punk_domain::ArchitectureSignals {
+            contract_id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            scope_roots: vec!["src".into()],
+            oversized_files: vec![punk_domain::ArchitectureOversizedFile {
+                path: "src/critical.rs".into(),
+                loc: 1300,
+            }],
+            distinct_scope_roots: 1,
+            entry_point_count: 1,
+            expected_interface_count: 1,
+            import_path_count: 0,
+            has_cleanup_obligations: false,
+            has_docs_obligations: false,
+            has_migration_sensitive_surfaces: false,
+            severity: punk_domain::ArchitectureSeverity::Critical,
+            trigger_reasons: vec!["oversized hotspot".into()],
+            thresholds: DEFAULT_ARCHITECTURE_THRESHOLDS.clone(),
+            computed_at: now_rfc3339(),
+        };
+        let current_signals = punk_domain::ArchitectureSignals {
+            contract_id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            scope_roots: vec!["src".into()],
+            oversized_files: Vec::new(),
+            distinct_scope_roots: 1,
+            entry_point_count: 1,
+            expected_interface_count: 1,
+            import_path_count: 0,
+            has_cleanup_obligations: false,
+            has_docs_obligations: false,
+            has_migration_sensitive_surfaces: false,
+            severity: punk_domain::ArchitectureSeverity::None,
+            trigger_reasons: Vec::new(),
+            thresholds: DEFAULT_ARCHITECTURE_THRESHOLDS.clone(),
+            computed_at: now_rfc3339(),
+        };
+        let existing = ContractArchitectureIntegrity {
+            review_required: true,
+            brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
+            touched_roots_max: Some(1),
+            file_loc_budgets: vec![ArchitectureFileLocBudget {
+                path: "src/critical.rs".into(),
+                max_after_loc: 1300,
+            }],
+            forbidden_path_dependencies: Vec::new(),
+        };
+
+        let refreshed = build_contract_architecture_integrity(
+            &contract,
+            &current_signals,
+            Some(&previous_signals),
+            ".punk/contracts/feat_1/architecture-brief.md",
+            Some(&existing),
+            ArchitectureMode::Auto,
+        );
+
+        assert!(refreshed.is_none());
     }
 
     #[test]
