@@ -439,4 +439,80 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn proofpack_hashes_architecture_assessment_artifact() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-proof-architecture-assessment-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/decisions")).unwrap();
+        fs::write(root.join(".punk/contracts/feat_1/v1.json"), "{}\n").unwrap();
+        write_json(
+            &root.join(".punk/runs/run_1/receipt.json"),
+            &Receipt {
+                id: "rcpt_1".into(),
+                run_id: "run_1".into(),
+                task_id: "task_1".into(),
+                status: "success".into(),
+                executor_name: "fake".into(),
+                changed_files: vec!["tracked.txt".into()],
+                artifacts: ReceiptArtifacts {
+                    stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                    stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+                },
+                checks_run: vec![],
+                duration_ms: 1,
+                cost_usd: None,
+                summary: "ok".into(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .unwrap();
+        fs::write(
+            root.join(".punk/runs/run_1/architecture-assessment.json"),
+            "{\"run_id\":\"run_1\"}\n",
+        )
+        .unwrap();
+
+        let decision = DecisionObject {
+            id: "dec_1".into(),
+            run_id: "run_1".into(),
+            contract_id: "ct_1".into(),
+            decision: Decision::Accept,
+            deterministic_status: DeterministicStatus::Pass,
+            target_status: CheckStatus::Pass,
+            integrity_status: CheckStatus::Pass,
+            confidence_estimate: 1.0,
+            decision_basis: vec!["checks passed".into()],
+            contract_ref: ".punk/contracts/feat_1/v1.json".into(),
+            receipt_ref: ".punk/runs/run_1/receipt.json".into(),
+            check_refs: vec![".punk/runs/run_1/architecture-assessment.json".into()],
+            verification_context_ref: None,
+            verification_context_identity: None,
+            command_evidence: Vec::new(),
+            declared_harness_evidence: Vec::new(),
+            harness_evidence: Vec::new(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/decisions/dec_1.json"), &decision).unwrap();
+
+        let proof = ProofService::new(&root, &global)
+            .write_proofpack("dec_1")
+            .unwrap();
+        assert!(proof
+            .check_refs
+            .contains(&".punk/runs/run_1/architecture-assessment.json".to_string()));
+        assert!(proof
+            .hashes
+            .contains_key(".punk/runs/run_1/architecture-assessment.json"));
+    }
 }

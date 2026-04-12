@@ -102,6 +102,126 @@ pub enum CheckStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchitectureSeverity {
+    None,
+    Warn,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchitectureAssessmentOutcome {
+    NotApplicable,
+    Pass,
+    Block,
+    Escalate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchitectureThresholds {
+    pub warn_file_loc: usize,
+    pub critical_file_loc: usize,
+    pub critical_scope_roots: usize,
+    pub warn_expected_interfaces: usize,
+    pub warn_import_paths: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchitectureOversizedFile {
+    pub path: String,
+    pub loc: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchitectureSignals {
+    pub contract_id: String,
+    pub feature_id: String,
+    #[serde(default)]
+    pub scope_roots: Vec<String>,
+    #[serde(default)]
+    pub oversized_files: Vec<ArchitectureOversizedFile>,
+    pub distinct_scope_roots: usize,
+    pub entry_point_count: usize,
+    pub expected_interface_count: usize,
+    pub import_path_count: usize,
+    pub has_cleanup_obligations: bool,
+    pub has_docs_obligations: bool,
+    pub has_migration_sensitive_surfaces: bool,
+    pub severity: ArchitectureSeverity,
+    #[serde(default)]
+    pub trigger_reasons: Vec<String>,
+    pub thresholds: ArchitectureThresholds,
+    pub computed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchitectureFileLocBudget {
+    pub path: String,
+    pub max_after_loc: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchitectureForbiddenPathDependency {
+    pub from_glob: String,
+    pub to_glob: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContractArchitectureIntegrity {
+    pub review_required: bool,
+    pub brief_ref: String,
+    #[serde(default)]
+    pub touched_roots_max: Option<usize>,
+    #[serde(default)]
+    pub file_loc_budgets: Vec<ArchitectureFileLocBudget>,
+    #[serde(default)]
+    pub forbidden_path_dependencies: Vec<ArchitectureForbiddenPathDependency>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchitectureFileLocAssessment {
+    pub path: String,
+    pub max_after_loc: usize,
+    pub actual_loc: usize,
+    pub status: CheckStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchitectureForbiddenPathDependencyAssessment {
+    pub from_glob: String,
+    pub to_glob: String,
+    pub status: CheckStatus,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchitectureAssessment {
+    pub run_id: String,
+    pub contract_id: String,
+    #[serde(default)]
+    pub signals_ref: Option<String>,
+    #[serde(default)]
+    pub brief_ref: Option<String>,
+    pub severity: ArchitectureSeverity,
+    pub outcome: ArchitectureAssessmentOutcome,
+    pub review_required: bool,
+    pub contract_integrity_present: bool,
+    pub touched_root_count: usize,
+    #[serde(default)]
+    pub touched_roots: Vec<String>,
+    #[serde(default)]
+    pub file_loc_results: Vec<ArchitectureFileLocAssessment>,
+    #[serde(default)]
+    pub forbidden_path_dependency_results: Vec<ArchitectureForbiddenPathDependencyAssessment>,
+    #[serde(default)]
+    pub reason_codes: Vec<String>,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    pub assessed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandEvidence {
     pub evidence_type: String,
     pub lane: String,
@@ -193,6 +313,16 @@ pub struct Contract {
     pub risk_level: String,
     pub created_at: String,
     pub approved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedContract {
+    #[serde(flatten)]
+    pub contract: Contract,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture_signals_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture_integrity: Option<ContractArchitectureIntegrity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -781,5 +911,56 @@ mod tests {
 
         let synthesis = ResearchSynthesis::deserialize(legacy).unwrap();
         assert!(synthesis.supersedes_ref.is_none());
+    }
+
+    #[test]
+    fn persisted_contract_architecture_integrity_round_trips() {
+        let persisted = PersistedContract {
+            contract: Contract {
+                id: "ct_1".into(),
+                feature_id: "feat_1".into(),
+                version: 1,
+                status: ContractStatus::Approved,
+                prompt_source: "add architecture steering".into(),
+                entry_points: vec!["crates/punk-orch/src/lib.rs".into()],
+                import_paths: vec!["crates/punk-core".into()],
+                expected_interfaces: vec!["architecture signals".into()],
+                behavior_requirements: vec!["keep gate deterministic".into()],
+                allowed_scope: vec!["crates/punk-orch/src/lib.rs".into()],
+                target_checks: vec!["cargo test -p punk-orch".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "medium".into(),
+                created_at: "2026-04-12T00:00:00Z".into(),
+                approved_at: Some("2026-04-12T00:05:00Z".into()),
+            },
+            architecture_signals_ref: Some(
+                ".punk/contracts/feat_1/architecture-signals.json".into(),
+            ),
+            architecture_integrity: Some(ContractArchitectureIntegrity {
+                review_required: true,
+                brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
+                touched_roots_max: Some(1),
+                file_loc_budgets: vec![ArchitectureFileLocBudget {
+                    path: "crates/punk-orch/src/lib.rs".into(),
+                    max_after_loc: 900,
+                }],
+                forbidden_path_dependencies: vec![ArchitectureForbiddenPathDependency {
+                    from_glob: "crates/punk-gate/**".into(),
+                    to_glob: "crates/punk-cli/**".into(),
+                }],
+            }),
+        };
+
+        let json = serde_json::to_value(&persisted).unwrap();
+        assert_eq!(
+            json["architecture_integrity"]["forbidden_path_dependencies"][0]["from_glob"],
+            "crates/punk-gate/**"
+        );
+
+        let decoded: PersistedContract = serde_json::from_value(json).unwrap();
+        let integrity = decoded.architecture_integrity.unwrap();
+        assert_eq!(integrity.touched_roots_max, Some(1));
+        assert_eq!(integrity.file_loc_budgets[0].max_after_loc, 900);
+        assert_eq!(integrity.forbidden_path_dependencies.len(), 1);
     }
 }

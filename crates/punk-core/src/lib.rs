@@ -5,8 +5,14 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use punk_domain::{DraftProposal, DraftValidationError, RepoScanSummary};
 
+pub mod architecture;
 pub mod artifacts;
 
+pub use architecture::{
+    compute_architecture_signals, line_count_for_path, scan_forbidden_path_dependency, scope_roots,
+    ArchitectureSignalInput, ForbiddenPathDependencyScan, ForbiddenPathDependencyViolation,
+    DEFAULT_ARCHITECTURE_THRESHOLDS,
+};
 pub use artifacts::{find_object_path, read_json, relative_ref, write_json};
 
 struct ScopeCandidates {

@@ -370,8 +370,8 @@ Use this when:
 ### Mode-level commands
 
 ```bash
-punk plot contract "<prompt>"
-punk plot refine <contract-id> "<guidance>"
+punk plot contract [--architecture auto|on|off] "<prompt>"
+punk plot refine <contract-id> "<guidance>" [--architecture auto|on|off]
 punk plot approve <contract-id>
 punk cut run <contract-id>
 punk gate run <run-id>
@@ -534,7 +534,7 @@ Writes:
 - `feature.created`
 - `contract.drafted`
 
-### `punk plot contract "<prompt>"`
+### `punk plot contract [--architecture auto|on|off] "<prompt>"`
 
 Creates:
 
@@ -544,10 +544,31 @@ Creates:
 Writes:
 
 - `.punk/contracts/<feature-id>/v1.json`
+- `.punk/contracts/<feature-id>/architecture-signals.json`
 - `feature.created`
 - `contract.drafted`
 
-### `punk plot refine <contract-id> "<guidance>"`
+Architecture steering notes:
+
+- `plot contract` always writes a deterministic `architecture-signals.json` artifact next to the contract
+- default thresholds live in code and docs:
+  - `warn_file_loc >= 600`
+  - `critical_file_loc >= 1200`
+  - `critical_scope_roots > 1`
+  - `warn_expected_interfaces > 2`
+  - `warn_import_paths > 5`
+- if signals are `critical`, `--architecture on` is used, or the draft already carries architecture integrity constraints, `plot contract` must also write `.punk/contracts/<feature-id>/architecture-brief.md`
+- that brief is deterministic/template-populated, not an LLM-authored freeform artifact
+- the persisted contract document may also carry:
+  - `architecture_signals_ref`
+  - optional `architecture_integrity` with:
+    - `review_required`
+    - `brief_ref`
+    - `touched_roots_max`
+    - `file_loc_budgets[]`
+    - optional `forbidden_path_dependencies[]` (deterministically enforced in `gate run` for touched matching files when direct local imports can be resolved; otherwise the assessment stays `Unverified`)
+
+### `punk plot refine <contract-id> "<guidance>" [--architecture auto|on|off]`
 
 Updates:
 
@@ -561,6 +582,8 @@ Timeout expectation:
 Writes:
 
 - updated `.punk/contracts/<feature-id>/vN.json`
+- refreshed `.punk/contracts/<feature-id>/architecture-signals.json`
+- refreshed `.punk/contracts/<feature-id>/architecture-brief.md` when architecture review remains active
 - `contract.refined`
 
 ### `punk plot approve <contract-id>`
@@ -571,6 +594,8 @@ Updates:
 
 Writes:
 
+- refreshed `.punk/contracts/<feature-id>/architecture-signals.json`
+- refreshed `.punk/contracts/<feature-id>/architecture-brief.md` when architecture review is active
 - `contract.approved`
 
 ### `punk cut run <contract-id>`
@@ -648,6 +673,7 @@ Checks:
 - policy
 - target checks
 - integrity checks
+- architecture assessment
 
 Behavior notes:
 
@@ -658,6 +684,14 @@ Behavior notes:
 - `gate run` must validate that persisted verification context before running trusted checks and fail closed if the context is missing, unreadable, or drifted
 - when a run executed inside an isolated VCS workspace (for example a git worktree in degraded git-only mode), `gate run` must execute trusted target and integrity checks inside that recorded `workspace_ref`, not back on the original repo root
 - if `gate run` executes cargo-based trusted checks for a contract whose scope does not include `Cargo.lock`, a newly generated `Cargo.lock` should be pruned after the check rather than left behind as avoidable project litter
+- `gate run` must read only frozen persisted architecture inputs:
+  - approved contract document
+  - persisted `architecture-signals.json`
+  - receipt / verification context / trusted check outputs
+- if architecture signals are `critical` but the approved contract document has no `architecture_integrity` section, `gate run` must return `Escalate` and record an explicit machine-readable reason in `.punk/runs/<run-id>/architecture-assessment.json`
+- if enforced architecture constraints are present and any are breached (for example `touched_roots_max` or `file_loc_budgets[]`), `gate run` must return `Block`
+- if enforced `forbidden_path_dependencies[]` are present, `gate run` must deterministically scan touched matching files for direct local dependency edges and return `Block` on a violated edge
+- v0 forbidden dependency enforcement is intentionally cheap: it currently covers deterministic Rust crate/module references plus JS/TS relative imports; if matching touched files are outside those supported forms, the assessment must report `Unverified` instead of pretending the rule passed
 
 Target and integrity checks must be validated and executed as direct trusted runners, not interpolated through `/bin/sh -lc` or other shell-fragment execution.
 
@@ -676,6 +710,7 @@ Behavior notes:
 
 - `Proofpack` should carry the same `verification_context_ref` and execution-context identity that `gate run` used for the final decision
 - when the referenced verification context artifact still exists, `Proofpack` should hash it alongside the contract, receipt, decision, and check outputs
+- `Proofpack` must also carry the architecture assessment ref/hash written by `gate run` (currently through `check_refs` / `hashes`)
 - `Proofpack` should also persist:
   - `run_ref`
   - `workspace_lineage`

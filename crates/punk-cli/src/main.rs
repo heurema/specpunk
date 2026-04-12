@@ -9,7 +9,8 @@ use punk_adapters::{CodexCliContractDrafter, CodexCliExecutor};
 use punk_domain::Project;
 use punk_gate::GateService;
 use punk_orch::{
-    project_id as runtime_project_id, read_json, relative_ref, write_json, OrchService,
+    project_id as runtime_project_id, read_json, relative_ref, write_json, ArchitectureMode,
+    OrchService,
 };
 use punk_proof::ProofService;
 use punk_vcs::{
@@ -183,16 +184,27 @@ struct PlotCommand {
     action: PlotAction,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ArchitectureCliMode {
+    Auto,
+    On,
+    Off,
+}
+
 #[derive(Subcommand)]
 enum PlotAction {
     Contract {
         prompt: String,
+        #[arg(long, value_enum, default_value_t = ArchitectureCliMode::Auto)]
+        architecture: ArchitectureCliMode,
         #[arg(long)]
         json: bool,
     },
     Refine {
         contract_id: String,
         guidance: String,
+        #[arg(long, value_enum, default_value_t = ArchitectureCliMode::Auto)]
+        architecture: ArchitectureCliMode,
         #[arg(long)]
         json: bool,
     },
@@ -201,6 +213,16 @@ enum PlotAction {
         #[arg(long)]
         json: bool,
     },
+}
+
+impl From<ArchitectureCliMode> for ArchitectureMode {
+    fn from(value: ArchitectureCliMode) -> Self {
+        match value {
+            ArchitectureCliMode::Auto => ArchitectureMode::Auto,
+            ArchitectureCliMode::On => ArchitectureMode::On,
+            ArchitectureCliMode::Off => ArchitectureMode::Off,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -380,26 +402,64 @@ fn run() -> Result<()> {
             }
         },
         Command::Plot(plot) => match plot.action {
-            PlotAction::Contract { prompt, json } => {
-                let orch = OrchService::new(&repo_root, &global_root)?;
-                let drafter = CodexCliContractDrafter::default();
-                let contract = orch.draft_contract(&drafter, &prompt)?;
-                render(json, &contract, &format!("drafted {}", contract.id))
-            }
-            PlotAction::Refine {
-                contract_id,
-                guidance,
+            PlotAction::Contract {
+                prompt,
+                architecture,
                 json,
             } => {
                 let orch = OrchService::new(&repo_root, &global_root)?;
                 let drafter = CodexCliContractDrafter::default();
-                let contract = orch.refine_contract(&drafter, &contract_id, &guidance)?;
-                render(json, &contract, &format!("refined {}", contract.id))
+                let contract =
+                    orch.draft_contract_with_options(&drafter, &prompt, architecture.into())?;
+                let persisted = orch.inspect(&contract.id)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&persisted)?);
+                } else {
+                    println!(
+                        "{}",
+                        format_plot_contract_summary("drafted", &contract, &persisted, &repo_root)
+                    );
+                }
+                Ok(())
+            }
+            PlotAction::Refine {
+                contract_id,
+                guidance,
+                architecture,
+                json,
+            } => {
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let drafter = CodexCliContractDrafter::default();
+                let contract = orch.refine_contract_with_options(
+                    &drafter,
+                    &contract_id,
+                    &guidance,
+                    architecture.into(),
+                )?;
+                let persisted = orch.inspect(&contract.id)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&persisted)?);
+                } else {
+                    println!(
+                        "{}",
+                        format_plot_contract_summary("refined", &contract, &persisted, &repo_root)
+                    );
+                }
+                Ok(())
             }
             PlotAction::Approve { contract_id, json } => {
                 let orch = OrchService::new(&repo_root, &global_root)?;
                 let contract = orch.approve_contract(&contract_id)?;
-                render(json, &contract, &format!("approved {}", contract.id))
+                let persisted = orch.inspect(&contract.id)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&persisted)?);
+                } else {
+                    println!(
+                        "{}",
+                        format_plot_contract_summary("approved", &contract, &persisted, &repo_root)
+                    );
+                }
+                Ok(())
             }
         },
         Command::Cut(cut) => match cut.action {
@@ -426,11 +486,16 @@ fn run() -> Result<()> {
                 let service = GateService::new(&repo_root, &global_root);
                 let decision = service.gate_run(&run_id)?;
                 let status = orch.status(Some(&run_id))?;
-                render(
-                    json,
-                    &decision,
-                    &format_gate_run_summary(&decision, &status),
-                )
+                let persisted = orch.inspect(&decision.id)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&persisted)?);
+                } else {
+                    println!(
+                        "{}",
+                        format_gate_run_summary(&decision, &status, &persisted, &repo_root)
+                    );
+                }
+                Ok(())
             }
             GateAction::Proof {
                 run_or_decision_id,
@@ -528,11 +593,26 @@ fn format_cut_run_summary(run: &punk_domain::Run, receipt: &punk_domain::Receipt
     )
 }
 
+fn format_plot_contract_summary(
+    action: &str,
+    contract: &punk_domain::Contract,
+    persisted: &serde_json::Value,
+    repo_root: &Path,
+) -> String {
+    let mut rendered = format!("{action} {}", contract.id);
+    if let Some(summary) = format_contract_architecture_summary(persisted, repo_root) {
+        rendered.push_str(&format!("\n{summary}"));
+    }
+    rendered
+}
+
 fn format_gate_run_summary(
     decision: &punk_domain::DecisionObject,
     status: &punk_orch::StatusSnapshot,
+    persisted: &serde_json::Value,
+    repo_root: &Path,
 ) -> String {
-    format!(
+    let mut rendered = format!(
         "decision {:?} for {} (vcs={:?} ref={:?} dirty={} workspace_root={:?})",
         decision.decision,
         decision.run_id,
@@ -540,7 +620,113 @@ fn format_gate_run_summary(
         status.vcs_ref,
         status.vcs_dirty,
         status.workspace_root
-    )
+    );
+    if let Some(assessment_ref) = decision_architecture_assessment_ref(persisted) {
+        if let Ok(assessment) =
+            read_json::<punk_domain::ArchitectureAssessment>(&repo_root.join(assessment_ref))
+        {
+            rendered.push_str(&format!(
+                "\narchitecture: {} ({})\narchitecture_assessment: {}",
+                architecture_assessment_outcome_label(&assessment.outcome),
+                summarize_architecture_reasons(&assessment.reasons),
+                assessment_ref
+            ));
+        } else {
+            rendered.push_str(&format!("\narchitecture_assessment: {}", assessment_ref));
+        }
+    }
+    rendered
+}
+
+fn format_contract_architecture_summary(
+    persisted: &serde_json::Value,
+    repo_root: &Path,
+) -> Option<String> {
+    let signals_ref = persisted
+        .get("architecture_signals_ref")
+        .and_then(|value| value.as_str());
+    let brief_ref = persisted
+        .get("architecture_integrity")
+        .and_then(|value| value.get("brief_ref"))
+        .and_then(|value| value.as_str());
+
+    if signals_ref.is_none() && brief_ref.is_none() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    if let Some(signals_ref) = signals_ref {
+        if let Ok(signals) =
+            read_json::<punk_domain::ArchitectureSignals>(&repo_root.join(signals_ref))
+        {
+            if matches!(signals.severity, punk_domain::ArchitectureSeverity::None)
+                && brief_ref.is_none()
+            {
+                return None;
+            }
+            let reason_summary = summarize_architecture_reasons(&signals.trigger_reasons);
+            lines.insert(
+                0,
+                format!(
+                    "architecture: {} ({})",
+                    architecture_severity_label(&signals.severity),
+                    reason_summary
+                ),
+            );
+        }
+        lines.push(format!("architecture signals: {signals_ref}"));
+    }
+    if let Some(brief_ref) = brief_ref {
+        lines.push(format!("architecture brief: {brief_ref}"));
+    }
+    Some(lines.join("\n"))
+}
+
+fn architecture_severity_label(severity: &punk_domain::ArchitectureSeverity) -> &'static str {
+    match severity {
+        punk_domain::ArchitectureSeverity::None => "none",
+        punk_domain::ArchitectureSeverity::Warn => "warn",
+        punk_domain::ArchitectureSeverity::Critical => "critical",
+    }
+}
+
+fn architecture_assessment_outcome_label(
+    outcome: &punk_domain::ArchitectureAssessmentOutcome,
+) -> &'static str {
+    match outcome {
+        punk_domain::ArchitectureAssessmentOutcome::NotApplicable => "not_applicable",
+        punk_domain::ArchitectureAssessmentOutcome::Pass => "pass",
+        punk_domain::ArchitectureAssessmentOutcome::Block => "block",
+        punk_domain::ArchitectureAssessmentOutcome::Escalate => "escalate",
+    }
+}
+
+fn summarize_architecture_reasons(reasons: &[String]) -> String {
+    let items = reasons
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .take(2)
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        "no explicit architecture notes recorded".to_string()
+    } else {
+        items.join("; ")
+    }
+}
+
+fn decision_architecture_assessment_ref(persisted: &serde_json::Value) -> Option<&str> {
+    persisted
+        .get("check_refs")
+        .and_then(|value| value.as_array())
+        .and_then(|refs| {
+            refs.iter().find_map(|value| {
+                let reference = value.as_str()?;
+                reference
+                    .ends_with("/architecture-assessment.json")
+                    .then_some(reference)
+            })
+        })
 }
 
 fn format_status_summary(snapshot: &punk_orch::StatusSnapshot) -> String {
@@ -2400,7 +2586,12 @@ mod tests {
             vcs_dirty: true,
             workspace_root: Some("/repo".into()),
         };
-        let rendered = format_gate_run_summary(&decision, &status);
+        let rendered = format_gate_run_summary(
+            &decision,
+            &status,
+            &serde_json::json!({"check_refs": []}),
+            Path::new("/repo"),
+        );
         assert!(rendered.contains("decision Accept for run_1"));
         assert!(rendered.contains("vcs=Some(Jj)"));
         assert!(rendered.contains("ref=Some(\"abc123\")"));
@@ -2576,6 +2767,7 @@ mod tests {
         let plot = Command::Plot(PlotCommand {
             action: PlotAction::Contract {
                 prompt: "ship interview summary".into(),
+                architecture: ArchitectureCliMode::Auto,
                 json: false,
             },
         });

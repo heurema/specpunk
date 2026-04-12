@@ -258,6 +258,12 @@ This is intentionally:
 
 The first objective is to make this loop real before reintroducing orchestration depth.
 
+Current v0 architecture steering stays inside that same loop and does **not** add a fourth runtime mode:
+
+- `plot` always writes a derived `architecture-signals.json` artifact next to the contract
+- `plot` may also write a deterministic `architecture-brief.md` plus contract architecture integrity commitments when review is required
+- `gate` writes a derived `architecture-assessment.json` artifact and uses it in the final verdict / proof chain
+
 ---
 
 ## 4. Target workspace
@@ -459,6 +465,24 @@ Every `Contract` must carry:
 - `target_checks`
 - `integrity_checks`
 
+The persisted contract document may also carry deterministic architecture-steering extensions without introducing a new primitive object:
+
+- `architecture_signals_ref`
+- optional `architecture_integrity` with:
+  - `review_required`
+  - `brief_ref`
+  - optional `touched_roots_max`
+  - optional `file_loc_budgets[]`
+  - optional `forbidden_path_dependencies[]`
+
+Default v0 `ArchitectureSignals` thresholds are:
+
+- `warn_file_loc >= 600`
+- `critical_file_loc >= 1200`
+- `critical_scope_roots > 1`
+- `warn_expected_interfaces > 2`
+- `warn_import_paths > 5`
+
 Stewardship-oriented contracts should also be able to express:
 
 - cleanup obligations
@@ -498,6 +522,7 @@ Everything else is derived:
 - cross-project views
 - council summaries
 - skill leaderboards
+- architecture signals / briefs / assessments
 
 These are views over canonical artifacts and the event log, not primary mutable state objects.
 
@@ -548,6 +573,7 @@ not through a separate verdict kind.
 That means:
 
 - `gate` reads the persisted approved `Contract`
+- `gate` may read the persisted contract-side `architecture-signals.json` artifact referenced by that contract document
 - `gate` reads the persisted `Receipt`
 - `gate` reads the persisted verification context referenced by `Run`
 - `gate` may read persisted check outputs
@@ -562,6 +588,15 @@ That means:
 - decision object
 - verification context, when present
 - check outputs
+- architecture assessment, when present
+
+Current architecture decision rule inside `gate`:
+
+- if persisted architecture signals are `critical` and the approved contract has no `architecture_integrity`, return `Escalate`
+- if enforced architecture constraints are present and breached, return `Block`
+- if enforced architecture constraints pass, keep the architecture assessment in the same decision/proof chain
+- if enforced `forbidden_path_dependencies[]` are present, `gate` must deterministically scan touched matching files for direct local dependency edges and return `Block` on a violated edge
+- v0 forbidden dependency enforcement is intentionally cheap: it currently resolves deterministic Rust crate/module references and JS/TS relative imports; unsupported matching file types must stay `Unverified`
 
 `Proofpack` v0 should also state an explicit reproducibility claim.
 

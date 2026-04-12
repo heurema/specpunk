@@ -13,13 +13,14 @@ use chrono::{DateTime, Utc};
 use punk_adapters::{ContractDrafter, ExecuteInput, Executor};
 use punk_core::{
     apply_explicit_prompt_overrides, build_bounded_fallback_proposal, canonicalize_draft_proposal,
-    scan_repo, validate_draft_proposal,
+    compute_architecture_signals, scan_repo, validate_draft_proposal, ArchitectureSignalInput,
 };
 pub use punk_core::{find_object_path, read_json, relative_ref, write_json};
 use punk_domain::{
-    now_rfc3339, AutonomyOutcome, AutonomyRecord, Contract, ContractStatus, DraftInput,
-    DraftProposal, EventEnvelope, Feature, FeatureStatus, ModeId, Project, Receipt,
-    ReceiptArtifacts, RefineInput, ResearchArtifact, ResearchArtifactInput,
+    now_rfc3339, ArchitectureFileLocBudget, ArchitectureSeverity, ArchitectureSignals,
+    AutonomyOutcome, AutonomyRecord, Contract, ContractArchitectureIntegrity, ContractStatus,
+    DraftInput, DraftProposal, EventEnvelope, Feature, FeatureStatus, ModeId, PersistedContract,
+    Project, Receipt, ReceiptArtifacts, RefineInput, ResearchArtifact, ResearchArtifactInput,
     ResearchInvalidationEntry, ResearchPacket, ResearchQuestion, ResearchRecord,
     ResearchStartInput, ResearchSynthesis, ResearchSynthesisInput, Run, RunStatus, Task, TaskKind,
     TaskStatus, VcsKind, VerificationContext, VerificationContextFileState,
@@ -46,6 +47,20 @@ pub struct RepoPaths {
     pub project_dir: PathBuf,
     pub harness_spec_path: PathBuf,
     pub project_overlay_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchitectureMode {
+    Auto,
+    On,
+    Off,
+}
+
+impl Default for ArchitectureMode {
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -398,6 +413,230 @@ fn derived_validation_recipes(
     recipes
 }
 
+fn architecture_signals_artifact_path(contract_path: &Path) -> PathBuf {
+    contract_path.with_file_name("architecture-signals.json")
+}
+
+fn architecture_brief_artifact_path(contract_path: &Path) -> PathBuf {
+    contract_path.with_file_name("architecture-brief.md")
+}
+
+fn read_persisted_contract_doc(path: &Path) -> Result<PersistedContract> {
+    read_json(path)
+}
+
+fn build_contract_architecture_integrity(
+    signals: &ArchitectureSignals,
+    brief_ref: &str,
+    existing: Option<&ContractArchitectureIntegrity>,
+    mode: ArchitectureMode,
+) -> Option<ContractArchitectureIntegrity> {
+    let should_attach = existing.is_some()
+        || matches!(signals.severity, ArchitectureSeverity::Critical)
+        || matches!(mode, ArchitectureMode::On);
+    if !should_attach {
+        return None;
+    }
+
+    let mut integrity = existing
+        .cloned()
+        .unwrap_or_else(|| ContractArchitectureIntegrity {
+            review_required: true,
+            brief_ref: brief_ref.to_string(),
+            touched_roots_max: Some(signals.distinct_scope_roots.max(1)),
+            file_loc_budgets: signals
+                .oversized_files
+                .iter()
+                .map(|file| ArchitectureFileLocBudget {
+                    path: file.path.clone(),
+                    max_after_loc: file.loc,
+                })
+                .collect(),
+            forbidden_path_dependencies: Vec::new(),
+        });
+
+    integrity.review_required = integrity.review_required
+        || matches!(signals.severity, ArchitectureSeverity::Critical)
+        || matches!(mode, ArchitectureMode::On);
+    integrity.brief_ref = brief_ref.to_string();
+    if integrity.touched_roots_max.is_none() {
+        integrity.touched_roots_max = Some(signals.distinct_scope_roots.max(1));
+    }
+    if integrity.file_loc_budgets.is_empty() {
+        integrity.file_loc_budgets = signals
+            .oversized_files
+            .iter()
+            .map(|file| ArchitectureFileLocBudget {
+                path: file.path.clone(),
+                max_after_loc: file.loc,
+            })
+            .collect();
+    }
+
+    Some(integrity)
+}
+
+fn architecture_severity_label(severity: &ArchitectureSeverity) -> &'static str {
+    match severity {
+        ArchitectureSeverity::None => "none",
+        ArchitectureSeverity::Warn => "warn",
+        ArchitectureSeverity::Critical => "critical",
+    }
+}
+
+fn render_architecture_brief(
+    contract: &Contract,
+    signals: &ArchitectureSignals,
+    integrity: Option<&ContractArchitectureIntegrity>,
+) -> String {
+    let trigger_reasons = if signals.trigger_reasons.is_empty() {
+        "- none".to_string()
+    } else {
+        signals
+            .trigger_reasons
+            .iter()
+            .map(|reason| format!("- {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let touched_zones = if signals.scope_roots.is_empty() {
+        "- none".to_string()
+    } else {
+        signals
+            .scope_roots
+            .iter()
+            .map(|root| format!("- {root}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let oversized_files = if signals.oversized_files.is_empty() {
+        "- none".to_string()
+    } else {
+        signals
+            .oversized_files
+            .iter()
+            .map(|file| format!("- {} ({})", file.path, file.loc))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let dependency_assumptions = if contract.import_paths.is_empty() {
+        "- keep existing dependency direction; no explicit import paths were recorded".to_string()
+    } else {
+        contract
+            .import_paths
+            .iter()
+            .map(|path| format!("- avoid introducing new reverse dependencies through {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let mut seam_notes = Vec::new();
+    if !signals.oversized_files.is_empty() {
+        seam_notes.push(
+            "prefer extracting helpers or narrow interfaces instead of growing the current hotspot files".to_string(),
+        );
+    }
+    if signals.distinct_scope_roots > 1 {
+        seam_notes.push(format!(
+            "treat the touched roots ({}) as explicit seams and avoid new cross-root coupling",
+            signals.scope_roots.join(", ")
+        ));
+    }
+    if seam_notes.is_empty() {
+        seam_notes.push(
+            "keep the slice within existing module boundaries; introduce seams only when the current contract requires them".to_string(),
+        );
+    }
+    let seam_notes = seam_notes
+        .iter()
+        .map(|note| format!("- {note}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut operator_questions = Vec::new();
+    if !signals.oversized_files.is_empty() {
+        operator_questions.push(
+            "Should hotspot files stay flat, or is this the right slice to extract a seam first?"
+                .to_string(),
+        );
+    }
+    if signals.distinct_scope_roots > 1 {
+        operator_questions.push(
+            "Are all touched roots required for this slice, or can one root be deferred?"
+                .to_string(),
+        );
+    }
+    if signals.has_migration_sensitive_surfaces {
+        operator_questions.push(
+            "Do migration-sensitive surfaces need an explicit rollback or compatibility note?"
+                .to_string(),
+        );
+    }
+    if operator_questions.is_empty() {
+        operator_questions.push(
+            "Does the current contract preserve the existing dependency direction and stay within one bounded slice?"
+                .to_string(),
+        );
+    }
+    let operator_questions = operator_questions
+        .iter()
+        .map(|question| format!("- {question}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let proposed_constraints = if let Some(integrity) = integrity {
+        let touched_roots_max = integrity
+            .touched_roots_max
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let file_loc_budgets = if integrity.file_loc_budgets.is_empty() {
+            "- none".to_string()
+        } else {
+            integrity
+                .file_loc_budgets
+                .iter()
+                .map(|budget| format!("- {} <= {}", budget.path, budget.max_after_loc))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let dependency_rules = if integrity.forbidden_path_dependencies.is_empty() {
+            "- none (deferred for v0 enforcement)".to_string()
+        } else {
+            integrity
+                .forbidden_path_dependencies
+                .iter()
+                .map(|rule| format!("- {} -> {}", rule.from_glob, rule.to_glob))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        format!(
+            "- review_required: {}\n- touched_roots_max: {}\n- file_loc_budgets:\n{}\n- forbidden_path_dependencies:\n{}",
+            integrity.review_required, touched_roots_max, file_loc_budgets, dependency_rules
+        )
+    } else {
+        "- none".to_string()
+    };
+
+    format!(
+        "# Architecture brief for {contract_id}\n\n## Signals summary\n- severity: {severity}\n- entry_point_count: {entry_point_count}\n- expected_interface_count: {expected_interface_count}\n- import_path_count: {import_path_count}\n- has_cleanup_obligations: {has_cleanup_obligations}\n- has_docs_obligations: {has_docs_obligations}\n- has_migration_sensitive_surfaces: {has_migration_sensitive_surfaces}\n- trigger_reasons:\n{trigger_reasons}\n\n## Touched zones / scope roots\n{touched_zones}\n\n## Hotspot / oversized files\n{oversized_files}\n\n## Dependency-direction assumptions\n{dependency_assumptions}\n\n## Candidate seams / extraction notes\n{seam_notes}\n\n## Operator questions\n{operator_questions}\n\n## Proposed contract constraints\n{proposed_constraints}\n",
+        contract_id = contract.id,
+        severity = architecture_severity_label(&signals.severity),
+        entry_point_count = signals.entry_point_count,
+        expected_interface_count = signals.expected_interface_count,
+        import_path_count = signals.import_path_count,
+        has_cleanup_obligations = signals.has_cleanup_obligations,
+        has_docs_obligations = signals.has_docs_obligations,
+        has_migration_sensitive_surfaces = signals.has_migration_sensitive_surfaces,
+        trigger_reasons = trigger_reasons,
+        touched_zones = touched_zones,
+        oversized_files = oversized_files,
+        dependency_assumptions = dependency_assumptions,
+        seam_notes = seam_notes,
+        operator_questions = operator_questions,
+        proposed_constraints = proposed_constraints,
+    )
+}
+
 impl OrchService {
     pub fn new(repo_root: impl AsRef<Path>, global_root: impl AsRef<Path>) -> Result<Self> {
         let repo_root = repo_root.as_ref().to_path_buf();
@@ -432,6 +671,55 @@ impl OrchService {
 
     pub fn event_store(&self) -> &EventStore {
         &self.events
+    }
+
+    fn write_contract_document(
+        &self,
+        contract_path: &Path,
+        contract: &Contract,
+        architecture_mode: ArchitectureMode,
+        existing: Option<&PersistedContract>,
+    ) -> Result<()> {
+        let signals = compute_architecture_signals(
+            &self.paths.repo_root,
+            ArchitectureSignalInput {
+                contract_id: &contract.id,
+                feature_id: &contract.feature_id,
+                prompt_source: &contract.prompt_source,
+                allowed_scope: &contract.allowed_scope,
+                entry_points: &contract.entry_points,
+                import_paths: &contract.import_paths,
+                expected_interfaces: &contract.expected_interfaces,
+                behavior_requirements: &contract.behavior_requirements,
+            },
+        )?;
+        let signals_path = architecture_signals_artifact_path(contract_path);
+        write_json(&signals_path, &signals)?;
+        let signals_ref = relative_ref(&self.paths.repo_root, &signals_path)?;
+
+        let brief_path = architecture_brief_artifact_path(contract_path);
+        let brief_ref = relative_ref(&self.paths.repo_root, &brief_path)?;
+        let integrity = build_contract_architecture_integrity(
+            &signals,
+            &brief_ref,
+            existing.and_then(|doc| doc.architecture_integrity.as_ref()),
+            architecture_mode,
+        );
+        if let Some(integrity) = integrity.as_ref() {
+            let brief = render_architecture_brief(contract, &signals, Some(integrity));
+            if let Some(parent) = brief_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&brief_path, brief)?;
+        }
+
+        let persisted = PersistedContract {
+            contract: contract.clone(),
+            architecture_signals_ref: Some(signals_ref.clone()),
+            architecture_integrity: integrity.clone(),
+        };
+        write_json(contract_path, &persisted)?;
+        Ok(())
     }
 
     pub fn bootstrap_project(&self) -> Result<Project> {
@@ -485,6 +773,15 @@ impl OrchService {
     }
 
     pub fn draft_contract(&self, drafter: &dyn ContractDrafter, prompt: &str) -> Result<Contract> {
+        self.draft_contract_with_options(drafter, prompt, ArchitectureMode::Auto)
+    }
+
+    pub fn draft_contract_with_options(
+        &self,
+        drafter: &dyn ContractDrafter,
+        prompt: &str,
+        architecture_mode: ArchitectureMode,
+    ) -> Result<Contract> {
         if prompt.trim().is_empty() {
             return Err(anyhow!("prompt must not be empty"));
         }
@@ -616,7 +913,7 @@ impl OrchService {
         }
         let (feature, contract) = phase_error(
             "persist",
-            self.persist_draft_contract(&project, prompt, &proposal),
+            self.persist_draft_contract(&project, prompt, &proposal, architecture_mode),
         )?;
         let contract_dir = self.paths.contracts_dir.join(&feature.id);
         phase_error(
@@ -656,13 +953,24 @@ impl OrchService {
         contract_id: &str,
         guidance: &str,
     ) -> Result<Contract> {
+        self.refine_contract_with_options(drafter, contract_id, guidance, ArchitectureMode::Auto)
+    }
+
+    pub fn refine_contract_with_options(
+        &self,
+        drafter: &dyn ContractDrafter,
+        contract_id: &str,
+        guidance: &str,
+        architecture_mode: ArchitectureMode,
+    ) -> Result<Contract> {
         let guidance = guidance.trim();
         if guidance.is_empty() {
             return Err(anyhow!("guidance must not be empty"));
         }
         let project = self.bootstrap_project()?;
         let contract_path = self.find_object_path(&self.paths.contracts_dir, contract_id)?;
-        let current_contract: Contract = read_json(&contract_path)?;
+        let current_doc = read_persisted_contract_doc(&contract_path)?;
+        let current_contract = current_doc.contract.clone();
         if current_contract.status != ContractStatus::Draft {
             return Err(anyhow!("only draft contracts can be refined"));
         }
@@ -800,7 +1108,12 @@ impl OrchService {
             created_at: current_contract.created_at.clone(),
             approved_at: None,
         };
-        write_json(&contract_path, &refined)?;
+        self.write_contract_document(
+            &contract_path,
+            &refined,
+            architecture_mode,
+            Some(&current_doc),
+        )?;
         self.append_event(
             &project.id,
             Some(&feature.id),
@@ -816,7 +1129,8 @@ impl OrchService {
     pub fn approve_contract(&self, contract_id: &str) -> Result<Contract> {
         let project = self.bootstrap_project()?;
         let contract_path = self.find_object_path(&self.paths.contracts_dir, contract_id)?;
-        let mut contract: Contract = read_json(&contract_path)?;
+        let persisted = read_persisted_contract_doc(&contract_path)?;
+        let mut contract = persisted.contract.clone();
         if contract.status != ContractStatus::Draft {
             return Err(anyhow!("only draft contracts can be approved"));
         }
@@ -835,7 +1149,12 @@ impl OrchService {
         }
         contract.status = ContractStatus::Approved;
         contract.approved_at = Some(now_rfc3339());
-        write_json(&contract_path, &contract)?;
+        self.write_contract_document(
+            &contract_path,
+            &contract,
+            ArchitectureMode::Auto,
+            Some(&persisted),
+        )?;
         self.append_event(
             &project.id,
             Some(&contract.feature_id),
@@ -853,6 +1172,7 @@ impl OrchService {
         project: &Project,
         prompt: &str,
         proposal: &DraftProposal,
+        architecture_mode: ArchitectureMode,
     ) -> Result<(Feature, Contract)> {
         let feature_id = new_id("feat");
         let feature = Feature {
@@ -902,7 +1222,7 @@ impl OrchService {
         let contract_dir = self.paths.contracts_dir.join(&feature.id);
         fs::create_dir_all(&contract_dir)?;
         let contract_path = contract_dir.join("v1.json");
-        write_json(&contract_path, &contract)?;
+        self.write_contract_document(&contract_path, &contract, architecture_mode, None)?;
         Ok((feature, contract))
     }
 
@@ -2688,7 +3008,11 @@ fn work_contract_records(contracts_dir: &Path, feature_id: &str) -> Result<Vec<C
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let contract: Contract = read_json(&path)?;
+        let value: serde_json::Value = read_json(&path)?;
+        if value.get("id").and_then(|value| value.as_str()).is_none() {
+            continue;
+        }
+        let contract: Contract = serde_json::from_value(value)?;
         records.push(ContractRecord { path, contract });
     }
     Ok(records)
@@ -6989,6 +7313,109 @@ mod tests {
         let (_run, receipt) = service.cut_run(&FakeExecutor, &contract.id).unwrap();
         assert_eq!(receipt.status, "success");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn approved_contract_persists_architecture_integrity_and_brief_refs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-architecture-contract-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-architecture-contract-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let oversized = std::iter::repeat("pub fn critical() {}\n")
+            .take(1300)
+            .collect::<String>();
+        fs::write(root.join("src/lib.rs"), oversized).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let project = service.bootstrap_project().unwrap();
+        let proposal = DraftProposal {
+            title: "architecture steering".into(),
+            summary: "critical hotspot".into(),
+            entry_points: vec!["src/lib.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["architecture signals".into()],
+            behavior_requirements: vec!["keep the hotspot bounded".into()],
+            allowed_scope: vec!["src/lib.rs".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "medium".into(),
+        };
+
+        let (_feature, contract) = service
+            .persist_draft_contract(
+                &project,
+                "implement architecture steering",
+                &proposal,
+                ArchitectureMode::Auto,
+            )
+            .unwrap();
+        let approved = service.approve_contract(&contract.id).unwrap();
+        assert_eq!(approved.status, ContractStatus::Approved);
+
+        let persisted = service.inspect(&approved.id).unwrap();
+        let signals_ref = persisted["architecture_signals_ref"].as_str().unwrap();
+        let brief_ref = persisted["architecture_integrity"]["brief_ref"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            persisted["architecture_integrity"]["review_required"].as_bool(),
+            Some(true)
+        );
+        assert!(root.join(signals_ref).exists());
+        assert!(root.join(brief_ref).exists());
+
+        let signals: punk_domain::ArchitectureSignals = read_json(&root.join(signals_ref)).unwrap();
+        assert_eq!(
+            signals.severity,
+            punk_domain::ArchitectureSeverity::Critical
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
     }
 
     #[test]
@@ -11985,7 +12412,12 @@ fn ok() {}
             risk_level: "low".into(),
         };
         let (_feature_a, contract_a) = service
-            .persist_draft_contract(&project, "first feature", &proposal_a)
+            .persist_draft_contract(
+                &project,
+                "first feature",
+                &proposal_a,
+                ArchitectureMode::Auto,
+            )
             .unwrap();
         service.approve_contract(&contract_a.id).unwrap();
         let (_run_a1, _receipt_a1) = service.cut_run(&FakeExecutor, &contract_a.id).unwrap();
@@ -12003,7 +12435,12 @@ fn ok() {}
             risk_level: "low".into(),
         };
         let (_feature_b, contract_b) = service
-            .persist_draft_contract(&project, "second feature", &proposal_b)
+            .persist_draft_contract(
+                &project,
+                "second feature",
+                &proposal_b,
+                ArchitectureMode::Auto,
+            )
             .unwrap();
         service.approve_contract(&contract_b.id).unwrap();
 
@@ -12112,7 +12549,7 @@ fn ok() {}
             risk_level: "low".into(),
         };
         let (_feature, contract) = service
-            .persist_draft_contract(&project, "feature", &proposal)
+            .persist_draft_contract(&project, "feature", &proposal, ArchitectureMode::Auto)
             .unwrap();
         service.approve_contract(&contract.id).unwrap();
         let (good_run, _receipt) = service.cut_run(&FakeExecutor, &contract.id).unwrap();
@@ -12225,7 +12662,7 @@ fn ok() {}
             risk_level: "low".into(),
         };
         let (_feature, contract) = service
-            .persist_draft_contract(&project, "feature", &proposal)
+            .persist_draft_contract(&project, "feature", &proposal, ArchitectureMode::Auto)
             .unwrap();
         service.approve_contract(&contract.id).unwrap();
 
@@ -12346,7 +12783,7 @@ fn ok() {}
             risk_level: "low".into(),
         };
         let (_feature, contract) = service
-            .persist_draft_contract(&project, "feature", &proposal)
+            .persist_draft_contract(&project, "feature", &proposal, ArchitectureMode::Auto)
             .unwrap();
         service.approve_contract(&contract.id).unwrap();
 
