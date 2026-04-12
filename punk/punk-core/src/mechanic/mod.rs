@@ -487,7 +487,7 @@ mod tests {
         std::fs::write(tmp.path().join("pyproject.toml"), "[project]\nname=\"x\"").unwrap();
         let cmds = detect_test_commands(tmp.path());
         // May or may not find pytest depending on system
-        assert!(!cmds.is_empty() || true); // at least no panic
+        let _ = cmds.is_empty(); // at least no panic
     }
 
     #[test]
@@ -549,8 +549,8 @@ FAIL";
 
     #[test]
     fn regression_detection_logic() {
-        let pre = vec!["test_a".to_string(), "test_b".to_string()];
-        let post = vec!["test_b".to_string(), "test_c".to_string()];
+        let pre = ["test_a".to_string(), "test_b".to_string()];
+        let post = ["test_b".to_string(), "test_c".to_string()];
 
         let pre_set: std::collections::HashSet<&str> = pre.iter().map(|s| s.as_str()).collect();
         let post_set: std::collections::HashSet<&str> = post.iter().map(|s| s.as_str()).collect();

@@ -14,6 +14,19 @@ struct ScopeCandidates {
     directories: Vec<String>,
 }
 
+enum GreenfieldScaffoldKind {
+    Rust,
+    Go,
+    Python,
+    Node,
+}
+
+struct GreenfieldScaffoldSeed {
+    entry_points: Vec<String>,
+    file_scope_paths: Vec<String>,
+    directory_scope_paths: Vec<String>,
+}
+
 fn is_swiftpm_build_path(path: &Path) -> bool {
     path.components()
         .any(|component| matches!(component, Component::Normal(name) if name == ".build"))
@@ -54,6 +67,18 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
             &mut candidate_integrity_checks,
         );
         "node".to_string()
+    } else if repo_root.join("go.mod").exists() {
+        manifests.push("go.mod".to_string());
+        candidate_integrity_checks.extend(go_integrity_checks());
+        candidate_target_checks.extend(go_target_checks());
+        "go".to_string()
+    } else if let Some(python_manifest) = python_manifest(repo_root) {
+        manifests.push(python_manifest);
+        python_checks(
+            &mut candidate_target_checks,
+            &mut candidate_integrity_checks,
+        );
+        "python".to_string()
     } else {
         "generic".to_string()
     };
@@ -75,6 +100,19 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
         }
     }
 
+    let greenfield_scaffold_kind = greenfield_scaffold_kind(repo_root, &tokens);
+    if candidate_integrity_checks.is_empty() {
+        if let Some(scaffold_kind) = &greenfield_scaffold_kind {
+            let bootstrap_check = greenfield_bootstrap_check(scaffold_kind, &tokens);
+            candidate_target_checks.push(bootstrap_check.clone());
+            candidate_integrity_checks.push(bootstrap_check);
+            notes.push(format!(
+                "inferred initial {} bootstrap checks from bootstrapped greenfield prompt",
+                greenfield_scaffold_kind_label(scaffold_kind)
+            ));
+        }
+    }
+
     dedupe(&mut candidate_integrity_checks);
     dedupe(&mut candidate_target_checks);
 
@@ -82,8 +120,30 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
         notes.push("no trustworthy integrity checks inferred".to_string());
     }
 
-    let scope_candidates = collect_scope_candidates(repo_root, prompt)?;
-    let candidate_entry_points = infer_entry_points(repo_root, prompt, &scope_candidates.files);
+    let greenfield_scaffold_seed = greenfield_scaffold_kind
+        .as_ref()
+        .map(|kind| greenfield_scaffold_seed(kind, &tokens));
+
+    let mut scope_candidates = collect_scope_candidates(repo_root, prompt)?;
+    if let Some(seed) = &greenfield_scaffold_seed {
+        prepend_preferred_candidates(&mut scope_candidates.files, &seed.file_scope_paths, 20);
+        prepend_preferred_candidates(
+            &mut scope_candidates.directories,
+            &seed.directory_scope_paths,
+            20,
+        );
+        if let Some(scaffold_kind) = &greenfield_scaffold_kind {
+            notes.push(format!(
+                "preferring scaffoldable {} scope candidates from bootstrapped greenfield prompt",
+                greenfield_scaffold_kind_label(scaffold_kind)
+            ));
+        }
+    }
+
+    let mut candidate_entry_points = infer_entry_points(repo_root, prompt, &scope_candidates.files);
+    if let Some(seed) = &greenfield_scaffold_seed {
+        prepend_preferred_candidates(&mut candidate_entry_points, &seed.entry_points, 10);
+    }
     let candidate_scope_paths = combined_scope_candidates(&scope_candidates);
 
     Ok(RepoScanSummary {
@@ -196,6 +256,7 @@ pub fn build_bounded_fallback_proposal(
     }
 
     let mut allowed_scope = fallback_source_paths(repo_root, prompt, proposal, scan);
+    extend_greenfield_scaffold_scope(repo_root, prompt, &mut allowed_scope);
     if allowed_scope.is_empty() {
         return None;
     }
@@ -229,7 +290,28 @@ pub fn build_bounded_fallback_proposal(
     fallback.target_checks = target_checks;
     fallback.integrity_checks = integrity_checks;
     canonicalize_draft_proposal(repo_root, prompt, &mut fallback);
+    extend_greenfield_scaffold_scope(repo_root, prompt, &mut fallback.allowed_scope);
+    stable_dedupe(&mut fallback.allowed_scope);
     Some(fallback)
+}
+
+fn extend_greenfield_scaffold_scope(
+    repo_root: &Path,
+    prompt: &str,
+    allowed_scope: &mut Vec<String>,
+) {
+    let tokens = prompt_tokens(prompt);
+    let Some(kind) = greenfield_scaffold_kind(repo_root, &tokens) else {
+        return;
+    };
+    let seed = greenfield_scaffold_seed(&kind, &tokens);
+    for path in seed
+        .file_scope_paths
+        .into_iter()
+        .chain(seed.directory_scope_paths.into_iter())
+    {
+        push_unique(allowed_scope, path);
+    }
 }
 
 pub fn canonicalize_draft_proposal(repo_root: &Path, prompt: &str, proposal: &mut DraftProposal) {
@@ -491,6 +573,227 @@ fn prompt_tokens(prompt: &str) -> Vec<String> {
     seen.into_iter().collect()
 }
 
+fn repo_has_bootstrap_markers(repo_root: &Path) -> bool {
+    let bootstrap_dir = repo_root.join(".punk/bootstrap");
+    let has_bootstrap_doc = fs::read_dir(&bootstrap_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .any(|entry| entry.path().is_file());
+    repo_root.join(".punk/AGENT_START.md").exists() && has_bootstrap_doc
+}
+
+fn python_manifest(repo_root: &Path) -> Option<String> {
+    for candidate in ["pyproject.toml", "pytest.ini", "requirements.txt"] {
+        if repo_root.join(candidate).exists() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+fn go_target_checks() -> Vec<String> {
+    vec!["go test ./...".to_string()]
+}
+
+fn go_integrity_checks() -> Vec<String> {
+    vec!["go test ./...".to_string()]
+}
+
+fn python_checks(target: &mut Vec<String>, integrity: &mut Vec<String>) {
+    target.push("pytest".to_string());
+    integrity.push("pytest".to_string());
+}
+
+fn prompt_explicitly_requests_greenfield_rust_scaffold(tokens: &[String]) -> bool {
+    let requests_rust = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "rust" | "cargo" | "crate" | "crates" | "workspace"
+        )
+    });
+    let requests_scaffold = prompt_explicitly_requests_scaffold(tokens);
+    requests_rust && requests_scaffold
+}
+
+fn prompt_explicitly_requests_greenfield_go_scaffold(tokens: &[String]) -> bool {
+    let requests_go = tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "go" | "golang" | "module"));
+    let requests_scaffold = prompt_explicitly_requests_scaffold(tokens);
+    requests_go && requests_scaffold
+}
+
+fn prompt_explicitly_requests_greenfield_python_scaffold(tokens: &[String]) -> bool {
+    let requests_python = tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "python" | "pytest" | "pyproject" | "poetry"));
+    let requests_scaffold = prompt_explicitly_requests_scaffold(tokens);
+    requests_python && requests_scaffold
+}
+
+fn prompt_explicitly_requests_greenfield_node_scaffold(tokens: &[String]) -> bool {
+    let requests_node = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "typescript"
+                | "javascript"
+                | "node"
+                | "npm"
+                | "pnpm"
+                | "yarn"
+                | "tsconfig"
+                | "tsx"
+                | "vite"
+        )
+    });
+    let requests_scaffold = prompt_explicitly_requests_scaffold(tokens);
+    requests_node && requests_scaffold
+}
+
+fn prompt_explicitly_requests_scaffold(tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .any(|token| matches!(token.as_str(), "scaffold" | "bootstrap" | "greenfield"))
+}
+
+fn greenfield_scaffold_kind(repo_root: &Path, tokens: &[String]) -> Option<GreenfieldScaffoldKind> {
+    if !repo_has_bootstrap_markers(repo_root) {
+        return None;
+    }
+    if !repo_root.join("Cargo.toml").exists()
+        && prompt_explicitly_requests_greenfield_rust_scaffold(tokens)
+    {
+        return Some(GreenfieldScaffoldKind::Rust);
+    }
+    if !repo_root.join("go.mod").exists()
+        && prompt_explicitly_requests_greenfield_go_scaffold(tokens)
+    {
+        return Some(GreenfieldScaffoldKind::Go);
+    }
+    if python_manifest(repo_root).is_none()
+        && prompt_explicitly_requests_greenfield_python_scaffold(tokens)
+    {
+        return Some(GreenfieldScaffoldKind::Python);
+    }
+    if !repo_root.join("package.json").exists()
+        && prompt_explicitly_requests_greenfield_node_scaffold(tokens)
+    {
+        return Some(GreenfieldScaffoldKind::Node);
+    }
+    None
+}
+
+fn greenfield_bootstrap_check(kind: &GreenfieldScaffoldKind, tokens: &[String]) -> String {
+    match kind {
+        GreenfieldScaffoldKind::Rust => {
+            if tokens.iter().any(|token| token == "workspace") {
+                "cargo test --workspace".to_string()
+            } else {
+                "cargo test".to_string()
+            }
+        }
+        GreenfieldScaffoldKind::Go => "go test ./...".to_string(),
+        GreenfieldScaffoldKind::Python => "pytest".to_string(),
+        GreenfieldScaffoldKind::Node => "npm test".to_string(),
+    }
+}
+
+fn greenfield_scaffold_kind_label(kind: &GreenfieldScaffoldKind) -> &'static str {
+    match kind {
+        GreenfieldScaffoldKind::Rust => "Rust",
+        GreenfieldScaffoldKind::Go => "Go",
+        GreenfieldScaffoldKind::Python => "Python",
+        GreenfieldScaffoldKind::Node => "TypeScript/Node",
+    }
+}
+
+fn greenfield_scaffold_seed(
+    kind: &GreenfieldScaffoldKind,
+    tokens: &[String],
+) -> GreenfieldScaffoldSeed {
+    match kind {
+        GreenfieldScaffoldKind::Rust => {
+            let prefers_workspace_layout = tokens
+                .iter()
+                .any(|token| matches!(token.as_str(), "workspace" | "crates"));
+            let mut directory_scope_paths = if prefers_workspace_layout {
+                vec!["crates".to_string()]
+            } else {
+                vec!["src".to_string()]
+            };
+            if tokens
+                .iter()
+                .any(|token| matches!(token.as_str(), "validate" | "validation" | "test" | "tests"))
+            {
+                directory_scope_paths.push("tests".to_string());
+            }
+            GreenfieldScaffoldSeed {
+                entry_points: vec!["Cargo.toml".to_string()],
+                file_scope_paths: vec!["Cargo.toml".to_string()],
+                directory_scope_paths,
+            }
+        }
+        GreenfieldScaffoldKind::Go => GreenfieldScaffoldSeed {
+            entry_points: vec!["go.mod".to_string()],
+            file_scope_paths: vec!["go.mod".to_string()],
+            directory_scope_paths: vec![
+                "cmd".to_string(),
+                "internal".to_string(),
+                "pkg".to_string(),
+            ],
+        },
+        GreenfieldScaffoldKind::Python => GreenfieldScaffoldSeed {
+            entry_points: vec!["pyproject.toml".to_string()],
+            file_scope_paths: vec!["pyproject.toml".to_string()],
+            directory_scope_paths: vec!["src".to_string(), "tests".to_string()],
+        },
+        GreenfieldScaffoldKind::Node => {
+            let prefers_workspace_layout = tokens.iter().any(|token| {
+                matches!(
+                    token.as_str(),
+                    "workspace" | "workspaces" | "monorepo" | "packages" | "apps"
+                )
+            });
+            let prefers_typescript = tokens
+                .iter()
+                .any(|token| matches!(token.as_str(), "typescript" | "tsconfig" | "tsx" | "vite"));
+            let mut file_scope_paths = vec!["package.json".to_string()];
+            if prefers_typescript {
+                file_scope_paths.push("tsconfig.json".to_string());
+            }
+            let mut directory_scope_paths = if prefers_workspace_layout {
+                vec!["packages".to_string(), "apps".to_string()]
+            } else {
+                vec!["src".to_string()]
+            };
+            if tokens.iter().any(|token| {
+                matches!(
+                    token.as_str(),
+                    "validate" | "validation" | "test" | "tests" | "check"
+                )
+            }) {
+                directory_scope_paths.push("tests".to_string());
+            }
+            GreenfieldScaffoldSeed {
+                entry_points: vec!["package.json".to_string()],
+                file_scope_paths,
+                directory_scope_paths,
+            }
+        }
+    }
+}
+
+fn prepend_preferred_candidates(existing: &mut Vec<String>, preferred: &[String], limit: usize) {
+    let mut merged = preferred.to_vec();
+    for candidate in existing.drain(..) {
+        if !merged.iter().any(|existing| existing == &candidate) {
+            merged.push(candidate);
+        }
+    }
+    *existing = merged.into_iter().take(limit).collect();
+}
+
 fn infer_entry_points(repo_root: &Path, prompt: &str, candidates: &[String]) -> Vec<String> {
     let tokens = prompt_tokens(prompt);
     let mut scored = candidates
@@ -571,10 +874,173 @@ fn matched_rust_packages(repo_root: &Path, prompt_tokens: &[String]) -> Vec<Stri
 }
 
 fn rust_package_names(repo_root: &Path) -> Result<Vec<String>> {
+    if let Some(workspace_member_packages) = workspace_member_package_names(repo_root)? {
+        return Ok(workspace_member_packages);
+    }
     let mut package_names = Vec::new();
     collect_rust_package_names(repo_root, repo_root, &mut package_names)?;
     dedupe(&mut package_names);
     Ok(package_names)
+}
+
+fn workspace_member_package_names(repo_root: &Path) -> Result<Option<Vec<String>>> {
+    let cargo_toml = repo_root.join("Cargo.toml");
+    if !cargo_toml.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&cargo_toml)
+        .with_context(|| format!("read {}", cargo_toml.display()))?;
+    if !contents.lines().any(|line| line.trim() == "[workspace]") {
+        return Ok(None);
+    }
+    let member_patterns = workspace_member_patterns(&contents);
+    if member_patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut package_names = Vec::new();
+    for pattern in member_patterns {
+        for member_path in expand_workspace_member_pattern(repo_root, &pattern)? {
+            let cargo_toml = if member_path.is_file() {
+                member_path.clone()
+            } else {
+                member_path.join("Cargo.toml")
+            };
+            if !cargo_toml.exists() {
+                continue;
+            }
+            if let Some(package_name) = cargo_package_name(&cargo_toml)? {
+                package_names.push(package_name);
+            }
+        }
+    }
+    dedupe(&mut package_names);
+    Ok(Some(package_names))
+}
+
+fn workspace_member_patterns(contents: &str) -> Vec<String> {
+    let mut patterns = Vec::new();
+    let mut in_workspace = false;
+    let mut collecting_members = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_workspace = trimmed == "[workspace]";
+            collecting_members = false;
+            continue;
+        }
+        if !in_workspace {
+            continue;
+        }
+        if collecting_members {
+            for pattern in quoted_values(trimmed) {
+                patterns.push(pattern);
+            }
+            if trimmed.contains(']') {
+                collecting_members = false;
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("members") {
+            let Some((_, value)) = rest.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            for pattern in quoted_values(value) {
+                patterns.push(pattern);
+            }
+            if value.starts_with('[') && !value.contains(']') {
+                collecting_members = true;
+            }
+        }
+    }
+
+    patterns
+}
+
+fn quoted_values(input: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut in_quote = false;
+    let mut start = 0;
+    for (idx, ch) in input.char_indices() {
+        if ch != '"' {
+            continue;
+        }
+        if in_quote {
+            values.push(input[start..idx].to_string());
+            in_quote = false;
+        } else {
+            in_quote = true;
+            start = idx + ch.len_utf8();
+        }
+    }
+    values
+}
+
+fn expand_workspace_member_pattern(repo_root: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
+    let mut paths = vec![repo_root.to_path_buf()];
+    for segment in pattern.split('/').filter(|segment| !segment.is_empty()) {
+        let mut next = Vec::new();
+        for base in paths {
+            if segment.contains('*') {
+                for entry in fs::read_dir(&base)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if ignored_name(&name) {
+                        continue;
+                    }
+                    if wildcard_match_segment(segment, &name) {
+                        next.push(path);
+                    }
+                }
+            } else {
+                let candidate = base.join(segment);
+                if candidate.exists() {
+                    next.push(candidate);
+                }
+            }
+        }
+        paths = next;
+        if paths.is_empty() {
+            break;
+        }
+    }
+    Ok(paths)
+}
+
+fn wildcard_match_segment(pattern: &str, value: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == value;
+    }
+    let parts = pattern.split('*').collect::<Vec<_>>();
+    let mut remainder = value;
+    let mut first = true;
+    for (idx, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if first && !pattern.starts_with('*') {
+            let Some(rest) = remainder.strip_prefix(part) else {
+                return false;
+            };
+            remainder = rest;
+            first = false;
+            continue;
+        }
+        if idx == parts.len() - 1 && !pattern.ends_with('*') {
+            return remainder.ends_with(part);
+        }
+        let Some(found) = remainder.find(part) else {
+            return false;
+        };
+        remainder = &remainder[found + part.len()..];
+        first = false;
+    }
+    true
 }
 
 fn collect_rust_package_names(
@@ -723,15 +1189,8 @@ fn has_structural_invalidity(
         return true;
     }
 
-    let explicit_target_checks = explicit_checks_from_prompt(
-        repo_root,
-        prompt,
-        &[
-            "target checks should include",
-            "target checks to satisfy",
-            "target checks:",
-        ],
-    );
+    let explicit_target_checks =
+        explicit_target_checks_override(repo_root, prompt).unwrap_or_default();
     if !explicit_target_checks.is_empty()
         && !explicit_target_checks.iter().all(|command| {
             proposal
@@ -743,15 +1202,8 @@ fn has_structural_invalidity(
         return true;
     }
 
-    let explicit_integrity_checks = explicit_checks_from_prompt(
-        repo_root,
-        prompt,
-        &[
-            "integrity checks should include",
-            "integrity checks to keep passing",
-            "integrity checks:",
-        ],
-    );
+    let explicit_integrity_checks =
+        explicit_integrity_checks_override(repo_root, prompt).unwrap_or_default();
     if !explicit_integrity_checks.is_empty()
         && !explicit_integrity_checks.iter().all(|command| {
             proposal
@@ -771,12 +1223,14 @@ fn has_structural_invalidity(
         return true;
     }
 
-    if proposal_misses_primary_candidate_entry_point(proposal, scan) {
-        return true;
-    }
+    if explicit_paths.is_empty() {
+        if proposal_misses_primary_candidate_entry_point(proposal, scan) {
+            return true;
+        }
 
-    if broad_directory_scope_needs_file_fallback(repo_root, prompt, proposal, scan) {
-        return true;
+        if broad_directory_scope_needs_file_fallback(repo_root, prompt, proposal, scan) {
+            return true;
+        }
     }
 
     if let Some(recipe) = best_protocol_recipe(prompt, proposal) {
@@ -1408,10 +1862,27 @@ fn validate_scope_path(repo_root: &Path, value: &str) -> std::result::Result<(),
     {
         return Ok(());
     }
+    if allow_missing_greenfield_scaffold_path(&relative) {
+        return Ok(());
+    }
     Err("path does not exist and has no existing parent directory".to_string())
 }
 
-fn validate_check_command(repo_root: &Path, value: &str) -> std::result::Result<(), String> {
+fn allow_missing_greenfield_scaffold_path(relative: &Path) -> bool {
+    let mut components = relative.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return false;
+    };
+    if components.next().is_none() {
+        return false;
+    }
+    matches!(
+        first.to_str(),
+        Some("crates" | "src" | "tests" | "cmd" | "internal" | "pkg" | "packages" | "apps")
+    )
+}
+
+pub fn validate_check_command(repo_root: &Path, value: &str) -> std::result::Result<(), String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err("must be non-empty".to_string());
@@ -1419,7 +1890,29 @@ fn validate_check_command(repo_root: &Path, value: &str) -> std::result::Result<
     if trimmed.contains('\n') || trimmed.contains('\r') {
         return Err("must be a single-line shell command".to_string());
     }
-    for token in trimmed.split_whitespace() {
+
+    let forbidden = [
+        ';', '&', '|', '>', '<', '$', '(', ')', '`', '!', '*', '?', '[', ']', '{', '}',
+    ];
+    if trimmed.chars().any(|c| forbidden.contains(&c)) {
+        return Err(
+            "must not contain shell metacharacters, redirection, or glob patterns".to_string(),
+        );
+    }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if let Some(program) = tokens.first() {
+        let allowed_programs = [
+            "cargo", "npm", "pnpm", "yarn", "bun", "make", "pytest", "go", "swift", "python",
+            "python3", "node", "deno", "rake", "gradle", "mvn", "ant", "true", "false",
+        ];
+        if !allowed_programs.contains(program) {
+            return Err(format!(
+                "program '{program}' is not in the allowlist of trusted check runners"
+            ));
+        }
+    }
+    for token in tokens {
         if token.contains("../") || token.starts_with("..") || token.contains("..\\") {
             return Err("must not reference paths outside repo root".to_string());
         }
@@ -1576,12 +2069,22 @@ fn explicit_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
     for candidate in code_spans(prompt)
         .into_iter()
         .chain(path_like_tokens(prompt).into_iter())
+        .chain(explicit_scaffold_dir_tokens(prompt).into_iter())
     {
         if !looks_like_repo_path(&candidate) {
             continue;
         }
+        let explicitly_reviewed_generated_path = is_generated_runtime_artifact_path(&candidate)
+            && prompt_explicitly_targets_generated_path(prompt, &candidate);
+        if is_artifact_storage_pattern(&candidate) && !explicitly_reviewed_generated_path {
+            continue;
+        }
+        if is_generated_runtime_artifact_path(&candidate) && !explicitly_reviewed_generated_path {
+            continue;
+        }
         if !candidate.contains('/')
             && !is_repo_root_file(&candidate)
+            && !is_top_level_scaffold_dir(&candidate)
             && !repo_root.join(&candidate).exists()
         {
             continue;
@@ -1593,7 +2096,196 @@ fn explicit_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
     paths
 }
 
+fn explicit_scaffold_dir_tokens(prompt: &str) -> Vec<String> {
+    if !prompt_declares_explicit_touch_set(prompt) {
+        return Vec::new();
+    }
+    prompt
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '`' | '"' | '\'' | ',' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+                )
+        })
+        .map(|token| token.trim_end_matches('.'))
+        .filter(|token| {
+            matches!(
+                *token,
+                "crates" | "src" | "tests" | "cmd" | "internal" | "pkg" | "packages" | "apps"
+            )
+        })
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn prompt_declares_explicit_touch_set(prompt: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    [
+        "touching exactly",
+        "touch exactly",
+        "exact touch set",
+        "requested touch set",
+        "scope bounded to",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+}
+
+fn is_generated_runtime_artifact_path(path: &str) -> bool {
+    let normalized = path.trim().trim_matches('`').replace('\\', "/");
+    normalized == ".punk/project/harness.json"
+        || normalized.starts_with(".punk/project/")
+        || normalized.contains("/.punk/project/")
+}
+
+fn is_top_level_scaffold_dir(path: &str) -> bool {
+    matches!(
+        path,
+        "crates" | "src" | "tests" | "cmd" | "internal" | "pkg" | "packages" | "apps"
+    )
+}
+
+fn prompt_explicitly_targets_generated_path(prompt: &str, path: &str) -> bool {
+    let prompt = prompt.to_ascii_lowercase();
+    let path = path
+        .trim()
+        .trim_matches('`')
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    [
+        format!("review `{path}`"),
+        format!("review {path}"),
+        format!("code review target `{path}`"),
+        format!("code review target {path}"),
+        format!("code-review target `{path}`"),
+        format!("code-review target {path}"),
+        format!("explicit review target `{path}`"),
+        format!("explicit review target {path}"),
+        format!("explicitly review `{path}`"),
+        format!("explicitly review {path}"),
+    ]
+    .into_iter()
+    .any(|needle| prompt.contains(&needle))
+}
+
+#[cfg(test)]
+mod generated_runtime_artifact_scope_tests {
+    use super::explicit_scope_paths;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn explicit_scope_paths_excludes_generated_runtime_artifacts_from_prompt_scope() {
+        let repo_root = create_temp_repo_root("exclude-generated-runtime-artifacts");
+        seed_scope_fixture(&repo_root, "crates/punk-orch/src/lib.rs");
+        seed_scope_fixture(&repo_root, "crates/punk-cli/src/main.rs");
+        seed_scope_fixture(&repo_root, ".punk/project/harness.json");
+
+        let prompt = "Review crates/punk-orch/src/lib.rs and crates/punk-cli/src/main.rs before writing .punk/project/harness.json as the generated runtime packet destination.";
+        let paths = explicit_scope_paths(prompt, &repo_root);
+
+        assert_eq!(
+            paths,
+            vec![
+                "crates/punk-orch/src/lib.rs".to_string(),
+                "crates/punk-cli/src/main.rs".to_string()
+            ]
+        );
+        assert!(!paths
+            .iter()
+            .any(|path| path == ".punk/project/harness.json"));
+    }
+
+    #[test]
+    fn explicit_scope_paths_keeps_generated_runtime_artifacts_when_explicitly_reviewed() {
+        let repo_root = create_temp_repo_root("preserve-explicit-generated-runtime-review");
+        seed_scope_fixture(&repo_root, ".punk/project/harness.json");
+
+        let prompt =
+            "Code-review target .punk/project/harness.json and confirm the generated runtime packet is valid.";
+        let paths = explicit_scope_paths(prompt, &repo_root);
+
+        assert_eq!(paths, vec![".punk/project/harness.json".to_string()]);
+    }
+
+    fn create_temp_repo_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("punk-core-{label}-{nanos}"));
+        fs::create_dir_all(&root).expect("create repo root");
+        root
+    }
+
+    fn seed_scope_fixture(repo_root: &Path, relative_path: &str) {
+        let path = repo_root.join(relative_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create fixture parent");
+        }
+        fs::write(path, "fixture\n").expect("write fixture file");
+    }
+}
+
+fn authoritative_exact_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
+    let lowered = prompt.to_ascii_lowercase();
+    let anchors = [
+        "allowed_scope exactly",
+        "allowed scope exactly",
+        "final allowed_scope must contain exactly",
+        "final allowed scope must contain exactly",
+        "restrict allowed_scope exactly",
+        "restrict allowed scope exactly",
+    ];
+    let stop_markers = [
+        "\ndo not ",
+        " do not ",
+        "\ndon't ",
+        " don't ",
+        "\ntarget checks",
+        " target checks",
+        "\nintegrity checks",
+        " integrity checks",
+        "\nthe regression",
+        " the regression",
+        "\nadd a focused regression",
+        " add a focused regression",
+        "\nupdate only ",
+        " update only ",
+        "\nkeep this ",
+        " keep this ",
+    ];
+
+    for anchor in anchors {
+        let Some(anchor_idx) = lowered.find(anchor) else {
+            continue;
+        };
+        let tail = &prompt[anchor_idx..];
+        let Some(colon_rel) = tail.find(':') else {
+            continue;
+        };
+        let start = anchor_idx + colon_rel + 1;
+        let end = stop_markers
+            .iter()
+            .filter_map(|marker| lowered[start..].find(marker).map(|idx| start + idx))
+            .min()
+            .unwrap_or(prompt.len());
+        let explicit = explicit_scope_paths(prompt[start..end].trim(), repo_root);
+        if !explicit.is_empty() {
+            return explicit;
+        }
+    }
+
+    Vec::new()
+}
+
 fn explicit_scope_override(prompt: &str, repo_root: &Path) -> Option<Vec<String>> {
+    let exact_scope = authoritative_exact_scope_paths(prompt, repo_root);
+    if !exact_scope.is_empty() {
+        return Some(exact_scope);
+    }
     let explicit_scope = explicit_scope_paths(prompt, repo_root);
     (!explicit_scope.is_empty()).then_some(explicit_scope)
 }
@@ -1608,29 +2300,51 @@ fn explicit_entry_points_override(explicit_scope: &[String]) -> Option<Vec<Strin
 }
 
 fn explicit_target_checks_override(repo_root: &Path, prompt: &str) -> Option<Vec<String>> {
-    let explicit_target_checks = explicit_checks_from_prompt(
-        repo_root,
-        prompt,
-        &[
-            "target checks should include",
-            "target checks to satisfy",
-            "target checks:",
-        ],
-    );
+    let explicit_target_checks =
+        explicit_checks_from_prompt(repo_root, prompt, target_check_markers());
     (!explicit_target_checks.is_empty()).then_some(explicit_target_checks)
 }
 
 fn explicit_integrity_checks_override(repo_root: &Path, prompt: &str) -> Option<Vec<String>> {
-    let explicit_integrity_checks = explicit_checks_from_prompt(
-        repo_root,
-        prompt,
-        &[
-            "integrity checks should include",
-            "integrity checks to keep passing",
-            "integrity checks:",
-        ],
-    );
+    let explicit_integrity_checks =
+        explicit_checks_from_prompt(repo_root, prompt, integrity_check_markers());
     (!explicit_integrity_checks.is_empty()).then_some(explicit_integrity_checks)
+}
+
+fn target_check_markers() -> &'static [&'static str] {
+    &[
+        "target_checks must contain exactly one command:",
+        "target checks must contain exactly one command:",
+        "replace target_checks with exactly one command:",
+        "replace target checks with exactly one command:",
+        "target_checks must contain exactly:",
+        "target checks must contain exactly:",
+        "replace target_checks with exactly:",
+        "replace target checks with exactly:",
+        "target_checks should include",
+        "target checks should include",
+        "target checks to satisfy",
+        "target checks:",
+        "target_checks:",
+    ]
+}
+
+fn integrity_check_markers() -> &'static [&'static str] {
+    &[
+        "integrity_checks must contain exactly one command:",
+        "integrity checks must contain exactly one command:",
+        "replace integrity_checks with exactly one command:",
+        "replace integrity checks with exactly one command:",
+        "integrity_checks must contain exactly:",
+        "integrity checks must contain exactly:",
+        "replace integrity_checks with exactly:",
+        "replace integrity checks with exactly:",
+        "integrity_checks should include",
+        "integrity checks should include",
+        "integrity checks to keep passing",
+        "integrity checks:",
+        "integrity_checks:",
+    ]
 }
 
 fn explicit_checks_from_prompt(repo_root: &Path, prompt: &str, markers: &[&str]) -> Vec<String> {
@@ -1692,7 +2406,18 @@ fn looks_like_repo_path(value: &str) -> bool {
     value.contains('/')
         || matches!(
             value,
-            "Cargo.toml" | "Cargo.lock" | "README.md" | "rust-toolchain.toml"
+            "Cargo.toml"
+                | "Cargo.lock"
+                | "README.md"
+                | "rust-toolchain.toml"
+                | "crates"
+                | "src"
+                | "tests"
+                | "cmd"
+                | "internal"
+                | "pkg"
+                | "packages"
+                | "apps"
         )
         || [".rs", ".toml", ".json", ".md", ".yaml", ".yml"]
             .iter()
@@ -1700,12 +2425,17 @@ fn looks_like_repo_path(value: &str) -> bool {
 }
 
 fn trim_token_punctuation(token: &str) -> &str {
-    token.trim_matches(|c: char| {
-        matches!(
-            c,
-            '`' | '"' | '\'' | ',' | '.' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
-        )
-    })
+    token
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '"' | '\'' | ',' | ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+        })
+        .trim_end_matches('.')
+        .trim_end_matches(|c: char| {
+            matches!(c, '`' | '"' | '\'' | ',' | ':' | ';' | ')' | ']' | '}')
+        })
 }
 
 fn section_until_break(input: &str) -> &str {
@@ -2101,6 +2831,380 @@ mod tests {
     }
 
     #[test]
+    fn rust_target_checks_ignore_nested_non_member_workspace_packages() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-workspace-members-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/Cargo.toml"),
+            "[package]\nname = \"punk-orch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/Cargo.toml"),
+            "[package]\nname = \"punk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("punk/punk-run/Cargo.toml"),
+            "[package]\nname = \"punk-run\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let summary = scan_repo(&root, "tighten run reporting in punk-orch").unwrap();
+        assert!(summary
+            .candidate_target_checks
+            .contains(&"cargo test -p punk-orch".to_string()));
+        assert!(!summary
+            .candidate_target_checks
+            .contains(&"cargo test -p punk-run".to_string()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_greenfield_rust_prompt_infers_initial_workspace_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-rust-bootstrap-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+
+        let summary = scan_repo(
+            &root,
+            "scaffold Rust workspace and implement pubpunk init + validate",
+        )
+        .unwrap();
+        assert_eq!(
+            summary.candidate_target_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert_eq!(
+            summary.candidate_integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert!(summary
+            .notes
+            .iter()
+            .any(|note| note.contains("inferred initial Rust bootstrap checks")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_greenfield_rust_prompt_prefers_scaffoldable_scope_candidates_over_docs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-rust-scope-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/PUBPUNK_DEVELOPMENT_HANDOFF.md"),
+            "scaffold Rust workspace and implement pubpunk init + validate\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/IMPLEMENTATION_PLAN.md"),
+            "workspace scaffold validate init plan\n",
+        )
+        .unwrap();
+        fs::write(root.join("archive/pubpunk-docs.zip"), "zip placeholder\n").unwrap();
+
+        let summary = scan_repo(
+            &root,
+            "scaffold Rust workspace and implement pubpunk init + validate",
+        )
+        .unwrap();
+        assert_eq!(
+            summary.candidate_entry_points.first().map(String::as_str),
+            Some("Cargo.toml")
+        );
+        assert_eq!(
+            summary
+                .candidate_file_scope_paths
+                .first()
+                .map(String::as_str),
+            Some("Cargo.toml")
+        );
+        assert_eq!(
+            summary
+                .candidate_directory_scope_paths
+                .first()
+                .map(String::as_str),
+            Some("crates")
+        );
+        assert!(summary
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "tests"));
+        assert!(summary
+            .notes
+            .iter()
+            .any(|note| { note.contains("preferring scaffoldable Rust scope candidates") }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_greenfield_non_rust_prompt_does_not_infer_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-non-rust-bootstrap-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+
+        let summary = scan_repo(&root, "write launch copy for landing page").unwrap();
+        assert!(summary.candidate_target_checks.is_empty());
+        assert!(summary.candidate_integrity_checks.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_generic_init_verbs_do_not_trigger_greenfield_scaffold() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-generic-init-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+
+        let rust_summary = scan_repo(&root, "initialize config loading in Rust").unwrap();
+        assert!(rust_summary.candidate_target_checks.is_empty());
+        assert!(rust_summary.candidate_integrity_checks.is_empty());
+        assert!(!rust_summary
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "Cargo.toml"));
+
+        let go_summary = scan_repo(&root, "implement a Go init helper").unwrap();
+        assert!(go_summary.candidate_target_checks.is_empty());
+        assert!(go_summary.candidate_integrity_checks.is_empty());
+        assert!(!go_summary
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "go.mod"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_greenfield_go_prompt_infers_initial_checks_and_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-go-bootstrap-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(
+            root.join("docs/IMPLEMENTATION_PLAN.md"),
+            "scaffold go module and validate pubpunk init\n",
+        )
+        .unwrap();
+
+        let summary = scan_repo(
+            &root,
+            "scaffold Go module and implement pubpunk init + validate",
+        )
+        .unwrap();
+        assert_eq!(
+            summary.candidate_target_checks,
+            vec!["go test ./...".to_string()]
+        );
+        assert_eq!(
+            summary.candidate_integrity_checks,
+            vec!["go test ./...".to_string()]
+        );
+        assert_eq!(
+            summary.candidate_entry_points.first().map(String::as_str),
+            Some("go.mod")
+        );
+        assert_eq!(
+            summary
+                .candidate_file_scope_paths
+                .first()
+                .map(String::as_str),
+            Some("go.mod")
+        );
+        assert_eq!(
+            summary
+                .candidate_directory_scope_paths
+                .first()
+                .map(String::as_str),
+            Some("cmd")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_greenfield_python_prompt_infers_initial_checks_and_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-python-bootstrap-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(
+            root.join("docs/SPEC.md"),
+            "scaffold python package and validate pubpunk init\n",
+        )
+        .unwrap();
+
+        let summary = scan_repo(
+            &root,
+            "scaffold Python package and implement pubpunk init + validate",
+        )
+        .unwrap();
+        assert_eq!(summary.candidate_target_checks, vec!["pytest".to_string()]);
+        assert_eq!(
+            summary.candidate_integrity_checks,
+            vec!["pytest".to_string()]
+        );
+        assert_eq!(
+            summary.candidate_entry_points.first().map(String::as_str),
+            Some("pyproject.toml")
+        );
+        assert_eq!(
+            summary
+                .candidate_file_scope_paths
+                .first()
+                .map(String::as_str),
+            Some("pyproject.toml")
+        );
+        assert_eq!(
+            summary
+                .candidate_directory_scope_paths
+                .first()
+                .map(String::as_str),
+            Some("src")
+        );
+        assert!(summary
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "tests"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bootstrapped_greenfield_node_prompt_infers_initial_checks_and_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-node-bootstrap-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(
+            root.join("docs/SPEC.md"),
+            "scaffold TypeScript package and validate pubpunk init\n",
+        )
+        .unwrap();
+
+        let summary = scan_repo(
+            &root,
+            "scaffold TypeScript package and implement pubpunk init + validate",
+        )
+        .unwrap();
+        assert_eq!(
+            summary.candidate_target_checks,
+            vec!["npm test".to_string()]
+        );
+        assert_eq!(
+            summary.candidate_integrity_checks,
+            vec!["npm test".to_string()]
+        );
+        assert_eq!(
+            summary.candidate_entry_points.first().map(String::as_str),
+            Some("package.json")
+        );
+        assert_eq!(
+            summary
+                .candidate_file_scope_paths
+                .first()
+                .map(String::as_str),
+            Some("package.json")
+        );
+        assert!(summary
+            .candidate_file_scope_paths
+            .iter()
+            .any(|path| path == "tsconfig.json"));
+        assert_eq!(
+            summary
+                .candidate_directory_scope_paths
+                .first()
+                .map(String::as_str),
+            Some("src")
+        );
+        assert!(summary
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "tests"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn rust_workspace_scan_prefers_workspace_integrity_check() {
         let root =
             std::env::temp_dir().join(format!("punk-core-workspace-int-{}", std::process::id()));
@@ -2157,6 +3261,38 @@ mod tests {
     }
 
     #[test]
+    fn validation_accepts_scaffold_paths_without_existing_scaffold_root() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-scaffold-missing-root-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let proposal = DraftProposal {
+            title: "bootstrap workspace".into(),
+            summary: "bootstrap workspace".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec!["crates/pubpunk-cli".into(), "crates/pubpunk-core".into()],
+            expected_interfaces: vec!["workspace bootstrap".into()],
+            behavior_requirements: vec!["create workspace members".into()],
+            allowed_scope: vec![
+                "Cargo.toml".into(),
+                "crates/pubpunk-cli".into(),
+                "crates/pubpunk-core".into(),
+                "tests".into(),
+            ],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+        };
+
+        let errors = validate_draft_proposal(&root, &proposal);
+        assert!(errors.is_empty(), "{errors:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn canonicalize_preserves_explicit_paths_and_checks() {
         let root =
             std::env::temp_dir().join(format!("punk-core-canonicalize-{}", std::process::id()));
@@ -2198,6 +3334,45 @@ mod tests {
             proposal.integrity_checks,
             vec!["cargo test --workspace".to_string()]
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn canonicalize_preserves_explicit_bootstrap_touch_set_without_existing_crates_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-bootstrap-explicit-scope-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let prompt = "bootstrap initial Rust workspace for pubpunk touching exactly Cargo.toml, crates/pubpunk-cli, crates/pubpunk-core, and tests; create workspace members and make cargo test --workspace pass";
+        let mut proposal = DraftProposal {
+            title: "wrong".into(),
+            summary: "wrong".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec!["crates/pubpunk-cli".into(), "crates/pubpunk-core".into()],
+            expected_interfaces: vec!["initial Rust scaffold".into()],
+            behavior_requirements: vec!["bootstrap workspace".into()],
+            allowed_scope: vec!["Cargo.toml".into()],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+        };
+
+        canonicalize_draft_proposal(&root, prompt, &mut proposal);
+
+        assert_eq!(
+            proposal.allowed_scope,
+            vec![
+                "Cargo.toml".to_string(),
+                "crates/pubpunk-cli".to_string(),
+                "crates/pubpunk-core".to_string(),
+                "tests".to_string(),
+            ]
+        );
+        assert_eq!(proposal.entry_points, vec!["Cargo.toml".to_string()]);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2296,6 +3471,129 @@ mod tests {
         assert_eq!(proposal.entry_points, proposal.allowed_scope);
         assert_eq!(proposal.target_checks, vec!["make test".to_string()]);
         assert_eq!(proposal.integrity_checks, vec!["make test".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_scope_override_keeps_exact_list_without_readding_excluded_path_mentions() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-exact-scope-negative-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
+        fs::write(
+            root.join("crates/punk-core/src/lib.rs"),
+            "pub fn core() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("punk/punk-run/src/main.rs"), "fn main() {}\n").unwrap();
+
+        let guidance = "Restrict allowed_scope exactly to these two files and nothing else: crates/punk-core/src/lib.rs; crates/punk-orch/src/lib.rs. Do not include punk/punk-run in allowed_scope.";
+        let explicit = explicit_scope_override(guidance, &root).unwrap();
+
+        assert_eq!(
+            explicit,
+            vec![
+                "crates/punk-core/src/lib.rs".to_string(),
+                "crates/punk-orch/src/lib.rs".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_scope_override_ignores_generated_runtime_artifact_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-exact-scope-generated-artifact-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-cli/src")).unwrap();
+        fs::create_dir_all(root.join(".punk/project")).unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/punk-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join(".punk/project/harness.json"), "{}\n").unwrap();
+
+        let guidance = "Restrict allowed_scope exactly to these two files and nothing else: crates/punk-orch/src/lib.rs; crates/punk-cli/src/main.rs. Mention the generated packet `.punk/project/harness.json` in docs, but do not include it in allowed_scope or entry_points because it is a runtime artifact destination.";
+        let explicit = explicit_scope_override(guidance, &root).unwrap();
+
+        assert_eq!(
+            explicit,
+            vec![
+                "crates/punk-orch/src/lib.rs".to_string(),
+                "crates/punk-cli/src/main.rs".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn explicit_target_checks_override_preserves_exact_combined_command() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-exact-target-checks-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::write(
+            root.join("crates/punk-core/src/lib.rs"),
+            "pub fn core() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
+
+        let guidance = "Keep allowed_scope exactly as-is. target_checks must contain exactly one command: cargo test -p punk-core -p punk-orch. integrity_checks must contain exactly one command: cargo test --workspace. Remove every other target check.";
+        let mut proposal = DraftProposal {
+            title: "tighten exact target checks".into(),
+            summary: "tighten exact target checks".into(),
+            entry_points: vec!["crates/punk-orch/src/lib.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec![
+                "crates/punk-core/src/lib.rs".into(),
+                "crates/punk-orch/src/lib.rs".into(),
+            ],
+            target_checks: vec![
+                "cargo test -p punk-core".into(),
+                "cargo test -p punk-orch".into(),
+                "cargo test -p punk-domain".into(),
+            ],
+            integrity_checks: vec!["cargo test".into()],
+            risk_level: "low".into(),
+        };
+
+        apply_explicit_prompt_overrides(&root, guidance, &mut proposal);
+
+        assert_eq!(
+            proposal.target_checks,
+            vec!["cargo test -p punk-core -p punk-orch".to_string()]
+        );
+        assert_eq!(
+            proposal.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2639,6 +3937,50 @@ mod tests {
     }
 
     #[test]
+    fn bounded_fallback_preserves_greenfield_rust_scaffold_scope_for_plain_init_goal() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-greenfield-rust-fallback-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/bootstrap/pubpunk-core.md"), "bootstrap\n").unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "agent start\n").unwrap();
+
+        let prompt = "scaffold Rust workspace and implement pubpunk init command with --json output and tests";
+        let scan = scan_repo(&root, prompt).unwrap();
+        let proposal = DraftProposal {
+            title: "pubpunk init".into(),
+            summary: "broken plain-goal fallback".into(),
+            entry_points: vec!["Cargo.toml".into(), "crates/pubpunk-cli/src/main.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "A Rust workspace with a `pubpunk` CLI crate.".into(),
+                "A `pubpunk init` command exposed through the CLI.".into(),
+            ],
+            behavior_requirements: vec![
+                "Scaffold a minimal Rust workspace rooted at Cargo.toml.".into(),
+                "Implement a conservative `pubpunk init` command with `--json` output.".into(),
+                "Add tests covering the `init` command and its JSON output.".into(),
+            ],
+            allowed_scope: vec!["tests".into()],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+        };
+        let errors = validate_draft_proposal(&root, &proposal);
+        let fallback =
+            build_bounded_fallback_proposal(&root, prompt, &proposal, &scan, &errors).unwrap();
+
+        assert!(fallback.allowed_scope.contains(&"Cargo.toml".to_string()));
+        assert!(fallback.allowed_scope.contains(&"crates".to_string()));
+        assert!(fallback.allowed_scope.contains(&"tests".to_string()));
+        assert!(fallback.entry_points.contains(&"Cargo.toml".to_string()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn bounded_fallback_replaces_directory_scope_with_concrete_file_candidates() {
         let root = std::env::temp_dir().join(format!(
             "punk-core-directory-fallback-{}",
@@ -2829,6 +4171,31 @@ mod tests {
                 "crates/punk-council/src/storage.rs".to_string(),
             ]
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_check_command_rejects_shell_fragments_and_untrusted_runners() {
+        let root =
+            std::env::temp_dir().join(format!("punk-core-check-guard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        assert!(validate_check_command(&root, "cargo test -p punk-core").is_ok());
+        assert!(validate_check_command(&root, "true").is_ok());
+
+        let shell_fragment = validate_check_command(&root, "cargo test; touch hacked")
+            .expect_err("shell metacharacters should be rejected");
+        assert!(shell_fragment.contains("must not contain shell metacharacters"));
+
+        let untrusted_runner = validate_check_command(&root, "sh -c true")
+            .expect_err("untrusted shell runner should be rejected");
+        assert!(untrusted_runner.contains("allowlist of trusted check runners"));
+
+        let traversal = validate_check_command(&root, "cargo test ../outside")
+            .expect_err("parent traversal should be rejected");
+        assert!(traversal.contains("outside repo root"));
 
         let _ = fs::remove_dir_all(&root);
     }

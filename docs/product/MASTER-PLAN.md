@@ -25,6 +25,19 @@ Implementation sequence:
 6. deep research mode
 7. benchmark/eval expansion
 
+Current bounded execution plan:
+
+- `docs/product/ACTION-PLAN.md`
+- supporting review memo: `docs/research/2026-04-11-specpunk-architecture-review.md`
+
+Repo-status vocabulary for this plan:
+
+- **active v0 surface** = current operator/runtime path
+- **in-tree but inactive** = workspace member kept buildable before its stage is promoted
+- **planned only** = target-shape crate not in today's workspace membership
+
+Canonical repo-status note: `docs/product/REPO-STATUS.md`
+
 Kernel rules that stay fixed across all stages:
 
 - `plot` owns `Feature` and `Contract`
@@ -52,6 +65,7 @@ v0 is:
 - one executor family only (`Codex CLI`)
 - single-repo from current `cwd`
 - `jj` preferred, `git` fallback
+- native `punk init` bootstrap (`.punk/project.json`, `AGENTS.md`, `.punk/AGENT_START.md`, `.punk/bootstrap/<project>-core.md`)
 - no daemon, queue, goals UI, council, or benchmark subsystem
 - strict gate against frozen approved contract + persisted receipt
 
@@ -141,8 +155,10 @@ Add `punk-council` with protocol families such as:
 - architecture council
 - contract council
 - review council
+
+Deferred beyond current v1 council scope:
 - migration/cleanup council
-- later `cut diverge`
+- any later `cut diverge`
 
 Rules:
 - `council` is advisory only
@@ -150,6 +166,14 @@ Rules:
 - `council` must not write final verdicts
 - `gate` remains the only writer of `DecisionObject`
 - council is selective, not always-on
+- selective means the repo already has a usable bootstrap + staged + proof-ready core loop, and the family-specific trigger in `docs/product/COUNCIL.md` is met
+
+Stage-boundary note:
+
+- `punk-council` is currently in-tree but inactive
+- it may stay as a workspace member before Stage 2 is active
+- until Stage 2 is explicitly promoted, that crate is not part of the normal v0 operator path
+- `punk-shell`, `punk-skills`, `punk-eval`, and `punk-research` remain planned only until their stages
 
 ### Stage 3 — orchestration depth
 Add `Goal`, project registry, queue, daemon, and higher-order orchestration.

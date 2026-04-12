@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -8,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use punk_adapters::{ContractDrafter, ExecuteInput, Executor};
 use punk_core::{
     apply_explicit_prompt_overrides, build_bounded_fallback_proposal, canonicalize_draft_proposal,
@@ -18,11 +19,15 @@ pub use punk_core::{find_object_path, read_json, relative_ref, write_json};
 use punk_domain::{
     now_rfc3339, AutonomyOutcome, AutonomyRecord, Contract, ContractStatus, DraftInput,
     DraftProposal, EventEnvelope, Feature, FeatureStatus, ModeId, Project, Receipt,
-    ReceiptArtifacts, RefineInput, Run, RunStatus, Task, TaskKind, TaskStatus, VcsKind,
+    ReceiptArtifacts, RefineInput, ResearchArtifact, ResearchArtifactInput,
+    ResearchInvalidationEntry, ResearchPacket, ResearchQuestion, ResearchRecord,
+    ResearchStartInput, ResearchSynthesis, ResearchSynthesisInput, Run, RunStatus, Task, TaskKind,
+    TaskStatus, VcsKind, VerificationContext, VerificationContextFileState,
+    VerificationContextIdentity,
 };
 use punk_events::EventStore;
 use punk_vcs::{current_snapshot_ref, detect_backend};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone)]
@@ -36,7 +41,11 @@ pub struct RepoPaths {
     pub runs_dir: PathBuf,
     pub decisions_dir: PathBuf,
     pub proofs_dir: PathBuf,
+    pub research_dir: PathBuf,
     pub autonomy_dir: PathBuf,
+    pub project_dir: PathBuf,
+    pub harness_spec_path: PathBuf,
+    pub project_overlay_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,7 +69,43 @@ pub struct StatusSnapshot {
     pub workspace_root: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResearchInspectView {
+    pub record: ResearchRecord,
+    pub question: ResearchQuestion,
+    pub packet: ResearchPacket,
+    pub artifacts: Vec<ResearchArtifact>,
+    pub synthesis: Option<ResearchSynthesis>,
+    pub invalidation: ResearchInvalidationInspectView,
+    pub synthesis_lineage: ResearchSynthesisLineageInspectView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResearchInvalidationInspectView {
+    pub active: Option<ResearchInvalidationEntry>,
+    pub latest: Option<ResearchInvalidationEntry>,
+    pub history_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResearchSynthesisLineageInspectView {
+    pub active: Option<ResearchSynthesisLineageEntry>,
+    pub latest: Option<ResearchSynthesisLineageEntry>,
+    pub history_count: usize,
+    pub history: Vec<ResearchSynthesisLineageEntry>,
+    pub has_active_current_view: bool,
+    pub has_replacements: bool,
+    pub latest_is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResearchSynthesisLineageEntry {
+    pub identity_ref: String,
+    pub outcome: String,
+    pub supersedes_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectCapabilitySummary {
     pub bootstrap_ready: bool,
     pub autonomous_ready: bool,
@@ -70,15 +115,65 @@ pub struct ProjectCapabilitySummary {
     pub project_guidance_ready: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectHarnessSummary {
+    pub inspect_ready: bool,
+    pub bootable_per_workspace: bool,
+    pub ui_legible: bool,
+    pub logs_legible: bool,
+    pub metrics_legible: bool,
+    pub traces_legible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedHarnessCapabilities {
+    pub ui_legible: bool,
+    pub logs_legible: bool,
+    pub metrics_legible: bool,
+    pub traces_legible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedHarnessRecipe {
+    pub kind: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedHarnessProfile {
+    pub name: String,
+    pub validation_surfaces: Vec<String>,
+    #[serde(default)]
+    pub validation_recipes: Vec<PersistedHarnessRecipe>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedHarnessSpec {
+    pub project_id: String,
+    pub inspect_ready: bool,
+    pub bootable_per_workspace: bool,
+    pub capabilities: PersistedHarnessCapabilities,
+    pub profiles: Vec<PersistedHarnessProfile>,
+    pub derivation_source: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectOverlay {
     pub project_id: String,
     pub repo_root: String,
+    pub overlay_ref: String,
     pub vcs_mode: String,
     pub bootstrap_ref: Option<String>,
     pub agent_guidance_ref: Vec<String>,
     pub capability_summary: ProjectCapabilitySummary,
+    pub harness_summary: ProjectHarnessSummary,
+    pub harness_spec_ref: String,
+    pub harness_spec: PersistedHarnessSpec,
+    pub project_skill_resolution_mode: String,
     pub project_skill_refs: Vec<String>,
+    #[serde(default)]
+    pub ambient_project_skill_refs: Vec<String>,
     pub local_constraints: Vec<String>,
     pub safe_default_checks: Vec<String>,
     pub status_scope_mode: String,
@@ -101,6 +196,7 @@ pub struct WorkLedgerView {
     pub recovery_contract_ref: Option<String>,
     pub lifecycle_state: String,
     pub blocked_reason: Option<String>,
+    pub latest_proof_command_evidence_summary: Vec<String>,
     pub next_action: Option<String>,
     pub next_action_ref: Option<String>,
     pub updated_at: String,
@@ -115,10 +211,198 @@ fn phase_error<T>(phase: &str, result: Result<T>) -> Result<T> {
     result.map_err(|err| anyhow!("phase {phase}: {err}"))
 }
 
+fn repo_has_any(repo_root: &Path, rel_paths: &[&str]) -> bool {
+    rel_paths
+        .iter()
+        .any(|rel_path| repo_root.join(rel_path).exists())
+}
+
+fn is_verification_context_runtime_artifact(path: &str) -> bool {
+    path.starts_with(".punk/")
+}
+
+fn filtered_verification_context_paths(changed_files: &[String]) -> Vec<String> {
+    let mut paths = changed_files
+        .iter()
+        .filter(|path| !is_verification_context_runtime_artifact(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn snapshot_verification_context_file(
+    workspace_root: &Path,
+    path: &str,
+) -> Result<VerificationContextFileState> {
+    let file_path = workspace_root.join(path);
+    if !file_path.exists() {
+        return Ok(VerificationContextFileState {
+            path: path.to_string(),
+            exists: false,
+            sha256: None,
+        });
+    }
+
+    Ok(VerificationContextFileState {
+        path: path.to_string(),
+        exists: true,
+        sha256: Some(sha256_file(&file_path)?),
+    })
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn verification_context_fingerprint(
+    backend: VcsKind,
+    workspace_ref: &str,
+    change_ref: &str,
+    base_ref: Option<&str>,
+    changed_files: &[String],
+    file_states: &[VerificationContextFileState],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("backend:{backend:?}\n"));
+    hasher.update(format!("workspace_ref:{workspace_ref}\n"));
+    hasher.update(format!("change_ref:{change_ref}\n"));
+    hasher.update(format!("base_ref:{}\n", base_ref.unwrap_or("")));
+    for path in changed_files {
+        hasher.update(format!("changed:{path}\n"));
+    }
+    for state in file_states {
+        hasher.update(format!(
+            "file:{}:{}:{}\n",
+            state.path,
+            if state.exists { "present" } else { "missing" },
+            state.sha256.as_deref().unwrap_or(""),
+        ));
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn build_verification_context(
+    run: &Run,
+    workspace_root: &Path,
+    changed_files: &[String],
+) -> Result<VerificationContext> {
+    let changed_files = filtered_verification_context_paths(changed_files);
+    let mut file_states = changed_files
+        .iter()
+        .map(|path| snapshot_verification_context_file(workspace_root, path))
+        .collect::<Result<Vec<_>>>()?;
+    file_states.sort_by(|a, b| a.path.cmp(&b.path));
+    let fingerprint_sha256 = verification_context_fingerprint(
+        run.vcs.backend.clone(),
+        &run.vcs.workspace_ref,
+        &run.vcs.change_ref,
+        run.vcs.base_ref.as_deref(),
+        &changed_files,
+        &file_states,
+    );
+    Ok(VerificationContext {
+        identity: VerificationContextIdentity {
+            backend: run.vcs.backend.clone(),
+            workspace_ref: run.vcs.workspace_ref.clone(),
+            change_ref: run.vcs.change_ref.clone(),
+            base_ref: run.vcs.base_ref.clone(),
+            changed_files,
+            fingerprint_sha256,
+        },
+        file_states,
+        captured_at: now_rfc3339(),
+    })
+}
+
+impl PersistedHarnessSpec {
+    fn from_summary(
+        project_id: &str,
+        summary: &ProjectHarnessSummary,
+        bootstrap_ref: Option<&str>,
+        agent_guidance_ref: &[String],
+        updated_at: &str,
+    ) -> Self {
+        let capabilities = PersistedHarnessCapabilities {
+            ui_legible: summary.ui_legible,
+            logs_legible: summary.logs_legible,
+            metrics_legible: summary.metrics_legible,
+            traces_legible: summary.traces_legible,
+        };
+        let validation_recipes = derived_validation_recipes(bootstrap_ref, agent_guidance_ref);
+        let mut validation_surfaces = Vec::new();
+        if summary.bootable_per_workspace {
+            validation_surfaces.push("command".to_string());
+        }
+        if summary.ui_legible {
+            validation_surfaces.push("ui_snapshot".to_string());
+        }
+        if summary.logs_legible {
+            validation_surfaces.push("log_query".to_string());
+        }
+        if summary.metrics_legible {
+            validation_surfaces.push("metric_assertion".to_string());
+        }
+        if summary.traces_legible {
+            validation_surfaces.push("trace_assertion".to_string());
+        }
+        let profiles = if validation_surfaces.is_empty() {
+            Vec::new()
+        } else {
+            vec![PersistedHarnessProfile {
+                name: "default".to_string(),
+                validation_surfaces,
+                validation_recipes,
+            }]
+        };
+        Self {
+            project_id: project_id.to_string(),
+            inspect_ready: summary.inspect_ready,
+            bootable_per_workspace: summary.bootable_per_workspace,
+            capabilities,
+            profiles,
+            derivation_source: "repo_markers_v1".to_string(),
+            updated_at: updated_at.to_string(),
+        }
+    }
+}
+
+fn derived_validation_recipes(
+    bootstrap_ref: Option<&str>,
+    agent_guidance_ref: &[String],
+) -> Vec<PersistedHarnessRecipe> {
+    let mut refs = Vec::new();
+    if let Some(path) = bootstrap_ref {
+        refs.push(path.to_string());
+    }
+    refs.extend(agent_guidance_ref.iter().cloned());
+
+    let mut recipes = Vec::new();
+    for path in refs {
+        if path.is_empty()
+            || recipes
+                .iter()
+                .any(|recipe: &PersistedHarnessRecipe| recipe.path == path)
+        {
+            continue;
+        }
+        recipes.push(PersistedHarnessRecipe {
+            kind: "artifact_assertion".to_string(),
+            path,
+        });
+    }
+    recipes
+}
+
 impl OrchService {
     pub fn new(repo_root: impl AsRef<Path>, global_root: impl AsRef<Path>) -> Result<Self> {
         let repo_root = repo_root.as_ref().to_path_buf();
         let dot_punk = repo_root.join(".punk");
+        let project_dir = dot_punk.join("project");
         let paths = RepoPaths {
             repo_root: repo_root.clone(),
             global_root: global_root.as_ref().to_path_buf(),
@@ -129,11 +413,16 @@ impl OrchService {
             runs_dir: dot_punk.join("runs"),
             decisions_dir: dot_punk.join("decisions"),
             proofs_dir: dot_punk.join("proofs"),
+            research_dir: dot_punk.join("research"),
             autonomy_dir: dot_punk.join("autonomy"),
+            project_dir: project_dir.clone(),
+            harness_spec_path: project_dir.join("harness.json"),
+            project_overlay_path: project_dir.join("overlay.json"),
         };
         let events = EventStore::new(paths.global_root.clone());
         let service = Self { paths, events };
         service.bootstrap_project()?;
+        service.quarantine_safe_stale_runs()?;
         Ok(service)
     }
 
@@ -152,7 +441,9 @@ impl OrchService {
         fs::create_dir_all(&self.paths.runs_dir)?;
         fs::create_dir_all(&self.paths.decisions_dir)?;
         fs::create_dir_all(&self.paths.proofs_dir)?;
+        fs::create_dir_all(&self.paths.research_dir)?;
         fs::create_dir_all(&self.paths.autonomy_dir)?;
+        fs::create_dir_all(&self.paths.project_dir)?;
         self.events.ensure_dirs()?;
 
         let project_id = project_id(&self.paths.repo_root)?;
@@ -203,6 +494,9 @@ impl OrchService {
             "repo scan",
             scan_repo(&self.paths.repo_root, trimmed_prompt),
         )?;
+        let mut scan = scan;
+        enrich_scan_with_nested_integrity_fallback(&self.paths.repo_root, &mut scan)?;
+        apply_prompt_targeting_bias(&self.paths.repo_root, trimmed_prompt, &mut scan);
         if scan.candidate_integrity_checks.is_empty() {
             return Err(anyhow!(
                 "phase repo scan: {}",
@@ -214,55 +508,102 @@ impl OrchService {
             prompt: trimmed_prompt.to_string(),
             scan: scan.clone(),
         };
-        let mut proposal = phase_error("drafter request", drafter.draft(input))?;
+        let mut proposal = match drafter.draft(input) {
+            Ok(proposal) => (proposal, false),
+            Err(err) if is_drafter_timeout_error(&err) => (
+                phase_error(
+                    "drafter timeout fallback",
+                    recover_timeout_draft_proposal(&self.paths.repo_root, trimmed_prompt, &scan),
+                )?,
+                true,
+            ),
+            Err(err) => return Err(anyhow!("phase drafter request: {err}")),
+        }
+        .0;
         canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
+        normalize_proposal_scope(&self.paths.repo_root, trimmed_prompt, &scan, &mut proposal);
         let mut errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
         if errors.is_empty() {
-            if let Some(fallback) = build_bounded_fallback_proposal(
+            if let Some(mut fallback) = build_bounded_fallback_proposal(
                 &self.paths.repo_root,
                 trimmed_prompt,
                 &proposal,
                 &scan,
                 &errors,
             ) {
+                normalize_proposal_scope(
+                    &self.paths.repo_root,
+                    trimmed_prompt,
+                    &scan,
+                    &mut fallback,
+                );
                 proposal = fallback;
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
         }
         if !errors.is_empty() {
-            proposal = phase_error(
-                "drafter repair",
-                drafter.refine(RefineInput {
-                    repo_root: self.paths.repo_root.display().to_string(),
-                    prompt: trimmed_prompt.to_string(),
-                    guidance: format_validation_guidance(&errors),
-                    current: proposal,
-                    scan: scan.clone(),
-                }),
-            )?;
+            let repair_guidance = format_validation_guidance(&errors);
+            let repair_current = proposal.clone();
+            proposal = match drafter.refine(RefineInput {
+                repo_root: self.paths.repo_root.display().to_string(),
+                prompt: trimmed_prompt.to_string(),
+                guidance: repair_guidance.clone(),
+                current: repair_current.clone(),
+                scan: scan.clone(),
+            }) {
+                Ok(proposal) => (proposal, false),
+                Err(err) if is_drafter_timeout_error(&err) => (
+                    phase_error(
+                        "drafter timeout fallback",
+                        recover_timeout_refine_proposal(
+                            &self.paths.repo_root,
+                            trimmed_prompt,
+                            &repair_guidance,
+                            repair_current,
+                            &scan,
+                        ),
+                    )?,
+                    true,
+                ),
+                Err(err) => return Err(anyhow!("phase drafter repair: {err}")),
+            }
+            .0;
             canonicalize_draft_proposal(&self.paths.repo_root, trimmed_prompt, &mut proposal);
+            normalize_proposal_scope(&self.paths.repo_root, trimmed_prompt, &scan, &mut proposal);
             errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             if errors.is_empty() {
-                if let Some(fallback) = build_bounded_fallback_proposal(
+                if let Some(mut fallback) = build_bounded_fallback_proposal(
                     &self.paths.repo_root,
                     trimmed_prompt,
                     &proposal,
                     &scan,
                     &errors,
                 ) {
+                    normalize_proposal_scope(
+                        &self.paths.repo_root,
+                        trimmed_prompt,
+                        &scan,
+                        &mut fallback,
+                    );
                     proposal = fallback;
                     errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
                 }
             }
         }
         if !errors.is_empty() {
-            if let Some(fallback) = build_bounded_fallback_proposal(
+            if let Some(mut fallback) = build_bounded_fallback_proposal(
                 &self.paths.repo_root,
                 trimmed_prompt,
                 &proposal,
                 &scan,
                 &errors,
             ) {
+                normalize_proposal_scope(
+                    &self.paths.repo_root,
+                    trimmed_prompt,
+                    &scan,
+                    &mut fallback,
+                );
                 proposal = fallback;
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
@@ -330,50 +671,97 @@ impl OrchService {
             .features_dir
             .join(format!("{}.json", current_contract.feature_id));
         let mut feature: Feature = read_json(&feature_path)?;
-        let scan = scan_repo(&self.paths.repo_root, &current_contract.prompt_source)?;
+        let mut scan = scan_repo(&self.paths.repo_root, &current_contract.prompt_source)?;
+        enrich_scan_with_nested_integrity_fallback(&self.paths.repo_root, &mut scan)?;
+        apply_prompt_targeting_bias(
+            &self.paths.repo_root,
+            &current_contract.prompt_source,
+            &mut scan,
+        );
         if scan.candidate_integrity_checks.is_empty() {
             return Err(anyhow!(
                 "unable to infer trustworthy integrity checks from repo scan"
             ));
         }
         let current = contract_to_proposal(&feature, &current_contract);
-        let mut proposal = drafter.refine(RefineInput {
+        let mut proposal = match drafter.refine(RefineInput {
             repo_root: self.paths.repo_root.display().to_string(),
             prompt: current_contract.prompt_source.clone(),
             guidance: guidance.to_string(),
             current,
             scan: scan.clone(),
-        })?;
+        }) {
+            Ok(proposal) => proposal,
+            Err(err) if is_drafter_timeout_error(&err) => recover_timeout_refine_proposal(
+                &self.paths.repo_root,
+                &current_contract.prompt_source,
+                guidance,
+                contract_to_proposal(&feature, &current_contract),
+                &scan,
+            )?,
+            Err(err) => return Err(err),
+        };
+        let combined_guidance = format!("{}\n{}", current_contract.prompt_source, guidance);
         canonicalize_draft_proposal(
             &self.paths.repo_root,
             &current_contract.prompt_source,
             &mut proposal,
         );
         apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
+        normalize_proposal_scope(
+            &self.paths.repo_root,
+            &combined_guidance,
+            &scan,
+            &mut proposal,
+        );
         let mut errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
         if errors.is_empty() {
-            if let Some(fallback) = build_bounded_fallback_proposal(
+            if let Some(mut fallback) = build_bounded_fallback_proposal(
                 &self.paths.repo_root,
                 &current_contract.prompt_source,
                 &proposal,
                 &scan,
                 &errors,
             ) {
+                normalize_proposal_scope(
+                    &self.paths.repo_root,
+                    &combined_guidance,
+                    &scan,
+                    &mut fallback,
+                );
                 proposal = fallback;
                 apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
+                normalize_proposal_scope(
+                    &self.paths.repo_root,
+                    &combined_guidance,
+                    &scan,
+                    &mut proposal,
+                );
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
         }
         if !errors.is_empty() {
-            if let Some(fallback) = build_bounded_fallback_proposal(
+            if let Some(mut fallback) = build_bounded_fallback_proposal(
                 &self.paths.repo_root,
                 &current_contract.prompt_source,
                 &proposal,
                 &scan,
                 &errors,
             ) {
+                normalize_proposal_scope(
+                    &self.paths.repo_root,
+                    &combined_guidance,
+                    &scan,
+                    &mut fallback,
+                );
                 proposal = fallback;
                 apply_explicit_prompt_overrides(&self.paths.repo_root, guidance, &mut proposal);
+                normalize_proposal_scope(
+                    &self.paths.repo_root,
+                    &combined_guidance,
+                    &scan,
+                    &mut proposal,
+                );
                 errors = validate_draft_proposal(&self.paths.repo_root, &proposal);
             }
         }
@@ -558,8 +946,14 @@ impl OrchService {
         )?;
 
         let backend = detect_backend(&self.paths.repo_root)?;
+        let preexisting_changed_files = backend.changed_files().unwrap_or_default();
         let isolated = backend.create_isolated_change(&task.id)?;
         let workspace_root = PathBuf::from(&isolated.workspace_ref);
+        sync_present_repo_root_changes_to_isolated_workspace(
+            &self.paths.repo_root,
+            &workspace_root,
+            &preexisting_changed_files,
+        )?;
         let isolated_backend = detect_backend(&workspace_root)?;
         let run_id = new_id("run");
         let run_dir = self.paths.runs_dir.join(&run_id);
@@ -578,6 +972,7 @@ impl OrchService {
                 change_ref: isolated.change_ref,
                 base_ref: isolated.base_ref,
             },
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: None,
         };
@@ -588,6 +983,7 @@ impl OrchService {
         let stderr_path = run_dir.join("stderr.log");
         let executor_pid_path = run_dir.join("executor.json");
         let heartbeat_path = run_dir.join("heartbeat.json");
+        let cargo_lock_existed_before_run = workspace_root.join("Cargo.lock").exists();
         fs::write(&stdout_path, b"")?;
         fs::write(&stderr_path, b"")?;
         write_run_heartbeat(
@@ -663,16 +1059,34 @@ impl OrchService {
             }
         };
 
-        let (status, summary, checks_run, cost_usd, duration_ms) = match execution {
+        let (mut status, mut summary, checks_run, cost_usd, duration_ms) = match execution {
             Ok(output) => {
-                run.status = if output.success {
+                let already_satisfied_before_dispatch = !output.success
+                    && should_treat_cut_run_as_already_satisfied(
+                        &contract,
+                        &output.summary,
+                        &preexisting_changed_files,
+                    );
+                run.status = if output.success || already_satisfied_before_dispatch {
                     RunStatus::Finished
                 } else {
                     RunStatus::Failed
                 };
                 (
-                    if output.success { "success" } else { "failure" }.to_string(),
-                    output.summary,
+                    if output.success || already_satisfied_before_dispatch {
+                        "success"
+                    } else {
+                        "failure"
+                    }
+                    .to_string(),
+                    if already_satisfied_before_dispatch {
+                        already_satisfied_before_dispatch_summary(
+                            &contract.entry_points,
+                            &output.summary,
+                        )
+                    } else {
+                        output.summary
+                    },
                     output.checks_run,
                     output.cost_usd,
                     output.duration_ms,
@@ -690,6 +1104,42 @@ impl OrchService {
                 )
             }
         };
+        prune_generated_cargo_lock_if_out_of_scope(
+            &workspace_root,
+            &contract,
+            cargo_lock_existed_before_run,
+        )?;
+        let changed_files = provenance_baseline
+            .as_ref()
+            .and_then(|baseline| isolated_backend.changed_files_since(baseline).ok())
+            .unwrap_or_default();
+        if backend.kind() == VcsKind::Git && workspace_root != self.paths.repo_root {
+            sync_present_isolated_changes_to_repo_root(
+                &self.paths.repo_root,
+                &workspace_root,
+                &changed_files,
+            )?;
+        }
+        if should_reject_empty_successful_bounded_run(&contract, &status, &summary, &changed_files)
+        {
+            status = "failure".to_string();
+            summary = empty_successful_bounded_run_summary(&contract.entry_points, &summary);
+            run.status = RunStatus::Failed;
+        }
+        if status == "success" {
+            ensure_default_gitignore_coverage(&workspace_root)?;
+            if workspace_root != self.paths.repo_root {
+                ensure_default_gitignore_coverage(&self.paths.repo_root)?;
+            }
+        }
+        let verification_context =
+            build_verification_context(&run, &workspace_root, &changed_files)?;
+        let verification_context_path = run_dir.join("verification-context.json");
+        write_json(&verification_context_path, &verification_context)?;
+        run.verification_context_ref = Some(relative_ref(
+            &self.paths.repo_root,
+            &verification_context_path,
+        )?);
         run.ended_at = Some(now_rfc3339());
         run_finalizer.sync(&run);
         write_json(&run_path, &run)?;
@@ -707,10 +1157,7 @@ impl OrchService {
             task_id: task.id.clone(),
             status,
             executor_name: executor.name().to_string(),
-            changed_files: provenance_baseline
-                .as_ref()
-                .and_then(|baseline| isolated_backend.changed_files_since(baseline).ok())
-                .unwrap_or_default(),
+            changed_files,
             artifacts: ReceiptArtifacts {
                 stdout_ref: relative_ref(&self.paths.repo_root, &stdout_path)?,
                 stderr_ref: relative_ref(&self.paths.repo_root, &stderr_path)?,
@@ -742,6 +1189,312 @@ impl OrchService {
             Some(&run_path),
         )?;
         Ok((run, receipt))
+    }
+
+    pub fn start_research(&self, input: ResearchStartInput) -> Result<ResearchInspectView> {
+        let project = self.bootstrap_project()?;
+        validate_research_start_input(&self.paths.repo_root, &input)?;
+        let repo_snapshot_ref = current_snapshot_ref(&self.paths.repo_root)?;
+        let research_id = new_id("research");
+        let question_id = new_id("rq");
+        let packet_id = new_id("rp");
+        let created_at = now_rfc3339();
+        let research_dir = self.paths.research_dir.join(&research_id);
+        fs::create_dir_all(&research_dir)?;
+
+        let question_path = research_dir.join("question.json");
+        let question = ResearchQuestion {
+            id: question_id,
+            project_id: project.id.clone(),
+            kind: input.kind.clone(),
+            subject_ref: input.subject_ref.clone(),
+            question: input.question,
+            goal: input.goal,
+            constraints: input.constraints,
+            success_criteria: input.success_criteria,
+            created_at: created_at.clone(),
+        };
+        write_json(&question_path, &question)?;
+        let question_ref = relative_ref(&self.paths.repo_root, &question_path)?;
+
+        let packet_path = research_dir.join("packet.json");
+        let packet = ResearchPacket {
+            id: packet_id,
+            research_id: research_id.clone(),
+            question_ref: question_ref.clone(),
+            repo_snapshot_ref,
+            contract_ref: input.contract_ref,
+            receipt_ref: input.receipt_ref,
+            skill_ref: input.skill_ref,
+            eval_ref: input.eval_ref,
+            context_refs: input.context_refs,
+            budget: input.budget,
+            stop_rules: default_research_stop_rules(),
+            output_schema_ref: "docs/product/RESEARCH.md#researchsynthesis".to_string(),
+            created_at: created_at.clone(),
+        };
+        write_json(&packet_path, &packet)?;
+        let packet_ref = relative_ref(&self.paths.repo_root, &packet_path)?;
+
+        let record_path = research_dir.join("record.json");
+        let record = ResearchRecord {
+            id: research_id,
+            project_id: project.id.clone(),
+            kind: question.kind.clone(),
+            state: "frozen".to_string(),
+            question_ref,
+            packet_ref,
+            artifact_refs: Vec::new(),
+            synthesis_ref: None,
+            synthesis_history_refs: Vec::new(),
+            invalidated_synthesis_ref: None,
+            invalidation_artifact_ref: None,
+            invalidation_history: Vec::new(),
+            outcome: None,
+            created_at: created_at.clone(),
+            updated_at: created_at,
+        };
+        write_json(&record_path, &record)?;
+        self.append_event(
+            &project.id,
+            None,
+            None,
+            None,
+            ModeId::Plot,
+            "research.started",
+            Some(&record_path),
+        )?;
+
+        Ok(ResearchInspectView {
+            record,
+            question,
+            packet,
+            artifacts: Vec::new(),
+            synthesis: None,
+            invalidation: ResearchInvalidationInspectView {
+                active: None,
+                latest: None,
+                history_count: 0,
+            },
+            synthesis_lineage: ResearchSynthesisLineageInspectView {
+                active: None,
+                latest: None,
+                history_count: 0,
+                history: Vec::new(),
+                has_active_current_view: false,
+                has_replacements: false,
+                latest_is_active: false,
+            },
+        })
+    }
+
+    pub fn write_research_artifact(
+        &self,
+        research_id: &str,
+        input: ResearchArtifactInput,
+    ) -> Result<ResearchInspectView> {
+        validate_research_artifact_input(&self.paths.repo_root, &input)?;
+        let record_path = self.find_object_path(&self.paths.research_dir, research_id)?;
+        let mut record: ResearchRecord = read_json(&record_path)?;
+        ensure_research_not_terminal(&record)?;
+        let artifact_id = new_id("artifact");
+        let created_at = now_rfc3339();
+        let artifact = ResearchArtifact {
+            id: artifact_id,
+            research_id: record.id.clone(),
+            kind: input.kind,
+            summary: input.summary,
+            source_ref: input.source_ref,
+            created_at,
+        };
+        let artifacts_dir = record_path
+            .parent()
+            .unwrap_or(&self.paths.research_dir)
+            .join("artifacts");
+        fs::create_dir_all(&artifacts_dir)?;
+        let artifact_path = artifacts_dir.join(format!("{}.json", artifact.id));
+        write_json(&artifact_path, &artifact)?;
+        let artifact_ref = relative_ref(&self.paths.repo_root, &artifact_path)?;
+        if !record.artifact_refs.contains(&artifact_ref) {
+            record.artifact_refs.push(artifact_ref.clone());
+        }
+        if record.synthesis_ref.is_some() {
+            record.invalidated_synthesis_ref = record.synthesis_history_refs.last().cloned();
+            record.invalidation_artifact_ref = Some(artifact_ref.clone());
+            if let Some(invalidated_synthesis_ref) = record.invalidated_synthesis_ref.clone() {
+                record.invalidation_history.push(ResearchInvalidationEntry {
+                    invalidated_synthesis_ref,
+                    invalidating_artifact_ref: artifact_ref.clone(),
+                    invalidated_at: now_rfc3339(),
+                });
+            }
+        }
+        let synthesis_path = record_path
+            .parent()
+            .unwrap_or(&self.paths.research_dir)
+            .join("synthesis.json");
+        if synthesis_path.exists() {
+            fs::remove_file(&synthesis_path)?;
+        }
+        record.state = "gathering".to_string();
+        record.synthesis_ref = None;
+        record.outcome = None;
+        record.updated_at = now_rfc3339();
+        write_json(&record_path, &record)?;
+        self.append_event(
+            &record.project_id,
+            None,
+            None,
+            None,
+            ModeId::Plot,
+            "research.artifact_written",
+            Some(&artifact_path),
+        )?;
+        self.inspect_research(research_id)
+    }
+
+    pub fn write_research_synthesis(
+        &self,
+        research_id: &str,
+        input: ResearchSynthesisInput,
+    ) -> Result<ResearchInspectView> {
+        validate_research_synthesis_input(&self.paths.repo_root, &input)?;
+        let record_path = self.find_object_path(&self.paths.research_dir, research_id)?;
+        let mut record: ResearchRecord = read_json(&record_path)?;
+        ensure_research_not_terminal(&record)?;
+        if record.artifact_refs.is_empty() {
+            return Err(anyhow!(
+                "research synthesis requires at least one persisted artifact"
+            ));
+        }
+        if record.synthesis_ref.is_some() && !input.replace_existing {
+            return Err(anyhow!(
+                "research already has a synthesis; rerun with explicit replace intent"
+            ));
+        }
+
+        let artifact_refs = if input.artifact_refs.is_empty() {
+            record.artifact_refs.clone()
+        } else {
+            let mut refs = Vec::new();
+            for artifact_ref in input.artifact_refs {
+                if !record
+                    .artifact_refs
+                    .iter()
+                    .any(|existing| existing == &artifact_ref)
+                {
+                    return Err(anyhow!(
+                        "research synthesis artifact_ref must reference a persisted research artifact: {artifact_ref}"
+                    ));
+                }
+                if !refs.iter().any(|existing| existing == &artifact_ref) {
+                    refs.push(artifact_ref);
+                }
+            }
+            refs
+        };
+
+        let synthesis = ResearchSynthesis {
+            id: new_id("synthesis"),
+            research_id: record.id.clone(),
+            outcome: input.outcome,
+            summary: input.summary,
+            artifact_refs,
+            supersedes_ref: record.synthesis_history_refs.last().cloned(),
+            follow_up_refs: input.follow_up_refs,
+            created_at: now_rfc3339(),
+        };
+        let syntheses_dir = record_path
+            .parent()
+            .unwrap_or(&self.paths.research_dir)
+            .join("syntheses");
+        fs::create_dir_all(&syntheses_dir)?;
+        let immutable_synthesis_path = syntheses_dir.join(format!("{}.json", synthesis.id));
+        write_json(&immutable_synthesis_path, &synthesis)?;
+        let immutable_synthesis_ref =
+            relative_ref(&self.paths.repo_root, &immutable_synthesis_path)?;
+        let synthesis_path = record_path
+            .parent()
+            .unwrap_or(&self.paths.research_dir)
+            .join("synthesis.json");
+        write_json(&synthesis_path, &synthesis)?;
+        let synthesis_ref = relative_ref(&self.paths.repo_root, &synthesis_path)?;
+        record.state = "synthesized".to_string();
+        record.synthesis_ref = Some(synthesis_ref);
+        record.synthesis_history_refs.push(immutable_synthesis_ref);
+        record.invalidated_synthesis_ref = None;
+        record.invalidation_artifact_ref = None;
+        record.outcome = Some(synthesis.outcome.clone());
+        record.updated_at = now_rfc3339();
+        write_json(&record_path, &record)?;
+        self.append_event(
+            &record.project_id,
+            None,
+            None,
+            None,
+            ModeId::Plot,
+            "research.synthesis_written",
+            Some(&immutable_synthesis_path),
+        )?;
+        self.inspect_research(research_id)
+    }
+
+    pub fn complete_research(&self, research_id: &str) -> Result<ResearchInspectView> {
+        let record_path = self.find_object_path(&self.paths.research_dir, research_id)?;
+        let mut record: ResearchRecord = read_json(&record_path)?;
+        let synthesis = require_research_synthesis(&self.paths.repo_root, &record)?;
+        if record.state != "synthesized" {
+            return Err(anyhow!(
+                "research can only be completed from the synthesized state"
+            ));
+        }
+        if synthesis.outcome == "escalate" {
+            return Err(anyhow!(
+                "research with outcome=escalate must use `punk research escalate`"
+            ));
+        }
+        record.state = "completed".to_string();
+        record.updated_at = now_rfc3339();
+        write_json(&record_path, &record)?;
+        self.append_event(
+            &record.project_id,
+            None,
+            None,
+            None,
+            ModeId::Plot,
+            "research.completed",
+            Some(&record_path),
+        )?;
+        self.inspect_research(research_id)
+    }
+
+    pub fn escalate_research(&self, research_id: &str) -> Result<ResearchInspectView> {
+        let record_path = self.find_object_path(&self.paths.research_dir, research_id)?;
+        let mut record: ResearchRecord = read_json(&record_path)?;
+        let synthesis = require_research_synthesis(&self.paths.repo_root, &record)?;
+        if record.state != "synthesized" {
+            return Err(anyhow!(
+                "research can only be escalated from the synthesized state"
+            ));
+        }
+        if synthesis.outcome != "escalate" {
+            return Err(anyhow!(
+                "research escalation requires synthesis outcome=escalate"
+            ));
+        }
+        record.state = "escalated".to_string();
+        record.updated_at = now_rfc3339();
+        write_json(&record_path, &record)?;
+        self.append_event(
+            &record.project_id,
+            None,
+            None,
+            None,
+            ModeId::Plot,
+            "research.escalated",
+            Some(&record_path),
+        )?;
+        self.inspect_research(research_id)
     }
 
     pub fn status(&self, id: Option<&str>) -> Result<StatusSnapshot> {
@@ -837,6 +1590,7 @@ impl OrchService {
             &self.paths.runs_dir,
             &self.paths.decisions_dir,
             &self.paths.proofs_dir,
+            &self.paths.research_dir,
             &self.paths.autonomy_dir,
         ] {
             if let Ok(path) = self.find_object_path(dir, id) {
@@ -850,11 +1604,49 @@ impl OrchService {
         Err(anyhow!("unknown id: {id}"))
     }
 
+    pub fn inspect_proofpack(&self, proof_id: &str) -> Result<punk_domain::Proofpack> {
+        let proof_path = self.find_object_path(&self.paths.proofs_dir, proof_id)?;
+        read_json(&proof_path)
+    }
+
+    pub fn inspect_research(&self, research_id: &str) -> Result<ResearchInspectView> {
+        let record_path = self.find_object_path(&self.paths.research_dir, research_id)?;
+        let record: ResearchRecord = read_json(&record_path)?;
+        let question: ResearchQuestion =
+            read_json(&self.paths.repo_root.join(&record.question_ref))?;
+        let packet: ResearchPacket = read_json(&self.paths.repo_root.join(&record.packet_ref))?;
+        let artifacts = record
+            .artifact_refs
+            .iter()
+            .map(|artifact_ref| read_json(&self.paths.repo_root.join(artifact_ref)))
+            .collect::<Result<Vec<ResearchArtifact>>>()?;
+        let synthesis = record
+            .synthesis_ref
+            .as_ref()
+            .map(|synthesis_ref| read_json(&self.paths.repo_root.join(synthesis_ref)))
+            .transpose()?;
+        let invalidation = build_research_invalidation_inspect(&record);
+        let synthesis_lineage = build_research_synthesis_lineage_inspect(
+            &self.paths.repo_root,
+            &record,
+            synthesis.as_ref(),
+        )?;
+        Ok(ResearchInspectView {
+            record,
+            question,
+            packet,
+            artifacts,
+            synthesis,
+            invalidation,
+            synthesis_lineage,
+        })
+    }
+
     pub fn inspect_work_ledger(&self, id: Option<&str>) -> Result<WorkLedgerView> {
         let project = self.bootstrap_project()?;
         let feature_id = match id {
             Some(id) => self.resolve_feature_id_for_work(id)?,
-            None => self.latest_feature_id_for_project(&project.id)?,
+            None => self.latest_feature_id_for_project(&project)?,
         };
         self.build_work_ledger_view(&project, &feature_id)
     }
@@ -862,18 +1654,10 @@ impl OrchService {
     pub fn inspect_project_overlay(&self) -> Result<ProjectOverlay> {
         let project = self.bootstrap_project()?;
         let project_label = project_label(&self.paths.repo_root);
-        let bootstrap_path = self
-            .paths
-            .dot_punk
-            .join("bootstrap")
-            .join(format!("{project_label}-core.md"));
         let repo_agents_path = self.paths.repo_root.join("AGENTS.md");
         let agent_start_path = self.paths.dot_punk.join("AGENT_START.md");
 
-        let bootstrap_ref = bootstrap_path
-            .exists()
-            .then(|| relative_ref(&self.paths.repo_root, &bootstrap_path))
-            .transpose()?;
+        let bootstrap_ref = resolve_project_bootstrap_ref(&self.paths.repo_root, &project_label)?;
 
         let mut agent_guidance_ref = Vec::new();
         if repo_agents_path.exists() {
@@ -893,7 +1677,39 @@ impl OrchService {
                 }
             };
 
-        let project_skill_refs = active_project_skill_refs(&project_label);
+        let repo_local_project_skill_refs =
+            match repo_local_project_skill_refs(&self.paths.repo_root) {
+                Ok(refs) => refs,
+                Err(error) => {
+                    local_constraints.push(format!(
+                        "unable to inspect repo-local project skills: {error}"
+                    ));
+                    Vec::new()
+                }
+            };
+        let (project_skill_refs, project_skill_resolution_mode, ambient_project_skill_refs) =
+            if !repo_local_project_skill_refs.is_empty() {
+                (
+                    repo_local_project_skill_refs,
+                    "repo_local".to_string(),
+                    Vec::new(),
+                )
+            } else {
+                let ambient_refs = ambient_project_skill_refs(&project_label);
+                if ambient_refs.is_empty() {
+                    (Vec::new(), "none".to_string(), Vec::new())
+                } else {
+                    local_constraints.push(
+                        "project skills resolved via ambient fallback; persist repo-local overlays under .punk/skills/overlays/"
+                            .to_string(),
+                    );
+                    (
+                        ambient_refs.clone(),
+                        "ambient_fallback".to_string(),
+                        ambient_refs,
+                    )
+                }
+            };
         if bootstrap_ref.is_none() {
             local_constraints.push("repo-local bootstrap guidance missing".to_string());
         }
@@ -922,20 +1738,177 @@ impl OrchService {
             proof_ready: staged_ready,
             project_guidance_ready,
         };
-
-        Ok(ProjectOverlay {
+        let ui_legible = repo_has_any(
+            &self.paths.repo_root,
+            &[
+                "playwright.config.ts",
+                "playwright.config.js",
+                "playwright.config.mjs",
+                "playwright.config.cjs",
+                "tests/e2e",
+                "e2e",
+            ],
+        );
+        let logs_legible = repo_has_any(
+            &self.paths.repo_root,
+            &[
+                "logs",
+                "observability/logs",
+                "config/logging.yaml",
+                "config/logging.yml",
+                "vector.toml",
+            ],
+        );
+        let metrics_legible = repo_has_any(
+            &self.paths.repo_root,
+            &[
+                "metrics",
+                "observability/metrics",
+                "prometheus.yml",
+                "prometheus.yaml",
+            ],
+        );
+        let traces_legible = repo_has_any(
+            &self.paths.repo_root,
+            &[
+                "traces",
+                "observability/traces",
+                "otel-collector.yaml",
+                "otel-collector.yml",
+            ],
+        );
+        let bootable_per_workspace =
+            bootstrap_ref.is_some() && staged_ready && vcs_mode != "no_vcs";
+        let harness_summary = ProjectHarnessSummary {
+            inspect_ready: bootable_per_workspace
+                || ui_legible
+                || logs_legible
+                || metrics_legible
+                || traces_legible,
+            bootable_per_workspace,
+            ui_legible,
+            logs_legible,
+            metrics_legible,
+            traces_legible,
+        };
+        let persisted_harness_spec = PersistedHarnessSpec::from_summary(
+            &project.id,
+            &harness_summary,
+            bootstrap_ref.as_deref(),
+            &agent_guidance_ref,
+            &project.updated_at,
+        );
+        write_json(&self.paths.harness_spec_path, &persisted_harness_spec)?;
+        let harness_spec: PersistedHarnessSpec = read_json(&self.paths.harness_spec_path)?;
+        let harness_spec_ref = relative_ref(&self.paths.repo_root, &self.paths.harness_spec_path)?;
+        let overlay_ref = relative_ref(&self.paths.repo_root, &self.paths.project_overlay_path)?;
+        let overlay = ProjectOverlay {
             project_id: project.id.clone(),
             repo_root: project.path,
+            overlay_ref,
             vcs_mode,
             bootstrap_ref,
             agent_guidance_ref,
             capability_summary,
+            harness_summary,
+            harness_spec_ref,
+            harness_spec,
+            project_skill_resolution_mode,
             project_skill_refs,
+            ambient_project_skill_refs,
             local_constraints,
             safe_default_checks,
             status_scope_mode: format!("project:{}", project.id),
             updated_at: project.updated_at,
+        };
+        write_json(&self.paths.project_overlay_path, &overlay)?;
+        read_json(&self.paths.project_overlay_path)
+    }
+
+    pub fn gc_stale_dry_run(&self) -> Result<StaleGcReport> {
+        let project = self.bootstrap_project()?;
+        let mut safe_to_archive = Vec::new();
+        let mut manual_review = Vec::new();
+
+        for entry in fs::read_dir(&self.paths.features_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let feature: Feature = read_json(&path)?;
+            if feature.project_id != project.id {
+                continue;
+            }
+            for run_record in work_run_records(&self.paths.runs_dir, &feature.id)? {
+                if let Some(candidate) =
+                    classify_stale_run_candidate(&self.paths, &feature.id, &run_record)?
+                {
+                    match candidate {
+                        StaleRunDisposition::SafeToArchive(candidate) => {
+                            safe_to_archive.push(candidate)
+                        }
+                        StaleRunDisposition::ManualReview(candidate) => {
+                            manual_review.push(candidate)
+                        }
+                    }
+                }
+            }
+        }
+
+        safe_to_archive.sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
+        manual_review.sort_by(|left, right| left.artifact_id.cmp(&right.artifact_id));
+
+        Ok(StaleGcReport {
+            project_id: project.id,
+            generated_at: now_rfc3339(),
+            safe_to_archive,
+            manual_review,
         })
+    }
+
+    fn quarantine_safe_stale_runs(&self) -> Result<Vec<StaleArtifactCandidate>> {
+        let report = self.gc_stale_dry_run()?;
+        let mut archived = Vec::new();
+        let archive_root = self.paths.dot_punk.join("archive").join("runs");
+        fs::create_dir_all(&archive_root)?;
+
+        for candidate in report.safe_to_archive {
+            let source_dir = self
+                .paths
+                .repo_root
+                .join(candidate.artifact_ref.trim_end_matches("/run.json"))
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.paths.runs_dir.join(&candidate.artifact_id));
+            let source_dir = if source_dir.ends_with(&candidate.artifact_id) {
+                source_dir
+            } else {
+                self.paths.runs_dir.join(&candidate.artifact_id)
+            };
+            if !source_dir.exists() {
+                continue;
+            }
+
+            let target_dir = archive_root.join(&candidate.artifact_id);
+            if target_dir.exists() {
+                fs::remove_dir_all(&target_dir)?;
+            }
+            fs::rename(&source_dir, &target_dir)?;
+
+            let archive_record = StaleArchiveRecord {
+                archived_at: now_rfc3339(),
+                run_id: candidate.artifact_id.clone(),
+                work_id: candidate.work_id.clone(),
+                original_ref: candidate.artifact_ref.clone(),
+                reason: candidate.reason.clone(),
+                last_progress_at: candidate.last_progress_at.clone(),
+                executor_pid: candidate.executor_pid,
+            };
+            write_json(&target_dir.join("quarantine.json"), &archive_record)?;
+            archived.push(candidate);
+        }
+
+        Ok(archived)
     }
 
     pub fn record_autonomy_outcome(
@@ -1019,12 +1992,20 @@ impl OrchService {
         });
 
         let runs = work_run_records(&self.paths.runs_dir, feature_id)?;
-        let latest_run = runs.into_iter().max_by(|left, right| {
-            left.run
-                .started_at
-                .cmp(&right.run.started_at)
-                .then_with(|| left.run.id.cmp(&right.run.id))
-        });
+        let latest_run = runs
+            .into_iter()
+            .filter(|record| {
+                !matches!(
+                    classify_stale_run_candidate(&self.paths, feature_id, record),
+                    Ok(Some(StaleRunDisposition::SafeToArchive(_)))
+                )
+            })
+            .max_by(|left, right| {
+                left.run
+                    .started_at
+                    .cmp(&right.run.started_at)
+                    .then_with(|| left.run.id.cmp(&right.run.id))
+            });
 
         let latest_decision = match latest_run.as_ref() {
             Some(run_record) => {
@@ -1101,6 +2082,10 @@ impl OrchService {
         let recovery_contract_ref = latest_autonomy
             .as_ref()
             .and_then(|record| record.record.recovery_contract_ref.clone());
+        let latest_proof_command_evidence_summary = latest_proof
+            .as_ref()
+            .map(|record| summarize_command_evidence(&record.proof.command_evidence))
+            .unwrap_or_default();
 
         Ok(WorkLedgerView {
             project_id: project.id.clone(),
@@ -1119,6 +2104,7 @@ impl OrchService {
             recovery_contract_ref,
             lifecycle_state: lifecycle_state.to_string(),
             blocked_reason,
+            latest_proof_command_evidence_summary,
             next_action,
             next_action_ref,
             updated_at: work_updated_at(
@@ -1174,34 +2160,37 @@ impl OrchService {
         Err(anyhow!("unknown work id: {id}"))
     }
 
-    fn latest_feature_id_for_project(&self, project_id: &str) -> Result<String> {
-        let mut latest: Option<Feature> = None;
+    fn latest_feature_id_for_project(&self, project: &Project) -> Result<String> {
+        let mut latest: Option<(String, String, String)> = None;
         for entry in fs::read_dir(&self.paths.features_dir)? {
             let path = entry?.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
             let feature: Feature = read_json(&path)?;
-            if feature.project_id != project_id {
+            if feature.project_id != project.id {
                 continue;
             }
+            let activity_updated_at = self
+                .build_work_ledger_view(project, &feature.id)
+                .map(|ledger| ledger.updated_at)
+                .unwrap_or_else(|_| feature.updated_at.clone());
             let replace = latest
                 .as_ref()
                 .map(|current| {
-                    feature
-                        .updated_at
-                        .cmp(&current.updated_at)
-                        .then_with(|| feature.created_at.cmp(&current.created_at))
+                    activity_updated_at
+                        .cmp(&current.1)
+                        .then_with(|| feature.created_at.cmp(&current.2))
                         .is_gt()
                 })
                 .unwrap_or(true);
             if replace {
-                latest = Some(feature);
+                latest = Some((feature.id, activity_updated_at, feature.created_at));
             }
         }
 
         latest
-            .map(|feature| feature.id)
+            .map(|feature| feature.0)
             .ok_or_else(|| anyhow!("no work items found for project"))
     }
 
@@ -1219,6 +2208,7 @@ impl OrchService {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_event(
         &self,
         project_id: &str,
@@ -1256,6 +2246,222 @@ impl OrchService {
     }
 }
 
+fn validate_research_start_input(repo_root: &Path, input: &ResearchStartInput) -> Result<()> {
+    if input.kind.trim().is_empty() {
+        return Err(anyhow!("research kind must not be empty"));
+    }
+    if input.question.trim().is_empty() {
+        return Err(anyhow!("research question must not be empty"));
+    }
+    if input.goal.trim().is_empty() {
+        return Err(anyhow!("research goal must not be empty"));
+    }
+    if input.success_criteria.is_empty()
+        || input
+            .success_criteria
+            .iter()
+            .all(|item| item.trim().is_empty())
+    {
+        return Err(anyhow!(
+            "research success criteria must include at least one non-empty item"
+        ));
+    }
+    if input.budget.max_rounds == 0 {
+        return Err(anyhow!(
+            "research budget max_rounds must be greater than zero"
+        ));
+    }
+    if input.budget.max_worker_slots == 0 {
+        return Err(anyhow!(
+            "research budget max_worker_slots must be greater than zero"
+        ));
+    }
+    if input.budget.max_duration_minutes == 0 {
+        return Err(anyhow!(
+            "research budget max_duration_minutes must be greater than zero"
+        ));
+    }
+    if input.budget.max_artifacts == 0 {
+        return Err(anyhow!(
+            "research budget max_artifacts must be greater than zero"
+        ));
+    }
+
+    if let Some(subject_ref) = input.subject_ref.as_deref() {
+        validate_repo_local_ref(repo_root, "subject_ref", subject_ref)?;
+    }
+    if let Some(contract_ref) = input.contract_ref.as_deref() {
+        validate_repo_local_ref(repo_root, "contract_ref", contract_ref)?;
+    }
+    if let Some(receipt_ref) = input.receipt_ref.as_deref() {
+        validate_repo_local_ref(repo_root, "receipt_ref", receipt_ref)?;
+    }
+    if let Some(skill_ref) = input.skill_ref.as_deref() {
+        validate_repo_local_ref(repo_root, "skill_ref", skill_ref)?;
+    }
+    if let Some(eval_ref) = input.eval_ref.as_deref() {
+        validate_repo_local_ref(repo_root, "eval_ref", eval_ref)?;
+    }
+    for context_ref in &input.context_refs {
+        validate_repo_local_ref(repo_root, "context_ref", context_ref)?;
+    }
+
+    Ok(())
+}
+
+fn validate_research_artifact_input(repo_root: &Path, input: &ResearchArtifactInput) -> Result<()> {
+    if input.kind.trim().is_empty() {
+        return Err(anyhow!("research artifact kind must not be empty"));
+    }
+    if input.summary.trim().is_empty() {
+        return Err(anyhow!("research artifact summary must not be empty"));
+    }
+    if let Some(source_ref) = input.source_ref.as_deref() {
+        validate_repo_local_ref(repo_root, "source_ref", source_ref)?;
+    }
+    Ok(())
+}
+
+fn validate_research_synthesis_input(
+    repo_root: &Path,
+    input: &ResearchSynthesisInput,
+) -> Result<()> {
+    if input.outcome.trim().is_empty() {
+        return Err(anyhow!("research synthesis outcome must not be empty"));
+    }
+    if input.summary.trim().is_empty() {
+        return Err(anyhow!("research synthesis summary must not be empty"));
+    }
+    for artifact_ref in &input.artifact_refs {
+        validate_repo_local_ref(repo_root, "artifact_ref", artifact_ref)?;
+    }
+    for follow_up_ref in &input.follow_up_refs {
+        validate_repo_local_ref(repo_root, "follow_up_ref", follow_up_ref)?;
+    }
+    Ok(())
+}
+
+fn ensure_research_not_terminal(record: &ResearchRecord) -> Result<()> {
+    if matches!(record.state.as_str(), "completed" | "escalated") {
+        return Err(anyhow!(
+            "research is already terminal and cannot accept more mutations"
+        ));
+    }
+    Ok(())
+}
+
+fn build_research_invalidation_inspect(record: &ResearchRecord) -> ResearchInvalidationInspectView {
+    let latest = record.invalidation_history.last().cloned();
+    let active = match (
+        record.invalidated_synthesis_ref.as_ref(),
+        record.invalidation_artifact_ref.as_ref(),
+    ) {
+        (Some(invalidated_synthesis_ref), Some(invalidating_artifact_ref)) => record
+            .invalidation_history
+            .iter()
+            .rev()
+            .find(|entry| {
+                &entry.invalidated_synthesis_ref == invalidated_synthesis_ref
+                    && &entry.invalidating_artifact_ref == invalidating_artifact_ref
+            })
+            .cloned()
+            .or_else(|| {
+                Some(ResearchInvalidationEntry {
+                    invalidated_synthesis_ref: invalidated_synthesis_ref.clone(),
+                    invalidating_artifact_ref: invalidating_artifact_ref.clone(),
+                    invalidated_at: record.updated_at.clone(),
+                })
+            }),
+        _ => None,
+    };
+
+    ResearchInvalidationInspectView {
+        active,
+        latest,
+        history_count: record.invalidation_history.len(),
+    }
+}
+
+fn build_research_synthesis_lineage_inspect(
+    repo_root: &Path,
+    record: &ResearchRecord,
+    active_synthesis: Option<&ResearchSynthesis>,
+) -> Result<ResearchSynthesisLineageInspectView> {
+    let history = record
+        .synthesis_history_refs
+        .iter()
+        .map(|identity_ref| {
+            let synthesis: ResearchSynthesis = read_json(&repo_root.join(identity_ref))?;
+            Ok(ResearchSynthesisLineageEntry {
+                identity_ref: identity_ref.clone(),
+                outcome: synthesis.outcome,
+                supersedes_ref: synthesis.supersedes_ref,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let active = match (record.synthesis_ref.as_ref(), active_synthesis) {
+        (Some(_), Some(_)) => history.last().cloned(),
+        _ => None,
+    };
+
+    let latest = history.last().cloned();
+    let has_active_current_view = active.is_some();
+    let has_replacements = history.len() > 1;
+    let latest_is_active = matches!(
+        (&active, &latest),
+        (Some(active), Some(latest)) if active.identity_ref == latest.identity_ref
+    );
+
+    Ok(ResearchSynthesisLineageInspectView {
+        active,
+        latest,
+        history_count: record.synthesis_history_refs.len(),
+        history,
+        has_active_current_view,
+        has_replacements,
+        latest_is_active,
+    })
+}
+
+fn require_research_synthesis(
+    repo_root: &Path,
+    record: &ResearchRecord,
+) -> Result<ResearchSynthesis> {
+    let synthesis_ref = record
+        .synthesis_ref
+        .as_ref()
+        .ok_or_else(|| anyhow!("research requires a persisted synthesis first"))?;
+    read_json(&repo_root.join(synthesis_ref))
+}
+
+fn validate_repo_local_ref(repo_root: &Path, field: &str, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("{field} must not be empty"));
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return Err(anyhow!("{field} must be repo-local, not absolute"));
+    }
+    let resolved = repo_root.join(candidate);
+    if !resolved.exists() {
+        return Err(anyhow!(
+            "{field} does not exist under repo root: {}",
+            candidate.display()
+        ));
+    }
+    Ok(())
+}
+
+fn default_research_stop_rules() -> Vec<String> {
+    vec![
+        "stop_when_budget_exhausted".to_string(),
+        "stop_when_evidence_is_sufficient".to_string(),
+        "escalate_on_persistent_ambiguity".to_string(),
+    ]
+}
+
 fn attach_live_vcs(value: &mut serde_json::Value, live_vcs: serde_json::Value) {
     if let Some(object) = value.as_object_mut() {
         object.insert("live_vcs".to_string(), live_vcs);
@@ -1281,6 +2487,46 @@ fn project_label(root: &Path) -> String {
         .to_string()
 }
 
+fn find_bootstrap_docs(repo_root: &Path) -> Result<Vec<PathBuf>> {
+    let bootstrap_dir = repo_root.join(".punk").join("bootstrap");
+    if !bootstrap_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut docs = fs::read_dir(&bootstrap_dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("-core.md"))
+        })
+        .collect::<Vec<_>>();
+    docs.sort();
+    Ok(docs)
+}
+
+fn resolve_project_bootstrap_ref(
+    repo_root: &Path,
+    preferred_label: &str,
+) -> Result<Option<String>> {
+    let preferred = repo_root
+        .join(".punk")
+        .join("bootstrap")
+        .join(format!("{preferred_label}-core.md"));
+    if preferred.exists() {
+        return Ok(Some(relative_ref(repo_root, &preferred)?));
+    }
+
+    let docs = find_bootstrap_docs(repo_root)?;
+    if docs.len() == 1 {
+        return Ok(Some(relative_ref(repo_root, &docs[0])?));
+    }
+
+    Ok(None)
+}
+
 fn project_overlay_vcs_mode(repo_root: &Path) -> String {
     use punk_vcs::VcsMode;
 
@@ -1292,7 +2538,43 @@ fn project_overlay_vcs_mode(repo_root: &Path) -> String {
     }
 }
 
-fn active_project_skill_refs(project_label: &str) -> Vec<String> {
+fn repo_local_project_skill_refs(repo_root: &Path) -> Result<Vec<String>> {
+    let overlays_dir = repo_root.join(".punk/skills/overlays");
+    collect_repo_local_markdown_refs(repo_root, &overlays_dir)
+}
+
+fn collect_repo_local_markdown_refs(repo_root: &Path, root: &Path) -> Result<Vec<String>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut refs = Vec::new();
+    collect_repo_local_markdown_refs_recursive(repo_root, root, &mut refs)?;
+    refs.sort();
+    refs.dedup();
+    Ok(refs)
+}
+
+fn collect_repo_local_markdown_refs_recursive(
+    repo_root: &Path,
+    current: &Path,
+    refs: &mut Vec<String>,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_repo_local_markdown_refs_recursive(repo_root, &path, refs)?;
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        refs.push(relative_ref(repo_root, &path)?);
+    }
+    Ok(())
+}
+
+fn ambient_project_skill_refs(project_label: &str) -> Vec<String> {
     let bus_dir = std::env::var("PUNK_BUS_DIR")
         .map(PathBuf::from)
         .or_else(|_| {
@@ -1385,6 +2667,11 @@ struct ProofRecord {
     proof: punk_domain::Proofpack,
 }
 
+enum StaleRunDisposition {
+    SafeToArchive(StaleArtifactCandidate),
+    ManualReview(StaleArtifactCandidate),
+}
+
 struct AutonomyRecordFile {
     path: PathBuf,
     record: AutonomyRecord,
@@ -1439,6 +2726,121 @@ fn work_run_records(runs_dir: &Path, feature_id: &str) -> Result<Vec<RunRecord>>
         });
     }
     Ok(records)
+}
+
+fn classify_stale_run_candidate(
+    paths: &RepoPaths,
+    feature_id: &str,
+    run_record: &RunRecord,
+) -> Result<Option<StaleRunDisposition>> {
+    if run_record.run.status != RunStatus::Running || run_record.receipt.is_some() {
+        return Ok(None);
+    }
+
+    let run_dir = run_record
+        .run_path
+        .parent()
+        .ok_or_else(|| anyhow!("run path missing parent: {}", run_record.run_path.display()))?;
+    let executor = read_executor_process_info(&run_dir.join("executor.json"))?;
+    let heartbeat = read_run_heartbeat_optional(&run_dir.join("heartbeat.json"))?;
+    let latest_decision = latest_decision_record(&paths.decisions_dir, &run_record.run.id)?;
+    if latest_decision.is_some() {
+        return Ok(None);
+    }
+
+    let Some(reason) = stale_run_reason(
+        &run_record.run,
+        executor.as_ref(),
+        heartbeat.as_ref(),
+        false,
+    ) else {
+        return Ok(None);
+    };
+
+    let candidate = StaleArtifactCandidate {
+        artifact_kind: "run".to_string(),
+        artifact_id: run_record.run.id.clone(),
+        work_id: feature_id.to_string(),
+        artifact_ref: relative_ref(&paths.repo_root, &run_record.run_path)?,
+        reason,
+        last_progress_at: heartbeat
+            .as_ref()
+            .map(|value| value.last_progress_at.clone()),
+        executor_pid: executor.as_ref().map(|value| value.child_pid),
+    };
+
+    if executor.is_none() || heartbeat.is_none() {
+        return Ok(Some(StaleRunDisposition::ManualReview(candidate)));
+    }
+
+    Ok(Some(StaleRunDisposition::SafeToArchive(candidate)))
+}
+
+fn read_executor_process_info(path: &Path) -> Result<Option<ExecutorProcessInfo>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_json(path).map(Some)
+}
+
+fn read_run_heartbeat_optional(path: &Path) -> Result<Option<RunHeartbeat>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_json(path).map(Some)
+}
+
+fn stale_run_reason(
+    _run: &Run,
+    executor: Option<&ExecutorProcessInfo>,
+    heartbeat: Option<&RunHeartbeat>,
+    has_decision: bool,
+) -> Option<String> {
+    if has_decision {
+        return None;
+    }
+    let executor = executor?;
+    let heartbeat = heartbeat?;
+    if heartbeat.state != "running" {
+        return None;
+    }
+    if process_is_alive(executor.child_pid) {
+        return None;
+    }
+    if !rfc3339_age_exceeds(&heartbeat.last_progress_at, Duration::from_secs(60)) {
+        return None;
+    }
+    Some(format!(
+        "status=running but child_pid {} is dead, heartbeat.state=running, last_progress_at={}, no receipt, no decision, no proof",
+        executor.child_pid, heartbeat.last_progress_at
+    ))
+}
+
+fn rfc3339_age_exceeds(timestamp: &str, threshold: Duration) -> bool {
+    let Ok(parsed) = DateTime::parse_from_rfc3339(timestamp) else {
+        return false;
+    };
+    let age = Utc::now().signed_duration_since(parsed.with_timezone(&Utc));
+    age.to_std()
+        .map(|value| value >= threshold)
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 fn latest_decision_record(decisions_dir: &Path, run_id: &str) -> Result<Option<DecisionRecord>> {
@@ -1728,6 +3130,29 @@ fn summarize_decision_basis(basis: &[String]) -> String {
         .join("; ")
 }
 
+fn summarize_command_evidence(command_evidence: &[punk_domain::CommandEvidence]) -> Vec<String> {
+    command_evidence
+        .iter()
+        .map(|item| {
+            format!(
+                "{} {}: {}",
+                item.lane,
+                check_status_label(&item.status),
+                item.command
+            )
+        })
+        .collect()
+}
+
+fn check_status_label(status: &punk_domain::CheckStatus) -> &'static str {
+    match status {
+        punk_domain::CheckStatus::Pass => "pass",
+        punk_domain::CheckStatus::Fail => "fail",
+        punk_domain::CheckStatus::Partial => "partial",
+        punk_domain::CheckStatus::Unverified => "unverified",
+    }
+}
+
 fn autonomy_outcome_label(outcome: &AutonomyOutcome) -> &'static str {
     match outcome {
         AutonomyOutcome::Succeeded => "succeeded",
@@ -1766,9 +3191,2654 @@ fn work_suggested_command(
     }
 }
 
+fn should_treat_cut_run_as_already_satisfied(
+    contract: &Contract,
+    summary: &str,
+    preexisting_changed_files: &[String],
+) -> bool {
+    contract_is_file_bounded(contract)
+        && is_explicit_already_satisfied_summary(summary)
+        && entry_points_already_changed_before_dispatch(contract, preexisting_changed_files)
+}
+
+fn is_explicit_already_satisfied_summary(summary: &str) -> bool {
+    summary
+        .trim()
+        .starts_with("PUNK_EXECUTION_ALREADY_SATISFIED:")
+}
+
+fn entry_points_already_changed_before_dispatch(
+    contract: &Contract,
+    preexisting_changed_files: &[String],
+) -> bool {
+    !contract.entry_points.is_empty()
+        && contract.entry_points.iter().all(|entry_point| {
+            preexisting_changed_files
+                .iter()
+                .any(|changed| path_covers_entry_point(changed, entry_point))
+        })
+}
+
+fn contract_is_file_bounded(contract: &Contract) -> bool {
+    !contract.entry_points.is_empty()
+        && contract
+            .entry_points
+            .iter()
+            .all(|entry_point| is_file_like_contract_path(entry_point))
+        && contract
+            .allowed_scope
+            .iter()
+            .all(|scope| is_file_like_contract_path(scope))
+}
+
+fn is_file_like_contract_path(path: &str) -> bool {
+    Path::new(path).extension().is_some()
+        || matches!(
+            path,
+            "Cargo.toml" | "Cargo.lock" | "README.md" | "rust-toolchain.toml"
+        )
+}
+
+fn path_covers_entry_point(changed_path: &str, entry_point: &str) -> bool {
+    changed_path == entry_point
+        || changed_path
+            .strip_prefix(entry_point)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn prune_generated_cargo_lock_if_out_of_scope(
+    repo_root: &Path,
+    contract: &Contract,
+    cargo_lock_existed_before_run: bool,
+) -> Result<()> {
+    if cargo_lock_existed_before_run || !contract_implies_generated_cargo_lock(contract) {
+        return Ok(());
+    }
+    let cargo_lock = repo_root.join("Cargo.lock");
+    if cargo_lock.exists() {
+        fs::remove_file(cargo_lock)?;
+    }
+    Ok(())
+}
+
+fn sync_present_isolated_changes_to_repo_root(
+    repo_root: &Path,
+    workspace_root: &Path,
+    changed_files: &[String],
+) -> Result<()> {
+    if repo_root == workspace_root {
+        return Ok(());
+    }
+    for path in changed_files.iter().filter(|path| {
+        !path.starts_with(".punk/")
+            && !path.starts_with("target/")
+            && !path.starts_with(".playwright-mcp/")
+    }) {
+        let source = workspace_root.join(path);
+        if !source.is_file() {
+            continue;
+        }
+        let destination = repo_root.join(path);
+        if source == destination {
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&source, &destination)?;
+    }
+    Ok(())
+}
+
+fn sync_present_repo_root_changes_to_isolated_workspace(
+    repo_root: &Path,
+    workspace_root: &Path,
+    changed_files: &[String],
+) -> Result<()> {
+    if repo_root == workspace_root {
+        return Ok(());
+    }
+    for path in changed_files.iter().filter(|path| {
+        !path.starts_with(".punk/")
+            && !path.starts_with("target/")
+            && !path.starts_with(".playwright-mcp/")
+    }) {
+        let source = repo_root.join(path);
+        if !source.is_file() {
+            continue;
+        }
+        let destination = workspace_root.join(path);
+        if source == destination {
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&source, &destination)?;
+    }
+    Ok(())
+}
+
+fn ensure_default_gitignore_coverage(project_root: &Path) -> Result<()> {
+    let gitignore_path = project_root.join(".gitignore");
+    let existing = if gitignore_path.exists() {
+        fs::read_to_string(&gitignore_path)?
+    } else {
+        String::new()
+    };
+    let merged = merge_default_gitignore_entries(&existing);
+    if merged != existing {
+        fs::write(gitignore_path, merged)?;
+    }
+    Ok(())
+}
+
+fn merge_default_gitignore_entries(existing: &str) -> String {
+    let mut lines = if existing.is_empty() {
+        Vec::new()
+    } else {
+        existing.lines().map(str::to_string).collect::<Vec<_>>()
+    };
+    if !gitignore_covers_pattern(&lines, ".punk/") {
+        lines.push(".punk/".to_string());
+    }
+    if !gitignore_covers_pattern(&lines, "target/") {
+        lines.push("target/".to_string());
+    }
+    if !gitignore_covers_pattern(&lines, ".playwright-mcp/") {
+        lines.push(".playwright-mcp/".to_string());
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
+}
+
+fn gitignore_covers_pattern(lines: &[String], required: &str) -> bool {
+    let aliases: &[&str] = match required {
+        ".punk/" => &[".punk/", ".punk"],
+        "target/" => &["target/", "target"],
+        ".playwright-mcp/" => &[".playwright-mcp/", ".playwright-mcp"],
+        _ => &[required],
+    };
+    lines.iter().any(|line| {
+        let trimmed = line.trim();
+        aliases.iter().any(|alias| trimmed == *alias)
+    })
+}
+
+#[derive(Default)]
+struct NestedCheckInference {
+    manifests: Vec<String>,
+    target_checks: Vec<String>,
+    integrity_checks: Vec<String>,
+}
+
+fn enrich_scan_with_nested_integrity_fallback(
+    repo_root: &Path,
+    scan: &mut punk_domain::RepoScanSummary,
+) -> Result<()> {
+    if !scan.candidate_integrity_checks.is_empty() {
+        return Ok(());
+    }
+    let inference = infer_nested_trustworthy_checks(repo_root)?;
+    if inference.integrity_checks.is_empty() {
+        return Ok(());
+    }
+    for manifest in inference.manifests {
+        push_unique_string(&mut scan.manifests, manifest);
+    }
+    for check in inference.target_checks {
+        push_unique_string(&mut scan.candidate_target_checks, check);
+    }
+    for check in inference.integrity_checks {
+        push_unique_string(&mut scan.candidate_integrity_checks, check);
+    }
+    push_unique_string(
+        &mut scan.notes,
+        "inferred trustworthy integrity checks from nested manifests because the repo root had no explicit integrity story".to_string(),
+    );
+    Ok(())
+}
+
+fn infer_nested_trustworthy_checks(repo_root: &Path) -> Result<NestedCheckInference> {
+    let mut inference = NestedCheckInference::default();
+    collect_nested_trustworthy_checks(repo_root, repo_root, &mut inference)?;
+    Ok(inference)
+}
+
+fn collect_nested_trustworthy_checks(
+    repo_root: &Path,
+    current: &Path,
+    inference: &mut NestedCheckInference,
+) -> Result<()> {
+    if current != repo_root {
+        let relative_dir = current
+            .strip_prefix(repo_root)
+            .map_err(|_| anyhow!("failed to relativize {}", current.display()))?;
+        if current.join("Cargo.toml").exists() {
+            let manifest = relative_dir.join("Cargo.toml");
+            let manifest = manifest.to_string_lossy().replace('\\', "/");
+            push_unique_string(&mut inference.manifests, manifest.clone());
+            let command = format!("cargo test --manifest-path {manifest}");
+            push_unique_string(&mut inference.target_checks, command.clone());
+            push_unique_string(&mut inference.integrity_checks, command);
+        }
+        if current.join("package.json").exists() {
+            let manifest = relative_dir.join("package.json");
+            let manifest = manifest.to_string_lossy().replace('\\', "/");
+            push_unique_string(&mut inference.manifests, manifest);
+            let scripts = read_package_scripts(&current.join("package.json"))?;
+            let package_manager = detect_nested_package_manager(current);
+            for script in ["check", "test", "lint", "typecheck"] {
+                if scripts.contains_key(script) {
+                    let command = nested_package_manager_run(
+                        package_manager.as_deref(),
+                        relative_dir,
+                        script,
+                    );
+                    push_unique_string(&mut inference.target_checks, command.clone());
+                    push_unique_string(&mut inference.integrity_checks, command);
+                }
+            }
+        }
+        if current.join("Makefile").exists() {
+            let manifest = relative_dir.join("Makefile");
+            let manifest = manifest.to_string_lossy().replace('\\', "/");
+            push_unique_string(&mut inference.manifests, manifest);
+            let makefile = fs::read_to_string(current.join("Makefile"))?;
+            if makefile
+                .lines()
+                .any(|line| line.trim_start().starts_with("test:"))
+            {
+                let command = format!("make -C {} test", relative_dir.to_string_lossy());
+                push_unique_string(&mut inference.target_checks, command.clone());
+                push_unique_string(&mut inference.integrity_checks, command);
+            }
+        }
+    }
+
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if ignored_nested_name(&name) {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(repo_root)
+            .map_err(|_| anyhow!("failed to relativize {}", path.display()))?;
+        if ignored_nested_relative_path(relative) {
+            continue;
+        }
+        collect_nested_trustworthy_checks(repo_root, &path, inference)?;
+    }
+
+    Ok(())
+}
+
+fn read_package_scripts(package_json: &Path) -> Result<BTreeMap<String, String>> {
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(package_json).map_err(|err| anyhow!("read {}: {err}", package_json.display()))?,
+    )
+    .map_err(|err| anyhow!("parse {}: {err}", package_json.display()))?;
+    Ok(value
+        .get("scripts")
+        .and_then(|value| value.as_object())
+        .map(|scripts| {
+            scripts
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default())
+}
+
+fn detect_nested_package_manager(package_dir: &Path) -> Option<String> {
+    for (file, pm) in [
+        ("pnpm-lock.yaml", "pnpm"),
+        ("yarn.lock", "yarn"),
+        ("bun.lockb", "bun"),
+        ("bun.lock", "bun"),
+        ("package-lock.json", "npm"),
+    ] {
+        if package_dir.join(file).exists() {
+            return Some(pm.to_string());
+        }
+    }
+    Some("npm".to_string())
+}
+
+fn nested_package_manager_run(
+    package_manager: Option<&str>,
+    relative_dir: &Path,
+    script: &str,
+) -> String {
+    let directory = relative_dir.to_string_lossy();
+    match package_manager.unwrap_or("npm") {
+        "pnpm" => format!("pnpm --dir {directory} {script}"),
+        "yarn" => format!("yarn --cwd {directory} {script}"),
+        "bun" => format!("bun --cwd {directory} run {script}"),
+        _ => format!("npm --prefix {directory} run {script}"),
+    }
+}
+
+fn ignored_nested_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | ".jj" | ".punk" | "target" | "node_modules" | ".playwright-mcp"
+    )
+}
+
+fn ignored_nested_relative_path(relative: &Path) -> bool {
+    relative.starts_with("docs/reference-repos")
+        || relative.starts_with("docs/research/_delve_runs")
+        || relative.starts_with(".build")
+}
+
+fn apply_prompt_targeting_bias(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &mut punk_domain::RepoScanSummary,
+) {
+    apply_baseline_targeting_profile(repo_root, prompt, None, scan);
+    augment_backend_service_candidates(repo_root, prompt, scan);
+    augment_mixed_service_backend_candidates(repo_root, prompt, scan);
+    prefer_backend_service_checks(repo_root, prompt, scan);
+    prefer_mixed_service_checks(repo_root, prompt, scan);
+    prune_generated_noise_candidates(prompt, scan);
+    if !prompt_prefers_backend_data(prompt) || prompt_prefers_ui(prompt) {
+        return;
+    }
+    let mut rebalanced = false;
+    rebalanced |= rebalance_candidate_paths(
+        &mut scan.candidate_file_scope_paths,
+        path_looks_backend_data,
+        path_looks_ui_surface,
+    );
+    rebalanced |= prune_demoted_candidates_if_preferred_exists(
+        &mut scan.candidate_file_scope_paths,
+        path_looks_backend_data,
+        path_looks_ui_surface,
+    );
+    rebalanced |= rebalance_candidate_paths(
+        &mut scan.candidate_entry_points,
+        path_looks_backend_data,
+        path_looks_ui_surface,
+    );
+    rebalanced |= prune_demoted_candidates_if_preferred_exists(
+        &mut scan.candidate_entry_points,
+        path_looks_backend_data,
+        path_looks_ui_surface,
+    );
+    rebalanced |= rebalance_candidate_paths(
+        &mut scan.candidate_scope_paths,
+        path_looks_backend_data,
+        path_looks_ui_surface,
+    );
+    rebalanced |= rebalance_candidate_paths(
+        &mut scan.candidate_directory_scope_paths,
+        path_looks_backend_data,
+        path_looks_ui_surface,
+    );
+    if rebalanced {
+        push_unique_string(
+            &mut scan.notes,
+            "biased candidate targeting toward backend/data surfaces because the prompt looked non-UI".to_string(),
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BaselineTargetMode {
+    Service,
+    MixedRuntime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PubpunkTargetMode {
+    ValidateParseabilityCoreAndTests,
+    ValidateCoreOnly,
+}
+
+#[derive(Default)]
+struct BaselineTargetingProfile {
+    entry_points: Vec<String>,
+    allowed_scope: Vec<String>,
+    target_checks: Vec<String>,
+    integrity_checks: Vec<String>,
+}
+
+fn apply_baseline_targeting_profile(
+    repo_root: &Path,
+    prompt: &str,
+    proposal: Option<&DraftProposal>,
+    scan: &mut punk_domain::RepoScanSummary,
+) {
+    let Some(mode) = detect_baseline_target_mode(repo_root, prompt, proposal) else {
+        return;
+    };
+    let profile = build_baseline_targeting_profile(repo_root, mode);
+    if profile.entry_points.is_empty() || profile.allowed_scope.is_empty() {
+        return;
+    }
+
+    prepend_candidate_paths(&mut scan.candidate_entry_points, &profile.entry_points, 10);
+    prepend_candidate_paths(
+        &mut scan.candidate_file_scope_paths,
+        &profile.allowed_scope,
+        20,
+    );
+    prepend_candidate_paths(&mut scan.candidate_scope_paths, &profile.allowed_scope, 20);
+    prepend_candidate_paths(
+        &mut scan.candidate_directory_scope_paths,
+        &profile.allowed_scope,
+        20,
+    );
+    if !profile.target_checks.is_empty() && !profile.integrity_checks.is_empty() {
+        scan.candidate_target_checks = profile.target_checks;
+        scan.candidate_integrity_checks = profile.integrity_checks;
+    }
+    push_unique_string(
+        &mut scan.notes,
+        "applied structured baseline targeting profile".to_string(),
+    );
+}
+
+fn detect_baseline_target_mode(
+    repo_root: &Path,
+    prompt: &str,
+    proposal: Option<&DraftProposal>,
+) -> Option<BaselineTargetMode> {
+    let has_node = repo_root.join("baseline-site/package.json").exists();
+    let has_rust = repo_root.join("crates/baseline-cli/Cargo.toml").exists();
+    if !has_node || !has_rust || prompt_prefers_ui(prompt) {
+        return None;
+    }
+    let lowered = prompt.to_ascii_lowercase();
+    let service_intent = prompt_has_service_intent(prompt)
+        || lowered.contains("report")
+        || lowered.contains("success")
+        || lowered.contains("activation");
+    if !service_intent {
+        return None;
+    }
+
+    let proposal_has_backend = proposal.is_some_and(proposal_looks_backend_service_slice);
+    let proposal_has_mixed = proposal.is_some_and(proposal_looks_mixed_service_slice);
+    let rust_signal = proposal_has_mixed
+        || ["rust", "cargo", "crate", "crates", "cli", "baseline-cli"]
+            .iter()
+            .any(|needle| lowered.contains(needle));
+
+    if rust_signal || lowered.contains("cli layer") || lowered.contains("rust cli layer") {
+        Some(BaselineTargetMode::MixedRuntime)
+    } else if proposal_has_backend
+        || lowered.contains("astro server")
+        || lowered.contains("backend")
+    {
+        Some(BaselineTargetMode::Service)
+    } else {
+        Some(BaselineTargetMode::Service)
+    }
+}
+
+fn build_baseline_targeting_profile(
+    repo_root: &Path,
+    mode: BaselineTargetMode,
+) -> BaselineTargetingProfile {
+    let mut profile = BaselineTargetingProfile::default();
+    let node_root = repo_root.join("baseline-site");
+    let rust_root = repo_root.join("crates/baseline-cli");
+
+    let mut node_entry_files =
+        collect_existing_files_under(repo_root, &node_root.join("src/pages/api"), 2);
+    node_entry_files.extend(collect_existing_files_under(
+        repo_root,
+        &node_root.join("src/lib/services"),
+        2,
+    ));
+    node_entry_files.extend(collect_existing_files_under(
+        repo_root,
+        &node_root.join("src/lib/session"),
+        2,
+    ));
+    for path in node_entry_files {
+        push_unique_string(&mut profile.entry_points, path);
+    }
+    if profile.entry_points.is_empty() && node_root.join("package.json").exists() {
+        profile
+            .entry_points
+            .push("baseline-site/package.json".to_string());
+    }
+
+    for path in [
+        "baseline-site/package.json",
+        "baseline-site/src/lib/services",
+        "baseline-site/src/lib/session",
+        "baseline-site/src/pages/api",
+    ] {
+        push_unique_string(&mut profile.allowed_scope, path.to_string());
+    }
+
+    match mode {
+        BaselineTargetMode::Service => {
+            if let Some((integrity, target)) = preferred_baseline_root_node_checks(repo_root) {
+                profile.integrity_checks = vec![integrity.clone()];
+                profile.target_checks = vec![target.unwrap_or(integrity)];
+            } else {
+                profile.integrity_checks = vec!["npm --prefix baseline-site run check".to_string()];
+                profile.target_checks =
+                    vec!["npm --prefix baseline-site run build:web".to_string()];
+            }
+        }
+        BaselineTargetMode::MixedRuntime => {
+            if rust_root.join("src/main.rs").exists() {
+                profile
+                    .entry_points
+                    .insert(0, "crates/baseline-cli/src/main.rs".to_string());
+            }
+            for path in [
+                "Cargo.toml",
+                "crates/baseline-cli",
+                "crates/baseline-cli/Cargo.toml",
+                "crates/baseline-cli/src/main.rs",
+            ] {
+                if repo_root.join(path).exists() || path == "crates/baseline-cli" {
+                    push_unique_string(&mut profile.allowed_scope, path.to_string());
+                }
+            }
+            if let Some((integrity, target)) = preferred_baseline_root_node_checks(repo_root) {
+                profile.target_checks = vec!["cargo check -p baseline-cli".to_string()];
+                if let Some(target) = target {
+                    profile.target_checks.push(target);
+                }
+                profile.integrity_checks = vec![integrity];
+            } else {
+                profile.target_checks = vec![
+                    "cargo check -p baseline-cli".to_string(),
+                    "npm --prefix baseline-site run build:web".to_string(),
+                ];
+                profile.integrity_checks = vec!["npm --prefix baseline-site run check".to_string()];
+            }
+        }
+    }
+
+    profile
+}
+
+fn preferred_baseline_root_node_checks(repo_root: &Path) -> Option<(String, Option<String>)> {
+    let root_package = repo_root.join("package.json");
+    let scripts = read_package_scripts(&root_package).ok()?;
+    if !scripts.contains_key("check") {
+        return None;
+    }
+    let integrity = "npm run check".to_string();
+    let target = if scripts.contains_key("build:web") {
+        Some("npm run build:web".to_string())
+    } else if scripts.contains_key("build") {
+        Some("npm run build".to_string())
+    } else {
+        None
+    };
+    Some((integrity, target))
+}
+
+fn collect_existing_files_under(repo_root: &Path, root: &Path, limit: usize) -> Vec<String> {
+    if !root.exists() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            if let Ok(relative) = path.strip_prefix(repo_root) {
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                push_unique_string(&mut files, relative);
+            }
+        }
+        if files.len() >= limit {
+            break;
+        }
+    }
+    files
+}
+
+fn augment_backend_service_candidates(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &mut punk_domain::RepoScanSummary,
+) {
+    if !prompt_requests_backend_service_scope(prompt, scan) {
+        return;
+    }
+    let Ok(anchors) = collect_backend_service_anchors(repo_root, false) else {
+        return;
+    };
+    if anchors.files.is_empty() && anchors.directories.is_empty() {
+        return;
+    }
+
+    let mut files = anchors.files;
+    let mut directories = anchors.directories;
+    files.sort_by_key(|path| mixed_service_file_anchor_rank(path));
+    directories.sort_by_key(|path| mixed_service_directory_anchor_rank(path));
+
+    prepend_candidate_paths(&mut scan.candidate_entry_points, &files, 10);
+    prepend_candidate_paths(&mut scan.candidate_file_scope_paths, &files, 20);
+    prepend_candidate_paths(&mut scan.candidate_scope_paths, &files, 20);
+    prepend_candidate_paths(&mut scan.candidate_directory_scope_paths, &directories, 20);
+    prepend_candidate_paths(&mut scan.candidate_scope_paths, &directories, 20);
+    push_unique_string(
+        &mut scan.notes,
+        "augmented candidate targeting with backend service anchors from the repo tree".to_string(),
+    );
+}
+
+fn augment_mixed_service_backend_candidates(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &mut punk_domain::RepoScanSummary,
+) {
+    if !prompt_requests_mixed_service_scope(prompt, scan) {
+        return;
+    }
+    let Ok(anchors) = collect_mixed_service_backend_anchors(repo_root) else {
+        return;
+    };
+    if anchors.files.is_empty() && anchors.directories.is_empty() {
+        return;
+    }
+
+    let mut files = anchors.files;
+    let mut directories = anchors.directories;
+    files.sort_by_key(|path| mixed_service_file_anchor_rank(path));
+    directories.sort_by_key(|path| mixed_service_directory_anchor_rank(path));
+
+    prepend_candidate_paths(&mut scan.candidate_entry_points, &files, 10);
+    prepend_candidate_paths(&mut scan.candidate_file_scope_paths, &files, 20);
+    prepend_candidate_paths(&mut scan.candidate_scope_paths, &files, 20);
+    prepend_candidate_paths(&mut scan.candidate_directory_scope_paths, &directories, 20);
+    prepend_candidate_paths(&mut scan.candidate_scope_paths, &directories, 20);
+    push_unique_string(
+        &mut scan.notes,
+        "augmented candidate targeting with mixed service backend anchors from the repo tree"
+            .to_string(),
+    );
+}
+
+#[derive(Default)]
+struct MixedServiceBackendAnchors {
+    files: Vec<String>,
+    directories: Vec<String>,
+}
+
+fn collect_mixed_service_backend_anchors(repo_root: &Path) -> Result<MixedServiceBackendAnchors> {
+    collect_backend_service_anchors(repo_root, true)
+}
+
+fn collect_backend_service_anchors(
+    repo_root: &Path,
+    include_rust: bool,
+) -> Result<MixedServiceBackendAnchors> {
+    let mut anchors = MixedServiceBackendAnchors::default();
+    collect_backend_service_anchors_inner(repo_root, repo_root, &mut anchors, include_rust)?;
+    Ok(anchors)
+}
+
+fn collect_backend_service_anchors_inner(
+    repo_root: &Path,
+    current: &Path,
+    anchors: &mut MixedServiceBackendAnchors,
+    include_rust: bool,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if ignored_nested_name(&name) {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(repo_root)
+            .map_err(|_| anyhow!("failed to relativize {}", path.display()))?;
+        if ignored_nested_relative_path(relative) {
+            continue;
+        }
+        if path.is_dir() {
+            let relative_str = relative.to_string_lossy().replace('\\', "/");
+            if path_looks_backend_service_directory_anchor(&relative_str)
+                || (include_rust && path_looks_rust_service_directory_anchor(&relative_str))
+            {
+                push_unique_string(&mut anchors.directories, relative_str);
+            }
+            collect_backend_service_anchors_inner(repo_root, &path, anchors, include_rust)?;
+            continue;
+        }
+
+        let relative_str = relative.to_string_lossy().replace('\\', "/");
+        if path_looks_backend_service_file_anchor(&relative_str)
+            || (include_rust && path_looks_rust_service_file_anchor(&relative_str))
+        {
+            push_unique_string(&mut anchors.files, relative_str.clone());
+        }
+        if let Some(parent) = Path::new(&relative_str).parent() {
+            let parent = parent.to_string_lossy().replace('\\', "/");
+            if !parent.is_empty()
+                && (path_looks_backend_service_directory_anchor(&parent)
+                    || (include_rust && path_looks_rust_service_directory_anchor(&parent)))
+            {
+                push_unique_string(&mut anchors.directories, parent);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prepend_candidate_paths(existing: &mut Vec<String>, preferred: &[String], limit: usize) {
+    let mut merged = preferred.to_vec();
+    for candidate in existing.drain(..) {
+        if !merged.iter().any(|existing| existing == &candidate) {
+            merged.push(candidate);
+        }
+    }
+    *existing = merged.into_iter().take(limit).collect();
+}
+
+fn prefer_mixed_service_checks(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &mut punk_domain::RepoScanSummary,
+) {
+    if !prompt_requests_mixed_service_scope(prompt, scan) {
+        return;
+    }
+
+    let mut target_checks = Vec::new();
+    let mut integrity_checks = Vec::new();
+
+    if let Some(command) = preferred_mixed_service_rust_check(repo_root, prompt, scan) {
+        push_unique_string(&mut target_checks, command);
+    }
+
+    if let Some((integrity, target)) = preferred_mixed_service_node_checks(repo_root, scan) {
+        push_unique_string(&mut integrity_checks, integrity.clone());
+        push_unique_string(&mut target_checks, target.unwrap_or(integrity));
+    }
+
+    if target_checks.is_empty() || integrity_checks.is_empty() {
+        return;
+    }
+
+    scan.candidate_target_checks = target_checks;
+    scan.candidate_integrity_checks = integrity_checks;
+    push_unique_string(
+        &mut scan.notes,
+        "preferred mixed service checks for combined Node and Rust service work".to_string(),
+    );
+}
+
+fn prefer_backend_service_checks(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &mut punk_domain::RepoScanSummary,
+) {
+    if !prompt_requests_backend_service_scope(prompt, scan)
+        || prompt_requests_mixed_service_scope(prompt, scan)
+    {
+        return;
+    }
+
+    let Some((integrity, target)) = preferred_mixed_service_node_checks(repo_root, scan) else {
+        return;
+    };
+
+    scan.candidate_integrity_checks = vec![integrity.clone()];
+    scan.candidate_target_checks = vec![target.unwrap_or(integrity)];
+    push_unique_string(
+        &mut scan.notes,
+        "preferred backend service checks for nested Node service work".to_string(),
+    );
+}
+
+fn preferred_mixed_service_rust_check(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+) -> Option<String> {
+    let prompt_tokens = prompt_tokens(prompt);
+    let mut manifests = scan
+        .candidate_file_scope_paths
+        .iter()
+        .filter(|path| path.ends_with("Cargo.toml") && path.contains("crates/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    manifests.sort_by_key(|path| mixed_service_rust_manifest_rank(path, &prompt_tokens));
+    for manifest in manifests {
+        let manifest_path = repo_root.join(&manifest);
+        let parent = manifest_path.parent()?;
+        if !parent.join("src/main.rs").exists() {
+            continue;
+        }
+        let Some(package_name) = cargo_package_name_from_manifest(&manifest_path) else {
+            continue;
+        };
+        return Some(format!("cargo check -p {package_name}"));
+    }
+    None
+}
+
+fn mixed_service_rust_manifest_rank(path: &str, prompt_tokens: &[String]) -> u8 {
+    let lowered = path.to_ascii_lowercase();
+    if lowered.contains("baseline-cli") || lowered.contains("/cli/") {
+        return 0;
+    }
+    if prompt_tokens
+        .iter()
+        .any(|token| lowered.contains(token.as_str()))
+    {
+        return 1;
+    }
+    2
+}
+
+fn cargo_package_name_from_manifest(manifest_path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(manifest_path).ok()?;
+    let mut in_package = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if !in_package || !trimmed.starts_with("name") {
+            continue;
+        }
+        let (_, value) = trimmed.split_once('=')?;
+        let package_name = value.trim().trim_matches('"');
+        if !package_name.is_empty() {
+            return Some(package_name.to_string());
+        }
+    }
+    None
+}
+
+fn preferred_mixed_service_node_checks(
+    repo_root: &Path,
+    scan: &punk_domain::RepoScanSummary,
+) -> Option<(String, Option<String>)> {
+    let package_json = scan
+        .candidate_file_scope_paths
+        .iter()
+        .find(|path| path.ends_with("package.json") && path.contains('/'))
+        .or_else(|| {
+            scan.candidate_file_scope_paths
+                .iter()
+                .find(|path| path.ends_with("package.json"))
+        })?
+        .clone();
+    let package_dir = Path::new(&package_json).parent()?.to_path_buf();
+    let scripts = read_package_scripts(&repo_root.join(&package_json)).ok()?;
+    if !scripts.contains_key("check") {
+        return None;
+    }
+    let package_manager = detect_nested_package_manager(&repo_root.join(&package_dir));
+    let integrity = nested_package_manager_run(package_manager.as_deref(), &package_dir, "check");
+    let target = if scripts.contains_key("build:web") {
+        Some(nested_package_manager_run(
+            package_manager.as_deref(),
+            &package_dir,
+            "build:web",
+        ))
+    } else if scripts.contains_key("build") {
+        Some(nested_package_manager_run(
+            package_manager.as_deref(),
+            &package_dir,
+            "build",
+        ))
+    } else {
+        None
+    };
+    Some((integrity, target))
+}
+
+fn prune_generated_noise_candidates(prompt: &str, scan: &mut punk_domain::RepoScanSummary) {
+    if prompt_mentions_generated_surface(prompt) {
+        return;
+    }
+    let mut pruned = false;
+    pruned |= retain_non_generated_noise(&mut scan.candidate_file_scope_paths);
+    pruned |= retain_non_generated_noise(&mut scan.candidate_entry_points);
+    pruned |= retain_non_generated_noise(&mut scan.candidate_scope_paths);
+    pruned |= retain_non_generated_noise(&mut scan.candidate_directory_scope_paths);
+    if pruned {
+        push_unique_string(
+            &mut scan.notes,
+            "pruned generated/output surfaces like dist and packs from candidate targeting"
+                .to_string(),
+        );
+    }
+}
+
+fn retain_non_generated_noise(paths: &mut Vec<String>) -> bool {
+    let before_len = paths.len();
+    paths.retain(|path| !path_is_generated_noise(path));
+    before_len != paths.len()
+}
+
+fn rebalance_candidate_paths(
+    paths: &mut Vec<String>,
+    prefer: fn(&str) -> bool,
+    demote: fn(&str) -> bool,
+) -> bool {
+    if !paths.iter().any(|path| prefer(path)) {
+        return false;
+    }
+    let original = paths.clone();
+    let mut preferred = Vec::new();
+    let mut neutral = Vec::new();
+    let mut demoted = Vec::new();
+    for path in original.iter() {
+        if prefer(path) {
+            preferred.push(path.clone());
+        } else if demote(path) {
+            demoted.push(path.clone());
+        } else {
+            neutral.push(path.clone());
+        }
+    }
+    let mut reordered = Vec::with_capacity(original.len());
+    reordered.extend(preferred);
+    reordered.extend(neutral);
+    reordered.extend(demoted);
+    if reordered == original {
+        return false;
+    }
+    *paths = reordered;
+    true
+}
+
+fn prune_demoted_candidates_if_preferred_exists(
+    paths: &mut Vec<String>,
+    prefer: fn(&str) -> bool,
+    demote: fn(&str) -> bool,
+) -> bool {
+    if !paths.iter().any(|path| prefer(path)) {
+        return false;
+    }
+    let before_len = paths.len();
+    paths.retain(|path| !demote(path) || prefer(path));
+    before_len != paths.len()
+}
+
+fn prompt_tokens(prompt: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    for token in prompt
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| token.len() >= 3)
+    {
+        seen.insert(token);
+    }
+    seen.into_iter().collect()
+}
+
+fn prompt_prefers_backend_data(prompt: &str) -> bool {
+    let lowered = prompt_intent_lower(prompt);
+    [
+        " db",
+        "db ",
+        "database",
+        "schema",
+        "migration",
+        "session",
+        "seed",
+        "service",
+        "services",
+        "dispatch",
+        "profile",
+        "profiles",
+        "track",
+        "tracks",
+        "enrollment",
+        "enrollments",
+        "support",
+        "backend",
+        "server",
+        "runtime",
+        "token",
+        "activation",
+        "cli",
+        "store",
+        "repo",
+        "model",
+        "models",
+        "api",
+        "enroll",
+        "handshake",
+    ]
+    .iter()
+    .any(|token| lowered.contains(token))
+}
+
+fn prompt_prefers_ui(prompt: &str) -> bool {
+    let lowered = prompt_intent_lower(prompt);
+    [
+        " ui",
+        "frontend",
+        "front-end",
+        "header",
+        "footer",
+        "layout",
+        "layouts",
+        "page",
+        "pages",
+        "component",
+        "components",
+        ".astro",
+        "tailwind",
+        "css",
+        "landing",
+    ]
+    .iter()
+    .any(|token| lowered.contains(token))
+}
+
+fn prompt_mentions_generated_surface(prompt: &str) -> bool {
+    let lowered = prompt_intent_lower(prompt);
+    lowered.contains("dist")
+        || lowered.contains("pack")
+        || lowered.contains("bundle")
+        || lowered.contains(".astro")
+}
+
+fn path_is_generated_noise(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered == "dist"
+        || lowered == "packs"
+        || lowered == ".astro"
+        || lowered.starts_with("dist/")
+        || lowered.starts_with("packs/")
+        || lowered.starts_with(".astro/")
+        || lowered.contains("/dist/")
+        || lowered.contains("/packs/")
+        || lowered.contains("/.astro/")
+}
+
+fn path_looks_ui_surface(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    if lowered.contains("/pages/api/") {
+        return false;
+    }
+    lowered.ends_with(".astro")
+        || lowered.contains("astro.config")
+        || lowered.ends_with(".css")
+        || lowered.ends_with(".scss")
+        || lowered.ends_with(".sass")
+        || lowered.contains("/components/")
+        || lowered.contains("/layouts/")
+        || lowered.contains("/pages/")
+        || lowered.contains("/styles/")
+        || lowered.contains("/public/")
+        || lowered.contains("header")
+        || lowered.contains("footer")
+}
+
+fn path_looks_backend_data(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    if path_looks_ui_surface(path) {
+        return false;
+    }
+    lowered.ends_with("package.json")
+        || lowered.contains("drizzle.config")
+        || lowered.ends_with(".sql")
+        || lowered.contains("/db/")
+        || lowered.contains("/lib/services/")
+        || lowered.contains("/lib/session/")
+        || lowered.contains("/lib/db/")
+        || lowered.contains("/database/")
+        || lowered.contains("/lib/persistence/")
+        || lowered.contains("/actions/")
+        || lowered.contains("/pages/api/")
+        || lowered.contains("schema")
+        || lowered.contains("migration")
+        || lowered.contains("session")
+        || lowered.contains("seed")
+        || lowered.contains("service")
+        || lowered.contains("dispatch")
+        || lowered.contains("profile")
+        || lowered.contains("track")
+        || lowered.contains("enrollment")
+        || lowered.contains("support")
+        || lowered.contains("/server/")
+        || lowered.contains("/api/")
+        || lowered.contains("/store/")
+        || lowered.contains("/repo/")
+        || lowered.contains("/model")
+        || lowered.contains("/data/")
+}
+
+fn contract_implies_generated_cargo_lock(contract: &Contract) -> bool {
+    !contract
+        .allowed_scope
+        .iter()
+        .any(|path| path == "Cargo.lock")
+        && contract
+            .target_checks
+            .iter()
+            .chain(contract.integrity_checks.iter())
+            .any(|command| command.trim_start().starts_with("cargo "))
+}
+
+fn already_satisfied_before_dispatch_summary(
+    entry_points: &[String],
+    original_summary: &str,
+) -> String {
+    let original_summary = original_summary.trim();
+    if original_summary.is_empty() {
+        format!(
+            "already satisfied in allowed scope before bounded dispatch: {}",
+            entry_points.join(", ")
+        )
+    } else {
+        format!(
+            "already satisfied in allowed scope before bounded dispatch: {} (original executor summary: {})",
+            entry_points.join(", "),
+            original_summary
+        )
+    }
+}
+
+fn should_reject_empty_successful_bounded_run(
+    contract: &Contract,
+    status: &str,
+    summary: &str,
+    changed_files: &[String],
+) -> bool {
+    status == "success"
+        && changed_files.is_empty()
+        && contract_has_non_manifest_entry_points(contract)
+        && !summary
+            .trim()
+            .starts_with("already satisfied in allowed scope before bounded dispatch")
+}
+
+fn contract_has_non_manifest_entry_points(contract: &Contract) -> bool {
+    contract
+        .entry_points
+        .iter()
+        .any(|entry_point| is_non_manifest_entry_point(entry_point))
+}
+
+fn is_non_manifest_entry_point(path: &str) -> bool {
+    if !is_file_like_contract_path(path) {
+        return false;
+    }
+    !matches!(
+        path,
+        "Cargo.toml" | "Cargo.lock" | "README.md" | "rust-toolchain.toml"
+    )
+}
+
+fn empty_successful_bounded_run_summary(entry_points: &[String], original_summary: &str) -> String {
+    let scope = if entry_points.is_empty() {
+        "approved entry points".to_string()
+    } else {
+        entry_points.join(", ")
+    };
+    let trimmed = original_summary.trim();
+    if trimmed.is_empty() {
+        format!(
+            "no implementation progress after bounded success report in {}: executor reported success without observable repo changes",
+            scope
+        )
+    } else {
+        format!(
+            "no implementation progress after bounded success report in {}: executor reported success without observable repo changes (original executor summary: {})",
+            scope, trimmed
+        )
+    }
+}
+
 fn summarize_prompt(prompt: &str) -> String {
     let trimmed = prompt.trim();
     trimmed.chars().take(60).collect()
+}
+
+fn is_drafter_timeout_error(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("timed out after")
+}
+
+fn recover_timeout_draft_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+) -> Result<DraftProposal> {
+    finalize_timeout_fallback_proposal(
+        repo_root,
+        prompt,
+        None,
+        timeout_seed_proposal(repo_root, prompt, scan),
+        scan,
+    )
+}
+
+fn recover_timeout_refine_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    guidance: &str,
+    current: DraftProposal,
+    scan: &punk_domain::RepoScanSummary,
+) -> Result<DraftProposal> {
+    finalize_timeout_fallback_proposal(repo_root, prompt, Some(guidance), current, scan)
+}
+
+fn finalize_timeout_fallback_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    guidance: Option<&str>,
+    mut proposal: DraftProposal,
+    scan: &punk_domain::RepoScanSummary,
+) -> Result<DraftProposal> {
+    canonicalize_draft_proposal(repo_root, prompt, &mut proposal);
+    if let Some(guidance) = guidance {
+        apply_explicit_prompt_overrides(repo_root, guidance, &mut proposal);
+    }
+    normalize_proposal_scope(repo_root, prompt, scan, &mut proposal);
+    let mut errors = validate_draft_proposal(repo_root, &proposal);
+    if errors.is_empty() {
+        return Ok(proposal);
+    }
+
+    if let Some(mut fallback) =
+        build_bounded_fallback_proposal(repo_root, prompt, &proposal, scan, &errors)
+    {
+        canonicalize_draft_proposal(repo_root, prompt, &mut fallback);
+        if let Some(guidance) = guidance {
+            apply_explicit_prompt_overrides(repo_root, guidance, &mut fallback);
+        }
+        normalize_proposal_scope(repo_root, prompt, scan, &mut fallback);
+        errors = validate_draft_proposal(repo_root, &fallback);
+        if errors.is_empty() {
+            return Ok(fallback);
+        }
+    }
+
+    Err(anyhow!(
+        "timed-out drafter proposal could not be recovered: {}",
+        format_validation_guidance(&errors)
+    ))
+}
+
+fn preserve_greenfield_scaffold_scope(
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+    proposal: &mut DraftProposal,
+) {
+    if prompt_declares_explicit_touch_set(prompt) {
+        return;
+    }
+    let Some((entry_points, allowed_scope)) = timeout_greenfield_scaffold_scope(prompt, scan)
+    else {
+        return;
+    };
+
+    for entry_point in entry_points {
+        if !proposal
+            .entry_points
+            .iter()
+            .any(|existing| existing == &entry_point)
+        {
+            proposal.entry_points.push(entry_point);
+        }
+    }
+
+    for scope_path in allowed_scope {
+        if !proposal
+            .allowed_scope
+            .iter()
+            .any(|existing| existing == &scope_path)
+        {
+            proposal.allowed_scope.push(scope_path);
+        }
+    }
+}
+
+fn normalize_proposal_scope(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+    proposal: &mut DraftProposal,
+) {
+    apply_baseline_profile_to_proposal(repo_root, prompt, proposal);
+    apply_pubpunk_targeting_profile_to_proposal(repo_root, prompt, proposal);
+    preserve_greenfield_scaffold_scope(prompt, scan, proposal);
+    preserve_backend_service_scope(prompt, scan, proposal);
+    preserve_mixed_service_scope(prompt, scan, proposal);
+    preserve_service_checks(prompt, scan, proposal);
+    apply_prompt_exclusion_pruning(prompt, proposal);
+    finalize_baseline_profile(repo_root, prompt, proposal);
+    let positive_prompt = prompt_positive_intent_text(prompt);
+    apply_explicit_prompt_overrides(repo_root, &positive_prompt, proposal);
+    ensure_proposal_scope_covers_entry_points(proposal);
+}
+
+fn apply_baseline_profile_to_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    proposal: &mut DraftProposal,
+) {
+    let Some(mode) = detect_baseline_target_mode(repo_root, prompt, Some(proposal)) else {
+        return;
+    };
+    let profile = build_baseline_targeting_profile(repo_root, mode);
+    if profile.entry_points.is_empty() || profile.allowed_scope.is_empty() {
+        return;
+    }
+
+    proposal
+        .entry_points
+        .retain(|path| !path_looks_ui_surface(path));
+    proposal
+        .allowed_scope
+        .retain(|path| !path_looks_ui_surface(path));
+
+    match mode {
+        BaselineTargetMode::Service => {
+            proposal
+                .entry_points
+                .retain(|path| !path_looks_rust_service_file_anchor(path));
+            proposal.allowed_scope.retain(|path| {
+                !path_looks_rust_service_file_anchor(path)
+                    && !path_looks_rust_service_directory_anchor(path)
+            });
+        }
+        BaselineTargetMode::MixedRuntime => {}
+    }
+
+    for path in profile.entry_points {
+        push_unique_string(&mut proposal.entry_points, path);
+    }
+    for path in profile.allowed_scope {
+        push_unique_string(&mut proposal.allowed_scope, path);
+    }
+    if !prompt_declares_explicit_check_set(prompt) {
+        proposal.target_checks = profile.target_checks;
+        proposal.integrity_checks = profile.integrity_checks;
+    }
+}
+
+fn finalize_baseline_profile(repo_root: &Path, prompt: &str, proposal: &mut DraftProposal) {
+    let Some(mode) = detect_baseline_target_mode(repo_root, prompt, Some(proposal)) else {
+        return;
+    };
+    proposal.entry_points.retain(|path| path != "package.json");
+    proposal.allowed_scope.retain(|path| path != "package.json");
+
+    if prompt_declares_explicit_check_set(prompt) {
+        return;
+    }
+
+    let profile = build_baseline_targeting_profile(repo_root, mode);
+    if !profile.integrity_checks.is_empty() {
+        proposal.integrity_checks = profile.integrity_checks;
+    }
+    if !profile.target_checks.is_empty() {
+        proposal.target_checks = profile.target_checks;
+    }
+}
+
+fn detect_pubpunk_target_mode(
+    repo_root: &Path,
+    prompt: &str,
+    proposal: Option<&DraftProposal>,
+) -> Option<PubpunkTargetMode> {
+    let has_core = repo_root.join("crates/pubpunk-core/src/lib.rs").exists();
+    let has_cli = repo_root.join("crates/pubpunk-cli/src/main.rs").exists();
+    if !has_core || !has_cli {
+        return None;
+    }
+
+    let lowered = prompt_intent_lower(prompt);
+    if !lowered.contains("pubpunk") || !lowered.contains("validate") {
+        return None;
+    }
+    if lowered.contains("scaffold") || lowered.contains("bootstrap") {
+        return None;
+    }
+    if lowered.contains(" init ")
+        || lowered.starts_with("init ")
+        || lowered.contains("init command")
+    {
+        return None;
+    }
+
+    let core_only_prompt = lowered.contains("core-only")
+        || lowered.contains("edit only crates/pubpunk-core/src/lib.rs")
+        || lowered.contains("crates/pubpunk-core/src/lib.rs");
+
+    let parseability_prompt = (lowered.contains("parse-check")
+        || lowered.contains("parseability")
+        || lowered.contains("style.toml")
+        || lowered.contains("targets, .pubpunk/review, and .pubpunk/lint")
+        || lowered.contains(".pubpunk/targets")
+        || lowered.contains(".pubpunk/review")
+        || lowered.contains(".pubpunk/lint"))
+        && (lowered.contains("tests/validate_json.rs")
+            || lowered.contains("add tests")
+            || lowered.contains("target .toml file"));
+    let parseability_proposal = proposal.is_some_and(|proposal| {
+        proposal
+            .entry_points
+            .iter()
+            .chain(proposal.allowed_scope.iter())
+            .any(|path| path == "tests/validate_json.rs" || path == "tests")
+            || proposal.expected_interfaces.iter().any(|line| {
+                let lowered = line.to_ascii_lowercase();
+                lowered.contains("style.toml")
+                    || lowered.contains("target .toml")
+                    || lowered.contains("validate_json")
+            })
+            || proposal.behavior_requirements.iter().any(|line| {
+                let lowered = line.to_ascii_lowercase();
+                lowered.contains("style.toml")
+                    || lowered.contains("target .toml")
+                    || lowered.contains("tests/validate_json.rs")
+            })
+    });
+
+    if core_only_prompt && !parseability_prompt {
+        return Some(PubpunkTargetMode::ValidateCoreOnly);
+    }
+
+    if parseability_prompt || parseability_proposal {
+        return Some(PubpunkTargetMode::ValidateParseabilityCoreAndTests);
+    }
+
+    let core_only_proposal = proposal.is_some_and(|proposal| {
+        proposal
+            .entry_points
+            .iter()
+            .chain(proposal.import_paths.iter())
+            .any(|path| path == "crates/pubpunk-core/src/lib.rs")
+    });
+
+    if core_only_prompt || core_only_proposal {
+        Some(PubpunkTargetMode::ValidateCoreOnly)
+    } else {
+        None
+    }
+}
+
+fn apply_pubpunk_targeting_profile_to_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    proposal: &mut DraftProposal,
+) {
+    let Some(mode) = detect_pubpunk_target_mode(repo_root, prompt, Some(proposal)) else {
+        return;
+    };
+    match mode {
+        PubpunkTargetMode::ValidateParseabilityCoreAndTests => {
+            proposal.entry_points = vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string(),
+            ];
+            proposal.allowed_scope = vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string(),
+            ];
+            proposal.import_paths.retain(|path| {
+                path == "crates/pubpunk-core/src/lib.rs" || path == "tests/validate_json.rs"
+            });
+            if !proposal
+                .import_paths
+                .iter()
+                .any(|path| path == "crates/pubpunk-core/src/lib.rs")
+            {
+                proposal
+                    .import_paths
+                    .insert(0, "crates/pubpunk-core/src/lib.rs".to_string());
+            }
+            proposal
+                .expected_interfaces
+                .retain(|item| !pubpunk_validate_line_looks_init_noise(item));
+            proposal
+                .behavior_requirements
+                .retain(|item| !pubpunk_validate_line_looks_init_noise(item));
+            if proposal.expected_interfaces.is_empty() {
+                proposal.expected_interfaces = vec![
+                    "validate_report keeps the structured JSON envelope unchanged.".to_string(),
+                    "Validate parseability checks surface explicit issues for unreadable or unparseable style/targets/review/lint TOML without widening scope into CLI or init flows.".to_string(),
+                ];
+            }
+            if proposal.behavior_requirements.is_empty() {
+                proposal.behavior_requirements =
+                    vec![summarize_prompt(&prompt_positive_intent_text(prompt))];
+            }
+            if !prompt_declares_explicit_check_set(prompt) {
+                proposal.target_checks = vec!["cargo test --workspace".to_string()];
+                proposal.integrity_checks = vec!["cargo test --workspace".to_string()];
+            }
+        }
+        PubpunkTargetMode::ValidateCoreOnly => {
+            proposal.entry_points = vec!["crates/pubpunk-core/src/lib.rs".to_string()];
+            proposal.allowed_scope = vec!["crates/pubpunk-core/src/lib.rs".to_string()];
+            proposal
+                .import_paths
+                .retain(|path| path == "crates/pubpunk-core/src/lib.rs");
+            proposal
+                .expected_interfaces
+                .retain(|item| !pubpunk_validate_line_looks_init_noise(item));
+            proposal
+                .behavior_requirements
+                .retain(|item| !pubpunk_validate_line_looks_init_noise(item));
+            if proposal.expected_interfaces.is_empty() {
+                proposal.expected_interfaces = vec![
+                    "validate_report keeps the structured JSON envelope unchanged.".to_string(),
+                    "Validate-only parseability checks surface explicit issues from crates/pubpunk-core/src/lib.rs without widening scope into CLI or init flows.".to_string(),
+                ];
+            }
+            if proposal.behavior_requirements.is_empty() {
+                proposal.behavior_requirements =
+                    vec![summarize_prompt(&prompt_positive_intent_text(prompt))];
+            }
+            if !prompt_declares_explicit_check_set(prompt) {
+                proposal.target_checks = vec!["cargo test -p pubpunk-core".to_string()];
+                proposal.integrity_checks = vec!["cargo test --workspace".to_string()];
+            }
+        }
+    }
+}
+
+fn timeout_pubpunk_validate_seed_proposal(repo_root: &Path, prompt: &str) -> Option<DraftProposal> {
+    let mode = detect_pubpunk_target_mode(repo_root, prompt, None)?;
+    match mode {
+        PubpunkTargetMode::ValidateParseabilityCoreAndTests => Some(DraftProposal {
+            title: summarize_prompt(prompt),
+            summary: summarize_prompt(prompt),
+            entry_points: vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string(),
+            ],
+            import_paths: vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string(),
+            ],
+            expected_interfaces: vec![
+                "validate_report keeps the structured JSON envelope unchanged.".to_string(),
+                "Validate parseability checks surface explicit issues for unreadable or unparseable style/targets/review/lint TOML without widening scope into CLI or init flows.".to_string(),
+            ],
+            behavior_requirements: vec![summarize_prompt(&prompt_positive_intent_text(prompt))],
+            allowed_scope: vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string(),
+            ],
+            target_checks: vec!["cargo test --workspace".to_string()],
+            integrity_checks: vec!["cargo test --workspace".to_string()],
+            risk_level: "medium".to_string(),
+        }),
+        PubpunkTargetMode::ValidateCoreOnly => Some(DraftProposal {
+            title: summarize_prompt(prompt),
+            summary: summarize_prompt(prompt),
+            entry_points: vec!["crates/pubpunk-core/src/lib.rs".to_string()],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".to_string()],
+            expected_interfaces: vec![
+                "validate_report keeps the structured JSON envelope unchanged.".to_string(),
+                "Validate-only parseability checks surface explicit issues from crates/pubpunk-core/src/lib.rs without widening scope into CLI or init flows.".to_string(),
+            ],
+            behavior_requirements: vec![summarize_prompt(&prompt_positive_intent_text(prompt))],
+            allowed_scope: vec!["crates/pubpunk-core/src/lib.rs".to_string()],
+            target_checks: vec!["cargo test -p pubpunk-core".to_string()],
+            integrity_checks: vec!["cargo test --workspace".to_string()],
+            risk_level: "medium".to_string(),
+        }),
+    }
+}
+
+fn pubpunk_validate_line_looks_init_noise(line: &str) -> bool {
+    let lowered = line.to_ascii_lowercase();
+    lowered.contains("init")
+        || lowered.contains("scaffold")
+        || lowered.contains("bootstrap")
+        || lowered.contains("starter files")
+        || lowered.contains("cargo.toml")
+        || lowered.contains("crates/pubpunk-cli")
+        || lowered.contains("tests cover the init command behavior")
+}
+
+fn preserve_backend_service_scope(
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+    proposal: &mut DraftProposal,
+) {
+    let looks_mixed = prompt_requests_mixed_service_scope(prompt, scan)
+        || proposal_looks_mixed_service_slice(proposal);
+    let wants_backend = prompt_requests_backend_service_scope(prompt, scan)
+        || proposal_looks_backend_service_slice(proposal);
+    if prompt_declares_explicit_touch_set(prompt) || !wants_backend || looks_mixed {
+        return;
+    }
+
+    let preferred_entry_files = collect_service_scope_files(
+        &scan.candidate_entry_points,
+        &proposal.import_paths,
+        path_looks_backend_service_file_anchor,
+    );
+    let preferred_scope_files = collect_service_scope_files(
+        &scan.candidate_file_scope_paths,
+        &proposal.import_paths,
+        path_looks_backend_service_file_anchor,
+    );
+    let preferred_scope_dirs = collect_service_scope_dirs(
+        &scan.candidate_directory_scope_paths,
+        &proposal.import_paths,
+        path_looks_backend_service_directory_anchor,
+    );
+    let synthesized_scope_dirs = conventional_backend_service_dirs(scan);
+
+    if preferred_entry_files.is_empty()
+        && preferred_scope_files.is_empty()
+        && preferred_scope_dirs.is_empty()
+        && synthesized_scope_dirs.is_empty()
+    {
+        return;
+    }
+
+    proposal
+        .entry_points
+        .retain(|path| !path_looks_ui_surface(path) && !path_looks_rust_service_file_anchor(path));
+    proposal.allowed_scope.retain(|path| {
+        !path_looks_ui_surface(path)
+            && !path_looks_rust_service_file_anchor(path)
+            && !path_looks_rust_service_directory_anchor(path)
+    });
+
+    for path in preferred_entry_files.into_iter().take(3) {
+        push_unique_string(&mut proposal.entry_points, path);
+    }
+    for path in preferred_scope_files.into_iter().take(8) {
+        push_unique_string(&mut proposal.allowed_scope, path);
+    }
+    for path in preferred_scope_dirs.into_iter().take(4) {
+        push_unique_string(&mut proposal.allowed_scope, path);
+    }
+    for path in synthesized_scope_dirs.into_iter().take(4) {
+        push_unique_string(&mut proposal.allowed_scope, path);
+    }
+}
+
+fn preserve_mixed_service_scope(
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+    proposal: &mut DraftProposal,
+) {
+    let wants_mixed = prompt_requests_mixed_service_scope(prompt, scan)
+        || proposal_looks_mixed_service_slice(proposal);
+    if prompt_declares_explicit_touch_set(prompt) || !wants_mixed {
+        return;
+    }
+
+    let mut preferred_entry_files = collect_service_scope_files(
+        &scan.candidate_entry_points,
+        &proposal.import_paths,
+        path_looks_mixed_service_file_anchor,
+    );
+    let mut preferred_files = collect_service_scope_files(
+        &scan.candidate_file_scope_paths,
+        &proposal.import_paths,
+        path_looks_mixed_service_file_anchor,
+    );
+    let mut preferred_dirs = collect_service_scope_dirs(
+        &scan.candidate_directory_scope_paths,
+        &proposal.import_paths,
+        path_looks_mixed_service_directory_anchor,
+    );
+    let synthesized_scope_dirs = conventional_mixed_service_dirs(scan);
+
+    if preferred_entry_files.is_empty()
+        && preferred_files.is_empty()
+        && preferred_dirs.is_empty()
+        && synthesized_scope_dirs.is_empty()
+    {
+        return;
+    }
+
+    proposal
+        .entry_points
+        .retain(|path| !path_looks_ui_surface(path));
+    proposal
+        .allowed_scope
+        .retain(|path| !path_looks_ui_surface(path));
+
+    preferred_entry_files.sort_by_key(|path| mixed_service_file_anchor_rank(path));
+    preferred_files.sort_by_key(|path| mixed_service_file_anchor_rank(path));
+    preferred_dirs.sort_by_key(|path| mixed_service_directory_anchor_rank(path));
+
+    for path in preferred_entry_files.into_iter().take(4) {
+        if !proposal
+            .entry_points
+            .iter()
+            .any(|existing| existing == &path)
+        {
+            proposal.entry_points.push(path);
+        }
+    }
+
+    for path in preferred_files.into_iter().take(8) {
+        if !proposal
+            .allowed_scope
+            .iter()
+            .any(|existing| existing == &path)
+        {
+            proposal.allowed_scope.push(path);
+        }
+    }
+
+    for path in preferred_dirs.into_iter().take(4) {
+        if !proposal
+            .allowed_scope
+            .iter()
+            .any(|existing| existing == &path)
+        {
+            proposal.allowed_scope.push(path);
+        }
+    }
+    for path in synthesized_scope_dirs.into_iter().take(4) {
+        if !proposal
+            .allowed_scope
+            .iter()
+            .any(|existing| existing == &path)
+        {
+            proposal.allowed_scope.push(path);
+        }
+    }
+}
+
+fn collect_service_scope_files(
+    scan_paths: &[String],
+    import_paths: &[String],
+    predicate: fn(&str) -> bool,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    for path in scan_paths {
+        if predicate(path) {
+            push_unique_string(&mut files, path.clone());
+        }
+    }
+    for path in import_paths {
+        if predicate(path) {
+            push_unique_string(&mut files, path.clone());
+        }
+    }
+    files
+}
+
+fn collect_service_scope_dirs(
+    scan_paths: &[String],
+    import_paths: &[String],
+    predicate: fn(&str) -> bool,
+) -> Vec<String> {
+    let mut directories = Vec::new();
+    for path in scan_paths {
+        if predicate(path) {
+            push_unique_string(&mut directories, path.clone());
+        }
+    }
+    for path in import_paths {
+        let Some(parent) = Path::new(path).parent() else {
+            continue;
+        };
+        let parent = parent.to_string_lossy().replace('\\', "/");
+        if !parent.is_empty() && predicate(&parent) {
+            push_unique_string(&mut directories, parent);
+        }
+    }
+    directories
+}
+
+fn conventional_backend_service_dirs(scan: &punk_domain::RepoScanSummary) -> Vec<String> {
+    let mut directories = Vec::new();
+    for package_json in scan
+        .candidate_file_scope_paths
+        .iter()
+        .filter(|path| path.ends_with("package.json") && path.contains('/'))
+    {
+        let Some(root) = Path::new(package_json).parent() else {
+            continue;
+        };
+        for suffix in ["src/lib/services", "src/lib/session", "src/pages/api"] {
+            let path = root.join(suffix).to_string_lossy().replace('\\', "/");
+            push_unique_string(&mut directories, path);
+        }
+    }
+    directories
+}
+
+fn conventional_mixed_service_dirs(scan: &punk_domain::RepoScanSummary) -> Vec<String> {
+    let mut directories = conventional_backend_service_dirs(scan);
+    for path in scan
+        .candidate_directory_scope_paths
+        .iter()
+        .filter(|path| path_looks_rust_service_directory_anchor(path))
+    {
+        push_unique_string(&mut directories, path.clone());
+    }
+    directories
+}
+
+fn proposal_looks_backend_service_slice(proposal: &DraftProposal) -> bool {
+    proposal
+        .import_paths
+        .iter()
+        .any(|path| path_looks_backend_service_file_anchor(path))
+        || proposal
+            .allowed_scope
+            .iter()
+            .any(|path| path_looks_backend_service_directory_anchor(path))
+}
+
+fn proposal_looks_mixed_service_slice(proposal: &DraftProposal) -> bool {
+    let has_backend = proposal
+        .import_paths
+        .iter()
+        .any(|path| path_looks_backend_service_file_anchor(path))
+        || proposal
+            .allowed_scope
+            .iter()
+            .any(|path| path_looks_backend_service_directory_anchor(path));
+    let has_rust = proposal
+        .entry_points
+        .iter()
+        .chain(proposal.allowed_scope.iter())
+        .any(|path| {
+            path_looks_rust_service_file_anchor(path)
+                || path_looks_rust_service_directory_anchor(path)
+        });
+    has_backend && has_rust
+}
+
+fn preserve_service_checks(
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+    proposal: &mut DraftProposal,
+) {
+    if prompt_declares_explicit_check_set(prompt) {
+        return;
+    }
+
+    if prompt_requests_mixed_service_scope(prompt, scan)
+        && candidate_checks_look_mixed_service(scan)
+    {
+        proposal.target_checks = scan.candidate_target_checks.clone();
+        proposal.integrity_checks = scan.candidate_integrity_checks.clone();
+        return;
+    }
+
+    if prompt_requests_backend_service_scope(prompt, scan)
+        && !prompt_requests_mixed_service_scope(prompt, scan)
+        && candidate_checks_look_backend_service(scan)
+    {
+        proposal.target_checks = scan.candidate_target_checks.clone();
+        proposal.integrity_checks = scan.candidate_integrity_checks.clone();
+    }
+}
+
+fn prompt_declares_explicit_check_set(prompt: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    lowered.contains("target_checks")
+        || lowered.contains("integrity_checks")
+        || lowered.contains("target checks")
+        || lowered.contains("integrity checks")
+        || lowered.contains("exactly one command")
+}
+
+fn candidate_checks_look_backend_service(scan: &punk_domain::RepoScanSummary) -> bool {
+    !scan.candidate_integrity_checks.is_empty()
+        && scan.candidate_integrity_checks.iter().all(|check| {
+            check.contains("npm ") || check.contains("pnpm ") || check.contains("yarn ")
+        })
+}
+
+fn candidate_checks_look_mixed_service(scan: &punk_domain::RepoScanSummary) -> bool {
+    candidate_checks_look_backend_service(scan)
+        && scan
+            .candidate_target_checks
+            .iter()
+            .any(|check| check.starts_with("cargo check -p "))
+}
+
+fn prompt_requests_mixed_service_scope(prompt: &str, scan: &punk_domain::RepoScanSummary) -> bool {
+    if !prompt_prefers_backend_data(prompt) || prompt_prefers_ui(prompt) {
+        return false;
+    }
+    if !prompt_has_service_intent(prompt) {
+        return false;
+    }
+
+    let lowered = prompt.to_ascii_lowercase();
+    let mentions_rust = ["rust", "cargo", "crate", "crates", "cli"]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+        || (lowered.contains("cli layer") && scan_has_rust_service_surface(scan));
+    let mentions_node = [
+        "node",
+        "npm",
+        "package.json",
+        "astro",
+        "typescript",
+        "ts",
+        "server layer",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+        || (lowered.contains("server") && scan_has_node_service_surface(scan));
+
+    mentions_rust && mentions_node
+}
+
+fn prompt_requests_backend_service_scope(
+    prompt: &str,
+    _scan: &punk_domain::RepoScanSummary,
+) -> bool {
+    prompt_prefers_backend_data(prompt)
+        && !prompt_prefers_ui(prompt)
+        && prompt_has_service_intent(prompt)
+}
+
+fn prompt_has_service_intent(prompt: &str) -> bool {
+    let lowered = prompt_intent_lower(prompt);
+    [
+        "session",
+        "dispatch",
+        "handoff",
+        "bridge",
+        "transaction",
+        "service",
+        "services",
+        "api",
+        "cli",
+        "runtime",
+        "token",
+        "activation",
+        "enroll",
+        "operator_session",
+        "probe_state",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn prompt_intent_lower(prompt: &str) -> String {
+    prompt_positive_intent_text(prompt).to_ascii_lowercase()
+}
+
+fn prompt_positive_intent_text(prompt: &str) -> String {
+    const EXCLUSION_MARKERS: &[&str] = &[
+        "do not touch",
+        "don't touch",
+        "must not touch",
+        "avoid ",
+        "avoid,",
+        "avoid:",
+        "exclude",
+        "excluding",
+        "not in scope",
+        "out of scope",
+        "without touching",
+        "without modifying",
+    ];
+
+    let mut parts = Vec::new();
+    for clause in prompt.split(['\n', ';']) {
+        let lowered = clause.to_ascii_lowercase();
+        let truncate_at = EXCLUSION_MARKERS
+            .iter()
+            .filter_map(|marker| lowered.find(marker))
+            .min();
+        let kept = match truncate_at {
+            Some(idx) => clause[..idx].trim(),
+            None => clause.trim(),
+        };
+        if !kept.is_empty() {
+            parts.push(kept.to_string());
+        }
+    }
+    parts.join(" ")
+}
+
+fn scan_has_rust_service_surface(scan: &punk_domain::RepoScanSummary) -> bool {
+    scan.candidate_file_scope_paths
+        .iter()
+        .any(|path| path.ends_with("Cargo.toml"))
+        || scan.candidate_directory_scope_paths.iter().any(|path| {
+            path == "crates" || path.starts_with("crates/") || path.contains("/crates/")
+        })
+}
+
+fn scan_has_node_service_surface(scan: &punk_domain::RepoScanSummary) -> bool {
+    scan.candidate_file_scope_paths
+        .iter()
+        .any(|path| path.ends_with("package.json"))
+}
+
+fn path_looks_mixed_service_file_anchor(path: &str) -> bool {
+    path_looks_backend_service_file_anchor(path) || path_looks_rust_service_file_anchor(path)
+}
+
+fn path_looks_backend_service_file_anchor(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered.ends_with("package.json")
+        || lowered.contains("drizzle.config")
+        || lowered.contains("/lib/services/")
+        || lowered.contains("/lib/session/")
+        || lowered.contains("/lib/db/")
+        || lowered.contains("/lib/persistence/")
+        || lowered.contains("/actions/")
+        || lowered.contains("/pages/api/")
+        || lowered.contains("/api/")
+        || lowered.contains("/server/")
+}
+
+fn path_looks_rust_service_file_anchor(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered.ends_with("cargo.toml") || (lowered.starts_with("crates/") && lowered.ends_with(".rs"))
+}
+
+fn mixed_service_file_anchor_rank(path: &str) -> u8 {
+    let lowered = path.to_ascii_lowercase();
+    if lowered.ends_with("package.json") {
+        0
+    } else if lowered == "cargo.toml" {
+        1
+    } else if lowered.ends_with("cargo.toml") {
+        2
+    } else if lowered.ends_with("/src/main.rs") {
+        3
+    } else if lowered.contains("drizzle.config") {
+        4
+    } else if lowered.contains("/pages/api/") {
+        5
+    } else if lowered.contains("/lib/services/") || lowered.contains("/lib/session/") {
+        6
+    } else if lowered.contains("/lib/db/") || lowered.contains("/lib/persistence/") {
+        7
+    } else if lowered.contains("/actions/")
+        || lowered.contains("/api/")
+        || lowered.contains("/server/")
+    {
+        8
+    } else {
+        9
+    }
+}
+
+fn path_looks_mixed_service_directory_anchor(path: &str) -> bool {
+    path_looks_backend_service_directory_anchor(path)
+        || path_looks_rust_service_directory_anchor(path)
+}
+
+fn path_looks_backend_service_directory_anchor(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered.contains("/lib/services")
+        || lowered.contains("/lib/session")
+        || lowered.contains("/lib/db")
+        || lowered.contains("/lib/persistence")
+        || lowered.contains("/actions")
+        || lowered.contains("/pages/api")
+        || lowered.contains("/api")
+        || lowered.contains("/server")
+}
+
+fn path_looks_rust_service_directory_anchor(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    lowered == "crates" || lowered.starts_with("crates/")
+}
+
+fn mixed_service_directory_anchor_rank(path: &str) -> u8 {
+    let lowered = path.to_ascii_lowercase();
+    if lowered == "crates" || lowered.starts_with("crates/") {
+        0
+    } else if lowered.contains("/lib/services") || lowered.contains("/lib/session") {
+        1
+    } else if lowered.contains("/lib/db") || lowered.contains("/lib/persistence") {
+        2
+    } else if lowered.contains("/pages/api") {
+        3
+    } else if lowered.contains("/actions") {
+        4
+    } else {
+        5
+    }
+}
+
+fn apply_prompt_exclusion_pruning(prompt: &str, proposal: &mut DraftProposal) {
+    let excluded = extract_prompt_excluded_scope_prefixes(prompt);
+    if excluded.is_empty() {
+        return;
+    }
+    proposal
+        .entry_points
+        .retain(|path| !path_matches_excluded_prefixes(path, &excluded));
+    proposal
+        .allowed_scope
+        .retain(|path| !path_matches_excluded_prefixes(path, &excluded));
+}
+
+fn extract_prompt_excluded_scope_prefixes(prompt: &str) -> Vec<String> {
+    const EXCLUSION_MARKERS: &[&str] = &[
+        "exclude",
+        "excluding",
+        "do not touch",
+        "don't touch",
+        "must not touch",
+        "not in scope",
+        "out of scope",
+        "without touching",
+        "without modifying",
+        "avoid ",
+        "avoid,",
+        "avoid:",
+    ];
+    let mut prefixes = Vec::new();
+    for line in prompt.lines() {
+        let lowered = line.to_ascii_lowercase();
+        let Some(start) = EXCLUSION_MARKERS
+            .iter()
+            .filter_map(|marker| lowered.find(marker).map(|idx| (idx, marker.len())))
+            .map(|(idx, len)| idx + len)
+            .min()
+        else {
+            continue;
+        };
+        let excluded_segment = line[start..].trim();
+        for token in excluded_segment.split_whitespace() {
+            let Some(prefix) = normalize_prompt_scope_token(token) else {
+                continue;
+            };
+            if !prefixes.iter().any(|existing| existing == &prefix) {
+                prefixes.push(prefix);
+            }
+        }
+    }
+    prefixes
+}
+
+fn normalize_prompt_scope_token(token: &str) -> Option<String> {
+    let mut trimmed = token
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | '`'
+            )
+        })
+        .trim()
+        .to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    while trimmed.ends_with('*') {
+        trimmed.pop();
+    }
+    while trimmed.ends_with('/') {
+        trimmed.pop();
+    }
+    if trimmed.is_empty() || !trimmed.contains('/') {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn path_matches_excluded_prefixes(path: &str, excluded: &[String]) -> bool {
+    let normalized = path.trim().trim_matches('/');
+    excluded.iter().any(|prefix| {
+        let prefix = prefix.trim().trim_matches('/');
+        normalized == prefix || normalized.starts_with(&format!("{prefix}/"))
+    })
+}
+
+fn prompt_declares_explicit_touch_set(prompt: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    [
+        "touching exactly",
+        "touch exactly",
+        "exact touch set",
+        "requested touch set",
+        "scope bounded to",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+}
+
+fn ensure_proposal_scope_covers_entry_points(proposal: &mut DraftProposal) {
+    let missing_entry_points = proposal
+        .entry_points
+        .iter()
+        .filter(|entry_point| {
+            !proposal_scope_covers_entry_point(&proposal.allowed_scope, entry_point)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for entry_point in missing_entry_points {
+        if !proposal
+            .allowed_scope
+            .iter()
+            .any(|existing| existing == &entry_point)
+        {
+            proposal.allowed_scope.push(entry_point);
+        }
+    }
+}
+
+fn proposal_scope_covers_entry_point(allowed_scope: &[String], entry_point: &str) -> bool {
+    let entry = entry_point.trim().trim_matches('/');
+    allowed_scope.iter().any(|scope| {
+        let scope = scope.trim().trim_matches('/');
+        entry == scope || entry.starts_with(&format!("{scope}/"))
+    })
+}
+
+fn timeout_seed_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+) -> DraftProposal {
+    if let Some(seed) = timeout_pubpunk_validate_seed_proposal(repo_root, prompt) {
+        return seed;
+    }
+    if let Some(seed) = timeout_service_seed_proposal(repo_root, prompt, scan) {
+        return seed;
+    }
+
+    let greenfield_scaffold_scope = timeout_greenfield_scaffold_scope(prompt, scan);
+    let entry_points: Vec<String> = if let Some((entry_points, _)) = &greenfield_scaffold_scope {
+        entry_points.clone()
+    } else if scan.candidate_entry_points.is_empty() {
+        scan.candidate_file_scope_paths
+            .iter()
+            .take(2)
+            .cloned()
+            .collect()
+    } else {
+        scan.candidate_entry_points
+            .iter()
+            .take(2)
+            .cloned()
+            .collect()
+    };
+    let allowed_scope: Vec<String> = if let Some((_, allowed_scope)) = greenfield_scaffold_scope {
+        allowed_scope
+    } else if scan.candidate_file_scope_paths.is_empty() {
+        entry_points.clone()
+    } else {
+        scan.candidate_file_scope_paths
+            .iter()
+            .take(4)
+            .cloned()
+            .collect()
+    };
+    let target_checks = if scan.candidate_target_checks.is_empty() {
+        scan.candidate_integrity_checks.clone()
+    } else {
+        scan.candidate_target_checks.clone()
+    };
+    let (expected_interfaces, behavior_requirements) =
+        timeout_seed_semantics(prompt, &entry_points);
+
+    DraftProposal {
+        title: summarize_prompt(prompt),
+        summary: summarize_prompt(prompt),
+        entry_points,
+        import_paths: Vec::new(),
+        expected_interfaces,
+        behavior_requirements,
+        allowed_scope,
+        target_checks,
+        integrity_checks: scan.candidate_integrity_checks.clone(),
+        risk_level: "medium".to_string(),
+    }
+}
+
+fn timeout_service_seed_proposal(
+    repo_root: &Path,
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+) -> Option<DraftProposal> {
+    if let Some(mode) = detect_baseline_target_mode(repo_root, prompt, None) {
+        let profile = build_baseline_targeting_profile(repo_root, mode);
+        if !profile.entry_points.is_empty() && !profile.allowed_scope.is_empty() {
+            let (expected_interfaces, behavior_requirements) =
+                timeout_seed_semantics(prompt, &profile.entry_points);
+            return Some(DraftProposal {
+                title: summarize_prompt(prompt),
+                summary: summarize_prompt(prompt),
+                entry_points: profile.entry_points,
+                import_paths: Vec::new(),
+                expected_interfaces,
+                behavior_requirements,
+                allowed_scope: profile.allowed_scope,
+                target_checks: profile.target_checks,
+                integrity_checks: profile.integrity_checks,
+                risk_level: "medium".to_string(),
+            });
+        }
+    }
+
+    let is_mixed = prompt_requests_mixed_service_scope(prompt, scan);
+    let is_backend_only = prompt_requests_backend_service_scope(prompt, scan) && !is_mixed;
+    if !is_mixed && !is_backend_only {
+        return None;
+    }
+
+    let file_predicate: fn(&str) -> bool = if is_mixed {
+        path_looks_mixed_service_file_anchor
+    } else {
+        path_looks_backend_service_file_anchor
+    };
+    let dir_predicate: fn(&str) -> bool = if is_mixed {
+        path_looks_mixed_service_directory_anchor
+    } else {
+        path_looks_backend_service_directory_anchor
+    };
+
+    let mut entry_points = scan
+        .candidate_entry_points
+        .iter()
+        .filter(|path| file_predicate(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if entry_points.is_empty() {
+        entry_points = scan
+            .candidate_file_scope_paths
+            .iter()
+            .filter(|path| file_predicate(path))
+            .take(4)
+            .cloned()
+            .collect();
+    }
+    if entry_points.is_empty() && is_backend_only {
+        entry_points = scan
+            .candidate_file_scope_paths
+            .iter()
+            .filter(|path| path.ends_with("package.json") && path.contains('/'))
+            .take(1)
+            .cloned()
+            .collect();
+    }
+    if entry_points.is_empty() {
+        return None;
+    }
+
+    let mut allowed_scope = scan
+        .candidate_file_scope_paths
+        .iter()
+        .filter(|path| file_predicate(path))
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>();
+    allowed_scope.extend(
+        scan.candidate_directory_scope_paths
+            .iter()
+            .filter(|path| dir_predicate(path))
+            .take(4)
+            .cloned(),
+    );
+    if is_backend_only {
+        allowed_scope.extend(conventional_backend_service_dirs(scan));
+    } else if is_mixed {
+        allowed_scope.extend(conventional_mixed_service_dirs(scan));
+    }
+    let mut deduped_entry_points = Vec::new();
+    for path in entry_points {
+        push_unique_string(&mut deduped_entry_points, path);
+    }
+    let mut deduped_allowed_scope = Vec::new();
+    for path in allowed_scope {
+        push_unique_string(&mut deduped_allowed_scope, path);
+    }
+
+    let (expected_interfaces, behavior_requirements) =
+        timeout_seed_semantics(prompt, &deduped_entry_points);
+
+    Some(DraftProposal {
+        title: summarize_prompt(prompt),
+        summary: summarize_prompt(prompt),
+        entry_points: deduped_entry_points,
+        import_paths: Vec::new(),
+        expected_interfaces,
+        behavior_requirements,
+        allowed_scope: deduped_allowed_scope,
+        target_checks: scan.candidate_target_checks.clone(),
+        integrity_checks: scan.candidate_integrity_checks.clone(),
+        risk_level: "medium".to_string(),
+    })
+}
+
+fn timeout_seed_semantics(prompt: &str, entry_points: &[String]) -> (Vec<String>, Vec<String>) {
+    let semantic_prompt = prompt_positive_intent_text(prompt);
+    let semantic_prompt = if semantic_prompt.trim().is_empty() {
+        prompt.trim()
+    } else {
+        semantic_prompt.trim()
+    };
+    let primary_entry_point = entry_points.first().map(String::as_str);
+    let expected_interface = match primary_entry_point {
+        Some("Cargo.toml") => "initial Rust scaffold",
+        Some("go.mod") => "initial Go scaffold",
+        Some("pyproject.toml") => "initial Python scaffold",
+        Some("package.json") => "initial TypeScript/Node scaffold",
+        _ => "bounded implementation slice",
+    };
+    let greenfield_scaffold_seed = matches!(
+        primary_entry_point,
+        Some("Cargo.toml" | "go.mod" | "pyproject.toml" | "package.json")
+    );
+    let mut expected_interfaces = vec![expected_interface.to_string()];
+    let mut behavior_requirements = vec![summarize_prompt(semantic_prompt)];
+    let lowered = semantic_prompt.to_ascii_lowercase();
+
+    let mentions_init_surface = lowered.contains(" init ")
+        || lowered.starts_with("init ")
+        || lowered.contains("init command");
+    if !greenfield_scaffold_seed && mentions_init_surface {
+        push_unique_string(
+            &mut expected_interfaces,
+            "CLI accepts an `init` command.".to_string(),
+        );
+    }
+    for flag in ["--json", "--force", "--project-root"] {
+        if lowered.contains(flag) {
+            push_unique_string(&mut expected_interfaces, format!("CLI supports `{flag}`."));
+            push_unique_string(
+                &mut behavior_requirements,
+                format!("Support `{flag}` in the init flow."),
+            );
+        }
+    }
+    let starter_files = timeout_prompt_starter_files(prompt);
+    if !starter_files.is_empty() {
+        push_unique_string(
+            &mut expected_interfaces,
+            format!(
+                "Init creates canonical starter files: {}.",
+                starter_files.join(", ")
+            ),
+        );
+        push_unique_string(
+            &mut behavior_requirements,
+            format!(
+                "Create canonical starter files: {}.",
+                starter_files.join(", ")
+            ),
+        );
+    }
+    if lowered.contains("test") {
+        push_unique_string(
+            &mut expected_interfaces,
+            "Tests cover the init command behavior.".to_string(),
+        );
+    }
+
+    (expected_interfaces, behavior_requirements)
+}
+
+fn timeout_greenfield_scaffold_scope(
+    prompt: &str,
+    scan: &punk_domain::RepoScanSummary,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let manifest = scan
+        .candidate_file_scope_paths
+        .iter()
+        .find(|path| {
+            matches!(
+                path.as_str(),
+                "Cargo.toml" | "go.mod" | "pyproject.toml" | "package.json"
+            )
+        })?
+        .clone();
+    if !prompt_requests_timeout_greenfield_scaffold(prompt, &manifest) {
+        return None;
+    }
+
+    let preferred_directories: &[&str] = match manifest.as_str() {
+        "Cargo.toml" => &["crates", "src", "tests"],
+        "go.mod" => &["cmd", "internal", "pkg"],
+        "pyproject.toml" => &["src", "tests"],
+        "package.json" => &["packages", "apps", "src", "tests"],
+        _ => &[],
+    };
+    let preferred_files: &[&str] = match manifest.as_str() {
+        "package.json" => &["tsconfig.json"],
+        _ => &[],
+    };
+    if preferred_directories.is_empty() {
+        return None;
+    }
+
+    let entry_points = vec![manifest.clone()];
+    let mut allowed_scope = entry_points.clone();
+    for candidate in &scan.candidate_file_scope_paths {
+        if preferred_files.contains(&candidate.as_str())
+            && !allowed_scope.iter().any(|existing| existing == candidate)
+        {
+            allowed_scope.push(candidate.clone());
+        }
+    }
+    for candidate in &scan.candidate_directory_scope_paths {
+        if preferred_directories.contains(&candidate.as_str())
+            && !allowed_scope.iter().any(|existing| existing == candidate)
+        {
+            allowed_scope.push(candidate.clone());
+        }
+    }
+
+    Some((entry_points, allowed_scope))
+}
+
+fn prompt_requests_timeout_greenfield_scaffold(prompt: &str, manifest: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    match manifest {
+        "Cargo.toml" => {
+            let requests_rust = ["rust", "cargo", "workspace", "crate", "crates"]
+                .iter()
+                .any(|needle| lowered.contains(needle));
+            let requests_scaffold = ["scaffold", "bootstrap", "greenfield"]
+                .iter()
+                .any(|needle| lowered.contains(needle))
+                || (lowered.contains("create") && lowered.contains("workspace"));
+            requests_rust && requests_scaffold
+        }
+        "go.mod" => {
+            let requests_go = ["go", "golang", "module"]
+                .iter()
+                .any(|needle| lowered.contains(needle));
+            let requests_scaffold = ["scaffold", "bootstrap", "greenfield"]
+                .iter()
+                .any(|needle| lowered.contains(needle))
+                || (lowered.contains("create") && lowered.contains("module"));
+            requests_go && requests_scaffold
+        }
+        "pyproject.toml" => {
+            let requests_python = ["python", "pytest", "pyproject", "package"]
+                .iter()
+                .any(|needle| lowered.contains(needle));
+            let requests_scaffold = ["scaffold", "bootstrap", "greenfield"]
+                .iter()
+                .any(|needle| lowered.contains(needle))
+                || (lowered.contains("create") && lowered.contains("project"));
+            requests_python && requests_scaffold
+        }
+        "package.json" => {
+            let requests_node = [
+                "typescript",
+                "javascript",
+                "node",
+                "npm",
+                "pnpm",
+                "yarn",
+                "package",
+                "workspace",
+            ]
+            .iter()
+            .any(|needle| lowered.contains(needle));
+            let requests_scaffold = ["scaffold", "bootstrap", "greenfield"]
+                .iter()
+                .any(|needle| lowered.contains(needle))
+                || (lowered.contains("create")
+                    && ["package", "workspace", "app"]
+                        .iter()
+                        .any(|needle| lowered.contains(needle)));
+            requests_node && requests_scaffold
+        }
+        _ => false,
+    }
+}
+
+fn timeout_prompt_starter_files(prompt: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for token in prompt.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '`' | '"' | '\'' | ',' | ';' | ':' | '(' | ')' | '[' | ']'
+            )
+    }) {
+        let token = token.trim_end_matches('.').trim();
+        if token.is_empty() {
+            continue;
+        }
+        if !(token.contains('/')
+            || token.ends_with(".toml")
+            || token.ends_with(".md")
+            || token.ends_with(".json")
+            || token.ends_with(".gitignore"))
+        {
+            continue;
+        }
+        if token.starts_with("crates/") || token.starts_with("src/") || token.starts_with("tests/")
+        {
+            continue;
+        }
+        push_unique_string(&mut files, token.to_string());
+    }
+    files
+}
+
+fn push_unique_string(values: &mut Vec<String>, candidate: String) {
+    if !values.iter().any(|existing| existing == &candidate) {
+        values.push(candidate);
+    }
 }
 
 fn contract_to_proposal(feature: &Feature, contract: &Contract) -> DraftProposal {
@@ -1804,13 +5874,48 @@ struct RunFinalizer {
     armed: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RunHeartbeat {
     run_id: String,
     state: String,
     last_progress_at: String,
     stdout_bytes: u64,
     stderr_bytes: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ExecutorProcessInfo {
+    child_pid: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StaleArtifactCandidate {
+    pub artifact_kind: String,
+    pub artifact_id: String,
+    pub work_id: String,
+    pub artifact_ref: String,
+    pub reason: String,
+    pub last_progress_at: Option<String>,
+    pub executor_pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StaleGcReport {
+    pub project_id: String,
+    pub generated_at: String,
+    pub safe_to_archive: Vec<StaleArtifactCandidate>,
+    pub manual_review: Vec<StaleArtifactCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StaleArchiveRecord {
+    archived_at: String,
+    run_id: String,
+    work_id: String,
+    original_ref: String,
+    reason: String,
+    last_progress_at: Option<String>,
+    executor_pid: Option<u32>,
 }
 
 struct RunHeartbeatGuard {
@@ -1979,7 +6084,10 @@ fn file_len(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use punk_adapters::{ContractDrafter, ExecuteInput, ExecuteOutput};
-    use punk_domain::{DraftInput, RefineInput};
+    use punk_domain::{
+        DraftInput, RefineInput, ResearchArtifactInput, ResearchBudget, ResearchStartInput,
+        ResearchSynthesisInput, RunVcs,
+    };
     use std::ffi::OsString;
 
     struct EnvVarGuard {
@@ -2011,7 +6119,7 @@ mod tests {
             "fake"
         }
         fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
-            fs::write(&input.repo_root.join("demo.txt"), b"ok")?;
+            fs::write(input.repo_root.join("demo.txt"), b"ok")?;
             fs::write(&input.stdout_path, b"done")?;
             fs::write(&input.stderr_path, b"")?;
             Ok(ExecuteOutput {
@@ -2032,8 +6140,8 @@ mod tests {
         }
 
         fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
-            fs::write(&input.repo_root.join("carry.txt"), b"changed during run")?;
-            fs::write(&input.repo_root.join("demo.txt"), b"ok")?;
+            fs::write(input.repo_root.join("carry.txt"), b"changed during run")?;
+            fs::write(input.repo_root.join("demo.txt"), b"ok")?;
             fs::write(&input.stdout_path, b"done")?;
             fs::write(&input.stderr_path, b"")?;
             Ok(ExecuteOutput {
@@ -2046,6 +6154,166 @@ mod tests {
         }
     }
 
+    struct NoProgressNoOpExecutor;
+
+    impl Executor for NoProgressNoOpExecutor {
+        fn name(&self) -> &'static str {
+            "no-progress-noop"
+        }
+
+        fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+            fs::write(
+                &input.stdout_path,
+                b"no implementation progress after bounded context dispatch in src/lib.rs: bounded executor found no additional edits\n",
+            )?;
+            fs::write(&input.stderr_path, b"")?;
+            Ok(ExecuteOutput {
+                success: false,
+                summary: "no implementation progress after bounded context dispatch in src/lib.rs: bounded executor found no additional edits".into(),
+                checks_run: vec![],
+                cost_usd: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    struct ExplicitAlreadySatisfiedExecutor;
+
+    impl Executor for ExplicitAlreadySatisfiedExecutor {
+        fn name(&self) -> &'static str {
+            "explicit-already-satisfied"
+        }
+
+        fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+            fs::write(
+                &input.stdout_path,
+                b"PUNK_EXECUTION_ALREADY_SATISFIED: src/lib.rs already contains the requested implementation\n",
+            )?;
+            fs::write(&input.stderr_path, b"")?;
+            Ok(ExecuteOutput {
+                success: false,
+                summary:
+                    "PUNK_EXECUTION_ALREADY_SATISFIED: src/lib.rs already contains the requested implementation"
+                        .into(),
+                checks_run: vec![],
+                cost_usd: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    struct BlockedNoOpExecutor;
+
+    impl Executor for BlockedNoOpExecutor {
+        fn name(&self) -> &'static str {
+            "blocked-noop"
+        }
+
+        fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+            fs::write(
+                &input.stdout_path,
+                b"PUNK_EXECUTION_BLOCKED: bounded executor found no additional edits\n",
+            )?;
+            fs::write(&input.stderr_path, b"")?;
+            Ok(ExecuteOutput {
+                success: false,
+                summary: "PUNK_EXECUTION_BLOCKED: bounded executor found no additional edits"
+                    .into(),
+                checks_run: vec![],
+                cost_usd: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    struct SuccessNoOpExecutor;
+
+    impl Executor for SuccessNoOpExecutor {
+        fn name(&self) -> &'static str {
+            "success-noop"
+        }
+
+        fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+            fs::write(
+                &input.stdout_path,
+                b"PUNK_EXECUTION_COMPLETE: claimed success without edits\n",
+            )?;
+            fs::write(&input.stderr_path, b"")?;
+            Ok(ExecuteOutput {
+                success: true,
+                summary: "PUNK_EXECUTION_COMPLETE: claimed success without edits".into(),
+                checks_run: vec![],
+                cost_usd: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    struct AlreadySatisfiedDrafter;
+
+    impl ContractDrafter for AlreadySatisfiedDrafter {
+        fn name(&self) -> &'static str {
+            "already-satisfied-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "already satisfied".into(),
+                summary: input.prompt,
+                entry_points: vec!["src/lib.rs".into()],
+                import_paths: vec!["src/lib.rs".into()],
+                expected_interfaces: vec!["demo".into()],
+                behavior_requirements: vec!["keep demo implemented".into()],
+                allowed_scope: vec!["src/lib.rs".into()],
+                target_checks: vec!["cargo test".into()],
+                integrity_checks: vec!["cargo test".into()],
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct DirectoryScopedAlreadySatisfiedDrafter;
+
+    impl ContractDrafter for DirectoryScopedAlreadySatisfiedDrafter {
+        fn name(&self) -> &'static str {
+            "directory-scoped-already-satisfied-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "directory scoped already satisfied".into(),
+                summary: input.prompt,
+                entry_points: vec![
+                    "crates/pubpunk-cli/Cargo.toml".into(),
+                    "crates/pubpunk-core/Cargo.toml".into(),
+                ],
+                import_paths: vec![
+                    "crates/pubpunk-cli".into(),
+                    "crates/pubpunk-core".into(),
+                    "tests".into(),
+                ],
+                expected_interfaces: vec!["bounded implementation slice".into()],
+                behavior_requirements: vec!["implement init logic".into()],
+                allowed_scope: vec![
+                    "crates/pubpunk-cli".into(),
+                    "crates/pubpunk-core".into(),
+                    "tests".into(),
+                ],
+                target_checks: vec!["cargo test -p pubpunk-cli".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "medium".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
     struct PanicExecutor;
 
     impl Executor for PanicExecutor {
@@ -2055,6 +6323,54 @@ mod tests {
 
         fn execute_contract(&self, _input: ExecuteInput) -> Result<ExecuteOutput> {
             panic!("executor interrupted");
+        }
+    }
+
+    struct CargoLockExecutor;
+
+    impl Executor for CargoLockExecutor {
+        fn name(&self) -> &'static str {
+            "cargo-lock"
+        }
+
+        fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+            fs::write(input.repo_root.join("Cargo.lock"), b"# generated\n")?;
+            fs::write(&input.stdout_path, b"done")?;
+            fs::write(&input.stderr_path, b"")?;
+            Ok(ExecuteOutput {
+                success: true,
+                summary: "done".into(),
+                checks_run: vec!["cargo test --workspace".into()],
+                cost_usd: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    struct CargoLockDrafter;
+
+    impl ContractDrafter for CargoLockDrafter {
+        fn name(&self) -> &'static str {
+            "cargo-lock-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "cargo lock".into(),
+                summary: input.prompt,
+                entry_points: vec!["Cargo.toml".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["demo".into()],
+                behavior_requirements: vec!["keep bootstrap bounded".into()],
+                allowed_scope: vec!["Cargo.toml".into()],
+                target_checks: vec!["cargo test --workspace".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
         }
     }
 
@@ -2190,6 +6506,33 @@ mod tests {
         }
     }
 
+    struct EntryPointScopeLeakDrafter;
+
+    impl ContractDrafter for EntryPointScopeLeakDrafter {
+        fn name(&self) -> &'static str {
+            "entry-point-scope-leak"
+        }
+
+        fn draft(&self, _input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "pubpunk init".into(),
+                summary: "scope leak".into(),
+                entry_points: vec!["src/lib.rs".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["library init surface".into()],
+                behavior_requirements: vec!["implement init".into()],
+                allowed_scope: vec!["Cargo.toml".into()],
+                target_checks: vec!["cargo test".into()],
+                integrity_checks: vec!["cargo test".into()],
+                risk_level: "medium".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
     struct ExplicitDetailsIgnoringDrafter;
 
     impl ContractDrafter for ExplicitDetailsIgnoringDrafter {
@@ -2209,6 +6552,242 @@ mod tests {
                 target_checks: vec!["cargo test".into()],
                 integrity_checks: vec!["cargo test".into()],
                 risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct ScanTargetChecksDrafter;
+
+    impl ContractDrafter for ScanTargetChecksDrafter {
+        fn name(&self) -> &'static str {
+            "scan-target-checks"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "scan target checks".into(),
+                summary: input.prompt,
+                entry_points: vec!["crates/punk-orch/src/lib.rs".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["keep target checks bounded".into()],
+                behavior_requirements: vec!["use scan candidate target checks".into()],
+                allowed_scope: vec!["crates/punk-orch/src/lib.rs".into()],
+                target_checks: input.scan.candidate_target_checks,
+                integrity_checks: input.scan.candidate_integrity_checks,
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct RustOnlyServiceDrafter;
+
+    impl ContractDrafter for RustOnlyServiceDrafter {
+        fn name(&self) -> &'static str {
+            "rust-only-service"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "service slice".into(),
+                summary: input.prompt,
+                entry_points: vec!["crates/baseline-cli/src/main.rs".into()],
+                import_paths: vec![
+                    "baseline-site/src/lib/services/dispatch.ts".into(),
+                    "baseline-site/src/lib/services/enrollments.ts".into(),
+                    "baseline-site/src/lib/session/operator.ts".into(),
+                    "baseline-site/src/lib/session/cookies.ts".into(),
+                ],
+                expected_interfaces: vec!["service layer".into()],
+                behavior_requirements: vec!["implement service/runtime work".into()],
+                allowed_scope: vec!["crates/baseline-cli/src/main.rs".into()],
+                target_checks: vec!["cargo test -p baseline-cli".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "medium".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct MixedReportPageDrafter;
+
+    impl ContractDrafter for MixedReportPageDrafter {
+        fn name(&self) -> &'static str {
+            "mixed-report-page"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "mixed slice".into(),
+                summary: input.prompt,
+                entry_points: vec![
+                    "crates/baseline-cli/src/main.rs".into(),
+                    "baseline-site/src/pages/report.astro".into(),
+                ],
+                import_paths: vec![
+                    "baseline-site/src/pages/api/cli/enroll.ts".into(),
+                    "baseline-site/src/lib/services/enrollments.ts".into(),
+                    "baseline-site/src/lib/session/operator.ts".into(),
+                ],
+                expected_interfaces: vec!["mixed runtime".into()],
+                behavior_requirements: vec!["implement mixed service/runtime work".into()],
+                allowed_scope: vec![
+                    "crates/baseline-cli".into(),
+                    "baseline-site/src/pages/report.astro".into(),
+                ],
+                target_checks: vec!["cargo test -p baseline-cli".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "medium".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct GreenfieldRustDrafter;
+
+    impl ContractDrafter for GreenfieldRustDrafter {
+        fn name(&self) -> &'static str {
+            "greenfield-rust-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "greenfield rust intake".into(),
+                summary: input.prompt,
+                entry_points: vec!["Cargo.toml".into(), "src/lib.rs".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["initial Rust scaffold".into()],
+                behavior_requirements: vec!["allow first Rust goal after init".into()],
+                allowed_scope: vec!["Cargo.toml".into(), "src/lib.rs".into()],
+                target_checks: input.scan.candidate_target_checks,
+                integrity_checks: input.scan.candidate_integrity_checks,
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct GreenfieldGoDrafter;
+
+    impl ContractDrafter for GreenfieldGoDrafter {
+        fn name(&self) -> &'static str {
+            "greenfield-go-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "greenfield go intake".into(),
+                summary: input.prompt,
+                entry_points: vec!["go.mod".into(), "cmd/pubpunk/main.go".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["initial Go scaffold".into()],
+                behavior_requirements: vec!["allow first Go goal after init".into()],
+                allowed_scope: vec!["go.mod".into(), "cmd".into(), "internal".into()],
+                target_checks: input.scan.candidate_target_checks,
+                integrity_checks: input.scan.candidate_integrity_checks,
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct GreenfieldPythonDrafter;
+
+    impl ContractDrafter for GreenfieldPythonDrafter {
+        fn name(&self) -> &'static str {
+            "greenfield-python-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "greenfield python intake".into(),
+                summary: input.prompt,
+                entry_points: vec!["pyproject.toml".into(), "src/pubpunk/__init__.py".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["initial Python scaffold".into()],
+                behavior_requirements: vec!["allow first Python goal after init".into()],
+                allowed_scope: vec!["pyproject.toml".into(), "src".into(), "tests".into()],
+                target_checks: input.scan.candidate_target_checks,
+                integrity_checks: input.scan.candidate_integrity_checks,
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct GreenfieldNodeDrafter;
+
+    impl ContractDrafter for GreenfieldNodeDrafter {
+        fn name(&self) -> &'static str {
+            "greenfield-node-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "greenfield node intake".into(),
+                summary: input.prompt,
+                entry_points: vec!["package.json".into(), "src/index.ts".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["initial TypeScript/Node scaffold".into()],
+                behavior_requirements: vec!["allow first TypeScript/Node goal after init".into()],
+                allowed_scope: vec![
+                    "package.json".into(),
+                    "tsconfig.json".into(),
+                    "src".into(),
+                    "tests".into(),
+                ],
+                target_checks: input.scan.candidate_target_checks,
+                integrity_checks: input.scan.candidate_integrity_checks,
+                risk_level: "low".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct BroadBootstrapDrafter;
+
+    impl ContractDrafter for BroadBootstrapDrafter {
+        fn name(&self) -> &'static str {
+            "broad-bootstrap"
+        }
+
+        fn draft(&self, _input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "bootstrap".into(),
+                summary: "bootstrap".into(),
+                entry_points: vec!["Cargo.toml".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["initial Rust scaffold".into()],
+                behavior_requirements: vec!["scaffold rust workspace".into()],
+                allowed_scope: vec!["Cargo.toml".into(), "crates".into(), "tests".into()],
+                target_checks: vec!["cargo test --workspace".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "medium".into(),
             })
         }
 
@@ -2294,6 +6873,67 @@ mod tests {
 
         fn refine(&self, _input: RefineInput) -> Result<DraftProposal> {
             Err(anyhow!("simulated refine failure"))
+        }
+    }
+
+    struct ContaminatedPubpunkValidateDrafter;
+
+    impl ContractDrafter for ContaminatedPubpunkValidateDrafter {
+        fn name(&self) -> &'static str {
+            "contaminated-pubpunk-validate-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            Ok(DraftProposal {
+                title: "contaminated pubpunk validate".into(),
+                summary: input.prompt,
+                entry_points: vec![
+                    "Cargo.toml".into(),
+                    "crates/pubpunk-cli/src/main.rs".into(),
+                    "crates/pubpunk-core/src/lib.rs".into(),
+                ],
+                import_paths: vec![
+                    "crates/pubpunk-cli/src/main.rs".into(),
+                    "crates/pubpunk-core/src/lib.rs".into(),
+                ],
+                expected_interfaces: vec![
+                    "CLI accepts an `init` command.".into(),
+                    "Init creates canonical starter files: project.toml, style/style.toml.".into(),
+                ],
+                behavior_requirements: vec![
+                    "Support `--project-root` in the init flow.".into(),
+                    "Add validate parseability helper in crates/pubpunk-core/src/lib.rs.".into(),
+                ],
+                allowed_scope: vec![
+                    "Cargo.toml".into(),
+                    "crates/pubpunk-cli/src/main.rs".into(),
+                    "crates/pubpunk-core/src/lib.rs".into(),
+                    "tests".into(),
+                ],
+                target_checks: vec!["cargo test -p pubpunk-cli".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "medium".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct TimeoutDrafter;
+
+    impl ContractDrafter for TimeoutDrafter {
+        fn name(&self) -> &'static str {
+            "timeout-drafter"
+        }
+
+        fn draft(&self, _input: DraftInput) -> Result<DraftProposal> {
+            Err(anyhow!("codex command timed out after 30s: 58,249"))
+        }
+
+        fn refine(&self, _input: RefineInput) -> Result<DraftProposal> {
+            Err(anyhow!("codex command timed out after 30s: 58,249"))
         }
     }
 
@@ -2404,6 +7044,2303 @@ mod tests {
         assert_eq!(
             changed_files,
             vec!["carry.txt".to_string(), "demo.txt".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_persists_verification_context_for_run() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-verification-context-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&FakeDrafter, "add file").unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (run, receipt) = service.cut_run(&FakeExecutor, &contract.id).unwrap();
+        let context_ref = run
+            .verification_context_ref
+            .as_ref()
+            .expect("verification context ref");
+        let context_path = root.join(context_ref);
+        assert!(context_path.exists());
+
+        let context: VerificationContext = read_json(&context_path).unwrap();
+        assert_eq!(context.identity.workspace_ref, run.vcs.workspace_ref);
+        assert_eq!(context.identity.change_ref, run.vcs.change_ref);
+        assert_eq!(context.identity.changed_files, receipt.changed_files);
+        assert!(context
+            .file_states
+            .iter()
+            .any(|state| state.path == "demo.txt" && state.exists));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_succeeds_when_bounded_diff_is_already_satisfied_before_dispatch() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-already-satisfied-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn demo() { println!(\"done\"); }\n",
+        )
+        .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&AlreadySatisfiedDrafter, "demo already satisfied")
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (run, receipt) = service
+            .cut_run(&ExplicitAlreadySatisfiedExecutor, &contract.id)
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Finished);
+        assert_eq!(receipt.status, "success");
+        assert!(receipt.changed_files.is_empty());
+        assert!(receipt
+            .summary
+            .contains("already satisfied in allowed scope before bounded dispatch"));
+        assert!(receipt.summary.contains("src/lib.rs"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_does_not_upgrade_generic_no_progress_summary_even_if_entry_points_are_dirty() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-no-progress-not-already-satisfied-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn demo() { println!(\"done\"); }\n",
+        )
+        .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&AlreadySatisfiedDrafter, "demo already satisfied")
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (run, receipt) = service
+            .cut_run(&NoProgressNoOpExecutor, &contract.id)
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(receipt.status, "failure");
+        assert!(receipt
+            .summary
+            .starts_with("no implementation progress after bounded context dispatch"));
+        assert!(!receipt
+            .summary
+            .contains("already satisfied in allowed scope before bounded dispatch"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_does_not_upgrade_blocked_file_slice_to_already_satisfied() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-blocked-not-already-satisfied-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn demo() { println!(\"done\"); }\n",
+        )
+        .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&AlreadySatisfiedDrafter, "demo cleanup slice")
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (run, receipt) = service.cut_run(&BlockedNoOpExecutor, &contract.id).unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(receipt.status, "failure");
+        assert!(receipt.changed_files.is_empty());
+        assert!(receipt.summary.starts_with("PUNK_EXECUTION_BLOCKED:"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_does_not_upgrade_directory_scoped_no_progress_to_already_satisfied() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-directory-already-satisfied-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=['crates/pubpunk-cli','crates/pubpunk-core']\nresolver='2'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname='pubpunk-cli'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname='pubpunk-core'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "tests\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname='pubpunk-cli'\nversion='0.2.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname='pubpunk-core'\nversion='0.2.0'\n",
+        )
+        .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &DirectoryScopedAlreadySatisfiedDrafter,
+                "implement pubpunk init in bounded dirs",
+            )
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (run, receipt) = service.cut_run(&BlockedNoOpExecutor, &contract.id).unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(receipt.status, "failure");
+        assert!(receipt
+            .summary
+            .starts_with("PUNK_EXECUTION_BLOCKED: bounded executor found no additional edits"));
+        assert!(!receipt
+            .summary
+            .contains("already satisfied in allowed scope before bounded dispatch"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_rejects_successful_noop_for_bounded_source_slice() {
+        let root =
+            std::env::temp_dir().join(format!("punk-orch-empty-success-{}", std::process::id()));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&AlreadySatisfiedDrafter, "demo implementation slice")
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (run, receipt) = service.cut_run(&SuccessNoOpExecutor, &contract.id).unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(receipt.status, "failure");
+        assert!(receipt.changed_files.is_empty());
+        assert!(receipt
+            .summary
+            .contains("no implementation progress after bounded success report"));
+        assert!(receipt
+            .summary
+            .contains("PUNK_EXECUTION_COMPLETE: claimed success without edits"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_prunes_generated_cargo_lock_when_out_of_scope() {
+        let root =
+            std::env::temp_dir().join(format!("punk-orch-cargo-lock-prune-{}", std::process::id()));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[]\nresolver='2'\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&CargoLockDrafter, "bounded rust bootstrap")
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (_run, receipt) = service.cut_run(&CargoLockExecutor, &contract.id).unwrap();
+        assert!(!receipt
+            .changed_files
+            .iter()
+            .any(|path| path == "Cargo.lock"));
+        assert!(!root.join("Cargo.lock").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn merge_default_gitignore_entries_adds_runtime_artifact_ignores_when_missing() {
+        let merged = merge_default_gitignore_entries("");
+        assert_eq!(merged, ".punk/\ntarget/\n.playwright-mcp/\n");
+
+        let already_covered = merge_default_gitignore_entries("target\n.punk\n.playwright-mcp\n");
+        assert_eq!(already_covered, "target\n.punk\n.playwright-mcp\n");
+    }
+
+    #[test]
+    fn draft_contract_accepts_nested_package_checks_when_root_has_no_integrity_story() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-nested-integrity-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "test": "echo test"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(root.join(".gitignore"), ".playwright-mcp/\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&FakeDrafter, "tighten the baseline-site homepage")
+            .unwrap();
+
+        assert_eq!(
+            contract.target_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/package.json"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_prefers_backend_candidates_over_ui_for_nested_repo() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-nested-backend-bias-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/components")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/db")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/persistence")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/actions")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/.astro/integrations/astro_db")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/dist")).unwrap();
+        fs::create_dir_all(root.join("packs")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "test": "echo test"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/components/SiteHeader.astro"),
+            "---\n---\n<header />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/components/SiteFooter.astro"),
+            "---\n---\n<footer />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/db/schema.ts"),
+            "export const schema = {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/persistence/store.ts"),
+            "export const store = {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/actions/create-session.ts"),
+            "export async function createSession() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/drizzle.config.ts"),
+            "export default {};\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/astro.config.mjs"),
+            "export default {};\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/.astro/integrations/astro_db/db.d.ts"),
+            "export {};\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/dist/app.js"),
+            "console.log('dist')\n",
+        )
+        .unwrap();
+        fs::write(root.join("packs/generated.json"), "{}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &FakeDrafter,
+                "implement DB session seed services for baseline dispatch",
+            )
+            .unwrap();
+
+        let first_allowed = contract.allowed_scope.first().map(String::as_str);
+        let first_entry = contract.entry_points.first().map(String::as_str);
+        let preferred_backend_paths = [
+            "baseline-site/src/db/schema.ts",
+            "baseline-site/src/lib/persistence/store.ts",
+            "baseline-site/src/actions/create-session.ts",
+            "baseline-site/drizzle.config.ts",
+            "baseline-site/package.json",
+        ];
+        assert!(first_allowed.is_some_and(|path| preferred_backend_paths.contains(&path)));
+        assert!(first_entry.is_some_and(|path| preferred_backend_paths.contains(&path)));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path.ends_with(".astro")));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path.contains("/dist/") || path.starts_with("packs/")));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path.contains("/.astro/") || path.contains("astro.config")));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/package.json"
+                || path == "baseline-site/drizzle.config.ts"
+                || path == "baseline-site/src/db/schema.ts"
+                || path == "baseline-site/src/lib/persistence/store.ts"
+                || path == "baseline-site/src/actions/create-session.ts"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_preserves_mixed_node_rust_service_scope() {
+        struct NarrowMixedServiceDrafter;
+
+        impl ContractDrafter for NarrowMixedServiceDrafter {
+            fn name(&self) -> &'static str {
+                "narrow-mixed-service"
+            }
+
+            fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+                Ok(DraftProposal {
+                    title: "session service".into(),
+                    summary: input.prompt,
+                    entry_points: vec!["baseline-site/src/lib/persistence/leads.ts".into()],
+                    import_paths: vec![],
+                    expected_interfaces: vec!["session handoff service".into()],
+                    behavior_requirements: vec!["implement session dispatch bridge".into()],
+                    allowed_scope: vec!["baseline-site/src/lib/persistence/leads.ts".into()],
+                    target_checks: vec!["npm --prefix baseline-site test".into()],
+                    integrity_checks: vec!["npm --prefix baseline-site test".into()],
+                    risk_level: "medium".into(),
+                })
+            }
+
+            fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+                Ok(input.current)
+            }
+        }
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-mixed-node-rust-service-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/lib/db")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/persistence")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/actions")).unwrap();
+        fs::create_dir_all(root.join("crates/session-bridge/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "test": "echo test"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/db/probe-state.ts"),
+            "export const probeState = {};\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/persistence/leads.ts"),
+            "export const leads = {};\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/actions/report.ts"),
+            "export async function report() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/session-bridge\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/session-bridge/Cargo.toml"),
+            "[package]\nname = \"session-bridge\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/session-bridge/src/lib.rs"),
+            "pub fn handoff() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &NarrowMixedServiceDrafter,
+                "implement session dispatch service bridge between baseline-site and Rust crates with transactional report handoff",
+            )
+            .unwrap();
+
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/package.json"));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "Cargo.toml" || path == "crates"));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/db"
+                || path == "baseline-site/src/lib/persistence"
+                || path == "baseline-site/src/actions"
+                || path == "baseline-site/src/lib/db/probe-state.ts"
+                || path == "baseline-site/src/actions/report.ts"
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_prefers_mixed_service_backend_anchors_over_ui_pages() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-mixed-service-anchors-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/components")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "build:web": "echo build"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/dispatch.astro"),
+            "---\n---\n<div>dispatch</div>\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/components/SiteHeader.astro"),
+            "---\n---\n<header />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/components/SiteFooter.astro"),
+            "---\n---\n<footer />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/dispatch.ts"),
+            "export async function dispatch() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/cookies.ts"),
+            "export function readCookies() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let prompt =
+            "mixed service/session/runtime handshake around enrollment activation across Astro server layer and Rust CLI layer";
+        let mut scan = scan_repo(&root, prompt).unwrap();
+        apply_prompt_targeting_bias(&root, prompt, &mut scan);
+
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api/cli/enroll.ts"));
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/services/enrollments.ts"));
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/session/operator.ts"));
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "crates/baseline-cli/src/main.rs"));
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "crates/baseline-cli/Cargo.toml"));
+        assert!(scan.candidate_file_scope_paths.iter().any(|path| {
+            path == "baseline-site/src/lib/services/enrollments.ts"
+                || path == "baseline-site/src/lib/services/dispatch.ts"
+        }));
+        assert!(scan.candidate_file_scope_paths.iter().any(|path| {
+            path == "baseline-site/src/lib/session/operator.ts"
+                || path == "baseline-site/src/lib/session/cookies.ts"
+        }));
+        assert!(scan
+            .candidate_file_scope_paths
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api/cli/enroll.ts"));
+        assert!(scan
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/services"));
+        assert!(scan
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/session"));
+        assert!(scan
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api"));
+        assert!(scan
+            .candidate_directory_scope_paths
+            .iter()
+            .any(|path| path == "crates/baseline-cli"));
+        assert!(!scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path.ends_with("dispatch.astro")
+                || path.ends_with("SiteHeader.astro")
+                || path.ends_with("SiteFooter.astro")));
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&FakeDrafter, prompt).unwrap();
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/services"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+        }));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "Cargo.toml" || path == "crates/baseline-cli"));
+        assert!(!contract
+            .allowed_scope
+            .iter()
+            .any(|path| path.ends_with("dispatch.astro")
+                || path.ends_with("SiteHeader.astro")
+                || path.ends_with("SiteFooter.astro")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_prefers_backend_service_anchors_over_astro_pages_for_nested_node_repo() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-backend-service-anchors-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/components")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "build:web": "echo build"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/dispatch.astro"),
+            "---\n---\n<div>dispatch</div>\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/components/SiteHeader.astro"),
+            "---\n---\n<header />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/components/SiteFooter.astro"),
+            "---\n---\n<footer />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/dispatch.ts"),
+            "export async function dispatch() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/cookies.ts"),
+            "export function readCookies() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let prompt =
+            "implement services/session/runtime handshake around enrollment activation in the Astro server backend";
+
+        let mut scan = scan_repo(&root, prompt).unwrap();
+        apply_prompt_targeting_bias(&root, prompt, &mut scan);
+
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api/cli/enroll.ts"));
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/services/enrollments.ts"));
+        assert!(scan
+            .candidate_entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/session/operator.ts"));
+        assert!(scan
+            .candidate_file_scope_paths
+            .iter()
+            .any(|path| path == "baseline-site/package.json"));
+        assert!(!scan.candidate_entry_points.iter().any(|path| {
+            path.ends_with("dispatch.astro")
+                || path.ends_with("SiteHeader.astro")
+                || path.ends_with("SiteFooter.astro")
+        }));
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&FakeDrafter, prompt).unwrap();
+
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/services"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+                || path == "baseline-site/src/lib/services/dispatch.ts"
+        }));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/session"
+                || path == "baseline-site/src/lib/session/operator.ts"
+        }));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api"
+                || path == "baseline-site/src/pages/api/cli/enroll.ts"));
+        assert!(!contract.allowed_scope.iter().any(|path| {
+            path.ends_with("dispatch.astro")
+                || path.ends_with("SiteHeader.astro")
+                || path.ends_with("SiteFooter.astro")
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_prefers_mixed_service_checks_for_nested_node_rust_repo() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-mixed-service-checks-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "build:web": "echo build"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &ScanTargetChecksDrafter,
+                "mixed service/session/runtime handshake around enrollment activation across Astro server layer and Rust CLI layer",
+            )
+            .unwrap();
+
+        assert_eq!(
+            contract.target_checks,
+            vec![
+                "cargo check -p baseline-cli".to_string(),
+                "npm --prefix baseline-site run build:web".to_string()
+            ]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_preserves_backend_service_scope_when_drafter_collapses_to_rust_only() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-backend-service-scope-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "build:web": "echo build"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/dispatch.ts"),
+            "export async function dispatch() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/cookies.ts"),
+            "export function readCookies() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &RustOnlyServiceDrafter,
+                "implement backend services/session activation flow for enrollment handoff",
+            )
+            .unwrap();
+
+        assert!(contract.entry_points.iter().any(|path| {
+            path == "baseline-site/src/lib/services/dispatch.ts"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+                || path == "baseline-site/src/pages/api/cli/enroll.ts"
+        }));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path == "crates/baseline-cli/src/main.rs"));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/package.json"
+                || path == "baseline-site/src/lib/services"
+                || path == "baseline-site/src/lib/services/dispatch.ts"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+        }));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/session"
+                || path == "baseline-site/src/lib/session/operator.ts"
+        }));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/pages/api"
+                || path == "baseline-site/src/pages/api/cli/enroll.ts"
+        }));
+        assert_eq!(
+            contract.target_checks,
+            vec!["npm --prefix baseline-site run build:web".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_replaces_report_page_anchor_with_backend_node_scope_for_mixed_slice() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-mixed-report-page-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "build:web": "echo build"
+  }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/report.astro"),
+            "---\n---\n<section />\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &MixedReportPageDrafter,
+                "mixed service/session/runtime handshake around enrollment activation across Astro server layer and Rust CLI layer",
+            )
+            .unwrap();
+
+        assert!(contract
+            .entry_points
+            .iter()
+            .any(|path| path == "crates/baseline-cli/src/main.rs"));
+        assert!(contract.entry_points.iter().any(|path| {
+            path == "baseline-site/src/pages/api/cli/enroll.ts"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+                || path == "baseline-site/src/lib/session/operator.ts"
+        }));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/report.astro"));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "crates/baseline-cli" || path == "crates/baseline-cli/src/main.rs"
+        }));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/services"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+        }));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/session"
+                || path == "baseline-site/src/lib/session/operator.ts"
+        }));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/pages/api"
+                || path == "baseline-site/src/pages/api/cli/enroll.ts"
+        }));
+        assert!(!contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/report.astro"));
+        assert_eq!(
+            contract.target_checks,
+            vec![
+                "cargo check -p baseline-cli".to_string(),
+                "npm --prefix baseline-site run build:web".to_string()
+            ]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_prunes_prompt_excluded_generated_scope_paths() {
+        struct PollutedScopeDrafter;
+
+        impl ContractDrafter for PollutedScopeDrafter {
+            fn name(&self) -> &'static str {
+                "polluted-scope"
+            }
+
+            fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+                Ok(DraftProposal {
+                    title: "db slice".into(),
+                    summary: input.prompt,
+                    entry_points: vec![
+                        "baseline-site/package.json".into(),
+                        "baseline-site/db/config.ts".into(),
+                        "baseline-site/db/seed.ts".into(),
+                        "baseline-site/src/lib/persistence/leads.ts".into(),
+                    ],
+                    import_paths: vec![],
+                    expected_interfaces: vec!["db layer".into()],
+                    behavior_requirements: vec!["implement db slice".into()],
+                    allowed_scope: vec![
+                        "baseline-site/package.json".into(),
+                        "baseline-site/db/config.ts".into(),
+                        "baseline-site/db/seed.ts".into(),
+                        "baseline-site/src/lib/persistence/leads.ts".into(),
+                        "baseline-site/design/stitch/mock.png".into(),
+                        "baseline-site/dist/server/chunk.mjs".into(),
+                        "baseline-site/.astro/integrations/astro_db/db.d.ts".into(),
+                        "baseline-site/.playwright-mcp/state.json".into(),
+                    ],
+                    target_checks: vec!["npm --prefix baseline-site test".into()],
+                    integrity_checks: vec!["npm --prefix baseline-site test".into()],
+                    risk_level: "medium".into(),
+                })
+            }
+
+            fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+                Ok(input.current)
+            }
+        }
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-exclusion-prune-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/db")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/persistence")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{"name":"baseline-site","scripts":{"test":"echo test"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/db/config.ts"),
+            "export default {};\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/db/seed.ts"),
+            "export async function seed() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/persistence/leads.ts"),
+            "export const leads = {};\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &PollutedScopeDrafter,
+                "implement DB layer for baseline-site; exclude baseline-site/design/** baseline-site/dist/** baseline-site/.astro/** baseline-site/.playwright-mcp/**",
+            )
+            .unwrap();
+
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .all(|path| !path.contains("/design/")));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .all(|path| !path.contains("/dist/")));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .all(|path| !path.contains("/.astro/")));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .all(|path| !path.contains("/.playwright-mcp/")));
+        assert!(
+            contract
+                .allowed_scope
+                .iter()
+                .any(|path| path == "baseline-site/db/config.ts"),
+            "{:?}",
+            contract.allowed_scope
+        );
+        assert!(!contract.allowed_scope.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeout_fallback_preserves_backend_service_seed_scope_for_baseline_repo() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-backend-service-{suffix}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{"name":"baseline-site","scripts":{"check":"echo check","build:web":"echo build"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"baseline","scripts":{"check":"npm --prefix baseline-site run check","build:web":"npm --prefix baseline-site run build:web"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let mut scan = scan_repo(
+            &root,
+            "implement services/session/runtime handshake around enrollment activation in the Astro server backend",
+        )
+        .unwrap();
+        enrich_scan_with_nested_integrity_fallback(&root, &mut scan).unwrap();
+        apply_prompt_targeting_bias(
+            &root,
+            "implement services/session/runtime handshake around enrollment activation in the Astro server backend",
+            &mut scan,
+        );
+        let fallback = recover_timeout_draft_proposal(
+            &root,
+            "implement services/session/runtime handshake around enrollment activation in the Astro server backend",
+            &scan,
+        )
+        .unwrap();
+
+        assert!(fallback.entry_points.iter().any(|path| {
+            path == "baseline-site/src/lib/services/enrollments.ts"
+                || path == "baseline-site/src/lib/session/operator.ts"
+                || path == "baseline-site/src/pages/api/cli/enroll.ts"
+        }));
+        assert!(fallback.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/services"
+                || path == "baseline-site/src/lib/session"
+                || path == "baseline-site/src/pages/api"
+        }));
+        assert_eq!(
+            fallback.target_checks,
+            vec!["npm --prefix baseline-site run build:web".to_string()]
+        );
+        assert_eq!(
+            fallback.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeout_fallback_uses_nested_package_root_when_backend_service_files_are_missing() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-backend-package-root-{suffix}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{"name":"baseline-site","scripts":{"check":"echo check","build:web":"echo build"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"baseline","scripts":{"check":"npm --prefix baseline-site run check","build:web":"npm --prefix baseline-site run build:web"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let prompt = "services/session layer for enrollment activation in the backend";
+        let mut scan = scan_repo(&root, prompt).unwrap();
+        enrich_scan_with_nested_integrity_fallback(&root, &mut scan).unwrap();
+        apply_prompt_targeting_bias(&root, prompt, &mut scan);
+        let fallback = recover_timeout_draft_proposal(&root, prompt, &scan).unwrap();
+
+        assert!(fallback
+            .entry_points
+            .iter()
+            .any(|path| path == "baseline-site/package.json"));
+        assert!(fallback
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/services"));
+        assert!(fallback
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/session"));
+        assert!(fallback
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api"));
+        assert_eq!(
+            fallback.target_checks,
+            vec!["npm --prefix baseline-site run build:web".to_string()]
+        );
+        assert_eq!(
+            fallback.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn timeout_fallback_preserves_mixed_service_seed_scope_for_baseline_repo() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-mixed-service-{suffix}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{"name":"baseline-site","scripts":{"check":"echo check","build:web":"echo build"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"baseline","scripts":{"check":"npm --prefix baseline-site run check","build:web":"npm --prefix baseline-site run build:web"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/report.astro"),
+            "---\\n---\\n<section />\\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let prompt =
+            "mixed service/session/runtime handshake around enrollment activation across Astro server layer and Rust CLI layer";
+        let mut scan = scan_repo(&root, prompt).unwrap();
+        enrich_scan_with_nested_integrity_fallback(&root, &mut scan).unwrap();
+        apply_prompt_targeting_bias(&root, prompt, &mut scan);
+        let fallback = recover_timeout_draft_proposal(&root, prompt, &scan).unwrap();
+
+        assert!(fallback
+            .entry_points
+            .iter()
+            .any(|path| path == "crates/baseline-cli/src/main.rs"));
+        assert!(fallback.entry_points.iter().any(|path| {
+            path == "baseline-site/src/lib/services/enrollments.ts"
+                || path == "baseline-site/src/lib/session/operator.ts"
+                || path == "baseline-site/src/pages/api/cli/enroll.ts"
+        }));
+        assert!(!fallback
+            .entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/report.astro"));
+        assert_eq!(
+            fallback.target_checks,
+            vec![
+                "cargo check -p baseline-cli".to_string(),
+                "npm --prefix baseline-site run build:web".to_string()
+            ]
+        );
+        assert_eq!(
+            fallback.integrity_checks,
+            vec!["npm --prefix baseline-site run check".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exact_services_prompt_with_exclusions_still_routes_to_baseline_backend_profile() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-exact-baseline-services-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{"name":"baseline-site","scripts":{"check":"echo check","build:web":"echo build"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"baseline","scripts":{"check":"npm --prefix baseline-site run check","build:web":"npm --prefix baseline-site run build:web"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let prompt = "Services phase only for Dispatch MVP. Goal: add server-side services in baseline-site/src/lib for operator session resolution, track catalog reads, latest baseline recommendation lookup, profile CRUD-lite, enrollment creation with draft-to-ready semantics, one-time enrollment token generation, support thread/message persistence, and a deterministic tutor behind a future-compatible interface. Keep scope bounded to backend/service/session/API surfaces; do not touch SiteHeader.astro, SiteFooter.astro, dispatch.astro, layouts, design assets, dist, .astro, or playwright artifacts.";
+
+        assert_eq!(
+            preferred_baseline_root_node_checks(&root),
+            Some((
+                "npm run check".to_string(),
+                Some("npm run build:web".to_string())
+            ))
+        );
+        assert_eq!(
+            build_baseline_targeting_profile(&root, BaselineTargetMode::Service).target_checks,
+            vec!["npm run build:web".to_string()]
+        );
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
+        eprintln!("services contract entry_points={:?} allowed_scope={:?} target_checks={:?} integrity_checks={:?}", contract.entry_points, contract.allowed_scope, contract.target_checks, contract.integrity_checks);
+
+        assert!(contract
+            .entry_points
+            .iter()
+            .any(|path| path == "baseline-site/package.json"));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path == "package.json"));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/services"));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/lib/session"));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/api"));
+        assert!(!contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "package.json"));
+        assert_eq!(
+            contract.target_checks,
+            vec!["npm run build:web".to_string()]
+        );
+        assert_eq!(contract.integrity_checks, vec!["npm run check".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exact_mixed_prompt_with_exclusions_still_routes_to_baseline_mixed_profile() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-exact-baseline-mixed-{suffix}-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{"name":"baseline-site","scripts":{"check":"echo check","build:web":"echo build"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"baseline","scripts":{"check":"npm --prefix baseline-site run check","build:web":"npm --prefix baseline-site run build:web"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/report.astro"),
+            "---\\n---\\n<section />\\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let prompt = "Mixed Node+Rust service/session/runtime integration slice for baseline. Goal: implement or refine the service/session/runtime handshake around enrollment activation across the Astro server layer and the Rust CLI layer. The change should naturally span runtime Node code in baseline-site and Rust CLI code in crates/baseline-cli. Keep scope bounded to backend/service/session/API/CLI surfaces and avoid UI pages, components, layouts, design assets, dist, .astro, and playwright artifacts. Prefer checks grounded in the current repo such as cargo check for the CLI and npm run check for the Astro app.";
+
+        assert_eq!(
+            preferred_baseline_root_node_checks(&root),
+            Some((
+                "npm run check".to_string(),
+                Some("npm run build:web".to_string())
+            ))
+        );
+        assert_eq!(
+            build_baseline_targeting_profile(&root, BaselineTargetMode::MixedRuntime).target_checks,
+            vec![
+                "cargo check -p baseline-cli".to_string(),
+                "npm run build:web".to_string()
+            ]
+        );
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
+
+        assert!(contract
+            .entry_points
+            .iter()
+            .any(|path| path == "crates/baseline-cli/src/main.rs"));
+        assert!(contract.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/services" || path == "baseline-site/src/pages/api"
+        }));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path == "package.json"));
+        assert!(!contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "package.json"));
+        assert!(!contract
+            .entry_points
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/report.astro"));
+        assert!(!contract
+            .allowed_scope
+            .iter()
+            .any(|path| path == "baseline-site/src/pages/report.astro"));
+        assert_eq!(
+            contract.target_checks,
+            vec![
+                "cargo check -p baseline-cli".to_string(),
+                "npm run build:web".to_string()
+            ]
+        );
+        assert_eq!(contract.integrity_checks, vec!["npm run check".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_success_ensures_default_gitignore_coverage_without_receipt_noise() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-success-gitignore-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&FakeDrafter, "add file").unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (_run, receipt) = service.cut_run(&FakeExecutor, &contract.id).unwrap();
+        assert_eq!(receipt.status, "success");
+        assert!(!receipt
+            .changed_files
+            .iter()
+            .any(|path| path == ".gitignore"));
+        assert_eq!(
+            fs::read_to_string(root.join(".gitignore")).unwrap(),
+            ".punk/\ntarget/\n.playwright-mcp/\n"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_generated_cargo_lock_for_file_scoped_cargo_contract() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-file-scope-cargo-lock-prune-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Cargo.lock"), "# generated\n").unwrap();
+        let contract = Contract {
+            id: "ct_file_scope_lock".into(),
+            feature_id: "feat_file_scope_lock".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "implement pubpunk init".into(),
+            entry_points: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["pubpunk init".into()],
+            behavior_requirements: vec!["keep tests green".into()],
+            allowed_scope: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            target_checks: vec!["cargo test -p pubpunk-core".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        prune_generated_cargo_lock_if_out_of_scope(&root, &contract, false).unwrap();
+
+        assert!(!root.join("Cargo.lock").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_present_isolated_changes_to_repo_root_copies_product_files_only() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-sync-isolated-{}-{suffix}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(workspace.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(workspace.join(".punk/runs/run_1")).unwrap();
+        fs::create_dir_all(workspace.join(".playwright-mcp/state")).unwrap();
+        fs::write(
+            workspace.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(workspace.join(".punk/runs/run_1/stdout.log"), "noise\n").unwrap();
+        fs::write(
+            workspace.join(".playwright-mcp/state/session.json"),
+            "{\"ok\":true}\n",
+        )
+        .unwrap();
+
+        sync_present_isolated_changes_to_repo_root(
+            &root,
+            &workspace,
+            &[
+                "crates/pubpunk-cli/src/main.rs".into(),
+                ".punk/runs/run_1/stdout.log".into(),
+                ".playwright-mcp/state/session.json".into(),
+            ],
+        )
+        .unwrap();
+
+        assert!(root.join("crates/pubpunk-cli/src/main.rs").exists());
+        assert!(!root.join(".punk/runs/run_1/stdout.log").exists());
+        assert!(!root.join(".playwright-mcp/state/session.json").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_present_repo_root_changes_to_isolated_workspace_copies_untracked_product_files() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-sync-root-{}-{suffix}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::create_dir_all(root.join(".playwright-mcp/state")).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname='pubpunk-cli'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname='pubpunk-core'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "tests\n").unwrap();
+        fs::write(root.join(".punk/runs/run_1/stdout.log"), "noise\n").unwrap();
+        fs::write(root.join("target/debug/app"), "bin\n").unwrap();
+        fs::write(
+            root.join(".playwright-mcp/state/session.json"),
+            "{\"ok\":true}\n",
+        )
+        .unwrap();
+
+        sync_present_repo_root_changes_to_isolated_workspace(
+            &root,
+            &workspace,
+            &[
+                "Cargo.toml".into(),
+                "crates/pubpunk-cli/Cargo.toml".into(),
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-core/Cargo.toml".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "tests/README.md".into(),
+                ".punk/runs/run_1/stdout.log".into(),
+                "target/debug/app".into(),
+                ".playwright-mcp/state/session.json".into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(workspace.join("Cargo.toml")).unwrap(),
+            "[workspace]\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("crates/pubpunk-cli/src/main.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("crates/pubpunk-core/src/lib.rs")).unwrap(),
+            "pub fn init() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("tests/README.md")).unwrap(),
+            "tests\n"
+        );
+        assert!(!workspace.join(".punk/runs/run_1/stdout.log").exists());
+        assert!(!workspace.join("target/debug/app").exists());
+        assert!(!workspace
+            .join(".playwright-mcp/state/session.json")
+            .exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_present_repo_root_changes_to_isolated_workspace_skips_self_copy() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-sync-self-root-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn keep() {}
+",
+        )
+        .unwrap();
+
+        sync_present_repo_root_changes_to_isolated_workspace(
+            &root,
+            &root,
+            &["crates/pubpunk-core/src/lib.rs".into()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("crates/pubpunk-core/src/lib.rs")).unwrap(),
+            "pub fn keep() {}
+"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_present_isolated_changes_to_repo_root_skips_self_copy() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-sync-self-workspace-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("tests/init_json.rs"),
+            "#[test]
+fn ok() {}
+",
+        )
+        .unwrap();
+
+        sync_present_isolated_changes_to_repo_root(&root, &root, &["tests/init_json.rs".into()])
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("tests/init_json.rs")).unwrap(),
+            "#[test]
+fn ok() {}
+"
         );
 
         let _ = fs::remove_dir_all(&root);
@@ -2593,6 +9530,736 @@ mod tests {
     }
 
     #[test]
+    fn draft_contract_ignores_nested_non_member_workspace_target_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-workspace-targets-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/Cargo.toml"),
+            "[package]\nname = \"punk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/Cargo.toml"),
+            "[package]\nname = \"punk-orch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("punk/punk-run/Cargo.toml"),
+            "[package]\nname = \"punk-run\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &ScanTargetChecksDrafter,
+                "tighten run reporting in punk-orch",
+            )
+            .unwrap();
+
+        assert!(contract
+            .target_checks
+            .contains(&"cargo test -p punk-orch".to_string()));
+        assert!(!contract
+            .target_checks
+            .contains(&"cargo test -p punk-run".to_string()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_allows_bootstrapped_greenfield_rust_repo_without_existing_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-rust-intake-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &GreenfieldRustDrafter,
+                "scaffold Rust workspace and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert!(!contract.allowed_scope.is_empty());
+        assert!(!contract.entry_points.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_expands_multi_surface_bootstrap_scope_without_existing_crates_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-rust-multisurface-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &GreenfieldRustDrafter,
+                "bootstrap initial Rust workspace for pubpunk touching exactly Cargo.toml, crates/pubpunk-cli, crates/pubpunk-core, and tests; create workspace members and make cargo test --workspace pass",
+            )
+            .unwrap();
+
+        assert_eq!(contract.entry_points, vec!["Cargo.toml".to_string()]);
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "Cargo.toml".to_string(),
+                "crates/pubpunk-cli".to_string(),
+                "crates/pubpunk-core".to_string(),
+                "tests".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_allows_bootstrapped_greenfield_go_repo_without_existing_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-go-intake-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &GreenfieldGoDrafter,
+                "scaffold Go module and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(contract.target_checks, vec!["go test ./...".to_string()]);
+        assert_eq!(contract.integrity_checks, vec!["go test ./...".to_string()]);
+        assert!(!contract.allowed_scope.is_empty());
+        assert!(!contract.entry_points.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_allows_bootstrapped_greenfield_python_repo_without_existing_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-python-intake-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &GreenfieldPythonDrafter,
+                "scaffold Python package and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(contract.target_checks, vec!["pytest".to_string()]);
+        assert_eq!(contract.integrity_checks, vec!["pytest".to_string()]);
+        assert!(!contract.allowed_scope.is_empty());
+        assert!(!contract.entry_points.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_allows_bootstrapped_greenfield_node_repo_without_existing_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-node-intake-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &GreenfieldNodeDrafter,
+                "scaffold TypeScript package and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(contract.target_checks, vec!["npm test".to_string()]);
+        assert_eq!(contract.integrity_checks, vec!["npm test".to_string()]);
+        assert!(!contract.allowed_scope.is_empty());
+        assert!(!contract.entry_points.is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_timeout_fallback_prefers_greenfield_rust_scaffold_scope_over_docs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-rust-scope-timeout-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/PUBPUNK_DEVELOPMENT_HANDOFF.md"),
+            "scaffold Rust workspace and implement pubpunk init + validate\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/IMPLEMENTATION_PLAN.md"),
+            "workspace scaffold validate init plan\n",
+        )
+        .unwrap();
+        fs::write(root.join("archive/pubpunk-docs.zip"), "zip placeholder\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &TimeoutDrafter,
+                "scaffold Rust workspace and implement pubpunk init + validate via go",
+            )
+            .unwrap();
+
+        assert_eq!(contract.entry_points, vec!["Cargo.toml".to_string()]);
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "Cargo.toml".to_string(),
+                "crates".to_string(),
+                "tests".to_string()
+            ]
+        );
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert_eq!(
+            contract.expected_interfaces,
+            vec!["initial Rust scaffold".to_string()]
+        );
+        assert_eq!(
+            contract.behavior_requirements,
+            vec![summarize_prompt(
+                "scaffold Rust workspace and implement pubpunk init + validate via go",
+            )]
+        );
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .all(|path| !path.starts_with("docs/") && !path.starts_with("archive/")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_timeout_fallback_keeps_crates_scope_when_plain_prompt_mentions_tests() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-rust-plain-tests-scope-timeout-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &TimeoutDrafter,
+                "scaffold Rust workspace and implement pubpunk init command with --json output and tests",
+            )
+            .unwrap();
+
+        assert_eq!(contract.entry_points, vec!["Cargo.toml".to_string()]);
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "tests".to_string(),
+                "Cargo.toml".to_string(),
+                "crates".to_string()
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_explicit_follow_up_touch_set_does_not_readd_bootstrap_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-explicit-followup-touch-set-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\nresolver='2'\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "tests\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &BroadBootstrapDrafter,
+                "implement pubpunk init command touching exactly crates/pubpunk-cli/src/main.rs, crates/pubpunk-core/src/lib.rs, and tests; add --json output and keep cargo test --workspace green",
+            )
+            .unwrap();
+
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "crates/pubpunk-cli/src/main.rs".to_string(),
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests".to_string(),
+            ]
+        );
+        assert_eq!(
+            contract.entry_points,
+            vec![
+                "crates/pubpunk-cli/src/main.rs".to_string(),
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_timeout_fallback_rich_init_prompt_keeps_file_scope_on_bootstrapped_repo() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-rich-init-file-scope-timeout-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\nresolver='2'\n").unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname = \"pubpunk-cli\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname = \"pubpunk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {\n    let _ = \"init --json --force --project-root\";\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() -> &'static str {\n    \"project.toml style/style.toml style/voice.md\"\n}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/init_json.rs"), "#[test]\nfn smoke() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &TimeoutDrafter,
+                "implement pubpunk init command with canonical starter files project.toml, style/style.toml, style/voice.md, style/lexicon.toml, style/normalize.toml, agent/skill.md, local/.gitignore; support --json, --force, --project-root; add tests; keep cargo test --workspace green",
+            )
+            .unwrap();
+
+        assert!(!contract.allowed_scope.iter().any(|scope| scope == "crates"));
+        assert!(!contract
+            .allowed_scope
+            .iter()
+            .any(|scope| scope == "Cargo.toml"));
+        assert!(contract
+            .entry_points
+            .iter()
+            .all(|scope| scope.contains('/') || scope.ends_with(".toml")));
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .any(|scope| scope.ends_with("tests/init_json.rs")
+                || scope.ends_with("tests/README.md")
+                || scope == "tests"));
+        assert!(contract.allowed_scope.len() <= 4);
+        assert!(contract
+            .expected_interfaces
+            .iter()
+            .any(|value| value.contains("`--json`")));
+        assert!(contract
+            .expected_interfaces
+            .iter()
+            .any(|value| value.contains("`--force`")));
+        assert!(contract
+            .expected_interfaces
+            .iter()
+            .any(|value| value.contains("`--project-root`")));
+        assert!(contract
+            .behavior_requirements
+            .iter()
+            .any(|value| value.contains("project.toml")
+                && value.contains("style/style.toml")
+                && value.contains("agent/skill.md")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_timeout_fallback_prefers_greenfield_go_scaffold_scope_over_docs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-go-scope-timeout-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/IMPLEMENTATION_PLAN.md"),
+            "scaffold go module and validate pubpunk init\n",
+        )
+        .unwrap();
+        fs::write(root.join("archive/pubpunk-docs.zip"), "zip placeholder\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &TimeoutDrafter,
+                "scaffold Go module and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(contract.entry_points, vec!["go.mod".to_string()]);
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "go.mod".to_string(),
+                "cmd".to_string(),
+                "internal".to_string(),
+                "pkg".to_string()
+            ]
+        );
+        assert_eq!(contract.target_checks, vec!["go test ./...".to_string()]);
+        assert_eq!(contract.integrity_checks, vec!["go test ./...".to_string()]);
+        assert_eq!(
+            contract.expected_interfaces,
+            vec!["initial Go scaffold".to_string()]
+        );
+        assert_eq!(
+            contract.behavior_requirements,
+            vec![summarize_prompt(
+                "scaffold Go module and implement pubpunk init + validate",
+            )]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_timeout_fallback_prefers_greenfield_python_scaffold_scope_over_docs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-python-scope-timeout-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/SPEC.md"),
+            "scaffold python package and validate pubpunk init\n",
+        )
+        .unwrap();
+        fs::write(root.join("archive/pubpunk-docs.zip"), "zip placeholder\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &TimeoutDrafter,
+                "scaffold Python package and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(contract.entry_points, vec!["pyproject.toml".to_string()]);
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "pyproject.toml".to_string(),
+                "src".to_string(),
+                "tests".to_string()
+            ]
+        );
+        assert_eq!(contract.target_checks, vec!["pytest".to_string()]);
+        assert_eq!(contract.integrity_checks, vec!["pytest".to_string()]);
+        assert_eq!(
+            contract.expected_interfaces,
+            vec!["initial Python scaffold".to_string()]
+        );
+        assert_eq!(
+            contract.behavior_requirements,
+            vec![summarize_prompt(
+                "scaffold Python package and implement pubpunk init + validate",
+            )]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_timeout_fallback_prefers_greenfield_node_scaffold_scope_over_docs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-greenfield-node-scope-timeout-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::create_dir_all(root.join("archive")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/pubpunk-core.md"),
+            "bootstrap guidance\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/SPEC.md"),
+            "scaffold TypeScript package and validate pubpunk init\n",
+        )
+        .unwrap();
+        fs::write(root.join("archive/pubpunk-docs.zip"), "zip placeholder\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &TimeoutDrafter,
+                "scaffold TypeScript package and implement pubpunk init + validate",
+            )
+            .unwrap();
+
+        assert_eq!(contract.entry_points, vec!["package.json".to_string()]);
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "package.json".to_string(),
+                "tsconfig.json".to_string(),
+                "src".to_string(),
+                "tests".to_string()
+            ]
+        );
+        assert_eq!(
+            contract.expected_interfaces,
+            vec!["initial TypeScript/Node scaffold".to_string()]
+        );
+        assert_eq!(
+            contract.behavior_requirements,
+            vec![summarize_prompt(
+                "scaffold TypeScript package and implement pubpunk init + validate",
+            )]
+        );
+        assert_eq!(contract.target_checks, vec!["npm test".to_string()]);
+        assert_eq!(contract.integrity_checks, vec!["npm test".to_string()]);
+        assert!(contract
+            .allowed_scope
+            .iter()
+            .all(|path| !path.starts_with("docs/") && !path.starts_with("archive/")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn refine_requires_draft_contract() {
         let root = std::env::temp_dir().join(format!("punk-orch-refine-{}", std::process::id()));
         let global = root.join("global");
@@ -2650,6 +10317,471 @@ mod tests {
     }
 
     #[test]
+    fn draft_contract_uses_timeout_fallback_when_initial_drafter_times_out() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-draft-fallback-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/Cargo.toml"),
+            "[package]\nname = \"punk-orch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/Cargo.toml"),
+            "[package]\nname = \"punk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/src/lib.rs"),
+            "pub fn core() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/CLI.md"), "# CLI\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let prompt = "Improve drafter timeout resilience for punk start and plot refine. Restrict allowed_scope exactly to crates/punk-orch/src/lib.rs; crates/punk-core/src/lib.rs; docs/product/CLI.md. Target checks should include cargo test -p punk-core -p punk-orch. Integrity checks should include cargo test --workspace.";
+        let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
+
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "crates/punk-orch/src/lib.rs".to_string(),
+                "crates/punk-core/src/lib.rs".to_string(),
+                "docs/product/CLI.md".to_string(),
+            ]
+        );
+        assert_eq!(contract.entry_points, contract.allowed_scope);
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test -p punk-core -p punk-orch".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn proposal_scope_readds_missing_entry_points_before_validation() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-entry-point-coverage-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname = \"pubpunk-cli\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname = \"pubpunk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "tests\n").unwrap();
+
+        let mut proposal = DraftProposal {
+            title: "Implement pubpunk init".to_string(),
+            summary: "Timeout fallback draft".to_string(),
+            entry_points: vec![
+                "crates/pubpunk-cli/Cargo.toml".to_string(),
+                "crates/pubpunk-core/Cargo.toml".to_string(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["pubpunk init".to_string()],
+            behavior_requirements: vec!["implement pubpunk init".to_string()],
+            allowed_scope: vec![
+                "crates/pubpunk-cli/src/main.rs".to_string(),
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/README.md".to_string(),
+            ],
+            target_checks: vec!["cargo test --workspace".to_string()],
+            integrity_checks: vec!["cargo test --workspace".to_string()],
+            risk_level: "medium".to_string(),
+        };
+
+        ensure_proposal_scope_covers_entry_points(&mut proposal);
+
+        assert!(proposal
+            .allowed_scope
+            .contains(&"crates/pubpunk-cli/Cargo.toml".to_string()));
+        assert!(proposal
+            .allowed_scope
+            .contains(&"crates/pubpunk-core/Cargo.toml".to_string()));
+        assert!(validate_draft_proposal(&root, &proposal).is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_repairs_missing_entry_point_scope_coverage_before_validation() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-entry-point-scope-leak-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn init() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &EntryPointScopeLeakDrafter,
+                "implement init behavior in src/lib.rs and keep cargo test green",
+            )
+            .unwrap();
+
+        assert!(contract.entry_points.contains(&"src/lib.rs".to_string()));
+        assert!(contract.allowed_scope.contains(&"src/lib.rs".to_string()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_exact_pubpunk_validate_core_prompt_stays_core_only() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-pubpunk-validate-core-only-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname=\"pubpunk-cli\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname=\"pubpunk-core\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn validate_report() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tests/validate_json.rs"),
+            "#[test]\nfn validate_json() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let prompt = "Core-only validate parseability helper slice for pubpunk. Goal: keep validate_report JSON envelope unchanged while extending TOML surface parseability review so invalid style/targets/review/lint inputs become explicit issue strings instead of silent omissions. Edit only crates/pubpunk-core/src/lib.rs. Do not touch CLI, tests, Cargo.toml, local/, or init files.";
+        let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
+
+        assert_eq!(
+            contract.entry_points,
+            vec!["crates/pubpunk-core/src/lib.rs".to_string()]
+        );
+        assert_eq!(
+            contract.allowed_scope,
+            vec!["crates/pubpunk-core/src/lib.rs".to_string()]
+        );
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test -p pubpunk-core".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert!(contract
+            .expected_interfaces
+            .iter()
+            .all(|line| !line.to_ascii_lowercase().contains("init")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_pubpunk_validate_core_prompt_prunes_cli_and_cargo_noise() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-pubpunk-validate-prune-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname=\"pubpunk-cli\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname=\"pubpunk-core\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn validate_report() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tests/validate_json.rs"),
+            "#[test]\nfn validate_json() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let prompt = "Core-only validate parseability helper slice for pubpunk. Goal: keep validate_report JSON envelope unchanged while extending TOML surface parseability review so invalid style/targets/review/lint inputs become explicit issue strings instead of silent omissions. Edit only crates/pubpunk-core/src/lib.rs. Do not touch CLI, tests, Cargo.toml, local/, or init files.";
+        let contract = service
+            .draft_contract(&ContaminatedPubpunkValidateDrafter, prompt)
+            .unwrap();
+
+        assert_eq!(
+            contract.entry_points,
+            vec!["crates/pubpunk-core/src/lib.rs".to_string()]
+        );
+        assert_eq!(
+            contract.allowed_scope,
+            vec!["crates/pubpunk-core/src/lib.rs".to_string()]
+        );
+        assert!(contract
+            .import_paths
+            .iter()
+            .all(|path| path == "crates/pubpunk-core/src/lib.rs"));
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test -p pubpunk-core".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert!(contract
+            .expected_interfaces
+            .iter()
+            .all(|line| !line.to_ascii_lowercase().contains("init")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_exact_pubpunk_validate_parseability_prompt_keeps_core_and_tests_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-pubpunk-validate-parseability-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname=\"pubpunk-cli\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname=\"pubpunk-core\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn validate_report() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tests/validate_json.rs"),
+            "#[test]\nfn validate_json() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let prompt = "bounded core-only validate parse-check extension. Edit only crates/pubpunk-core/src/lib.rs and tests/validate_json.rs. Do not touch CLI or Cargo. Reuse the existing simple TOML parser so validate_report also checks parseability of .pubpunk/style/style.toml, .pubpunk/style/lexicon.toml, .pubpunk/style/normalize.toml, plus any *.toml files present under .pubpunk/targets, .pubpunk/review, and .pubpunk/lint. Add tests that corrupt style.toml and a target .toml file and expect structured validate JSON issues. Final check cargo test --workspace.";
+        let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
+
+        assert_eq!(
+            contract.entry_points,
+            vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string()
+            ]
+        );
+        assert_eq!(
+            contract.allowed_scope,
+            vec![
+                "crates/pubpunk-core/src/lib.rs".to_string(),
+                "tests/validate_json.rs".to_string()
+            ]
+        );
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_timeout_fallback_keeps_entry_points_covered_for_pubpunk_init_prompt() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-pubpunk-init-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname = \"pubpunk-cli\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname = \"pubpunk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn init() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("tests/README.md"), "tests\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let prompt = "implement pubpunk init command in crates/pubpunk-cli and crates/pubpunk-core with tests: when run, it creates the canonical .pubpunk skeleton and returns JSON for --json; keep cargo test --workspace green";
+        let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
+
+        assert!(!contract.entry_points.is_empty());
+        for entry_point in &contract.entry_points {
+            assert!(
+                contract.allowed_scope.iter().any(|scope| {
+                    let scope = scope.trim_matches('/');
+                    let entry = entry_point.trim_matches('/');
+                    entry == scope || entry.starts_with(&format!("{scope}/"))
+                }),
+                "entry point {} must be covered by allowed_scope {:?}",
+                entry_point,
+                contract.allowed_scope
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn refine_contract_applies_explicit_guidance_scope_exactly() {
         let root = std::env::temp_dir().join(format!(
             "punk-orch-refine-explicit-scope-{}",
@@ -2661,6 +10793,7 @@ mod tests {
             .unwrap();
         fs::create_dir_all(root.join("Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests"))
             .unwrap();
+        fs::create_dir_all(root.join("punk/punk-run/src")).unwrap();
         fs::write(root.join("Makefile"), "test:\n\t@echo ok\n").unwrap();
         fs::write(
             root.join(
@@ -2681,6 +10814,7 @@ mod tests {
             "func testExample() {}\n",
         )
         .unwrap();
+        fs::write(root.join("punk/punk-run/src/main.rs"), "fn main() {}\n").unwrap();
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(&root)
@@ -2694,7 +10828,7 @@ mod tests {
                 "Add the next bounded dev-only slice for interviewcoach.",
             )
             .unwrap();
-        let guidance = "Expand allowed_scope exactly to the files needed for the copy/export trace slice: `Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/DevAppViewModel.swift`; `Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/MainWindowView.swift`; `Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests/DevAppViewModelTests.swift`. Target checks should include make test. Integrity checks should include make test.";
+        let guidance = "Expand allowed_scope exactly to the files needed for the copy/export trace slice: `Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/DevAppViewModel.swift`; `Packages/InterviewCoachKit/Sources/InterviewCoachDevUI/MainWindowView.swift`; `Packages/InterviewCoachKit/Tests/InterviewCoachDevUITests/DevAppViewModelTests.swift`. Do not include `punk/punk-run` in allowed_scope. Target checks should include make test. Integrity checks should include make test.";
         let refined = service
             .refine_contract(&FakeDrafter, &contract.id, guidance)
             .unwrap();
@@ -2713,6 +10847,212 @@ mod tests {
         assert_eq!(refined.entry_points, refined.allowed_scope);
         assert_eq!(refined.target_checks, vec!["make test".to_string()]);
         assert_eq!(refined.integrity_checks, vec!["make test".to_string()]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refine_contract_uses_timeout_fallback_with_explicit_guidance() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-refine-fallback-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/Cargo.toml"),
+            "[package]\nname = \"punk-orch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/Cargo.toml"),
+            "[package]\nname = \"punk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/src/lib.rs"),
+            "pub fn core() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/CLI.md"), "# CLI\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&FakeDrafter, "harden drafter timeout fallback")
+            .unwrap();
+        let guidance = "Restrict allowed_scope exactly to crates/punk-orch/src/lib.rs; crates/punk-core/src/lib.rs; docs/product/CLI.md. target_checks must contain exactly one command: cargo test -p punk-core -p punk-orch. integrity_checks must contain exactly one command: cargo test --workspace.";
+        let refined = service
+            .refine_contract(&TimeoutDrafter, &contract.id, guidance)
+            .unwrap();
+
+        assert_eq!(
+            refined.allowed_scope,
+            vec![
+                "crates/punk-orch/src/lib.rs".to_string(),
+                "crates/punk-core/src/lib.rs".to_string(),
+                "docs/product/CLI.md".to_string(),
+            ]
+        );
+        assert_eq!(refined.entry_points, refined.allowed_scope);
+        assert_eq!(
+            refined.target_checks,
+            vec!["cargo test -p punk-core -p punk-orch".to_string()]
+        );
+        assert_eq!(
+            refined.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refine_contract_preserves_exact_combined_target_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-refine-exact-target-checks-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-core/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/Cargo.toml"),
+            "[package]\nname = \"punk-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/Cargo.toml"),
+            "[package]\nname = \"punk-orch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-core/src/lib.rs"),
+            "pub fn core() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(&ScanTargetChecksDrafter, "tighten target check guidance")
+            .unwrap();
+        let guidance = "Keep allowed_scope exactly as-is. target_checks must contain exactly one command: cargo test -p punk-core -p punk-orch. integrity_checks must contain exactly one command: cargo test --workspace. Remove every other target check.";
+        let refined = service
+            .refine_contract(&ScanTargetChecksDrafter, &contract.id, guidance)
+            .unwrap();
+
+        assert_eq!(
+            refined.target_checks,
+            vec!["cargo test -p punk-core -p punk-orch".to_string()]
+        );
+        assert_eq!(
+            refined.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refine_contract_ignores_generated_runtime_artifact_paths_in_exact_scope_guidance() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-refine-generated-artifact-scope-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-cli/src")).unwrap();
+        fs::create_dir_all(root.join(".punk/project")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/Cargo.toml"),
+            "[package]\nname = \"punk-orch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-cli/Cargo.toml"),
+            "[package]\nname = \"punk-cli\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn orch() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("crates/punk-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join(".punk/project/harness.json"), "{}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service
+            .draft_contract(
+                &FakeDrafter,
+                "Add the next bounded harness slice for project inspect.",
+            )
+            .unwrap();
+        let guidance = "Restrict allowed_scope exactly to these two files and nothing else: crates/punk-orch/src/lib.rs; crates/punk-cli/src/main.rs. Mention the generated packet `.punk/project/harness.json` in docs, but do not include it in allowed_scope or entry_points because it is a runtime artifact destination. target_checks must contain exactly one command: cargo test -p punk-core -p punk-orch. integrity_checks must contain exactly one command: cargo test --workspace.";
+        let refined = service
+            .refine_contract(&FakeDrafter, &contract.id, guidance)
+            .unwrap();
+
+        assert_eq!(
+            refined.allowed_scope,
+            vec![
+                "crates/punk-orch/src/lib.rs".to_string(),
+                "crates/punk-cli/src/main.rs".to_string(),
+            ]
+        );
+        assert_eq!(refined.entry_points, refined.allowed_scope);
+        assert_eq!(
+            refined.target_checks,
+            vec!["cargo test -p punk-core -p punk-orch".to_string()]
+        );
+        assert_eq!(
+            refined.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -3020,19 +11360,9 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let bus = std::env::temp_dir().join(format!(
-            "punk-orch-project-overlay-bus-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _bus_guard = EnvVarGuard::set("PUNK_BUS_DIR", &bus);
         let _ = fs::remove_dir_all(&base);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);
-        let _ = fs::remove_dir_all(&bus);
 
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
@@ -3042,6 +11372,18 @@ mod tests {
         .unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
         fs::write(root.join("Makefile"), "test:\n\tcargo test\n").unwrap();
+        fs::write(root.join("playwright.config.ts"), "export default {};\n").unwrap();
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::write(
+            root.join("prometheus.yml"),
+            "global:\n  scrape_interval: 15s\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("otel-collector.yaml"),
+            "receivers: {}\nexporters: {}\nservice: {}\n",
+        )
+        .unwrap();
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(&root)
@@ -3076,12 +11418,11 @@ mod tests {
         fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
         fs::create_dir_all(root.join(".punk")).unwrap();
         fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
-
-        let skills_dir = bus.parent().unwrap().join("skills");
-        fs::create_dir_all(&skills_dir).unwrap();
+        let repo_skills_dir = root.join(".punk/skills/overlays/implementer");
+        fs::create_dir_all(&repo_skills_dir).unwrap();
         fs::write(
-            skills_dir.join("interviewcoach-core.md"),
-            "---\nname: interviewcoach-core\ndescription: Core rules\nproject: [\"interviewcoach\"]\n---\n\nUse existing architecture.\n",
+            repo_skills_dir.join("interviewcoach-core.md"),
+            "# Implementer overlay\n",
         )
         .unwrap();
 
@@ -3096,6 +11437,8 @@ mod tests {
             overlay.agent_guidance_ref,
             vec!["AGENTS.md", ".punk/AGENT_START.md"]
         );
+        assert_eq!(overlay.overlay_ref, ".punk/project/overlay.json");
+        assert_eq!(overlay.project_skill_resolution_mode, "repo_local");
         assert!(overlay
             .safe_default_checks
             .iter()
@@ -3107,11 +11450,56 @@ mod tests {
         assert!(overlay
             .project_skill_refs
             .iter()
-            .any(|path| path.ends_with("interviewcoach-core.md")));
+            .any(|path| path == ".punk/skills/overlays/implementer/interviewcoach-core.md"));
+        assert!(overlay.ambient_project_skill_refs.is_empty());
         assert!(overlay.capability_summary.bootstrap_ready);
         assert!(overlay.capability_summary.project_guidance_ready);
         assert!(overlay.capability_summary.staged_ready);
         assert!(overlay.capability_summary.autonomous_ready);
+        assert!(overlay.harness_summary.inspect_ready);
+        assert!(overlay.harness_summary.bootable_per_workspace);
+        assert!(overlay.harness_summary.ui_legible);
+        assert!(overlay.harness_summary.logs_legible);
+        assert!(overlay.harness_summary.metrics_legible);
+        assert!(overlay.harness_summary.traces_legible);
+        assert_eq!(overlay.harness_spec_ref, ".punk/project/harness.json");
+        assert_eq!(overlay.harness_spec.project_id, overlay.project_id);
+        assert_eq!(overlay.harness_spec.derivation_source, "repo_markers_v1");
+        assert!(overlay.harness_spec.inspect_ready);
+        assert!(overlay.harness_spec.bootable_per_workspace);
+        assert_eq!(
+            overlay.harness_spec.profiles,
+            vec![PersistedHarnessProfile {
+                name: "default".into(),
+                validation_surfaces: vec![
+                    "command".into(),
+                    "ui_snapshot".into(),
+                    "log_query".into(),
+                    "metric_assertion".into(),
+                    "trace_assertion".into(),
+                ],
+                validation_recipes: vec![
+                    PersistedHarnessRecipe {
+                        kind: "artifact_assertion".into(),
+                        path: ".punk/bootstrap/interviewcoach-core.md".into(),
+                    },
+                    PersistedHarnessRecipe {
+                        kind: "artifact_assertion".into(),
+                        path: "AGENTS.md".into(),
+                    },
+                    PersistedHarnessRecipe {
+                        kind: "artifact_assertion".into(),
+                        path: ".punk/AGENT_START.md".into(),
+                    },
+                ],
+            }]
+        );
+        let persisted: PersistedHarnessSpec =
+            read_json(&root.join(".punk/project/harness.json")).unwrap();
+        assert_eq!(persisted, overlay.harness_spec);
+        let persisted_overlay: ProjectOverlay =
+            read_json(&root.join(".punk/project/overlay.json")).unwrap();
+        assert_eq!(persisted_overlay, overlay);
         assert_eq!(
             overlay.status_scope_mode,
             format!("project:{}", overlay.project_id)
@@ -3120,7 +11508,194 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&base);
         let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn inspect_project_overlay_uses_ambient_fallback_only_when_repo_local_skills_are_missing() {
+        let base = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-ambient-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = base.join("interviewcoach");
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-ambient-fallback-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bus = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-ambient-fallback-bus-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _bus_guard = EnvVarGuard::set("PUNK_BUS_DIR", &bus);
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
         let _ = fs::remove_dir_all(&bus);
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='interviewcoach'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        fs::write(root.join("Makefile"), "test:\n\tcargo test\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/interviewcoach-core.md"),
+            "Use existing architecture.\n",
+        )
+        .unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::create_dir_all(root.join(".punk")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+
+        let skills_dir = bus.parent().unwrap().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        fs::write(
+            skills_dir.join("interviewcoach-core.md"),
+            "---\nname: interviewcoach-core\ndescription: Core rules\nproject: [\"interviewcoach\"]\n---\n\nUse existing architecture.\n",
+        )
+        .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let overlay = service.inspect_project_overlay().unwrap();
+
+        assert_eq!(overlay.project_skill_resolution_mode, "ambient_fallback");
+        assert_eq!(
+            overlay.project_skill_refs,
+            overlay.ambient_project_skill_refs
+        );
+        assert!(overlay
+            .project_skill_refs
+            .iter()
+            .any(|path| path.ends_with("interviewcoach-core.md")));
+        assert!(overlay.local_constraints.iter().any(|constraint| constraint
+            == "project skills resolved via ambient fallback; persist repo-local overlays under .punk/skills/overlays/"));
+
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        let _ = fs::remove_dir_all(&bus);
+    }
+
+    #[test]
+    fn inspect_project_overlay_reuses_single_existing_bootstrap_doc() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-custom-bootstrap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-custom-bootstrap-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='interviewcoach'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/custom-project-core.md"),
+            "Use existing architecture.\n",
+        )
+        .unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::create_dir_all(root.join(".punk")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let overlay = service.inspect_project_overlay().unwrap();
+
+        assert_eq!(
+            overlay.bootstrap_ref.as_deref(),
+            Some(".punk/bootstrap/custom-project-core.md")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn inspect_project_overlay_persists_empty_harness_profile_when_markers_missing() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-empty-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let overlay = service.inspect_project_overlay().unwrap();
+
+        assert_eq!(overlay.harness_spec_ref, ".punk/project/harness.json");
+        assert!(!overlay.harness_summary.inspect_ready);
+        assert!(!overlay.harness_summary.bootable_per_workspace);
+        assert!(!overlay.harness_spec.inspect_ready);
+        assert!(overlay.harness_spec.profiles.is_empty());
+        let persisted: PersistedHarnessSpec =
+            read_json(&root.join(".punk/project/harness.json")).unwrap();
+        assert_eq!(persisted, overlay.harness_spec);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
     }
 
     #[test]
@@ -3198,6 +11773,11 @@ mod tests {
             contract_ref: format!(".punk/contracts/{}/v1.json", run.feature_id),
             receipt_ref: format!(".punk/runs/{}/receipt.json", run.id),
             check_refs: Vec::new(),
+            verification_context_ref: run.verification_context_ref.clone(),
+            verification_context_identity: None,
+            command_evidence: Vec::new(),
+            declared_harness_evidence: Vec::new(),
+            harness_evidence: Vec::new(),
             created_at: now_rfc3339(),
         };
         let decision_path = root
@@ -3208,10 +11788,38 @@ mod tests {
             id: format!("proof_{}", decision.id.trim_start_matches("dec_")),
             decision_id: decision.id.clone(),
             run_id: run.id.clone(),
+            run_ref: Some(format!(".punk/runs/{}/run.json", run.id)),
             contract_ref: decision.contract_ref.clone(),
             receipt_ref: decision.receipt_ref.clone(),
             decision_ref: format!(".punk/decisions/{}.json", decision.id),
             check_refs: Vec::new(),
+            workspace_lineage: Some(run.vcs.clone()),
+            verification_context_ref: decision.verification_context_ref.clone(),
+            verification_context_identity: decision.verification_context_identity.clone(),
+            executor_identity: None,
+            reproducibility_claim: None,
+            command_evidence: vec![
+                punk_domain::CommandEvidence {
+                    evidence_type: "command".into(),
+                    lane: "target".into(),
+                    command: "cargo test -p punk-orch".into(),
+                    status: punk_domain::CheckStatus::Pass,
+                    summary: "target check passed".into(),
+                    stdout_ref: None,
+                    stderr_ref: None,
+                },
+                punk_domain::CommandEvidence {
+                    evidence_type: "command".into(),
+                    lane: "integrity".into(),
+                    command: "cargo test --workspace".into(),
+                    status: punk_domain::CheckStatus::Pass,
+                    summary: "integrity check passed".into(),
+                    stdout_ref: None,
+                    stderr_ref: None,
+                },
+            ],
+            declared_harness_evidence: Vec::new(),
+            harness_evidence: Vec::new(),
             hashes: Default::default(),
             summary: format!("proof for {}", decision.id),
             created_at: now_rfc3339(),
@@ -3244,6 +11852,13 @@ mod tests {
             Some(decision_ref.as_str())
         );
         assert_eq!(ledger.latest_proof_ref.as_deref(), Some(proof_ref.as_str()));
+        assert_eq!(
+            ledger.latest_proof_command_evidence_summary,
+            vec![
+                "target pass: cargo test -p punk-orch".to_string(),
+                "integrity pass: cargo test --workspace".to_string()
+            ]
+        );
         assert_eq!(ledger.lifecycle_state, "accepted");
         assert_eq!(ledger.next_action.as_deref(), Some("inspect_proof"));
         assert_eq!(ledger.next_action_ref.as_deref(), Some(proof.id.as_str()));
@@ -3296,6 +11911,494 @@ mod tests {
             status_for_project.work_id.as_deref(),
             Some(ledger.work_id.as_str())
         );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn status_prefers_feature_with_latest_ledger_activity_over_newer_feature_timestamp() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-latest-ledger-activity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-latest-ledger-activity-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let project = service.bootstrap_project().unwrap();
+        fs::write(root.join("demo-a.txt"), "a\n").unwrap();
+        fs::write(root.join("demo-b.txt"), "b\n").unwrap();
+
+        let proposal_a = DraftProposal {
+            title: "feature a".into(),
+            summary: "first feature".into(),
+            entry_points: vec!["demo-a.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["demo a".into()],
+            behavior_requirements: vec!["update demo a".into()],
+            allowed_scope: vec!["demo-a.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+        };
+        let (_feature_a, contract_a) = service
+            .persist_draft_contract(&project, "first feature", &proposal_a)
+            .unwrap();
+        service.approve_contract(&contract_a.id).unwrap();
+        let (_run_a1, _receipt_a1) = service.cut_run(&FakeExecutor, &contract_a.id).unwrap();
+
+        let proposal_b = DraftProposal {
+            title: "feature b".into(),
+            summary: "second feature".into(),
+            entry_points: vec!["demo-b.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["demo b".into()],
+            behavior_requirements: vec!["update demo b".into()],
+            allowed_scope: vec!["demo-b.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+        };
+        let (_feature_b, contract_b) = service
+            .persist_draft_contract(&project, "second feature", &proposal_b)
+            .unwrap();
+        service.approve_contract(&contract_b.id).unwrap();
+
+        let stale_run = Run {
+            id: "run_stale_b".into(),
+            task_id: "task_stale_b".into(),
+            feature_id: contract_b.feature_id.clone(),
+            contract_id: contract_b.id.clone(),
+            attempt: 1,
+            status: RunStatus::Running,
+            mode_origin: ModeId::Cut,
+            vcs: RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: "HEAD".into(),
+                change_ref: "HEAD".into(),
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: None,
+        };
+        let stale_dir = service.paths.runs_dir.join(&stale_run.id);
+        fs::create_dir_all(&stale_dir).unwrap();
+        write_json(&stale_dir.join("run.json"), &stale_run).unwrap();
+
+        let (run_a2, _receipt_a2) = service.cut_run(&FakeExecutor, &contract_a.id).unwrap();
+
+        let latest = service.inspect_work_ledger(None).unwrap();
+        assert_eq!(latest.work_id, contract_a.feature_id);
+        let expected_run_ref = format!(".punk/runs/{}/run.json", run_a2.id);
+        assert_eq!(
+            latest.latest_run_ref.as_deref(),
+            Some(expected_run_ref.as_str())
+        );
+
+        let status = service.status(None).unwrap();
+        assert_eq!(
+            status.work_id.as_deref(),
+            Some(contract_a.feature_id.as_str())
+        );
+        assert_eq!(status.last_run_id.as_deref(), Some(run_a2.id.as_str()));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn inspect_work_ledger_ignores_stale_orphaned_running_run() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-ignore-stale-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-ignore-stale-run-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("demo.txt"), "seed\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let project = service.bootstrap_project().unwrap();
+        let proposal = DraftProposal {
+            title: "feature".into(),
+            summary: "feature".into(),
+            entry_points: vec!["demo.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["demo".into()],
+            behavior_requirements: vec!["update demo".into()],
+            allowed_scope: vec!["demo.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+        };
+        let (_feature, contract) = service
+            .persist_draft_contract(&project, "feature", &proposal)
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+        let (good_run, _receipt) = service.cut_run(&FakeExecutor, &contract.id).unwrap();
+
+        let stale_run = Run {
+            id: "run_stale_orphan".into(),
+            task_id: "task_stale_orphan".into(),
+            feature_id: contract.feature_id.clone(),
+            contract_id: contract.id.clone(),
+            attempt: 2,
+            status: RunStatus::Running,
+            mode_origin: ModeId::Cut,
+            vcs: good_run.vcs.clone(),
+            verification_context_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: None,
+        };
+        let stale_dir = service.paths.runs_dir.join(&stale_run.id);
+        fs::create_dir_all(&stale_dir).unwrap();
+        write_json(&stale_dir.join("run.json"), &stale_run).unwrap();
+        write_json(
+            &stale_dir.join("executor.json"),
+            &serde_json::json!({"child_pid": 999999_u32, "process_group_id": 999999_u32}),
+        )
+        .unwrap();
+        write_json(
+            &stale_dir.join("heartbeat.json"),
+            &RunHeartbeat {
+                run_id: stale_run.id.clone(),
+                state: "running".into(),
+                last_progress_at: "2020-01-01T00:00:00Z".into(),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            },
+        )
+        .unwrap();
+
+        let ledger = service
+            .inspect_work_ledger(Some(&contract.feature_id))
+            .unwrap();
+        assert_eq!(
+            ledger.latest_run_ref.as_deref(),
+            Some(format!(".punk/runs/{}/run.json", good_run.id).as_str())
+        );
+        assert_eq!(ledger.lifecycle_state, "awaiting_gate");
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn gc_stale_dry_run_reports_safe_orphaned_runs() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-gc-stale-dry-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-gc-stale-dry-run-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("demo.txt"), "seed\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let project = service.bootstrap_project().unwrap();
+        let proposal = DraftProposal {
+            title: "feature".into(),
+            summary: "feature".into(),
+            entry_points: vec!["demo.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["demo".into()],
+            behavior_requirements: vec!["update demo".into()],
+            allowed_scope: vec!["demo.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+        };
+        let (_feature, contract) = service
+            .persist_draft_contract(&project, "feature", &proposal)
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let stale_run = Run {
+            id: "run_gc_stale".into(),
+            task_id: "task_gc_stale".into(),
+            feature_id: contract.feature_id.clone(),
+            contract_id: contract.id.clone(),
+            attempt: 1,
+            status: RunStatus::Running,
+            mode_origin: ModeId::Cut,
+            vcs: RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: "HEAD".into(),
+                change_ref: "HEAD".into(),
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: None,
+        };
+        let stale_dir = service.paths.runs_dir.join(&stale_run.id);
+        fs::create_dir_all(&stale_dir).unwrap();
+        write_json(&stale_dir.join("run.json"), &stale_run).unwrap();
+        write_json(
+            &stale_dir.join("executor.json"),
+            &serde_json::json!({"child_pid": 999999_u32, "process_group_id": 999999_u32}),
+        )
+        .unwrap();
+        write_json(
+            &stale_dir.join("heartbeat.json"),
+            &RunHeartbeat {
+                run_id: stale_run.id.clone(),
+                state: "running".into(),
+                last_progress_at: "2020-01-01T00:00:00Z".into(),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            },
+        )
+        .unwrap();
+
+        let report = service.gc_stale_dry_run().unwrap();
+        assert_eq!(report.project_id, project.id);
+        assert_eq!(report.safe_to_archive.len(), 1);
+        assert!(report.manual_review.is_empty());
+        let candidate = &report.safe_to_archive[0];
+        assert_eq!(candidate.artifact_id, stale_run.id);
+        assert_eq!(candidate.work_id, contract.feature_id);
+        assert!(candidate.reason.contains("child_pid 999999 is dead"));
+        assert_eq!(
+            candidate.artifact_ref,
+            format!(".punk/runs/{}/run.json", stale_run.id)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn orch_new_quarantines_safe_stale_runs_into_archive() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-auto-quarantine-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-auto-quarantine-stale-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("demo.txt"), "seed\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let project = service.bootstrap_project().unwrap();
+        let proposal = DraftProposal {
+            title: "feature".into(),
+            summary: "feature".into(),
+            entry_points: vec!["demo.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["demo".into()],
+            behavior_requirements: vec!["update demo".into()],
+            allowed_scope: vec!["demo.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+        };
+        let (_feature, contract) = service
+            .persist_draft_contract(&project, "feature", &proposal)
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let stale_run = Run {
+            id: "run_auto_quarantine".into(),
+            task_id: "task_auto_quarantine".into(),
+            feature_id: contract.feature_id.clone(),
+            contract_id: contract.id.clone(),
+            attempt: 1,
+            status: RunStatus::Running,
+            mode_origin: ModeId::Cut,
+            vcs: RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: "HEAD".into(),
+                change_ref: "HEAD".into(),
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: None,
+        };
+        let stale_dir = service.paths.runs_dir.join(&stale_run.id);
+        fs::create_dir_all(&stale_dir).unwrap();
+        write_json(&stale_dir.join("run.json"), &stale_run).unwrap();
+        write_json(
+            &stale_dir.join("executor.json"),
+            &serde_json::json!({"child_pid": 999999_u32, "process_group_id": 999999_u32}),
+        )
+        .unwrap();
+        write_json(
+            &stale_dir.join("heartbeat.json"),
+            &RunHeartbeat {
+                run_id: stale_run.id.clone(),
+                state: "running".into(),
+                last_progress_at: "2020-01-01T00:00:00Z".into(),
+                stdout_bytes: 0,
+                stderr_bytes: 0,
+            },
+        )
+        .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        assert!(!service.paths.runs_dir.join(&stale_run.id).exists());
+        let archived_dir = root.join(".punk/archive/runs").join(&stale_run.id);
+        assert!(archived_dir.exists());
+        let quarantine: StaleArchiveRecord =
+            read_json(&archived_dir.join("quarantine.json")).unwrap();
+        assert_eq!(quarantine.run_id, stale_run.id);
+        assert_eq!(quarantine.work_id, contract.feature_id);
+        assert!(quarantine
+            .reason
+            .contains("status=running but child_pid 999999 is dead"));
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);
@@ -3376,6 +12479,11 @@ mod tests {
             contract_ref: format!(".punk/contracts/{}/v1.json", run.feature_id),
             receipt_ref: format!(".punk/runs/{}/receipt.json", run.id),
             check_refs: Vec::new(),
+            verification_context_ref: run.verification_context_ref.clone(),
+            verification_context_identity: None,
+            command_evidence: Vec::new(),
+            declared_harness_evidence: Vec::new(),
+            harness_evidence: Vec::new(),
             created_at: now_rfc3339(),
         };
         let decision_path = root
@@ -3386,10 +12494,19 @@ mod tests {
             id: format!("proof_{}", decision.id.trim_start_matches("dec_")),
             decision_id: decision.id.clone(),
             run_id: run.id.clone(),
+            run_ref: Some(format!(".punk/runs/{}/run.json", run.id)),
             contract_ref: decision.contract_ref.clone(),
             receipt_ref: decision.receipt_ref.clone(),
             decision_ref: format!(".punk/decisions/{}.json", decision.id),
             check_refs: Vec::new(),
+            workspace_lineage: Some(run.vcs.clone()),
+            verification_context_ref: decision.verification_context_ref.clone(),
+            verification_context_identity: decision.verification_context_identity.clone(),
+            executor_identity: None,
+            reproducibility_claim: None,
+            command_evidence: Vec::new(),
+            declared_harness_evidence: Vec::new(),
+            harness_evidence: Vec::new(),
             hashes: Default::default(),
             summary: format!("proof for {}", decision.id),
             created_at: now_rfc3339(),
@@ -3456,6 +12573,1193 @@ mod tests {
             autonomy_inspect["recovery_contract_ref"].as_str(),
             Some(recovery_ref.as_str())
         );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_start_freezes_packet_and_inspects_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-start-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-start-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let view = service
+            .start_research(ResearchStartInput {
+                kind: "architecture".into(),
+                question: "Should research packets become first-class repo artifacts?".into(),
+                goal: "Freeze the bounded research question for later execution.".into(),
+                subject_ref: Some(".punk/project.json".into()),
+                constraints: vec!["Keep this advisory-only.".into()],
+                success_criteria: vec![
+                    "Packet captures an explicit budget.".into(),
+                    "Inspect can recover the frozen packet.".into(),
+                ],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 2,
+                    max_worker_slots: 3,
+                    max_cost_usd: Some(5.0),
+                    max_duration_minutes: 15,
+                    max_artifacts: 6,
+                },
+            })
+            .unwrap();
+
+        assert_eq!(view.record.project_id, project_id(&root).unwrap());
+        assert_eq!(view.record.state, "frozen");
+        assert_eq!(view.question.kind, "architecture");
+        assert_eq!(
+            view.packet.output_schema_ref,
+            "docs/product/RESEARCH.md#researchsynthesis"
+        );
+        assert_eq!(
+            view.packet.context_refs,
+            vec!["docs/product/RESEARCH.md".to_string()]
+        );
+        assert_eq!(view.packet.budget.max_rounds, 2);
+        assert_eq!(view.packet.budget.max_worker_slots, 3);
+        assert_eq!(view.packet.budget.max_cost_usd, Some(5.0));
+        assert_eq!(
+            view.packet.stop_rules,
+            vec![
+                "stop_when_budget_exhausted".to_string(),
+                "stop_when_evidence_is_sufficient".to_string(),
+                "escalate_on_persistent_ambiguity".to_string()
+            ]
+        );
+        assert_eq!(view.synthesis_lineage.history_count, 0);
+        assert!(view.synthesis_lineage.history.is_empty());
+        assert!(!view.synthesis_lineage.has_active_current_view);
+        assert!(!view.synthesis_lineage.has_replacements);
+        assert!(!view.synthesis_lineage.latest_is_active);
+
+        let record_path = root
+            .join(&view.record.packet_ref)
+            .parent()
+            .unwrap()
+            .join("record.json");
+        assert!(record_path.exists());
+        assert!(root.join(&view.record.question_ref).exists());
+        assert!(root.join(&view.record.packet_ref).exists());
+
+        let inspected = service.inspect_research(&view.record.id).unwrap();
+        assert_eq!(inspected, view);
+
+        let generic = service.inspect(&view.record.id).unwrap();
+        assert_eq!(generic["id"].as_str(), Some(view.record.id.as_str()));
+        assert_eq!(generic["state"].as_str(), Some("frozen"));
+
+        let events = service.event_store().load_all().unwrap();
+        let expected_payload_ref = format!(".punk/research/{}/record.json", view.record.id);
+        assert!(events.iter().any(|event| {
+            event.kind == "research.started"
+                && event.payload_ref.as_deref() == Some(expected_payload_ref.as_str())
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_artifact_write_updates_record_and_inspect_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-artifact-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-artifact-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "cleanup_impact".into(),
+                question: "What files would a cleanup remove?".into(),
+                goal: "Freeze cleanup-impact research first.".into(),
+                subject_ref: None,
+                constraints: vec!["Stay repo-local.".into()],
+                success_criteria: vec!["Artifact list stays inspectable.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+
+        let updated = service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Initial cleanup hypothesis captured.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.record.state, "gathering");
+        assert_eq!(updated.record.artifact_refs.len(), 1);
+        assert_eq!(updated.artifacts.len(), 1);
+        assert_eq!(updated.synthesis_lineage.history_count, 0);
+        assert!(updated.synthesis_lineage.history.is_empty());
+        assert!(!updated.synthesis_lineage.has_active_current_view);
+        assert!(!updated.synthesis_lineage.has_replacements);
+        assert!(!updated.synthesis_lineage.latest_is_active);
+        assert_eq!(updated.artifacts[0].kind, "note");
+        assert_eq!(
+            updated.artifacts[0].summary,
+            "Initial cleanup hypothesis captured."
+        );
+        assert_eq!(
+            updated.artifacts[0].source_ref.as_deref(),
+            Some("docs/product/RESEARCH.md")
+        );
+
+        let inspected = service.inspect_research(&started.record.id).unwrap();
+        assert_eq!(inspected, updated);
+
+        let artifact_value = service.inspect(&updated.artifacts[0].id).unwrap();
+        assert_eq!(
+            artifact_value["id"].as_str(),
+            Some(updated.artifacts[0].id.as_str())
+        );
+        assert_eq!(
+            artifact_value["research_id"].as_str(),
+            Some(started.record.id.as_str())
+        );
+
+        let events = service.event_store().load_all().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "research.artifact_written"
+                && event.payload_ref.as_deref() == Some(updated.record.artifact_refs[0].as_str())
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_synthesis_write_updates_record_and_inspect_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-synthesis-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-synthesis-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "migration_risk".into(),
+                question: "What is the smallest migration risk summary?".into(),
+                goal: "Attach evidence and synthesize a bounded recommendation.".into(),
+                subject_ref: None,
+                constraints: vec!["Stay inspectable.".into()],
+                success_criteria: vec!["Synthesis links back to gathered artifacts.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+
+        let gathered = service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "risk_note".into(),
+                    summary: "Captured the first migration constraint.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+
+        let updated = service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "risk_memo".into(),
+                    summary: "The migration should stay staged because only one bounded risk note exists so far.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: vec!["docs/product/RESEARCH.md".into()],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.record.state, "synthesized");
+        assert_eq!(updated.record.outcome.as_deref(), Some("risk_memo"));
+        assert!(updated.record.synthesis_ref.is_some());
+        assert_eq!(updated.record.synthesis_history_refs.len(), 1);
+        assert!(updated.record.invalidated_synthesis_ref.is_none());
+        assert!(updated.record.invalidation_artifact_ref.is_none());
+        assert_eq!(updated.artifacts.len(), 1);
+        let synthesis = updated.synthesis.as_ref().expect("missing synthesis");
+        assert_eq!(synthesis.outcome, "risk_memo");
+        assert_eq!(
+            synthesis.summary,
+            "The migration should stay staged because only one bounded risk note exists so far."
+        );
+        assert_eq!(synthesis.artifact_refs, gathered.record.artifact_refs);
+        assert!(synthesis.supersedes_ref.is_none());
+        assert_eq!(synthesis.follow_up_refs, vec!["docs/product/RESEARCH.md"]);
+        assert!(updated.record.synthesis_history_refs[0]
+            .ends_with(&format!("syntheses/{}.json", synthesis.id)));
+        assert_eq!(updated.synthesis_lineage.history_count, 1);
+        assert_eq!(
+            updated
+                .synthesis_lineage
+                .active
+                .as_ref()
+                .map(|entry| entry.identity_ref.as_str()),
+            Some(updated.record.synthesis_history_refs[0].as_str())
+        );
+        assert_eq!(
+            updated
+                .synthesis_lineage
+                .latest
+                .as_ref()
+                .map(|entry| entry.outcome.as_str()),
+            Some("risk_memo")
+        );
+        assert_eq!(updated.synthesis_lineage.history.len(), 1);
+        assert_eq!(
+            updated.synthesis_lineage.history[0].identity_ref,
+            updated.record.synthesis_history_refs[0]
+        );
+        assert_eq!(updated.synthesis_lineage.history[0].outcome, "risk_memo");
+        assert!(updated.synthesis_lineage.history[0]
+            .supersedes_ref
+            .is_none());
+        assert!(updated.synthesis_lineage.has_active_current_view);
+        assert!(!updated.synthesis_lineage.has_replacements);
+        assert!(updated.synthesis_lineage.latest_is_active);
+
+        let inspected = service.inspect_research(&started.record.id).unwrap();
+        assert_eq!(inspected, updated);
+
+        let synthesis_value = service.inspect(&synthesis.id).unwrap();
+        assert_eq!(synthesis_value["id"].as_str(), Some(synthesis.id.as_str()));
+        assert_eq!(
+            synthesis_value["research_id"].as_str(),
+            Some(started.record.id.as_str())
+        );
+        assert_eq!(synthesis_value["outcome"].as_str(), Some("risk_memo"));
+
+        let events = service.event_store().load_all().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "research.synthesis_written"
+                && event.payload_ref.as_deref()
+                    == Some(updated.record.synthesis_history_refs[0].as_str())
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_synthesis_replace_requires_explicit_opt_in() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-synthesis-replace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-synthesis-replace-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "architecture".into(),
+                question: "Should synthesis replacement be explicit?".into(),
+                goal: "Require explicit replace intent.".into(),
+                subject_ref: None,
+                constraints: vec!["Stay bounded.".into()],
+                success_criteria: vec!["Repeated synthesis needs opt-in.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+        service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Captured the first note.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        let first = service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "adr_draft".into(),
+                    summary: "First bounded synthesis.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: vec!["docs/product/RESEARCH.md".into()],
+                },
+            )
+            .unwrap();
+        let first_id = first.synthesis.as_ref().unwrap().id.clone();
+
+        let err = service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "risk_memo".into(),
+                    summary: "Second synthesis without explicit replace.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: Vec::new(),
+                },
+            )
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("research already has a synthesis; rerun with explicit replace intent"));
+
+        let replaced = service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "risk_memo".into(),
+                    summary: "Second synthesis with explicit replace.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: true,
+                    follow_up_refs: vec!["docs/product/RESEARCH.md".into()],
+                },
+            )
+            .unwrap();
+        let replacement = replaced
+            .synthesis
+            .as_ref()
+            .expect("missing replacement synthesis");
+        assert_eq!(replaced.record.state, "synthesized");
+        assert_eq!(replaced.record.synthesis_history_refs.len(), 2);
+        assert_eq!(replacement.outcome, "risk_memo");
+        assert_eq!(
+            replacement.summary,
+            "Second synthesis with explicit replace."
+        );
+        assert_eq!(
+            replacement.supersedes_ref.as_deref(),
+            Some(first.record.synthesis_history_refs[0].as_str())
+        );
+        assert_eq!(replacement.follow_up_refs, vec!["docs/product/RESEARCH.md"]);
+        assert_ne!(replacement.id, first_id);
+        let expected_current_ref = format!(".punk/research/{}/synthesis.json", started.record.id);
+        assert_eq!(
+            replaced.record.synthesis_ref.as_deref(),
+            Some(expected_current_ref.as_str())
+        );
+        assert!(replaced.record.synthesis_history_refs[1]
+            .ends_with(&format!("syntheses/{}.json", replacement.id)));
+        assert_eq!(replaced.synthesis_lineage.history_count, 2);
+        assert_eq!(
+            replaced
+                .synthesis_lineage
+                .active
+                .as_ref()
+                .and_then(|entry| entry.supersedes_ref.as_deref()),
+            Some(first.record.synthesis_history_refs[0].as_str())
+        );
+        assert_eq!(
+            replaced
+                .synthesis_lineage
+                .latest
+                .as_ref()
+                .map(|entry| entry.identity_ref.as_str()),
+            Some(replaced.record.synthesis_history_refs[1].as_str())
+        );
+        assert_eq!(replaced.synthesis_lineage.history.len(), 2);
+        assert_eq!(
+            replaced.synthesis_lineage.history[0].identity_ref,
+            first.record.synthesis_history_refs[0]
+        );
+        assert_eq!(replaced.synthesis_lineage.history[0].outcome, "adr_draft");
+        assert!(replaced.synthesis_lineage.history[0]
+            .supersedes_ref
+            .is_none());
+        assert_eq!(
+            replaced.synthesis_lineage.history[1].identity_ref,
+            replaced.record.synthesis_history_refs[1]
+        );
+        assert_eq!(replaced.synthesis_lineage.history[1].outcome, "risk_memo");
+        assert_eq!(
+            replaced.synthesis_lineage.history[1]
+                .supersedes_ref
+                .as_deref(),
+            Some(first.record.synthesis_history_refs[0].as_str())
+        );
+        assert!(replaced.synthesis_lineage.has_active_current_view);
+        assert!(replaced.synthesis_lineage.has_replacements);
+        assert!(replaced.synthesis_lineage.latest_is_active);
+
+        let first_synthesis_value = service.inspect(&first_id).unwrap();
+        assert_eq!(
+            first_synthesis_value["id"].as_str(),
+            Some(first_id.as_str())
+        );
+        assert_eq!(first_synthesis_value["outcome"].as_str(), Some("adr_draft"));
+
+        let events = service.event_store().load_all().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "research.synthesis_written")
+                .count(),
+            2
+        );
+        let synthesis_event_refs = events
+            .iter()
+            .filter(|event| event.kind == "research.synthesis_written")
+            .filter_map(|event| event.payload_ref.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            synthesis_event_refs,
+            vec![
+                first.record.synthesis_history_refs[0].as_str(),
+                replaced.record.synthesis_history_refs[1].as_str()
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_artifact_after_synthesis_clears_mutable_current_view_but_keeps_history() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-artifact-invalidate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-artifact-invalidate-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "architecture".into(),
+                question: "How should current synthesis invalidation behave?".into(),
+                goal: "Keep mutable current view truthful after new evidence arrives.".into(),
+                subject_ref: None,
+                constraints: vec!["Keep history immutable.".into()],
+                success_criteria: vec!["Stale synthesis alias disappears.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+        service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Captured first note.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        let synthesized = service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "adr_draft".into(),
+                    summary: "First bounded synthesis.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        let synthesis = synthesized.synthesis.clone().expect("missing synthesis");
+        let synthesis_alias_path = root
+            .join(".punk")
+            .join("research")
+            .join(&started.record.id)
+            .join("synthesis.json");
+        assert!(synthesis_alias_path.exists());
+
+        let updated = service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Captured second note after synthesis.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.record.state, "gathering");
+        assert!(updated.record.synthesis_ref.is_none());
+        assert!(updated.record.outcome.is_none());
+        assert_eq!(updated.record.synthesis_history_refs.len(), 1);
+        assert_eq!(
+            updated.record.invalidated_synthesis_ref.as_deref(),
+            Some(synthesized.record.synthesis_history_refs[0].as_str())
+        );
+        assert_eq!(
+            updated.record.invalidation_artifact_ref.as_deref(),
+            Some(updated.record.artifact_refs[1].as_str())
+        );
+        assert_eq!(updated.record.invalidation_history.len(), 1);
+        assert_eq!(
+            updated.record.invalidation_history[0].invalidated_synthesis_ref,
+            synthesized.record.synthesis_history_refs[0]
+        );
+        assert_eq!(
+            updated.record.invalidation_history[0].invalidating_artifact_ref,
+            updated.record.artifact_refs[1]
+        );
+        assert_eq!(updated.invalidation.history_count, 1);
+        assert_eq!(
+            updated
+                .invalidation
+                .active
+                .as_ref()
+                .map(|entry| entry.invalidated_synthesis_ref.as_str()),
+            Some(synthesized.record.synthesis_history_refs[0].as_str())
+        );
+        assert_eq!(
+            updated
+                .invalidation
+                .latest
+                .as_ref()
+                .map(|entry| entry.invalidating_artifact_ref.as_str()),
+            Some(updated.record.artifact_refs[1].as_str())
+        );
+        assert_eq!(updated.synthesis_lineage.history_count, 1);
+        assert!(updated.synthesis_lineage.active.is_none());
+        assert_eq!(
+            updated
+                .synthesis_lineage
+                .latest
+                .as_ref()
+                .map(|entry| entry.identity_ref.as_str()),
+            Some(synthesized.record.synthesis_history_refs[0].as_str())
+        );
+        assert_eq!(
+            updated
+                .synthesis_lineage
+                .latest
+                .as_ref()
+                .map(|entry| entry.outcome.as_str()),
+            Some("adr_draft")
+        );
+        assert_eq!(updated.synthesis_lineage.history.len(), 1);
+        assert_eq!(
+            updated.synthesis_lineage.history[0].identity_ref,
+            synthesized.record.synthesis_history_refs[0]
+        );
+        assert!(!updated.synthesis_lineage.has_active_current_view);
+        assert!(!updated.synthesis_lineage.has_replacements);
+        assert!(!updated.synthesis_lineage.latest_is_active);
+        assert_eq!(updated.synthesis, None);
+        assert!(!synthesis_alias_path.exists());
+
+        let historical = service.inspect(&synthesis.id).unwrap();
+        assert_eq!(historical["id"].as_str(), Some(synthesis.id.as_str()));
+        assert_eq!(
+            historical["summary"].as_str(),
+            Some("First bounded synthesis.")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_resynthesis_clears_invalidation_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-resynthesis-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-resynthesis-clear-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "architecture".into(),
+                question: "How should invalidation notes clear?".into(),
+                goal: "Drop invalidation note after new synthesis.".into(),
+                subject_ref: None,
+                constraints: vec!["Stay bounded.".into()],
+                success_criteria: vec!["New synthesis clears invalidation metadata.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+        service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "First note.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "adr_draft".into(),
+                    summary: "First synthesis.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        let invalidated = service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Second note invalidates synthesis.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        assert!(invalidated.record.invalidated_synthesis_ref.is_some());
+        assert!(invalidated.record.invalidation_artifact_ref.is_some());
+        assert_eq!(invalidated.record.invalidation_history.len(), 1);
+
+        let resynthesized = service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "risk_memo".into(),
+                    summary: "Second synthesis.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(resynthesized.record.invalidated_synthesis_ref.is_none());
+        assert!(resynthesized.record.invalidation_artifact_ref.is_none());
+        assert_eq!(resynthesized.record.invalidation_history.len(), 1);
+        assert!(resynthesized.invalidation.active.is_none());
+        assert_eq!(resynthesized.invalidation.history_count, 1);
+        assert!(resynthesized.invalidation.latest.is_some());
+        assert_eq!(resynthesized.synthesis_lineage.history_count, 2);
+        assert_eq!(
+            resynthesized
+                .synthesis_lineage
+                .active
+                .as_ref()
+                .map(|entry| entry.identity_ref.as_str()),
+            Some(resynthesized.record.synthesis_history_refs[1].as_str())
+        );
+        assert_eq!(
+            resynthesized
+                .synthesis_lineage
+                .latest
+                .as_ref()
+                .map(|entry| entry.outcome.as_str()),
+            Some("risk_memo")
+        );
+        assert_eq!(resynthesized.synthesis_lineage.history.len(), 2);
+        assert_eq!(
+            resynthesized.synthesis_lineage.history[0].outcome,
+            "adr_draft"
+        );
+        assert_eq!(
+            resynthesized.synthesis_lineage.history[1].outcome,
+            "risk_memo"
+        );
+        assert_eq!(
+            resynthesized.synthesis_lineage.history[1]
+                .supersedes_ref
+                .as_deref(),
+            Some(resynthesized.record.synthesis_history_refs[0].as_str())
+        );
+        assert!(resynthesized.synthesis_lineage.has_active_current_view);
+        assert!(resynthesized.synthesis_lineage.has_replacements);
+        assert!(resynthesized.synthesis_lineage.latest_is_active);
+
+        let invalidated_again = service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Third note invalidates the second synthesis.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(invalidated_again.record.invalidation_history.len(), 2);
+        assert_eq!(
+            invalidated_again.record.invalidation_history[0].invalidated_synthesis_ref,
+            invalidated
+                .record
+                .invalidated_synthesis_ref
+                .clone()
+                .expect("first invalidated synthesis ref")
+        );
+        assert_eq!(
+            invalidated_again.record.invalidation_history[1].invalidated_synthesis_ref,
+            resynthesized.record.synthesis_history_refs[1]
+        );
+        assert_eq!(invalidated_again.invalidation.history_count, 2);
+        assert_eq!(
+            invalidated_again
+                .invalidation
+                .latest
+                .as_ref()
+                .map(|entry| entry.invalidated_synthesis_ref.as_str()),
+            Some(resynthesized.record.synthesis_history_refs[1].as_str())
+        );
+        assert_eq!(invalidated_again.synthesis_lineage.history_count, 2);
+        assert!(invalidated_again.synthesis_lineage.active.is_none());
+        assert_eq!(
+            invalidated_again
+                .synthesis_lineage
+                .latest
+                .as_ref()
+                .map(|entry| entry.identity_ref.as_str()),
+            Some(resynthesized.record.synthesis_history_refs[1].as_str())
+        );
+        assert_eq!(invalidated_again.synthesis_lineage.history.len(), 2);
+        assert_eq!(
+            invalidated_again.synthesis_lineage.history[0].identity_ref,
+            resynthesized.record.synthesis_history_refs[0]
+        );
+        assert_eq!(
+            invalidated_again.synthesis_lineage.history[1].identity_ref,
+            resynthesized.record.synthesis_history_refs[1]
+        );
+        assert!(!invalidated_again.synthesis_lineage.has_active_current_view);
+        assert!(invalidated_again.synthesis_lineage.has_replacements);
+        assert!(!invalidated_again.synthesis_lineage.latest_is_active);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_complete_updates_terminal_state_and_blocks_more_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-complete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-complete-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "architecture".into(),
+                question: "What should we complete?".into(),
+                goal: "Reach a bounded research completion.".into(),
+                subject_ref: None,
+                constraints: vec!["Stay bounded.".into()],
+                success_criteria: vec!["Completion stays inspectable.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+        service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Captured the final architecture note.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "adr_draft".into(),
+                    summary: "The bounded architecture recommendation is ready.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: vec!["docs/product/RESEARCH.md".into()],
+                },
+            )
+            .unwrap();
+
+        let completed = service.complete_research(&started.record.id).unwrap();
+        assert_eq!(completed.record.state, "completed");
+        assert_eq!(completed.record.outcome.as_deref(), Some("adr_draft"));
+        assert!(completed.synthesis.is_some());
+
+        let err = service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "late_note".into(),
+                    summary: "Should be rejected after completion.".into(),
+                    source_ref: None,
+                },
+            )
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("research is already terminal and cannot accept more mutations"));
+
+        let events = service.event_store().load_all().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "research.completed"
+                && event
+                    .payload_ref
+                    .as_deref()
+                    .is_some_and(|payload| payload.ends_with("/record.json"))
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_escalate_requires_escalate_outcome_and_updates_terminal_state() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-escalate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-escalate-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "migration_risk".into(),
+                question: "What must be escalated?".into(),
+                goal: "Produce an explicit escalate outcome.".into(),
+                subject_ref: None,
+                constraints: vec!["Stay inspectable.".into()],
+                success_criteria: vec!["Escalation stays inspectable.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+        service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "risk_note".into(),
+                    summary: "Captured the unresolved migration ambiguity.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "escalate".into(),
+                    summary:
+                        "This migration needs escalation because ambiguity remains unresolved."
+                            .into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: vec!["docs/product/RESEARCH.md".into()],
+                },
+            )
+            .unwrap();
+
+        let escalated = service.escalate_research(&started.record.id).unwrap();
+        assert_eq!(escalated.record.state, "escalated");
+        assert_eq!(escalated.record.outcome.as_deref(), Some("escalate"));
+        assert!(escalated.synthesis.is_some());
+
+        let wrong = service.complete_research(&started.record.id).unwrap_err();
+        assert!(
+            wrong
+                .to_string()
+                .contains("research can only be completed from the synthesized state")
+                || wrong
+                    .to_string()
+                    .contains("research with outcome=escalate must use `punk research escalate`")
+        );
+
+        let events = service.event_store().load_all().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "research.escalated"
+                && event
+                    .payload_ref
+                    .as_deref()
+                    .is_some_and(|payload| payload.ends_with("/record.json"))
+        }));
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);

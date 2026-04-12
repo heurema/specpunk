@@ -174,6 +174,7 @@ impl CodexAdapter {
         cmd.arg("exec")
             .arg("--full-auto")
             .arg("--json")
+            .arg("--")
             .arg(&task.prompt);
 
         if !task.model.is_empty() {

@@ -18,8 +18,28 @@ This repo is in a **design reset / rebuild** phase.
 - current code still contains legacy nested workspace pieces under `punk/`
 - those crates are treated as **source material for extraction**
 - docs in `docs/product/` describe the **target architecture**, not a finished released implementation
+- current repo truth uses one explicit status vocabulary:
+  - **active v0 surface**
+  - **in-tree but inactive**
+  - **planned only**
+- the current crate map lives in `docs/product/REPO-STATUS.md`
 
 No backward compatibility is required. The project has not launched, so the repo is being reshaped toward the cleanest final design.
+
+## Read this first
+
+If you are orienting in the repo or choosing the next bounded slice, read in this order:
+
+1. `docs/product/CURRENT-ROADMAP.md`
+2. `docs/product/ADR-provider-alignment.md`
+3. `docs/product/ARCHITECTURE.md`
+4. `docs/product/NORTH-ROADMAP.md`
+
+Short version:
+
+- `specpunk` should stay a **bounded correctness and stewardship layer**
+- provider-native runtimes, tools, tracing, and session primitives should usually be **wrapped**, not rebuilt
+- roadmap work that increases platform complexity without improving boundedness, reliability, inspectability, or operator simplicity should be downgraded or cut
 
 ## Product thesis
 
@@ -59,6 +79,7 @@ Key rules:
 - **one vocabulary**: `plot / cut / gate`
 - **one state truth**: append-only event log + materialized views
 - **one decision writer**: only `gate` writes final `DecisionObject`
+- **one frozen verification context per run**: `gate` verifies against the persisted run context, not mutable live repo state
 - **VCS-aware, not git-bound**: `jj` preferred, `git` fallback
 - **feature-centric, not PR-centric**
 - **skills improve through curated ratchet, not silent mutation**
@@ -96,10 +117,31 @@ If the repo basename is not a good project id, use:
 punk init --project <id> --enable-jj --verify
 ```
 
-Bootstrap creates repo-local agent guidance:
+Goal-intake commands will auto-run `git init` if the directory has no VCS yet, then continue in degraded git-only mode. If that automatic init fails, initialize the repo manually:
 
+```bash
+git init
+punk init --project <id> --enable-jj --verify
+```
+
+Bootstrap is native to `punk`; it does not shell out to `punk-run`.
+
+Bootstrap writes the current repo-local packet and guidance:
+
+- `.punk/project.json`
 - `AGENTS.md`
 - `.punk/AGENT_START.md`
+- `.punk/bootstrap/<project>-core.md`
+
+If a repo already has one legacy `.punk/bootstrap/*-core.md` packet, `punk init` and `punk inspect project` reuse it instead of creating a second competing bootstrap packet.
+
+Bootstrap also ensures safe default ignore coverage for:
+
+- `.punk/`
+- `target/`
+- `.playwright-mcp/`
+
+Successful `cut run` receipts also backfill the same safe ignore coverage if a repo was bootstrapped without a `.gitignore`.
 
 Inspect the current derived project-intelligence view with:
 
@@ -132,6 +174,8 @@ This path runs:
 goal -> draft -> approve -> cut -> gate -> proof
 ```
 
+If the first accepted cycle only proves a controller-created bootstrap scaffold and the same goal still clearly asks for implementation work, `punk go` should immediately continue into one bounded follow-up cycle instead of stopping at the bootstrap proof. For greenfield Rust bootstrap+implementation goals, that follow-up should narrow toward the implementation files instead of rerunning the broad bootstrap prompt unchanged.
+
 If autonomy blocks or escalates, `punk` prepares a staged recovery contract and returns a non-zero exit.
 
 The intended operator experience is:
@@ -156,6 +200,13 @@ punk gate run <run-id>
 punk gate proof <run-id|decision-id>
 ```
 
+If the workspace cannot auto-initialize Git, `punk start` should stop early and point back to:
+
+```bash
+git init
+punk init --project <id> --enable-jj --verify
+```
+
 Read-only inspection:
 
 ```bash
@@ -175,6 +226,9 @@ What is explicitly out of scope for v0:
 
 ## Docs
 
+- `docs/product/CURRENT-ROADMAP.md` — short active roadmap for current-forward work
+- `docs/product/ACTION-PLAN.md` — current bounded execution plan derived from the 2026-04-11 architecture review
+- `docs/product/ADR-provider-alignment.md` — accepted build/wrap/avoid rule for provider alignment
 - `docs/product/VISION.md` — product boundary and laws
 - `docs/product/ARCHITECTURE.md` — kernel, stewardship, council, skills/eval architecture
 - `docs/product/COUNCIL.md` — advisory multi-model deliberation protocols
@@ -186,6 +240,7 @@ What is explicitly out of scope for v0:
 - `docs/product/NORTH-ROADMAP.md` — durable strategic backlog and linked research tracks
 - `docs/product/MASTER-PLAN.md` — staged build plan
 - `docs/product/CONTINUE-PROMPT.md` — handoff prompt for the next build session
+- `docs/research/2026-04-11-specpunk-architecture-review.md` — review memo that drove the current action plan
 
 ## Target repo shape
 
@@ -221,6 +276,13 @@ It should be treated as:
 - code to extract
 - code to relocate
 - code to delete when replaced
+
+Also note:
+
+- active v0 surface today: `punk-cli`, `punk-domain`, `punk-events`, `punk-vcs`, `punk-core`, `punk-orch`, `punk-gate`, `punk-proof`, `punk-adapters`
+- `crates/punk-council/` is **in-tree but inactive**: it stays buildable in the workspace, but is **not** part of the active v0 operator surface yet
+- `punk-shell`, `punk-skills`, `punk-eval`, and `punk-research` are **planned only**
+- the exact repo truth is tracked in `docs/product/REPO-STATUS.md`
 
 ## License
 

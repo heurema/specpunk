@@ -28,9 +28,7 @@ pub fn synthesize_from_scoreboard(
 }
 
 fn choose_outcome(scoreboard: &CouncilScoreboard) -> CouncilOutcome {
-    if scoreboard.top_label.is_none() {
-        CouncilOutcome::Escalate
-    } else if scoreboard.high_disagreement {
+    if scoreboard.top_label.is_none() || scoreboard.high_disagreement {
         CouncilOutcome::Escalate
     } else if scoreboard.top_gap.unwrap_or_default() >= 1.0 {
         CouncilOutcome::Leader
@@ -111,4 +109,43 @@ fn build_unresolved_risks(
     }
 
     risks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use punk_domain::council::CouncilProposalScore;
+
+    #[test]
+    fn high_disagreement_forces_escalation_even_with_leading_label() {
+        let scoreboard = CouncilScoreboard {
+            proposal_scores: vec![
+                CouncilProposalScore {
+                    proposal_label: "A".into(),
+                    weighted_score: 8.5,
+                    blocker_count: 0,
+                    review_count: 3,
+                },
+                CouncilProposalScore {
+                    proposal_label: "B".into(),
+                    weighted_score: 7.0,
+                    blocker_count: 0,
+                    review_count: 3,
+                },
+            ],
+            top_label: Some("A".into()),
+            second_label: Some("B".into()),
+            top_gap: Some(1.5),
+            high_disagreement: true,
+        };
+
+        let synthesis = synthesize_from_scoreboard("council_1", &scoreboard).unwrap();
+
+        assert_eq!(synthesis.outcome, CouncilOutcome::Escalate);
+        assert_eq!(synthesis.selected_labels, vec!["A".to_string()]);
+        assert!(synthesis
+            .unresolved_risks
+            .iter()
+            .any(|risk| risk.contains("high review disagreement")));
+    }
 }

@@ -1,8 +1,50 @@
 # Queued Next Tasks
 
-Last updated: 2026-03-14
+Last updated: 2026-04-11
 Owner: Vitaly
-Status: paused queue
+Status: historical queue with current shortlist
+
+> **Important:** this file contains an older paused queue from the pre-alignment phase.
+> Use it only as historical context.
+>
+> Current strategic truth lives in:
+>
+> - `docs/product/NORTH-ROADMAP.md`
+> - `docs/product/ADR-provider-alignment.md`
+> - `docs/product/ARCHITECTURE.md`
+> - `docs/product/CURRENT-ROADMAP.md`
+
+## Current shortlist (2026-04-11)
+
+### Ship now
+
+These are current-forward and should be preferred when choosing bounded slices:
+
+1. reliability fixes for bounded execution, rollback, and proof integrity
+2. repo fixture matrix expansion for known dogfood repo classes
+3. one-face shell improvements that simplify `go/start/gate/status`
+4. typed evidence / harness improvements that strengthen `Receipt` and `Proofpack`
+5. structured repo anchors and source-first targeting that reduce free-text contract drift
+6. provider adapter and wrapping improvements that simplify, rather than expand, the kernel
+
+### Later
+
+These remain valid only in bounded, derived form:
+
+1. autonomous loop improvements that stay inside existing primitives
+2. project overlays / project intelligence that remain small and structured
+3. selective council improvements for high-risk work only
+4. bounded research tooling that improves decisions without becoming product core
+
+### Cut or avoid
+
+Do not treat these as default-forward:
+
+1. daemon-first rebuilds
+2. broad multi-model divergence as routine behavior
+3. large internal memory or self-improvement subsystems
+4. provider-zoo or control-plane UX
+5. free-text-heavy orchestration layers that do not improve boundedness or reliability
 
 ## Queue Rule
 

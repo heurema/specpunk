@@ -1898,6 +1898,7 @@ fn run_goal_planner_provider(provider: &str, prompt: &str) -> Result<String, Str
             let out = std::process::Command::new("codex")
                 .args(["exec", "--ephemeral", "-p", "fast", "--output-last-message"])
                 .arg(&out_file)
+                .arg("--")
                 .arg(prompt)
                 .output()
                 .map_err(|e| e.to_string())?;

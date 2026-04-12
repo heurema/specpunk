@@ -412,6 +412,63 @@ fn item_is_stale(item: &Value, now: chrono::DateTime<Utc>) -> bool {
     now.signed_duration_since(updated_at.with_timezone(&Utc)) >= Duration::days(3)
 }
 
+fn receipt_stats_24h(index_path: &Path) -> (u32, u32, u32, f64) {
+    receipt_stats_window(index_path, 1)
+}
+
+fn receipt_stats_window(index_path: &Path, days: i64) -> (u32, u32, u32, f64) {
+    let cutoff = Utc::now() - Duration::days(days);
+    let cutoff_str = cutoff.to_rfc3339();
+
+    let content = match fs::read_to_string(index_path) {
+        Ok(c) => c,
+        Err(_) => return (0, 0, 0, 0.0),
+    };
+
+    let mut total = 0u32;
+    let mut success = 0u32;
+    let mut failed = 0u32;
+    let mut cost = 0.0f64;
+
+    for line in content.lines() {
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Filter by time
+        let ts = v
+            .get("created_at")
+            .or_else(|| v.get("completed_at"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if ts < cutoff_str.as_str() {
+            continue;
+        }
+
+        total += 1;
+        let status = v.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status == "success" || status == "completed" {
+            success += 1;
+        } else {
+            failed += 1;
+        }
+        cost += v.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    }
+
+    (total, success, failed, cost)
+}
+
+fn count_dir_entries(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,61 +626,4 @@ mod tests {
     fn cleanup(path: PathBuf) {
         let _ = fs::remove_dir_all(path);
     }
-}
-
-fn receipt_stats_24h(index_path: &Path) -> (u32, u32, u32, f64) {
-    receipt_stats_window(index_path, 1)
-}
-
-fn receipt_stats_window(index_path: &Path, days: i64) -> (u32, u32, u32, f64) {
-    let cutoff = Utc::now() - Duration::days(days);
-    let cutoff_str = cutoff.to_rfc3339();
-
-    let content = match fs::read_to_string(index_path) {
-        Ok(c) => c,
-        Err(_) => return (0, 0, 0, 0.0),
-    };
-
-    let mut total = 0u32;
-    let mut success = 0u32;
-    let mut failed = 0u32;
-    let mut cost = 0.0f64;
-
-    for line in content.lines() {
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Filter by time
-        let ts = v
-            .get("created_at")
-            .or_else(|| v.get("completed_at"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if ts < cutoff_str.as_str() {
-            continue;
-        }
-
-        total += 1;
-        let status = v.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if status == "success" || status == "completed" {
-            success += 1;
-        } else {
-            failed += 1;
-        }
-        cost += v.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    }
-
-    (total, success, failed, cost)
-}
-
-fn count_dir_entries(dir: &Path) -> usize {
-    fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .count()
 }

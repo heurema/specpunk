@@ -16,6 +16,8 @@ Recent critical bugs were discovered only via external dogfood:
 - `.build/` scope pollution
 - exact refine scope drift
 - fresh intake hangs
+- mixed Node+Rust backend contract drift in `baseline`
+- stable bounded `pubpunk` slices that needed controller-owned recipes (`init`, cleanup, validate)
 
 That means internal happy paths are not enough.
 
@@ -29,6 +31,8 @@ That means internal happy paths are not enough.
 6. Python repo with `.venv/`, `dist/`, `.pytest_cache/`
 7. repo with ambiguous basename collision across different roots
 8. repo with generated agent instructions already present
+9. mixed Node+Rust repo with nested backend app plus Rust CLI
+10. bootstrapped Rust repo with stable bounded `core + cli + tests` product slices
 
 ## Proposed v1 fixture matrix
 
@@ -44,6 +48,8 @@ The first useful matrix should be explicit and small enough to maintain.
 | `python-build-noise` | Python workspace pollution | `.venv/`, `.pytest_cache/`, `dist/` excluded from scope and scans |
 | `basename-collision-a` / `basename-collision-b` | identity correctness | project ids and status views do not mix two repos with same basename |
 | `bootstrap-reused` | idempotent onboarding | existing `AGENTS.md` / bootstrap files are reused safely and verified |
+| `node-rust-mixed-runtime` | nested backend app plus Rust CLI | service/session/API prompts route to backend Node surfaces plus Rust CLI, not `.astro` pages, and choose grounded checks |
+| `rust-bounded-controller-slice` | recurring deterministic bounded product work | stable `core + cli + tests` slices can complete through controller-owned templates instead of stalling or damaging repo state |
 
 ## Required command matrix by fixture
 
@@ -59,6 +65,8 @@ Not every fixture needs every command, but the baseline should be explicit.
 | `python-build-noise` | required | required | optional | required | required |
 | `basename-collision-*` | required | optional | optional | required | optional |
 | `bootstrap-reused` | required | optional | optional | required | optional |
+| `node-rust-mixed-runtime` | required | required | required | required | required |
+| `rust-bounded-controller-slice` | required | optional | required | required | required |
 
 ## Regression discipline
 
@@ -97,6 +105,8 @@ The current known bug history suggests these should be the first concrete regres
 4. `.build/` exclusion from SwiftPM scope inference
 5. exact refine scope preservation
 6. `punk start` bounded fail-fast before artifact creation
+7. mixed Node+Rust service/session/runtime contract generation for `baseline`
+8. stable bounded `pubpunk` slices for init / cleanup / validate
 
 ## Required command matrix
 
@@ -125,3 +135,17 @@ This track is done when:
 - adding a new repo class becomes a standard maintenance move
 - contributors can point to fixture coverage before claiming a flow is reliable
 - fixture coverage is discussed in contributor guidance, not just in one research doc
+
+## 2026-04-11 evidence update
+
+New external dogfood classes are now concrete enough to treat as required fixtures:
+
+- `node-rust-mixed-runtime`
+  - exact baseline prompts must route service/session/API work into backend Node surfaces and Rust CLI surfaces
+  - checks should stay grounded (`cargo check`, `npm run check`, repo wrapper builds), not optimistic workspace-wide `cargo test`
+- `rust-bounded-controller-slice`
+  - stable `pubpunk` slices now have controller-owned recipes for:
+    - `init`
+    - cleanup of obsolete `style/examples` references
+    - `validate --json --project-root`
+  - these slices should be tested as deterministic bounded controller paths, not only as general patch/apply flows

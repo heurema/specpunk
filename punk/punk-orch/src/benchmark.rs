@@ -208,7 +208,7 @@ pub fn list_benchmarks(cwd: &Path) -> Result<Vec<BenchmarkResult>, String> {
     for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "json") {
+        if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
         let content = fs::read_to_string(path).map_err(|e| e.to_string())?;

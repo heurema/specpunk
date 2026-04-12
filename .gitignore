@@ -5,3 +5,5 @@ punk/target/
 .wrangler/
 docs/research/_delve_runs/
 docs/reference-repos/
+target/
+.playwright-mcp/

@@ -130,7 +130,7 @@ pub fn format_goal_summary_line_for_project(bus: &Path, project_filter: Option<&
 
     for goal in list_goals(bus)
         .into_iter()
-        .filter(|goal| project_filter.map_or(true, |project| goal.project == project))
+        .filter(|goal| project_filter.is_none_or(|project| goal.project == project))
     {
         match goal.status {
             GoalStatus::Active => active += 1,
@@ -165,7 +165,7 @@ pub fn format_goal_attention_line_for_project(
 ) -> Option<String> {
     let count = list_goals(bus)
         .into_iter()
-        .filter(|goal| project_filter.map_or(true, |project| goal.project == project))
+        .filter(|goal| project_filter.is_none_or(|project| goal.project == project))
         .filter(|goal| goal.status_reason.as_deref() == Some("replan_needed_dead_end"))
         .count();
     if count > 0 {
@@ -369,7 +369,7 @@ pub fn queue_ready_steps(bus: &Path, goal: &mut Goal) -> Result<Vec<String>, Que
     let step_statuses: HashMap<u32, StepStatus> = plan
         .steps
         .iter()
-        .map(|s| (s.step, s.status.clone()))
+        .map(|s| (s.step, s.status))
         .collect();
 
     for step in &mut plan.steps {

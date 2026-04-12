@@ -7,7 +7,10 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
 punk-domain = { path = "../punk-domain" }
 punk-events = { path = "../punk-events" }
 punk-core = { path = "../punk-core" }
 punk-orch = { path = "../punk-orch" }
+punk-vcs = { path = "../punk-vcs" }

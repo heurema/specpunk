@@ -1,6 +1,6 @@
 # Specpunk North Roadmap
 
-Last updated: 2026-04-03
+Last updated: 2026-04-11
 Owner: Vitaly
 Status: active
 
@@ -12,9 +12,11 @@ Use it when:
 - a session starts cold
 - roadmap work must survive compaction or context loss
 - contributors need to know which high-level tracks matter next
+- contributors need a pointer to the short active roadmap for current-forward work
 
 `ROADMAP-v2.md` remains the implementation roadmap.
 This file is the strategic map that explains **what** must be strengthened and **why**.
+`CURRENT-ROADMAP.md` is the short operational roadmap for active work right now.
 
 ## How to use this file in a new session
 
@@ -67,6 +69,57 @@ Recommended order unless a production bug forces reprioritization:
 5. One-face operator shell
 6. Autonomous loop
 7. Project intelligence
+
+## Current operator-shell note
+
+- Goal-intake commands such as `punk start` and `punk go --fallback-staged` should fail early with one explicit recovery path when the workspace is not VCS-backed, instead of surfacing late repo-scan or adapter errors.
+
+## Cross-cutting harness note
+
+- Harness engineering should be implemented as a derived harness/evidence plane across existing tracks, not as a new primitive layer.
+- Near-term focus: inspectable project harness packets, typed evidence paths for `gate` / `proof`, and stronger harness-linked recovery continuity in the work ledger.
+- Reference note: `docs/research/2026-04-08-specpunk-harness-engineering.md`.
+
+## Cross-cutting autonomy note
+
+- The intended operator model is: user at the first step, system inside the loop, user again at the last step.
+- If the loop needs a second technical opinion, the default escalation target should be another model/provider or a bounded council protocol, not the user.
+- Sensitive decisions still require single-model handling when multi-provider escalation would broaden data exposure beyond policy.
+
+## Cross-cutting provider-alignment note
+
+- `specpunk` should stay a **local-first correctness and stewardship layer** over provider-native agent runtimes.
+- Build locally only what protects boundedness, verification, rollback, and proof.
+- Wrap provider-native runtimes, tools, tracing, and session/memory primitives instead of rebuilding them in the kernel.
+- Prefer simplification over abstraction growth when a provider ships a stable primitive that replaces custom `specpunk` logic.
+- Reference note: `docs/research/2026-04-11-provider-alignment-build-wrap-avoid.md`.
+- Accepted ADR: `docs/product/ADR-provider-alignment.md`.
+
+## Provider-aligned pruning table
+
+Use this table before adding roadmap work that increases architecture depth.
+
+| Track / idea | Decision | Rule |
+|---|---|---|
+| Identity and layering | **keep** | strengthens the kernel/shell split and reduces drift |
+| Work ledger | **keep** | durable local truth is a core differentiator |
+| Primitives and derived mechanisms | **keep** | prevents accidental kernel growth |
+| Repo fixture matrix | **keep** | reliability and regressions are core |
+| One-face operator shell | **keep** | simpler operator UX is a product advantage |
+| Harness / typed evidence | **keep** | strengthens proof without adding a new primitive layer |
+| Autonomous loop | **downgrade** | keep as a bounded goal-to-result loop over existing primitives, not as a giant autonomous platform |
+| Project intelligence | **downgrade** | prefer structured overlays and repo anchors, not a large memory/intelligence subsystem |
+| Council | **downgrade** | selective advisory mechanism only, never a default tax on all work |
+| Research subsystem | **downgrade** | bounded support mechanism, not a product core that keeps expanding |
+| Multi-model divergence everywhere | **cut / avoid** | use only when correctness materially improves |
+| Provider-zoo UX | **cut / avoid** | adapters matter, provider-dashboard behavior does not |
+| Custom universal agent runtime | **cut / avoid** | duplicate of provider direction |
+| Large internal memory platform | **cut / avoid** | duplicate of provider session/state direction |
+| Free-text-heavy orchestration logic | **cut / avoid** | repeatedly harms reliability and inspectability |
+
+Default decision:
+
+> if a roadmap item does not clearly improve boundedness, reliability, inspectability, or operator simplicity, it should be downgraded or cut
 
 ## Rules for future contributors
 

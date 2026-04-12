@@ -148,6 +148,14 @@ The runtime must support project-specific competence that improves through:
 
 For v0, only a subset is implemented. Council, skill ratchet, and research are later layers, but they are part of the target product shape.
 
+Repo-status vocabulary:
+
+- **active v0 surface** = current operator/runtime path
+- **in-tree but inactive** = present/buildable in the workspace, but not part of the current operator path
+- **planned only** = target-shape crate not yet present in today's workspace
+
+Canonical repo-status note: `docs/product/REPO-STATUS.md`
+
 Detailed subsystem specs live in:
 - `docs/product/COUNCIL.md`
 - `docs/product/SKILLS.md`

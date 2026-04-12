@@ -36,6 +36,66 @@ The critical rule is:
 
 > Keep the kernel stable. Let model integrations, skills, councils, and research protocols evolve at the edges.
 
+### Provider-alignment rule
+
+`punk` should evolve as a **correctness and stewardship layer**, not as a parallel general-purpose agent platform.
+
+Build in the kernel only what is local-trust-critical:
+
+- bounded scope and safety policy
+- repo scan and source anchors
+- VCS-aware isolation and rollback
+- gate truth
+- receipts and proof artifacts
+
+Wrap rather than rebuild when providers offer stable primitives for:
+
+- agent runtimes
+- tool calling and built-in tools
+- tracing and observability
+- session, memory, caching, or compaction
+- structured output controls
+
+Avoid adding kernel complexity that duplicates provider direction, especially:
+
+- a custom universal agent runtime
+- a large internal memory platform
+- free-text-heavy orchestration magic
+- a parallel tracing/eval stack
+
+Reference note:
+
+- `docs/research/2026-04-11-provider-alignment-build-wrap-avoid.md`
+- `docs/product/ADR-provider-alignment.md`
+
+### Inner-loop second-opinion rule
+
+When the system needs a second opinion inside the autonomous loop, the default escalation target is:
+
+- another model
+- another provider
+- or a bounded structured council protocol
+
+It is **not** the user by default.
+
+The user should participate:
+
+- at goal intake
+- at final result or final blocker review
+
+but not as the routine tie-breaker for inner-loop uncertainty.
+
+This means:
+
+- model disagreement is an internal execution concern
+- selective cross-model/provider checks are a derived mechanism over the same primitives
+- user interruption should happen only when the system reaches a real terminal blocker, not when it merely wants another opinion
+
+Security exception:
+
+- sensitive decisions should remain single-model only when policy forbids sending the same material to multiple providers
+- in those cases, the system should degrade to a local blocked/escalated outcome rather than silently broadening provider exposure
+
 See also:
 
 - `docs/product/NORTH-ROADMAP.md`
@@ -79,6 +139,7 @@ The shell owns operator ergonomics and default paths:
 - `punk go --fallback-staged`
 - summary formatting
 - blocked / recovery UX
+- native repo bootstrap packet writes (`.punk/project.json`)
 - generated `AGENTS.md`
 - repo-local bootstrap guidance
 - shell-facing status output
@@ -126,6 +187,8 @@ Derived mechanisms are compositions over those primitives:
 - eval
 - research protocols
 
+Harness engineering should be treated the same way: it is a derived harness/evidence plane over existing primitives, not a new primitive truth object.
+
 ### Derived mechanism map
 
 The first practical mapping should stay explicit:
@@ -149,6 +212,30 @@ The first practical mapping should stay explicit:
 Contributor rule:
 
 > every roadmap item, proposal, or implementation slice should be able to answer: which primitive does this touch, and is this a primitive change or a derived mechanism change?
+
+### Harness / evidence plane
+
+`punk` should absorb harness engineering as a derived plane that makes runtime behavior more legible and verifiable without redefining substrate truth.
+
+That means:
+
+- `ProjectOverlay` should grow into the shell-facing map of harness capabilities
+- `Workspace` remains the isolated execution context for harness boot and evidence collection
+- `gate` should gradually move toward typed validation recipes, not only raw command checks
+- `Proofpack` should persist enough execution context to distinguish a recorded bundle from a partially reconstructable verdict context
+- `Ledger` should keep blocked harness recovery inspectable after the shell output is gone
+
+Current bounded progress:
+
+- `ProjectOverlay` now exposes derived `harness_summary`
+- the current proof step persists typed `command` evidence for existing `target` / `integrity` checks in `DecisionObject` and `Proofpack`
+- `Proofpack` now also persists `run_ref`, `workspace_lineage`, `executor_identity`, and an explicit `reproducibility_claim`
+- this still does **not** introduce a repo-local harness packet or non-command evidence execution
+
+See also:
+
+- `docs/product/HARNESS.md`
+- `docs/research/2026-04-08-specpunk-harness-engineering.md`
 
 ---
 
@@ -199,7 +286,15 @@ specpunk/
 
 This is the **target** workspace shape, not the current implementation snapshot.
 
-Current v0/v0.1 implemented crates:
+Repo-status vocabulary used below:
+
+- **active v0 surface** = current operator/runtime path
+- **in-tree but inactive** = workspace member kept buildable, but not part of the current operator path
+- **planned only** = target-shape crate not in today's workspace membership
+
+Canonical repo-status note: `docs/product/REPO-STATUS.md`
+
+Current workspace members in the active v0 surface:
 
 - `punk-cli`
 - `punk-domain`
@@ -211,10 +306,13 @@ Current v0/v0.1 implemented crates:
 - `punk-proof`
 - `punk-adapters`
 
-Planned crates for Stage 1+:
+Current workspace members that are in-tree but inactive:
+
+- `punk-council`
+
+Planned-only crates for later stages:
 
 - `punk-shell`
-- `punk-council`
 - `punk-skills`
 - `punk-eval`
 - `punk-research`
@@ -223,20 +321,27 @@ Planned crates for Stage 1+:
 
 | Crate | Status | Owns |
 |---|---|---|
-| `punk-cli` | implemented | non-interactive command entrypoint |
-| `punk-shell` | Stage 1+ | interactive REPL, mode switching, context routing |
-| `punk-domain` | implemented | canonical types and schemas |
-| `punk-events` | implemented | append-only event log and projections |
-| `punk-vcs` | implemented | `jj` / `git` backend abstraction |
-| `punk-core` | implemented | deterministic repo helpers, scan, scope, validation |
-| `punk-orch` | implemented | feature/contract/task/run lifecycle services |
-| `punk-gate` | implemented | validation, checks, decision synthesis |
-| `punk-proof` | implemented | proof bundle writing and hashing |
-| `punk-adapters` | implemented | external drafting/execution/review adapters |
-| `punk-council` | Stage 2+ | structured deliberation protocols |
-| `punk-skills` | Stage 4+ | skill registry, overlays, candidate patches |
-| `punk-eval` | Stage 4+ | task eval, skill eval, promotion evidence |
-| `punk-research` | Stage 5+ | bounded deep-research protocols |
+| `punk-cli` | active v0 surface | non-interactive command entrypoint |
+| `punk-shell` | planned only (Stage 1+) | interactive REPL, mode switching, context routing |
+| `punk-domain` | active v0 surface | canonical types and schemas |
+| `punk-events` | active v0 surface | append-only event log and projections |
+| `punk-vcs` | active v0 surface | `jj` / `git` backend abstraction |
+| `punk-core` | active v0 surface | deterministic repo helpers, scan, scope, validation |
+| `punk-orch` | active v0 surface | feature/contract/task/run lifecycle services |
+| `punk-gate` | active v0 surface | validation, checks, decision synthesis |
+| `punk-proof` | active v0 surface | proof bundle writing and hashing |
+| `punk-adapters` | active v0 surface | external drafting/execution/review adapters |
+| `punk-council` | in-tree but inactive (Stage 2+) | structured deliberation protocols |
+| `punk-skills` | planned only (Stage 4+) | skill registry, overlays, candidate patches |
+| `punk-eval` | planned only (Stage 4+) | task eval, skill eval, promotion evidence |
+| `punk-research` | planned only (Stage 5+) | bounded deep-research protocols |
+
+Stage-boundary note:
+
+- workspace membership is not the same thing as active operator surface
+- a crate may exist in-tree before its stage is active
+- `punk-council` is the current example: it remains a workspace member, but it is still in-tree but inactive until Stage 2 is promoted
+- before a dedicated `punk-research` crate exists, the first frozen research-packet slice may live in `punk-cli` + `punk-orch` + `punk-domain` without promoting full research execution into the active runtime surface
 
 Traits are only required where real backend choice exists.
 
@@ -249,6 +354,47 @@ Required ports over time:
 - `SkillProvider`
 - `EvalRunner`
 - `PromotionPolicy`
+
+### Adapter boundary policy
+
+`punk-adapters` exists to **wrap** upstream runtimes, not to become a second runtime product.
+
+What belongs inside `punk-adapters`:
+
+- provider-specific invocation glue
+- preflight/readiness checks
+- normalized drafting and execution IO
+- bounded prompt/context shaping needed to call upstream runtimes safely
+- provider-specific failure classification and retry shaping
+- future advisory council slot execution wrappers
+
+What must stay out of `punk-adapters`:
+
+- local scope law
+- gate policy and final decision semantics
+- proof ownership
+- repo truth and source-anchor truth
+- a universal provider-zoo runtime
+- custom protocol invention where MCP or official provider surfaces already fit
+
+Current minimum provider-agnostic adapter ports:
+
+| Port | Status | Purpose |
+|---|---|---|
+| `ContractDrafter` | active v0 surface | normalize upstream drafting/refinement into `DraftProposal` |
+| `Executor` | active v0 surface | normalize bounded execution into `ExecuteOutput` / receipt-ready facts |
+| `ProviderAdapter` | in-tree but inactive | future council slot adapter for advisory-only protocol runs |
+
+Rule of thumb:
+
+- if an upstream-native capability gets better, `punk-adapters` should usually shrink
+- new adapter code should preserve local correctness boundaries, not duplicate provider runtimes
+- correctness guards remain local, but provider choreography should stay thin
+
+Companion adapter docs:
+
+- `docs/sauce/03-delta/CAPABILITY-MATRIX.md`
+- `docs/sauce/03-delta/PROVIDER-DELTAS.md`
 
 Companion subsystem specs:
 - `docs/product/COUNCIL.md`
@@ -299,7 +445,7 @@ Not every object in the chain is equally primitive.
 - `Run` = one execution attempt
 - `Receipt` = execution truth
 - `DecisionObject` = final gate verdict
-- `Proofpack` = hash-linked artifact bundle
+- `Proofpack` = hash-linked artifact bundle plus an explicit reproducibility claim about what execution context was captured
 
 ### Contract requirements
 
@@ -403,15 +549,31 @@ That means:
 
 - `gate` reads the persisted approved `Contract`
 - `gate` reads the persisted `Receipt`
+- `gate` reads the persisted verification context referenced by `Run`
 - `gate` may read persisted check outputs
 - `gate` must not rely on live prompt reinterpretation
+- `gate` must execute trusted checks from that frozen verification context, not from mutable live repo state
 
 `Proofpack` must point to immutable refs and hashes of:
 
+- run artifact, when present
 - approved contract
 - receipt
 - decision object
+- verification context, when present
 - check outputs
+
+`Proofpack` v0 should also state an explicit reproducibility claim.
+
+Current claim levels are:
+
+- `frozen_context_v0` — proof records run lineage, executor identity, and the frozen verification-context digest used by `gate`
+- `run_record_v0` — proof records run lineage and executor identity, but lacks a frozen verification-context digest
+- `record_plus_context_v0` — proof records executor identity and frozen context digest, but the run artifact is missing
+- `record_only_v0` — proof is only a hash-linked record bundle
+
+These levels are intentionally honest.
+They do **not** claim hermetic rebuilds, notarized provenance, or full environment replay.
 
 ---
 
@@ -421,7 +583,7 @@ That means:
 |---|---|---|
 | `plot` | repo read, VCS read, deterministic repo scan, contract draft/refine writes, local planning artifact writes under `.punk/` | source mutation, patch apply, broad mutating execution, final decision writing |
 | `cut` | isolated change creation, source mutation within approved scope, executor invocation, test/build/check execution, receipt writing | final decision writing, proof writing |
-| `gate` | artifact read, scope validation, deterministic target/integrity checks, decision writing, proof writing | broad source mutation, unrestricted repair edits |
+| `gate` | artifact read, scope validation, deterministic target/integrity checks via trusted direct process execution, decision writing, proof writing | broad source mutation, unrestricted repair edits |
 
 Mode enforcement must live in runtime behavior, not only in prompts.
 
@@ -667,11 +829,17 @@ The intended packet shape is:
 ProjectOverlay
   project_id
   repo_root
+  overlay_ref
   vcs_mode
   bootstrap_ref
   agent_guidance_ref
   capability_summary
+  harness_summary
+  harness_spec_ref
+  harness_spec
+  project_skill_resolution_mode
   project_skill_refs
+  ambient_project_skill_refs
   local_constraints
   safe_default_checks
   status_scope_mode
@@ -691,6 +859,12 @@ It should unify:
 
 so that operators and agents can inspect one source instead of reconstructing project intelligence from scattered files.
 
+Current bootstrap-packet rule:
+
+- prefer the native `.punk/bootstrap/<project>-core.md` packet written by `punk init`
+- if a repo already has exactly one legacy `.punk/bootstrap/*-core.md` packet, reuse that packet as the current `bootstrap_ref` instead of assuming the repo basename
+- do not create competing bootstrap docs for the same repo unless migration policy explicitly says so
+
 ### Projection rule
 
 `ProjectOverlay` should be inspectable and explicit.
@@ -703,8 +877,10 @@ It must not become:
 
 The likely correct model is:
 
-- canonical project facts and refs are persisted
-- shell commands read them through one project-intelligence packet
+- canonical project facts and refs are persisted at `.punk/project/overlay.json`
+- shell commands read and display that one project-intelligence packet instead of reconstructing primary truth from ambient directories
+- repo-local `.punk/skills/overlays/**/*.md` refs are the primary project-skill source
+- ambient skill discovery is fallback/migration-only and must stay explicit in the packet when it is used
 - project-specific skill composition remains explicit and inspectable
 
 ---
@@ -808,16 +984,25 @@ Future docs may still use `verify` as a `council` protocol name, but it must rem
 
 ### Council protocol families
 
-The intended families are:
+Current v1 families are:
 
 - architecture council
 - contract council
 - review council
+
+Deferred beyond the current v1 council scope:
+
 - migration/cleanup council
 - implementation diverge
 - research-backed synthesis
 
 Council is selective, not always-on.
+
+Selective means:
+
+- the repo already has a usable bootstrap + staged + proof-ready core loop
+- the council family is advisory-only
+- the family-specific trigger from `docs/product/COUNCIL.md` is actually met
 
 ---
 
@@ -897,6 +1082,18 @@ Example uses:
 
 This is the long-term role of `punk-research` and `delve`-style workflows.
 
+Current implemented boundary:
+
+- the current slice only freezes repo-local research packets and inspectable records
+- `punk research start` may write `question.json`, `packet.json`, and `record.json` under `.punk/research/<research-id>/`
+- `punk research artifact <research-id> ...` may append structured artifact records under `.punk/research/<research-id>/artifacts/`
+- if artifact writing invalidates a previously synthesized current view, the mutable `synthesis.json` alias may be removed while immutable synthesis history remains intact
+- repeated invalidation cycles may accumulate typed invalidation history entries on the record even after the active invalidation note is cleared by a later synthesis
+- `punk research synthesize <research-id> ...` may write one structured mutable `synthesis.json` current view, persist an immutable identity copy under `syntheses/<synthesis-id>.json`, carry explicit repo-local `follow_up_refs[]`, and require explicit operator replace intent for repeated synthesis writes
+- `punk research complete <research-id>` and `punk research escalate <research-id>` may apply terminal operator-triggered stop states to the persisted `record.json`
+- `punk inspect research_<id>` may read that frozen bundle back and surface persisted synthesis follow-up refs, immutable synthesis identity, replacement lineage, and current-view invalidation notes in human summaries; the JSON inspect payload may also expose derived `invalidation` and `synthesis_lineage` projections for downstream tooling, including oldest-to-newest synthesis history built from immutable refs plus small convenience booleans derived from the same lineage
+- worker orchestration and critique loops remain future Stage 5+ behavior
+
 ---
 
 ## 15. Dogfooding and trust separation
@@ -918,6 +1115,7 @@ These rules must hold in the first working version:
 2. Every `Run` must record:
    - VCS backend
    - `change_ref`
+   - `verification_context_ref` once `cut run` persists the frozen check context
 3. Every approved `Contract` must have non-empty:
    - `allowed_scope`
    - `target_checks`
@@ -926,6 +1124,7 @@ These rules must hold in the first working version:
    - `target_status`
    - `integrity_status`
    - `confidence_estimate`
+   - the verification-context ref / identity used for the verdict
 5. No code path outside `gate` may persist final decision artifacts.
 6. The event log remains the SSoT for runtime state.
 
@@ -948,8 +1147,9 @@ Owns:
 Owns:
 
 - scope validation
+- frozen verification-context validation
 - policy validation
-- target/integrity checks
+- target/integrity checks via trusted direct execution of validated runners
 - decision synthesis
 
 ### `punk-proof`
@@ -958,6 +1158,7 @@ Owns:
 
 - proofpack creation
 - artifact hashing
+- verification-context hashing / propagation
 - proof writing
 
 ### Future `punk-council`

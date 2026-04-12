@@ -293,6 +293,7 @@ pub async fn run(dcfg: DaemonConfig) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_queued(
     bus: &Path,
     slots: &SlotManager,
@@ -1044,7 +1045,7 @@ fn evaluate_goals(bus: &Path) {
             let step_statuses = plan
                 .steps
                 .iter()
-                .map(|step| (step.step, step.status.clone()))
+                .map(|step| (step.step, step.status))
                 .collect();
             for step in &mut plan.steps {
                 if step.status != StepStatus::Pending {
@@ -1061,7 +1062,7 @@ fn evaluate_goals(bus: &Path) {
             let step_statuses = plan
                 .steps
                 .iter()
-                .map(|step| (step.step, step.status.clone()))
+                .map(|step| (step.step, step.status))
                 .collect();
             plan.steps.iter().any(|step| {
                 step.status == StepStatus::Pending

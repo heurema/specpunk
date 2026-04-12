@@ -1291,7 +1291,7 @@ mod tests {
         let git_root = workspace.parent().unwrap_or(workspace);
         let arch = run_git_archaeology(git_root);
         // We just verify it doesn't panic and returns something reasonable
-        assert!(arch.contributor_count >= 0); // always true, checks it runs
+        let _ = arch.contributor_count; // check it runs
         assert!(arch.conventional_commit_ratio >= 0.0 && arch.conventional_commit_ratio <= 1.0);
         assert!(
             arch.commit_style == "conventional"

@@ -196,6 +196,37 @@ impl GitBackend {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
+
+    fn has_committed_head(&self) -> bool {
+        Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(&self.root)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn symbolic_head_ref(path: &Path) -> Result<String> {
+        match run_capture(path, "git", &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+            Ok(value) => Ok(value.trim().to_string()),
+            Err(_) => {
+                let value = run_capture(path, "git", &["branch", "--show-current"])?;
+                let value = value.trim().to_string();
+                if value.is_empty() {
+                    Err(anyhow!("unable to resolve git branch for unborn HEAD"))
+                } else {
+                    Ok(value)
+                }
+            }
+        }
+    }
+
+    fn current_change_ref_at(path: &Path) -> Result<String> {
+        match run_capture(path, "git", &["rev-parse", "HEAD"]) {
+            Ok(value) => Ok(value.trim().to_string()),
+            Err(_) => Self::symbolic_head_ref(path),
+        }
+    }
 }
 
 impl ProvenanceBaseline {
@@ -243,21 +274,34 @@ impl VcsBackend for GitBackend {
         if let Some(parent) = workspace_root.parent() {
             fs::create_dir_all(parent)?;
         }
-        run_capture(
-            &self.root,
-            "git",
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch,
-                workspace_root.to_string_lossy().as_ref(),
-                "HEAD",
-            ],
-        )?;
-        let change_ref = run_capture(&workspace_root, "git", &["rev-parse", "HEAD"])?
-            .trim()
-            .to_string();
+        if self.has_committed_head() {
+            run_capture(
+                &self.root,
+                "git",
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch,
+                    workspace_root.to_string_lossy().as_ref(),
+                    "HEAD",
+                ],
+            )?;
+        } else {
+            run_capture(
+                &self.root,
+                "git",
+                &[
+                    "worktree",
+                    "add",
+                    "--orphan",
+                    "-b",
+                    &branch,
+                    workspace_root.to_string_lossy().as_ref(),
+                ],
+            )?;
+        }
+        let change_ref = Self::current_change_ref_at(&workspace_root)?;
         Ok(IsolatedChange {
             workspace_ref: workspace_root.display().to_string(),
             change_ref,
@@ -265,14 +309,7 @@ impl VcsBackend for GitBackend {
         })
     }
     fn current_change_ref(&self) -> Result<String> {
-        match run_capture(&self.root, "git", &["rev-parse", "HEAD"]) {
-            Ok(value) => Ok(value.trim().to_string()),
-            Err(_) => Ok(
-                run_capture(&self.root, "git", &["rev-parse", "--abbrev-ref", "HEAD"])?
-                    .trim()
-                    .to_string(),
-            ),
-        }
+        Self::current_change_ref_at(&self.root)
     }
     fn changed_files(&self) -> Result<Vec<String>> {
         let mut changed = match run_capture(
@@ -625,6 +662,51 @@ mod tests {
                 .trim(),
             original_ref
         );
+
+        let _ = run_capture(
+            &root,
+            "git",
+            &["worktree", "remove", "--force", &isolated.workspace_ref],
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_isolated_change_supports_unborn_head_repo() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-vcs-git-unborn-worktree-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        run_capture(&root, "git", &["init"]).unwrap();
+        fs::write(root.join("README.md"), "unborn\n").unwrap();
+
+        let backend = GitBackend::new(&root).unwrap();
+        let isolated = backend
+            .create_isolated_change("Bootstrap plain go")
+            .unwrap();
+        let workspace_root = PathBuf::from(&isolated.workspace_ref);
+        let canonical_workspace_root = fs::canonicalize(&workspace_root).unwrap();
+        let canonical_worktrees_root = fs::canonicalize(root.join(".punk/worktrees")).unwrap();
+
+        assert_ne!(canonical_workspace_root, fs::canonicalize(&root).unwrap());
+        assert!(canonical_workspace_root.starts_with(&canonical_worktrees_root));
+        assert!(!isolated.change_ref.is_empty());
+        assert_ne!(isolated.change_ref, "HEAD");
+        assert!(isolated.base_ref.is_some());
+        assert_ne!(isolated.base_ref.as_deref(), Some("HEAD"));
+
+        let root_head = GitBackend::new(&root)
+            .unwrap()
+            .current_change_ref()
+            .unwrap();
+        assert!(!root_head.is_empty());
+        assert_ne!(root_head, "HEAD");
 
         let _ = run_capture(
             &root,

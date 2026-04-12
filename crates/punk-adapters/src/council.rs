@@ -5,6 +5,10 @@ use anyhow::{anyhow, Result};
 use serde_json::json;
 
 /// Provider-facing execution contract for future council slot runs.
+///
+/// This is intentionally narrow: council adapters normalize one slot run at a time and return
+/// provider output plus minimal metadata. They do not own rubric semantics, scoring policy,
+/// synthesis policy, or final acceptance.
 pub trait ProviderAdapter {
     fn provider_name(&self) -> &'static str;
     fn preflight(&self) -> Result<ProviderPreflightReport>;

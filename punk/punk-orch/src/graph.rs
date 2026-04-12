@@ -303,8 +303,7 @@ mod tests {
         fs::create_dir_all(&receipts).unwrap();
 
         let now = Utc::now();
-        let lines = vec![
-            serde_json::json!({
+        let lines = [serde_json::json!({
                 "project": "punk",
                 "task_id": "task-a",
                 "status": "success",
@@ -321,8 +320,7 @@ mod tests {
                 "completed_at": (now - Duration::minutes(5)).to_rfc3339(),
                 "duration_ms": 600_000u64
             })
-            .to_string(),
-        ];
+            .to_string()];
         fs::write(receipts.join("index.jsonl"), lines.join("\n") + "\n").unwrap();
 
         let out = gantt_chart(&bus, 7);

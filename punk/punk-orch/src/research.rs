@@ -321,7 +321,7 @@ fn load_artifacts(root_dir: &Path) -> Result<Vec<ResearchArtifact>, String> {
     for entry in fs::read_dir(&artifacts_dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "json") {
+        if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
         let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
@@ -771,8 +771,10 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
 
-        let mut budget = ResearchBudget::default();
-        budget.max_artifacts = 1;
+        let budget = ResearchBudget {
+            max_artifacts: 1,
+            ..Default::default()
+        };
         let started = start_research(
             &repo,
             StartResearchRequest {
