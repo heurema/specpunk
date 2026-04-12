@@ -295,7 +295,11 @@ pub fn build_bounded_fallback_proposal(
     Some(fallback)
 }
 
-fn extend_greenfield_scaffold_scope(repo_root: &Path, prompt: &str, allowed_scope: &mut Vec<String>) {
+fn extend_greenfield_scaffold_scope(
+    repo_root: &Path,
+    prompt: &str,
+    allowed_scope: &mut Vec<String>,
+) {
     let tokens = prompt_tokens(prompt);
     let Some(kind) = greenfield_scaffold_kind(repo_root, &tokens) else {
         return;
@@ -1219,12 +1223,14 @@ fn has_structural_invalidity(
         return true;
     }
 
-    if proposal_misses_primary_candidate_entry_point(proposal, scan) {
-        return true;
-    }
+    if explicit_paths.is_empty() {
+        if proposal_misses_primary_candidate_entry_point(proposal, scan) {
+            return true;
+        }
 
-    if broad_directory_scope_needs_file_fallback(repo_root, prompt, proposal, scan) {
-        return true;
+        if broad_directory_scope_needs_file_fallback(repo_root, prompt, proposal, scan) {
+            return true;
+        }
     }
 
     if let Some(recipe) = best_protocol_recipe(prompt, proposal) {
@@ -3946,10 +3952,7 @@ mod tests {
         let proposal = DraftProposal {
             title: "pubpunk init".into(),
             summary: "broken plain-goal fallback".into(),
-            entry_points: vec![
-                "Cargo.toml".into(),
-                "crates/pubpunk-cli/src/main.rs".into(),
-            ],
+            entry_points: vec!["Cargo.toml".into(), "crates/pubpunk-cli/src/main.rs".into()],
             import_paths: vec![],
             expected_interfaces: vec![
                 "A Rust workspace with a `pubpunk` CLI crate.".into(),

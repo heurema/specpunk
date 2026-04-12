@@ -1,8 +1,12 @@
 [workspace]
+# Status vocabulary for this manifest:
+# - active_v0_surface: workspace member and part of today's operator/runtime surface
+# - in_tree_inactive: workspace member kept buildable in-tree, but not part of the active v0 operator path
+# - planned_only: target-shape crate not present in today's workspace membership
 members = [
+  # active_v0_surface
   "crates/punk-cli",
   "crates/punk-domain",
-  "crates/punk-council",
   "crates/punk-events",
   "crates/punk-core",
   "crates/punk-vcs",
@@ -10,6 +14,8 @@ members = [
   "crates/punk-gate",
   "crates/punk-proof",
   "crates/punk-adapters",
+  # in_tree_inactive (Stage 2+ advisory council surface, not active v0 operator path)
+  "crates/punk-council",
 ]
 resolver = "2"
 

@@ -4,6 +4,14 @@ This document defines the target command surface for the first working version.
 
 Unless explicitly marked as planned, commands in this document refer to the current v0/v0.1 CLI surface.
 
+Repo-status vocabulary used in this doc:
+
+- **active v0 surface** = current operator/runtime path
+- **in-tree but inactive** = present/buildable in workspace, but not part of the current operator path
+- **planned only** = target shape, not current workspace surface
+
+Canonical repo-status note: `docs/product/REPO-STATUS.md`
+
 ---
 
 ## 1. Two surfaces
@@ -23,6 +31,12 @@ punk <command> ...
 ```
 
 Both must route into the same application services.
+
+Status note:
+
+- the non-interactive CLI above is **active v0 surface**
+- the interactive shell is **planned only**
+- council-related protocol code may exist **in-tree but inactive**, but that does not add council commands to the current CLI surface
 
 ---
 
@@ -94,17 +108,27 @@ punk init --project <id> --enable-jj --verify
 
 Use `--project <id>` only when the repo basename is not a suitable project id.
 
+Bootstrap is native inside `punk-cli`; the init/bootstrap path does not require `punk-run`.
+
 Bootstrap should:
 
 - pin the current repo as a known project
 - create repo-local agent guidance
+- persist the current repo-local project packet
 - verify status scope and VCS mode
 - converge project-local intelligence toward one inspectable project packet over time
 
 Generated guidance:
 
+- `.punk/project.json`
 - `AGENTS.md`
 - `.punk/AGENT_START.md`
+- `.punk/bootstrap/<project>-core.md`
+
+Current bootstrap migration rule:
+
+- if the repo already contains exactly one legacy `.punk/bootstrap/*-core.md` packet, `punk init` and `punk inspect project` should reuse that packet instead of creating a competing second bootstrap doc
+- if no bootstrap packet exists, `punk init` should write the native `.punk/bootstrap/<project>-core.md` file
 
 Current project inspect surface:
 
@@ -113,6 +137,8 @@ Current project inspect surface:
 
 Current `inspect project` overlay should include:
 
+- persisted packet ref:
+  - `overlay_ref`
 - existing project capability summary (`bootstrap_ready`, `project_guidance_ready`, `staged_ready`, `autonomous_ready`, `jj_ready`, `proof_ready`)
 - derived `harness_summary` fields from current repo state only:
   - `inspect_ready`
@@ -124,6 +150,18 @@ Current `inspect project` overlay should include:
 - derived persisted harness packet fields:
   - `harness_spec_ref`
   - `harness_spec`
+- explicit project skill resolution fields:
+  - `project_skill_resolution_mode`
+  - `project_skill_refs`
+  - `ambient_project_skill_refs`
+
+Current persisted project-intelligence packet behavior:
+
+- `punk inspect project` writes the canonical repo-local packet to `.punk/project/overlay.json`
+- `punk inspect project --json` returns the same persisted packet shape that was written to `.punk/project/overlay.json`
+- the overlay packet should be sufficient to inspect bootstrap/guidance refs, current capability status, safe default checks, and active project skill refs without searching ambient directories first
+- repo-local project skills resolve from `.punk/skills/overlays/**/*.md`
+- external bus / ambient skill discovery is fallback-only and should surface both `project_skill_resolution_mode=ambient_fallback` and explicit `ambient_project_skill_refs`
 
 Current persisted harness packet behavior:
 
@@ -144,12 +182,122 @@ Current proof inspect surface:
 - `punk inspect proof_<id> --json`
 - `punk inspect proof_<id>`
 
+Current bounded research freeze/start surface:
+
+```bash
+punk research start "<question>" \
+  --kind architecture \
+  --goal "<goal>" \
+  --success "<criterion>" \
+  [--success "<criterion>"] \
+  [--constraint "<constraint>"] \
+  [--subject-ref <repo-local-ref>] \
+  [--context-ref <repo-local-ref>] \
+  [--max-rounds 3] \
+  [--max-worker-slots 5] \
+  [--max-duration-minutes 30] \
+  [--max-artifacts 12] \
+  [--max-cost-usd 10.0]
+```
+
+Current structured research artifact surface:
+
+```bash
+punk research artifact <research-id> \
+  --kind note \
+  --summary "<summary>" \
+  [--source-ref <repo-local-ref>]
+```
+
+Current structured research synthesis surface:
+
+```bash
+punk research synthesize <research-id> \
+  --outcome risk_memo \
+  --summary "<summary>" \
+  [--artifact-ref <repo-local-ref>] \
+  [--artifact-ref <repo-local-ref>] \
+  [--follow-up-ref <repo-local-ref>] \
+  [--follow-up-ref <repo-local-ref>] \
+  [--replace]
+```
+
+Current research terminal-transition surface:
+
+```bash
+punk research complete <research-id>
+punk research escalate <research-id>
+```
+
+Current research inspect surface:
+
+- `punk inspect research_<id> --json`
+- `punk inspect research_<id>`
+
+Current research-start semantics:
+
+- `punk research start` is an expert/control surface, not the default user path
+- this v0 slice freezes repo-local research intent only
+- it writes:
+  - `.punk/research/<research-id>/question.json`
+  - `.punk/research/<research-id>/packet.json`
+  - `.punk/research/<research-id>/record.json`
+- it appends `research.started`
+- it does **not** execute workers, write synthesis, invoke council, or promote anything
+
+Current research-artifact semantics:
+
+- `punk research artifact <research-id> ...` writes `.punk/research/<research-id>/artifacts/<artifact-id>.json`
+- it updates `.punk/research/<research-id>/record.json`
+- it appends `research.artifact_written`
+- it advances the record state from `frozen` to `gathering`
+- if a synthesized mutable current view existed, artifact writing removes `.punk/research/<research-id>/synthesis.json` so the current-view alias cannot stay stale
+- when that invalidation happens, the record may keep minimal invalidation metadata for human inspect output until a new synthesis is written
+- invalidation history entries remain on the record even after re-synthesis clears the active invalidation note
+- it still does **not** execute workers, critique loops, or synthesis
+
+Current research-synthesis semantics:
+
+- `punk research synthesize <research-id> ...` writes `.punk/research/<research-id>/synthesis.json`
+- the same write also persists an immutable identity copy under `.punk/research/<research-id>/syntheses/<synthesis-id>.json`
+- it requires at least one previously persisted research artifact
+- when no `--artifact-ref` flags are provided, it links the current full `artifact_refs[]` set
+- optional `--follow-up-ref <repo-local-ref>` flags persist explicit synthesis `follow_up_refs[]`
+- if a synthesis already exists, rerunning `punk research synthesize ...` requires `--replace`
+- replacement appends immutable `synthesis_history_refs[]` instead of silently losing prior synthesis identity
+- it updates `.punk/research/<research-id>/record.json`
+- it appends `research.synthesis_written`
+- it advances the record state to `synthesized` and stores `outcome` + `synthesis_ref`
+- it clears any temporary invalidation note once a fresh current view exists again
+- it still does **not** execute workers, close the research run, invoke council, or promote anything
+
+Current research terminal-transition semantics:
+
+- `punk research complete <research-id>` requires a persisted synthesis and a synthesized state
+- `punk research complete <research-id>` rejects `outcome=escalate`; those runs must use `punk research escalate <research-id>`
+- `punk research escalate <research-id>` requires a persisted synthesis with `outcome=escalate`
+- both commands update `.punk/research/<research-id>/record.json`
+- they append `research.completed` or `research.escalated`
+- they mark the research run terminal so later artifact/synthesis writes are rejected
+
 Current human-facing inspect expectations:
 
+- `punk inspect project` should show the persisted overlay packet ref, project-skill resolution mode, active project skill refs, and any ambient fallback refs when fallback mode is active
 - `punk inspect work` should show a concise latest-proof evidence summary when a latest proof exists
 - `punk inspect work` may also show a concise latest-proof harness summary derived from the latest proof's declared and executed harness evidence
 - declared harness evidence in human summaries should preserve any declared `source_ref` when the proof carries it
 - `punk inspect proof_<id>` should render a concise human summary for typed `command` evidence, `declared_harness_evidence`, and executed `harness_evidence` without requiring raw JSON reading
+- `punk inspect research_<id>` should render the frozen question, explicit budget, repo snapshot, stop rules, and the obvious next inspect command without requiring raw JSON reading
+- `punk inspect research_<id>` should also show artifact count and persisted artifact refs once research notes are attached
+- `punk inspect research_<id>` should also show synthesis outcome, `synthesis_ref`, and linked artifact refs once a synthesis is attached
+- `punk inspect research_<id>` should also show synthesis `follow_up_refs[]` once they are attached
+- `punk inspect research_<id>` should also show the current immutable synthesis identity ref and any replacement lineage once repeated synthesis writes exist
+- when the run returns to `gathering` because a newer artifact invalidated the previous current view, `punk inspect research_<id>` should show an explicit invalidation note plus the invalidated synthesis ref and invalidating artifact ref
+- `punk inspect research_<id>` should also show a concise invalidation history section when one or more invalidation cycles have happened
+- `punk inspect research_<id>` should suggest the obvious terminal next step (`research complete` or `research escalate`) while the run is still in `state = synthesized`
+- once the run is terminal, `punk inspect research_<id>` should switch the obvious next step to follow-up review when persisted follow-up refs exist
+- `punk inspect research_<id> --json` should also expose a derived `invalidation` object with `active`, `latest`, and `history_count` fields for downstream tooling
+- `punk inspect research_<id> --json` should also expose a derived `synthesis_lineage` object with `active`, `latest`, `history_count`, oldest-to-newest `history[]`, and convenience booleans (`has_active_current_view`, `has_replacements`, `latest_is_active`) for downstream tooling, parallel to the invalidation projection
 - JSON object inspect remains the source of full structured proof detail
 
 Current JSON artifact expectations:
@@ -506,6 +654,8 @@ Behavior notes:
 - `gate run` must never accept a run whose receipt status is not `success`, even if trusted target and integrity checks happen to pass afterward
 - `gate run` must also block a bounded implementation receipt that claims success while reporting no observable repo changes, unless the receipt explicitly says the slice was already satisfied before bounded dispatch
 - controller-owned runtime artifacts written under `.punk/runs/<run-id>/...` should not count as user scope violations during `gate run`; scope validation should judge only repo changes attributable to the bounded work itself
+- `cut run` should persist a canonical verification context for the run and record its ref on `Run` before `gate run` starts
+- `gate run` must validate that persisted verification context before running trusted checks and fail closed if the context is missing, unreadable, or drifted
 - when a run executed inside an isolated VCS workspace (for example a git worktree in degraded git-only mode), `gate run` must execute trusted target and integrity checks inside that recorded `workspace_ref`, not back on the original repo root
 - if `gate run` executes cargo-based trusted checks for a contract whose scope does not include `Cargo.lock`, a newly generated `Cargo.lock` should be pruned after the check rather than left behind as avoidable project litter
 
@@ -521,6 +671,22 @@ Writes:
 
 - `.punk/proofs/<decision-id>/proofpack.json`
 - `proofpack.written`
+
+Behavior notes:
+
+- `Proofpack` should carry the same `verification_context_ref` and execution-context identity that `gate run` used for the final decision
+- when the referenced verification context artifact still exists, `Proofpack` should hash it alongside the contract, receipt, decision, and check outputs
+- `Proofpack` should also persist:
+  - `run_ref`
+  - `workspace_lineage`
+  - `executor_identity`
+  - `reproducibility_claim`
+- current reproducibility claim levels are:
+  - `frozen_context_v0`
+  - `run_record_v0`
+  - `record_plus_context_v0`
+  - `record_only_v0`
+- these levels are intentionally bounded: v0 proof distinguishes recorded evidence from partially reconstructable verdict context, but does **not** claim hermetic rebuilds
 
 ---
 

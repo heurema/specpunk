@@ -394,11 +394,14 @@ name = "punk-gate"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "punk-core",
  "punk-domain",
  "punk-events",
  "punk-orch",
+ "punk-vcs",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

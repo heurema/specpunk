@@ -7,9 +7,11 @@ use punk_core::{find_object_path, read_json, relative_ref, validate_check_comman
 use punk_domain::{
     now_rfc3339, CheckStatus, CommandEvidence, Contract, ContractStatus, Decision, DecisionObject,
     DeclaredHarnessEvidence, DeterministicStatus, EventEnvelope, HarnessEvidence, ModeId, Receipt,
+    VerificationContext, VerificationContextFileState, VerificationContextIdentity,
 };
 use punk_events::EventStore;
 use punk_orch::project_id;
+use punk_vcs::detect_backend;
 
 pub struct GateService {
     repo_root: PathBuf,
@@ -27,6 +29,14 @@ struct HarnessRunSummary {
     status: CheckStatus,
     reasons: Vec<String>,
     harness_evidence: Vec<HarnessEvidence>,
+}
+
+struct VerificationContextOutcome {
+    check_root: Option<PathBuf>,
+    context_ref: Option<String>,
+    identity: Option<VerificationContextIdentity>,
+    reasons: Vec<String>,
+    valid: bool,
 }
 
 impl GateService {
@@ -51,7 +61,7 @@ impl GateService {
         if contract.status != ContractStatus::Approved {
             return Err(anyhow!("gate requires an approved contract"));
         }
-        let check_root = gate_check_root(&self.repo_root, &run);
+        let verification_context = resolve_verification_context(&self.repo_root, &run);
         let declared_harness_evidence = load_declared_harness_evidence(&self.repo_root);
         let harness = run_harness_recipes(&self.repo_root)?;
 
@@ -79,22 +89,33 @@ impl GateService {
         if !scope_ok {
             decision_basis.push("scope violation: changed files outside allowed_scope".to_string());
         }
-        let target = run_checks(
-            &check_root,
-            &self.repo_root,
-            &run.id,
-            "target",
-            &contract.target_checks,
-            &contract.allowed_scope,
-        )?;
-        let integrity = run_checks(
-            &check_root,
-            &self.repo_root,
-            &run.id,
-            "integrity",
-            &contract.integrity_checks,
-            &contract.allowed_scope,
-        )?;
+        decision_basis.extend(verification_context.reasons.clone());
+        let (target, integrity) = if let Some(check_root) = verification_context.check_root.as_ref()
+        {
+            (
+                run_checks(
+                    check_root,
+                    &self.repo_root,
+                    &run.id,
+                    "target",
+                    &contract.target_checks,
+                    &contract.allowed_scope,
+                )?,
+                run_checks(
+                    check_root,
+                    &self.repo_root,
+                    &run.id,
+                    "integrity",
+                    &contract.integrity_checks,
+                    &contract.allowed_scope,
+                )?,
+            )
+        } else {
+            (
+                invalid_verification_check_summary("target"),
+                invalid_verification_check_summary("integrity"),
+            )
+        };
         check_refs.extend(target.refs.iter().cloned());
         check_refs.extend(integrity.refs.iter().cloned());
         decision_basis.extend(target.reasons.clone());
@@ -105,6 +126,7 @@ impl GateService {
 
         let (decision, deterministic_status, confidence_estimate) = if !receipt_ok
             || !scope_ok
+            || !verification_context.valid
             || target.status == CheckStatus::Fail
             || integrity.status == CheckStatus::Fail
             || harness.status == CheckStatus::Fail
@@ -129,6 +151,8 @@ impl GateService {
             contract_ref: relative_ref(&self.repo_root, &contract_path)?,
             receipt_ref: relative_ref(&self.repo_root, &receipt_path)?,
             check_refs,
+            verification_context_ref: verification_context.context_ref,
+            verification_context_identity: verification_context.identity,
             command_evidence,
             declared_harness_evidence,
             harness_evidence: harness.harness_evidence,
@@ -199,6 +223,17 @@ fn is_controller_runtime_artifact(path: &str) -> bool {
     path.starts_with(".punk/runs/")
 }
 
+fn invalid_verification_check_summary(kind: &str) -> CheckRunSummary {
+    CheckRunSummary {
+        status: CheckStatus::Fail,
+        reasons: vec![format!(
+            "{kind} checks skipped: frozen verification context unavailable"
+        )],
+        refs: Vec::new(),
+        command_evidence: Vec::new(),
+    }
+}
+
 fn prune_generated_cargo_lock_if_out_of_scope(
     check_root: &Path,
     allowed_scope: &[String],
@@ -218,12 +253,247 @@ fn prune_generated_cargo_lock_if_out_of_scope(
     Ok(())
 }
 
-fn gate_check_root(repo_root: &Path, run: &punk_domain::Run) -> PathBuf {
-    let workspace = PathBuf::from(&run.vcs.workspace_ref);
-    if workspace.exists() {
-        workspace
-    } else {
-        repo_root.to_path_buf()
+fn snapshot_verification_file_state(
+    workspace_root: &Path,
+    path: &str,
+    event_store: &EventStore,
+) -> Result<VerificationContextFileState> {
+    let file_path = workspace_root.join(path);
+    if !file_path.exists() {
+        return Ok(VerificationContextFileState {
+            path: path.to_string(),
+            exists: false,
+            sha256: None,
+        });
+    }
+
+    Ok(VerificationContextFileState {
+        path: path.to_string(),
+        exists: true,
+        sha256: Some(event_store.file_sha256(&file_path)?),
+    })
+}
+
+fn verification_context_fingerprint(
+    identity: &VerificationContextIdentity,
+    file_states: &[VerificationContextFileState],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(format!("backend:{:?}\n", identity.backend));
+    hasher.update(format!("workspace_ref:{}\n", identity.workspace_ref));
+    hasher.update(format!("change_ref:{}\n", identity.change_ref));
+    hasher.update(format!(
+        "base_ref:{}\n",
+        identity.base_ref.as_deref().unwrap_or("")
+    ));
+    for path in &identity.changed_files {
+        hasher.update(format!("changed:{path}\n"));
+    }
+    for state in file_states {
+        hasher.update(format!(
+            "file:{}:{}:{}\n",
+            state.path,
+            if state.exists { "present" } else { "missing" },
+            state.sha256.as_deref().unwrap_or(""),
+        ));
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn is_verification_context_runtime_artifact(path: &str) -> bool {
+    path.starts_with(".punk/")
+}
+
+fn normalize_verification_changed_files(
+    check_root: &Path,
+    current_files: Vec<String>,
+    expected_files: &[String],
+) -> Vec<String> {
+    let mut normalized = BTreeSet::new();
+    for path in current_files {
+        let trimmed = path.trim_end_matches('/').to_string();
+        if check_root.join(&trimmed).is_dir() {
+            let mut matched = false;
+            let prefix = format!("{trimmed}/");
+            for expected in expected_files {
+                if expected == &trimmed || expected.starts_with(&prefix) {
+                    normalized.insert(expected.clone());
+                    matched = true;
+                }
+            }
+            if !matched {
+                normalized.insert(trimmed);
+            }
+        } else {
+            normalized.insert(trimmed);
+        }
+    }
+    normalized.into_iter().collect()
+}
+
+fn resolve_verification_context(
+    repo_root: &Path,
+    run: &punk_domain::Run,
+) -> VerificationContextOutcome {
+    let Some(context_ref) = run.verification_context_ref.clone() else {
+        return VerificationContextOutcome {
+            check_root: None,
+            context_ref: None,
+            identity: None,
+            reasons: vec!["frozen verification context missing from run".to_string()],
+            valid: false,
+        };
+    };
+
+    let context_path = repo_root.join(&context_ref);
+    if !context_path.exists() {
+        return VerificationContextOutcome {
+            check_root: None,
+            context_ref: Some(context_ref),
+            identity: None,
+            reasons: vec![format!(
+                "frozen verification context missing at {}",
+                context_path.display()
+            )],
+            valid: false,
+        };
+    }
+
+    let context: VerificationContext = match read_json(&context_path) {
+        Ok(context) => context,
+        Err(err) => {
+            return VerificationContextOutcome {
+                check_root: None,
+                context_ref: Some(context_ref),
+                identity: None,
+                reasons: vec![format!("unable to read frozen verification context: {err}")],
+                valid: false,
+            };
+        }
+    };
+
+    let mut reasons = Vec::new();
+    if context.identity.workspace_ref != run.vcs.workspace_ref {
+        reasons.push("frozen verification context workspace_ref does not match run".to_string());
+    }
+    if context.identity.change_ref != run.vcs.change_ref {
+        reasons.push("frozen verification context change_ref does not match run".to_string());
+    }
+    if context.identity.base_ref != run.vcs.base_ref {
+        reasons.push("frozen verification context base_ref does not match run".to_string());
+    }
+    if context.identity.backend != run.vcs.backend {
+        reasons.push("frozen verification context backend does not match run".to_string());
+    }
+
+    let check_root = PathBuf::from(&context.identity.workspace_ref);
+    if !check_root.exists() {
+        reasons.push(format!(
+            "frozen verification workspace missing: {}",
+            check_root.display()
+        ));
+        return VerificationContextOutcome {
+            check_root: None,
+            context_ref: Some(context_ref),
+            identity: Some(context.identity),
+            reasons,
+            valid: false,
+        };
+    }
+
+    let backend = match detect_backend(&check_root) {
+        Ok(backend) => backend,
+        Err(err) => {
+            reasons.push(format!(
+                "unable to open frozen verification workspace {}: {err}",
+                check_root.display()
+            ));
+            return VerificationContextOutcome {
+                check_root: None,
+                context_ref: Some(context_ref),
+                identity: Some(context.identity),
+                reasons,
+                valid: false,
+            };
+        }
+    };
+
+    if backend.kind() != context.identity.backend {
+        reasons.push("frozen verification workspace backend drifted".to_string());
+    }
+    match backend.current_change_ref() {
+        Ok(current_change_ref) if current_change_ref != context.identity.change_ref => {
+            reasons.push(format!(
+                "frozen verification context drifted: change_ref {} != {}",
+                current_change_ref, context.identity.change_ref
+            ));
+        }
+        Err(err) => reasons.push(format!("unable to read frozen change_ref: {err}")),
+        _ => {}
+    }
+
+    let current_changed_files = match backend.changed_files() {
+        Ok(files) => files
+            .into_iter()
+            .filter(|path| !is_verification_context_runtime_artifact(path))
+            .collect::<Vec<_>>(),
+        Err(err) => {
+            reasons.push(format!("unable to read frozen changed files: {err}"));
+            Vec::new()
+        }
+    };
+    let current_changed_files = normalize_verification_changed_files(
+        &check_root,
+        current_changed_files,
+        &context.identity.changed_files,
+    );
+    if current_changed_files != context.identity.changed_files {
+        reasons.push(format!(
+            "frozen verification context drifted: changed_files {:?} != {:?}",
+            current_changed_files, context.identity.changed_files
+        ));
+    }
+
+    let event_store = EventStore::new(repo_root);
+    let mut current_file_states = Vec::new();
+    for state in &context.file_states {
+        match snapshot_verification_file_state(&check_root, &state.path, &event_store) {
+            Ok(current_state) => {
+                if current_state != *state {
+                    reasons.push(format!(
+                        "frozen verification context drifted at {}",
+                        state.path
+                    ));
+                }
+                current_file_states.push(current_state);
+            }
+            Err(err) => reasons.push(format!(
+                "unable to snapshot frozen verification file {}: {err}",
+                state.path
+            )),
+        }
+    }
+    if verification_context_fingerprint(&context.identity, &context.file_states)
+        != context.identity.fingerprint_sha256
+    {
+        reasons.push("stored frozen verification fingerprint is invalid".to_string());
+    }
+    if reasons.is_empty()
+        && verification_context_fingerprint(&context.identity, &current_file_states)
+            != context.identity.fingerprint_sha256
+    {
+        reasons.push("frozen verification fingerprint drifted".to_string());
+    }
+
+    let valid = reasons.is_empty();
+    VerificationContextOutcome {
+        check_root: valid.then_some(check_root),
+        context_ref: Some(context_ref),
+        identity: Some(context.identity),
+        reasons,
+        valid,
     }
 }
 
@@ -535,6 +805,64 @@ mod tests {
     use punk_core::write_json;
     use punk_domain::{ReceiptArtifacts, RunStatus, VcsKind};
 
+    fn normalized_decision_value(decision: &punk_domain::DecisionObject) -> serde_json::Value {
+        let mut value = serde_json::to_value(decision).unwrap();
+        value["created_at"] = serde_json::Value::String("<normalized>".into());
+        value
+    }
+
+    fn attach_verification_context(
+        root: &Path,
+        run: &mut punk_domain::Run,
+        changed_files: &[&str],
+    ) {
+        let workspace_root = PathBuf::from(&run.vcs.workspace_ref);
+        if let Ok(backend) = detect_backend(&workspace_root) {
+            run.vcs.backend = backend.kind();
+            if let Ok(change_ref) = backend.current_change_ref() {
+                run.vcs.change_ref = change_ref;
+            }
+        }
+        let mut changed_files = changed_files
+            .iter()
+            .filter(|path| !is_verification_context_runtime_artifact(path))
+            .map(|path| path.to_string())
+            .collect::<Vec<_>>();
+        changed_files.sort();
+        changed_files.dedup();
+        let event_store = EventStore::new(root);
+        let mut file_states = changed_files
+            .iter()
+            .map(|path| {
+                snapshot_verification_file_state(&workspace_root, path, &event_store).unwrap()
+            })
+            .collect::<Vec<_>>();
+        file_states.sort_by(|a, b| a.path.cmp(&b.path));
+        let identity = VerificationContextIdentity {
+            backend: run.vcs.backend.clone(),
+            workspace_ref: run.vcs.workspace_ref.clone(),
+            change_ref: run.vcs.change_ref.clone(),
+            base_ref: run.vcs.base_ref.clone(),
+            changed_files,
+            fingerprint_sha256: String::new(),
+        };
+        let fingerprint_sha256 = verification_context_fingerprint(&identity, &file_states);
+        let context = VerificationContext {
+            identity: VerificationContextIdentity {
+                fingerprint_sha256,
+                ..identity
+            },
+            file_states,
+            captured_at: now_rfc3339(),
+        };
+        let context_path = root
+            .join(".punk/runs")
+            .join(&run.id)
+            .join("verification-context.json");
+        write_json(&context_path, &context).unwrap();
+        run.verification_context_ref = Some(relative_ref(root, &context_path).unwrap());
+    }
+
     #[test]
     fn gate_blocks_scope_violation() {
         let root = std::env::temp_dir().join(format!("punk-gate-{}", std::process::id()));
@@ -565,7 +893,7 @@ mod tests {
             approved_at: Some(now_rfc3339()),
         };
         write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
-        let run = punk_domain::Run {
+        let mut run = punk_domain::Run {
             id: "run_1".into(),
             task_id: "task_1".into(),
             feature_id: "feat_1".into(),
@@ -579,10 +907,12 @@ mod tests {
                 change_ref: "head".into(),
                 base_ref: None,
             },
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
         write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        fs::write(root.join("not-allowed.txt"), "scope drift\n").unwrap();
         let receipt = Receipt {
             id: "rcpt_1".into(),
             run_id: "run_1".into(),
@@ -601,6 +931,13 @@ mod tests {
             created_at: now_rfc3339(),
         };
         write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        let changed_files = receipt
+            .changed_files
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        attach_verification_context(&root, &mut run, &changed_files);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
         let gate = GateService::new(&root, &global);
         let decision = gate.gate_run("run_1").unwrap();
         assert_eq!(decision.decision, Decision::Block);
@@ -614,10 +951,8 @@ mod tests {
 
     #[test]
     fn gate_blocks_successful_noop_bounded_receipt() {
-        let root = std::env::temp_dir().join(format!(
-            "punk-gate-successful-noop-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("punk-gate-successful-noop-{}", std::process::id()));
         let global = root.join("global");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
@@ -645,7 +980,7 @@ mod tests {
             approved_at: Some(now_rfc3339()),
         };
         write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
-        let run = punk_domain::Run {
+        let mut run = punk_domain::Run {
             id: "run_1".into(),
             task_id: "task_1".into(),
             feature_id: "feat_1".into(),
@@ -659,6 +994,7 @@ mod tests {
                 change_ref: "head".into(),
                 base_ref: None,
             },
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -681,6 +1017,13 @@ mod tests {
             created_at: now_rfc3339(),
         };
         write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        let changed_files = receipt
+            .changed_files
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        attach_verification_context(&root, &mut run, &changed_files);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
         let gate = GateService::new(&root, &global);
         let decision = gate.gate_run("run_1").unwrap();
         assert_eq!(decision.decision, Decision::Block);
@@ -713,6 +1056,24 @@ mod tests {
             .output()
             .unwrap();
         fs::write(root.join("artifacts/result.txt"), "ok\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "artifacts/result.txt"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "baseline",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
         fs::write(
             root.join(".punk/project/harness.json"),
             r#"{
@@ -760,7 +1121,7 @@ mod tests {
             approved_at: Some(now_rfc3339()),
         };
         write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
-        let run = punk_domain::Run {
+        let mut run = punk_domain::Run {
             id: "run_1".into(),
             task_id: "task_1".into(),
             feature_id: "feat_1".into(),
@@ -774,6 +1135,7 @@ mod tests {
                 change_ref: "head".into(),
                 base_ref: None,
             },
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -796,6 +1158,13 @@ mod tests {
             created_at: now_rfc3339(),
         };
         write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        let changed_files = receipt
+            .changed_files
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        attach_verification_context(&root, &mut run, &changed_files);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
         let gate = GateService::new(&root, &global);
         let decision = gate.gate_run("run_1").unwrap();
         assert_eq!(decision.decision, Decision::Accept);
@@ -889,7 +1258,7 @@ mod tests {
             approved_at: Some(now_rfc3339()),
         };
         write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
-        let run = punk_domain::Run {
+        let mut run = punk_domain::Run {
             id: "run_1".into(),
             task_id: "task_1".into(),
             feature_id: "feat_1".into(),
@@ -903,6 +1272,7 @@ mod tests {
                 change_ref: "head".into(),
                 base_ref: None,
             },
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -925,6 +1295,13 @@ mod tests {
             created_at: now_rfc3339(),
         };
         write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        let changed_files = receipt
+            .changed_files
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        attach_verification_context(&root, &mut run, &changed_files);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
         let gate = GateService::new(&root, &global);
         let decision = gate.gate_run("run_1").unwrap();
         assert_eq!(decision.decision, Decision::Block);
@@ -1007,7 +1384,7 @@ mod tests {
             approved_at: Some(now_rfc3339()),
         };
         write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
-        let run = punk_domain::Run {
+        let mut run = punk_domain::Run {
             id: "run_1".into(),
             task_id: "task_1".into(),
             feature_id: "feat_1".into(),
@@ -1021,6 +1398,7 @@ mod tests {
                 change_ref: "head".into(),
                 base_ref: None,
             },
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -1047,6 +1425,13 @@ mod tests {
             created_at: now_rfc3339(),
         };
         write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        let changed_files = receipt
+            .changed_files
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        attach_verification_context(&root, &mut run, &changed_files);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
 
         let gate = GateService::new(&root, &global);
         let decision = gate.gate_run("run_1").unwrap();
@@ -1079,7 +1464,7 @@ mod tests {
         fs::create_dir_all(workspace.join("crates/demo-cli/src")).unwrap();
         std::process::Command::new("git")
             .args(["init"])
-            .current_dir(&root)
+            .current_dir(&workspace)
             .output()
             .unwrap();
         fs::write(
@@ -1117,7 +1502,7 @@ mod tests {
         };
         write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
 
-        let run = punk_domain::Run {
+        let mut run = punk_domain::Run {
             id: "run_1".into(),
             task_id: "task_1".into(),
             feature_id: "feat_1".into(),
@@ -1131,6 +1516,7 @@ mod tests {
                 change_ref: "head".into(),
                 base_ref: None,
             },
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -1157,6 +1543,13 @@ mod tests {
             created_at: now_rfc3339(),
         };
         write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        let changed_files = receipt
+            .changed_files
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        attach_verification_context(&root, &mut run, &changed_files);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
 
         let gate = GateService::new(&root, &global);
         let decision = gate.gate_run("run_1").unwrap();
@@ -1166,6 +1559,233 @@ mod tests {
             .decision_basis
             .iter()
             .all(|reason| !reason.contains("failed")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gate_replay_preserves_substantive_decision_payload() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("punk-gate-replay-{}-{suffix}", std::process::id()));
+        let global = root.join("global");
+        let workspace = root.join("isolated-workspace");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        let change_ref = detect_backend(&workspace)
+            .unwrap()
+            .current_change_ref()
+            .unwrap();
+        fs::write(workspace.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "implement demo source change".into(),
+            entry_points: vec!["src/lib.rs".into()],
+            import_paths: vec!["src/lib.rs".into()],
+            expected_interfaces: vec!["demo source edit".into()],
+            behavior_requirements: vec!["change source".into()],
+            allowed_scope: vec!["src/lib.rs".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
+
+        let mut run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: workspace.display().to_string(),
+                change_ref,
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "success".into(),
+            executor_name: "fake".into(),
+            changed_files: vec!["src/lib.rs".into()],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec![],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "done".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        let changed_files = receipt
+            .changed_files
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        attach_verification_context(&root, &mut run, &changed_files);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+
+        let gate = GateService::new(&root, &global);
+        let first = gate.gate_run("run_1").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = gate.gate_run("run_1").unwrap();
+
+        assert_ne!(first.created_at, second.created_at);
+        assert_eq!(
+            normalized_decision_value(&first),
+            normalized_decision_value(&second)
+        );
+
+        let persisted: punk_domain::DecisionObject =
+            read_json(&root.join(".punk/decisions/dec_1.json")).unwrap();
+        assert_eq!(
+            normalized_decision_value(&second),
+            normalized_decision_value(&persisted)
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gate_blocks_when_frozen_verification_context_drifted() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-verification-drift-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let workspace = root.join("isolated-workspace");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        let change_ref = detect_backend(&workspace)
+            .unwrap()
+            .current_change_ref()
+            .unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "bootstrap".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["workspace scaffold".into()],
+            behavior_requirements: vec!["bootstrap project".into()],
+            allowed_scope: vec!["Cargo.toml".into(), "src".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "medium".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
+
+        let mut run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: workspace.display().to_string(),
+                change_ref,
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "success".into(),
+            executor_name: "fake".into(),
+            changed_files: vec!["Cargo.toml".into(), "src/main.rs".into()],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec![],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "bootstrap succeeded".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        let changed_files = receipt
+            .changed_files
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        attach_verification_context(&root, &mut run, &changed_files);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+
+        fs::write(
+            workspace.join("src/main.rs"),
+            "fn main() { println!(\"drift\"); }\n",
+        )
+        .unwrap();
+
+        let gate = GateService::new(&root, &global);
+        let decision = gate.gate_run("run_1").unwrap();
+
+        assert_eq!(decision.decision, Decision::Block);
+        assert!(decision
+            .decision_basis
+            .iter()
+            .any(|reason| reason.contains("frozen verification context drifted")));
+        assert_eq!(
+            decision.verification_context_ref.as_deref(),
+            run.verification_context_ref.as_deref()
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1204,7 +1824,7 @@ mod tests {
         };
         write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
 
-        let run = punk_domain::Run {
+        let mut run = punk_domain::Run {
             id: "run_1".into(),
             task_id: "task_1".into(),
             feature_id: "feat_1".into(),
@@ -1218,6 +1838,7 @@ mod tests {
                 change_ref: "head".into(),
                 base_ref: None,
             },
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -1240,6 +1861,13 @@ mod tests {
             created_at: now_rfc3339(),
         };
         write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        let changed_files = receipt
+            .changed_files
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        attach_verification_context(&root, &mut run, &changed_files);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
 
         let gate = GateService::new(&root, &global);
         let decision = gate.gate_run("run_1").unwrap();
@@ -1378,7 +2006,7 @@ mod tests {
             approved_at: Some(now_rfc3339()),
         };
         write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
-        let run = punk_domain::Run {
+        let mut run = punk_domain::Run {
             id: "run_1".into(),
             task_id: "task_1".into(),
             feature_id: "feat_1".into(),
@@ -1392,10 +2020,12 @@ mod tests {
                 change_ref: "head".into(),
                 base_ref: None,
             },
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
         write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        fs::write(root.join("allowed.txt"), "ok\n").unwrap();
         let receipt = Receipt {
             id: "rcpt_1".into(),
             run_id: "run_1".into(),
@@ -1414,6 +2044,13 @@ mod tests {
             created_at: now_rfc3339(),
         };
         write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        let changed_files = receipt
+            .changed_files
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        attach_verification_context(&root, &mut run, &changed_files);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
 
         let gate = GateService::new(&root, &global);
         let decision = gate.gate_run("run_1").unwrap();

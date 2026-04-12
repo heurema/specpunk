@@ -128,6 +128,25 @@ Supported lifecycle states:
 - `superseded`
 - `rolled_back`
 
+### Candidate patch lifecycle
+
+The minimum lifecycle is:
+
+```text
+candidate
+-> eval
+-> promote | reject
+-> rollback (later, if promoted behavior regresses)
+```
+
+Hard rules:
+
+- a candidate patch is not active just because it exists on disk
+- activation requires an explicit `PromotionDecision`
+- one successful task/run is never enough to promote a candidate patch
+- safety regressions found by eval must block promotion
+- rollback is a first-class state, not an implicit delete
+
 ### Repo-local storage
 Project overlays and candidates live in:
 
@@ -140,6 +159,14 @@ Project overlays and candidates live in:
     packets/
 ```
 
+The active repo-local overlay refs should be surfaced through the canonical project-intelligence packet at:
+
+```text
+.punk/project/overlay.json
+```
+
+That packet is the inspectable source of truth for project skill refs.
+
 ### Global storage
 Shared reusable base/domain layers live in:
 
@@ -149,6 +176,9 @@ Shared reusable base/domain layers live in:
     base/
     domain/
 ```
+
+Global or ambient locations are not the primary source of repo-specific project intelligence.
+If a repo has no repo-local overlays yet, ambient discovery may be used only as explicit fallback/migration behavior and must be exposed by `ProjectOverlay`.
 
 ### Hard invariant
 Every task/run must be able to reconstruct:
@@ -189,6 +219,14 @@ Every candidate patch must cite evidence from:
 
 No unsupported patches in v1.
 
+Minimum candidate patch packet should therefore be reviewable with:
+
+- target layer ref
+- evidence refs
+- intended project/role scope
+- eval suite refs once evaluation starts
+- final promotion decision ref once the ratchet closes
+
 ---
 
 ## Integration
@@ -216,6 +254,12 @@ It exposes:
 
 `punk-eval` later decides whether to promote or reject a candidate patch.
 
+That separation is permanent:
+
+- `punk-skills` owns composition and overlay state
+- `punk-eval` owns comparison, scoring, and promotion/rollback decisions
+- `gate` still decides acceptance for the current run only
+
 ---
 
 ## Implementation defaults
@@ -226,6 +270,7 @@ v1 defaults:
 - one project may have different overlays per role
 - packet composition is deterministic and schema-based
 - promotion is deferred to `punk-eval`
+- candidate patches stay inert until eval closes with an explicit decision
 
 ---
 

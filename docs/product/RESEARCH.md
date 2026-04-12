@@ -24,6 +24,16 @@ v1 covers:
 - skill improvement research
 - model/protocol comparison research
 
+Current implemented slice:
+- `punk research start` freezes a repo-local `ResearchQuestion`, `ResearchPacket`, and `ResearchRecord`
+- `punk research artifact <research-id> ...` appends structured repo-local `ResearchArtifact` records
+- `punk research synthesize <research-id> ...` writes one structured repo-local `ResearchSynthesis`
+- `punk research complete <research-id>` and `punk research escalate <research-id>` apply terminal operator-triggered stop states after synthesis
+- `punk inspect research_<id>` reads that frozen packet bundle back
+- `punk inspect research_<id> --json` may also carry a derived invalidation projection (`active`, `latest`, `history_count`) for downstream tooling
+- `punk inspect research_<id> --json` may also carry a derived synthesis-lineage projection (`active`, `latest`, `history_count`, `history[]`, `has_active_current_view`, `has_replacements`, `latest_is_active`) built from immutable synthesis history for downstream tooling
+- worker orchestration and critique loops are still later-stage work
+
 ---
 
 ## Core model
@@ -70,6 +80,14 @@ Kinds may include:
 - critique
 - synthesis input
 
+Current v0 shape:
+- `id`
+- `research_id`
+- `kind`
+- `summary`
+- optional `source_ref`
+- `created_at`
+
 ### `ResearchSynthesis`
 Final structured output.
 
@@ -82,8 +100,27 @@ Allowed outcomes:
 - `eval_suite_patch`
 - `escalate`
 
+Current v0 shape:
+- `id`
+- `research_id`
+- `outcome`
+- `summary`
+- `artifact_refs[]`
+- optional `supersedes_ref`
+- `follow_up_refs[]`
+- `created_at`
+
 ### `ResearchRecord`
 Stored execution record for one research run.
+
+Current v0 shape includes:
+- `artifact_refs[]`
+- optional mutable-current `synthesis_ref`
+- immutable `synthesis_history_refs[]`
+- optional `invalidated_synthesis_ref`
+- optional `invalidation_artifact_ref`
+- `invalidation_history[]`
+- optional `outcome`
 
 ---
 
@@ -200,10 +237,11 @@ Research may be attached as advisory evidence, but cannot bypass gate.
 .punk/
   research/
     <research-id>/
+      question.json
       packet.json
+      record.json
       artifacts/
       synthesis.json
-      record.json
 ```
 
 ### Event kinds
@@ -222,6 +260,45 @@ v1 defaults:
 - all research is bounded by explicit budget and stop rules
 - all outputs are structured artifacts
 - research informs council, skills, and eval but never becomes final project truth by itself
+
+Current v0 start/freeze slice:
+- `research.started` is implemented
+- the stored `record.json` state is `frozen`
+- `packet.json` carries an explicit budget even when defaults are used
+- `output_schema_ref` currently points at this doc (`docs/product/RESEARCH.md#researchsynthesis`)
+- the current slice does **not** execute workers or write `synthesis.json`
+
+Current v0 artifact slice:
+- `research.artifact_written` is now implemented
+- `record.json` appends `artifact_refs[]` and moves to `state = gathering`
+- if artifact writing arrives after a previously synthesized current view, the mutable `.punk/research/<research-id>/synthesis.json` alias is removed so it cannot remain stale
+- that same invalidation may persist minimal metadata explaining which immutable synthesis was cleared and which artifact caused the invalidation
+- historical invalidation entries are retained across later re-synthesis cycles for inspectability
+- artifact writing is still operator-triggered and repo-local only
+- artifact writing does **not** imply synthesis, completion, or promotion
+
+Current v0 synthesis slice:
+- `research.synthesis_written` is now implemented
+- `punk research synthesize <research-id> ...` writes `.punk/research/<research-id>/synthesis.json`
+- each synthesis write also persists an immutable identity copy under `.punk/research/<research-id>/syntheses/<synthesis-id>.json`
+- synthesis writing requires at least one persisted artifact and defaults to linking all current `artifact_refs[]` when no explicit subset is given
+- synthesis may also persist explicit repo-local `follow_up_refs[]` for the next bounded operator action after research stops
+- repeating `punk research synthesize <research-id> ...` now requires explicit replace intent
+- replacement is allowed only before terminal `completed` / `escalated` states
+- `record.json` stores the mutable current-view `synthesis_ref`, appends immutable `synthesis_history_refs[]`, sets `outcome`, and moves to `state = synthesized`
+- writing a new synthesis clears any prior current-view invalidation note on the record
+- synthesis writing is still operator-triggered and repo-local only
+- synthesis writing does **not** imply worker execution, `research.completed`, or promotion
+
+Current v0 terminal-state slice:
+- `research.completed` is now implemented as an operator-triggered terminal transition from `state = synthesized`
+- `research.escalated` is now implemented as an operator-triggered terminal transition from `state = synthesized`
+- `punk research complete <research-id>` requires a persisted synthesis whose `outcome != escalate`
+- `punk research escalate <research-id>` requires a persisted synthesis whose `outcome == escalate`
+- after either terminal transition, further artifact/synthesis mutations are rejected
+- terminal transitions do **not** add worker execution, council routing, or promotion semantics
+- terminal human summaries should show `follow_up_refs[]` and shift the obvious next step from mutation to follow-up review when those refs exist
+- terminal or synthesized human summaries may also show the current immutable synthesis identity and any replacement lineage
 
 ---
 

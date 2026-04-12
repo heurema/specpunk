@@ -19,7 +19,11 @@ pub use punk_core::{find_object_path, read_json, relative_ref, write_json};
 use punk_domain::{
     now_rfc3339, AutonomyOutcome, AutonomyRecord, Contract, ContractStatus, DraftInput,
     DraftProposal, EventEnvelope, Feature, FeatureStatus, ModeId, Project, Receipt,
-    ReceiptArtifacts, RefineInput, Run, RunStatus, Task, TaskKind, TaskStatus, VcsKind,
+    ReceiptArtifacts, RefineInput, ResearchArtifact, ResearchArtifactInput,
+    ResearchInvalidationEntry, ResearchPacket, ResearchQuestion, ResearchRecord,
+    ResearchStartInput, ResearchSynthesis, ResearchSynthesisInput, Run, RunStatus, Task, TaskKind,
+    TaskStatus, VcsKind, VerificationContext, VerificationContextFileState,
+    VerificationContextIdentity,
 };
 use punk_events::EventStore;
 use punk_vcs::{current_snapshot_ref, detect_backend};
@@ -37,9 +41,11 @@ pub struct RepoPaths {
     pub runs_dir: PathBuf,
     pub decisions_dir: PathBuf,
     pub proofs_dir: PathBuf,
+    pub research_dir: PathBuf,
     pub autonomy_dir: PathBuf,
     pub project_dir: PathBuf,
     pub harness_spec_path: PathBuf,
+    pub project_overlay_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,7 +69,43 @@ pub struct StatusSnapshot {
     pub workspace_root: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResearchInspectView {
+    pub record: ResearchRecord,
+    pub question: ResearchQuestion,
+    pub packet: ResearchPacket,
+    pub artifacts: Vec<ResearchArtifact>,
+    pub synthesis: Option<ResearchSynthesis>,
+    pub invalidation: ResearchInvalidationInspectView,
+    pub synthesis_lineage: ResearchSynthesisLineageInspectView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResearchInvalidationInspectView {
+    pub active: Option<ResearchInvalidationEntry>,
+    pub latest: Option<ResearchInvalidationEntry>,
+    pub history_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResearchSynthesisLineageInspectView {
+    pub active: Option<ResearchSynthesisLineageEntry>,
+    pub latest: Option<ResearchSynthesisLineageEntry>,
+    pub history_count: usize,
+    pub history: Vec<ResearchSynthesisLineageEntry>,
+    pub has_active_current_view: bool,
+    pub has_replacements: bool,
+    pub latest_is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResearchSynthesisLineageEntry {
+    pub identity_ref: String,
+    pub outcome: String,
+    pub supersedes_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectCapabilitySummary {
     pub bootstrap_ready: bool,
     pub autonomous_ready: bool,
@@ -73,7 +115,7 @@ pub struct ProjectCapabilitySummary {
     pub project_guidance_ready: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectHarnessSummary {
     pub inspect_ready: bool,
     pub bootable_per_workspace: bool,
@@ -116,10 +158,11 @@ pub struct PersistedHarnessSpec {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectOverlay {
     pub project_id: String,
     pub repo_root: String,
+    pub overlay_ref: String,
     pub vcs_mode: String,
     pub bootstrap_ref: Option<String>,
     pub agent_guidance_ref: Vec<String>,
@@ -127,7 +170,10 @@ pub struct ProjectOverlay {
     pub harness_summary: ProjectHarnessSummary,
     pub harness_spec_ref: String,
     pub harness_spec: PersistedHarnessSpec,
+    pub project_skill_resolution_mode: String,
     pub project_skill_refs: Vec<String>,
+    #[serde(default)]
+    pub ambient_project_skill_refs: Vec<String>,
     pub local_constraints: Vec<String>,
     pub safe_default_checks: Vec<String>,
     pub status_scope_mode: String,
@@ -169,6 +215,108 @@ fn repo_has_any(repo_root: &Path, rel_paths: &[&str]) -> bool {
     rel_paths
         .iter()
         .any(|rel_path| repo_root.join(rel_path).exists())
+}
+
+fn is_verification_context_runtime_artifact(path: &str) -> bool {
+    path.starts_with(".punk/")
+}
+
+fn filtered_verification_context_paths(changed_files: &[String]) -> Vec<String> {
+    let mut paths = changed_files
+        .iter()
+        .filter(|path| !is_verification_context_runtime_artifact(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn snapshot_verification_context_file(
+    workspace_root: &Path,
+    path: &str,
+) -> Result<VerificationContextFileState> {
+    let file_path = workspace_root.join(path);
+    if !file_path.exists() {
+        return Ok(VerificationContextFileState {
+            path: path.to_string(),
+            exists: false,
+            sha256: None,
+        });
+    }
+
+    Ok(VerificationContextFileState {
+        path: path.to_string(),
+        exists: true,
+        sha256: Some(sha256_file(&file_path)?),
+    })
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn verification_context_fingerprint(
+    backend: VcsKind,
+    workspace_ref: &str,
+    change_ref: &str,
+    base_ref: Option<&str>,
+    changed_files: &[String],
+    file_states: &[VerificationContextFileState],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("backend:{backend:?}\n"));
+    hasher.update(format!("workspace_ref:{workspace_ref}\n"));
+    hasher.update(format!("change_ref:{change_ref}\n"));
+    hasher.update(format!("base_ref:{}\n", base_ref.unwrap_or("")));
+    for path in changed_files {
+        hasher.update(format!("changed:{path}\n"));
+    }
+    for state in file_states {
+        hasher.update(format!(
+            "file:{}:{}:{}\n",
+            state.path,
+            if state.exists { "present" } else { "missing" },
+            state.sha256.as_deref().unwrap_or(""),
+        ));
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn build_verification_context(
+    run: &Run,
+    workspace_root: &Path,
+    changed_files: &[String],
+) -> Result<VerificationContext> {
+    let changed_files = filtered_verification_context_paths(changed_files);
+    let mut file_states = changed_files
+        .iter()
+        .map(|path| snapshot_verification_context_file(workspace_root, path))
+        .collect::<Result<Vec<_>>>()?;
+    file_states.sort_by(|a, b| a.path.cmp(&b.path));
+    let fingerprint_sha256 = verification_context_fingerprint(
+        run.vcs.backend.clone(),
+        &run.vcs.workspace_ref,
+        &run.vcs.change_ref,
+        run.vcs.base_ref.as_deref(),
+        &changed_files,
+        &file_states,
+    );
+    Ok(VerificationContext {
+        identity: VerificationContextIdentity {
+            backend: run.vcs.backend.clone(),
+            workspace_ref: run.vcs.workspace_ref.clone(),
+            change_ref: run.vcs.change_ref.clone(),
+            base_ref: run.vcs.base_ref.clone(),
+            changed_files,
+            fingerprint_sha256,
+        },
+        file_states,
+        captured_at: now_rfc3339(),
+    })
 }
 
 impl PersistedHarnessSpec {
@@ -265,9 +413,11 @@ impl OrchService {
             runs_dir: dot_punk.join("runs"),
             decisions_dir: dot_punk.join("decisions"),
             proofs_dir: dot_punk.join("proofs"),
+            research_dir: dot_punk.join("research"),
             autonomy_dir: dot_punk.join("autonomy"),
             project_dir: project_dir.clone(),
             harness_spec_path: project_dir.join("harness.json"),
+            project_overlay_path: project_dir.join("overlay.json"),
         };
         let events = EventStore::new(paths.global_root.clone());
         let service = Self { paths, events };
@@ -291,6 +441,7 @@ impl OrchService {
         fs::create_dir_all(&self.paths.runs_dir)?;
         fs::create_dir_all(&self.paths.decisions_dir)?;
         fs::create_dir_all(&self.paths.proofs_dir)?;
+        fs::create_dir_all(&self.paths.research_dir)?;
         fs::create_dir_all(&self.paths.autonomy_dir)?;
         fs::create_dir_all(&self.paths.project_dir)?;
         self.events.ensure_dirs()?;
@@ -821,6 +972,7 @@ impl OrchService {
                 change_ref: isolated.change_ref,
                 base_ref: isolated.base_ref,
             },
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: None,
         };
@@ -980,6 +1132,14 @@ impl OrchService {
                 ensure_default_gitignore_coverage(&self.paths.repo_root)?;
             }
         }
+        let verification_context =
+            build_verification_context(&run, &workspace_root, &changed_files)?;
+        let verification_context_path = run_dir.join("verification-context.json");
+        write_json(&verification_context_path, &verification_context)?;
+        run.verification_context_ref = Some(relative_ref(
+            &self.paths.repo_root,
+            &verification_context_path,
+        )?);
         run.ended_at = Some(now_rfc3339());
         run_finalizer.sync(&run);
         write_json(&run_path, &run)?;
@@ -1029,6 +1189,312 @@ impl OrchService {
             Some(&run_path),
         )?;
         Ok((run, receipt))
+    }
+
+    pub fn start_research(&self, input: ResearchStartInput) -> Result<ResearchInspectView> {
+        let project = self.bootstrap_project()?;
+        validate_research_start_input(&self.paths.repo_root, &input)?;
+        let repo_snapshot_ref = current_snapshot_ref(&self.paths.repo_root)?;
+        let research_id = new_id("research");
+        let question_id = new_id("rq");
+        let packet_id = new_id("rp");
+        let created_at = now_rfc3339();
+        let research_dir = self.paths.research_dir.join(&research_id);
+        fs::create_dir_all(&research_dir)?;
+
+        let question_path = research_dir.join("question.json");
+        let question = ResearchQuestion {
+            id: question_id,
+            project_id: project.id.clone(),
+            kind: input.kind.clone(),
+            subject_ref: input.subject_ref.clone(),
+            question: input.question,
+            goal: input.goal,
+            constraints: input.constraints,
+            success_criteria: input.success_criteria,
+            created_at: created_at.clone(),
+        };
+        write_json(&question_path, &question)?;
+        let question_ref = relative_ref(&self.paths.repo_root, &question_path)?;
+
+        let packet_path = research_dir.join("packet.json");
+        let packet = ResearchPacket {
+            id: packet_id,
+            research_id: research_id.clone(),
+            question_ref: question_ref.clone(),
+            repo_snapshot_ref,
+            contract_ref: input.contract_ref,
+            receipt_ref: input.receipt_ref,
+            skill_ref: input.skill_ref,
+            eval_ref: input.eval_ref,
+            context_refs: input.context_refs,
+            budget: input.budget,
+            stop_rules: default_research_stop_rules(),
+            output_schema_ref: "docs/product/RESEARCH.md#researchsynthesis".to_string(),
+            created_at: created_at.clone(),
+        };
+        write_json(&packet_path, &packet)?;
+        let packet_ref = relative_ref(&self.paths.repo_root, &packet_path)?;
+
+        let record_path = research_dir.join("record.json");
+        let record = ResearchRecord {
+            id: research_id,
+            project_id: project.id.clone(),
+            kind: question.kind.clone(),
+            state: "frozen".to_string(),
+            question_ref,
+            packet_ref,
+            artifact_refs: Vec::new(),
+            synthesis_ref: None,
+            synthesis_history_refs: Vec::new(),
+            invalidated_synthesis_ref: None,
+            invalidation_artifact_ref: None,
+            invalidation_history: Vec::new(),
+            outcome: None,
+            created_at: created_at.clone(),
+            updated_at: created_at,
+        };
+        write_json(&record_path, &record)?;
+        self.append_event(
+            &project.id,
+            None,
+            None,
+            None,
+            ModeId::Plot,
+            "research.started",
+            Some(&record_path),
+        )?;
+
+        Ok(ResearchInspectView {
+            record,
+            question,
+            packet,
+            artifacts: Vec::new(),
+            synthesis: None,
+            invalidation: ResearchInvalidationInspectView {
+                active: None,
+                latest: None,
+                history_count: 0,
+            },
+            synthesis_lineage: ResearchSynthesisLineageInspectView {
+                active: None,
+                latest: None,
+                history_count: 0,
+                history: Vec::new(),
+                has_active_current_view: false,
+                has_replacements: false,
+                latest_is_active: false,
+            },
+        })
+    }
+
+    pub fn write_research_artifact(
+        &self,
+        research_id: &str,
+        input: ResearchArtifactInput,
+    ) -> Result<ResearchInspectView> {
+        validate_research_artifact_input(&self.paths.repo_root, &input)?;
+        let record_path = self.find_object_path(&self.paths.research_dir, research_id)?;
+        let mut record: ResearchRecord = read_json(&record_path)?;
+        ensure_research_not_terminal(&record)?;
+        let artifact_id = new_id("artifact");
+        let created_at = now_rfc3339();
+        let artifact = ResearchArtifact {
+            id: artifact_id,
+            research_id: record.id.clone(),
+            kind: input.kind,
+            summary: input.summary,
+            source_ref: input.source_ref,
+            created_at,
+        };
+        let artifacts_dir = record_path
+            .parent()
+            .unwrap_or(&self.paths.research_dir)
+            .join("artifacts");
+        fs::create_dir_all(&artifacts_dir)?;
+        let artifact_path = artifacts_dir.join(format!("{}.json", artifact.id));
+        write_json(&artifact_path, &artifact)?;
+        let artifact_ref = relative_ref(&self.paths.repo_root, &artifact_path)?;
+        if !record.artifact_refs.contains(&artifact_ref) {
+            record.artifact_refs.push(artifact_ref.clone());
+        }
+        if record.synthesis_ref.is_some() {
+            record.invalidated_synthesis_ref = record.synthesis_history_refs.last().cloned();
+            record.invalidation_artifact_ref = Some(artifact_ref.clone());
+            if let Some(invalidated_synthesis_ref) = record.invalidated_synthesis_ref.clone() {
+                record.invalidation_history.push(ResearchInvalidationEntry {
+                    invalidated_synthesis_ref,
+                    invalidating_artifact_ref: artifact_ref.clone(),
+                    invalidated_at: now_rfc3339(),
+                });
+            }
+        }
+        let synthesis_path = record_path
+            .parent()
+            .unwrap_or(&self.paths.research_dir)
+            .join("synthesis.json");
+        if synthesis_path.exists() {
+            fs::remove_file(&synthesis_path)?;
+        }
+        record.state = "gathering".to_string();
+        record.synthesis_ref = None;
+        record.outcome = None;
+        record.updated_at = now_rfc3339();
+        write_json(&record_path, &record)?;
+        self.append_event(
+            &record.project_id,
+            None,
+            None,
+            None,
+            ModeId::Plot,
+            "research.artifact_written",
+            Some(&artifact_path),
+        )?;
+        self.inspect_research(research_id)
+    }
+
+    pub fn write_research_synthesis(
+        &self,
+        research_id: &str,
+        input: ResearchSynthesisInput,
+    ) -> Result<ResearchInspectView> {
+        validate_research_synthesis_input(&self.paths.repo_root, &input)?;
+        let record_path = self.find_object_path(&self.paths.research_dir, research_id)?;
+        let mut record: ResearchRecord = read_json(&record_path)?;
+        ensure_research_not_terminal(&record)?;
+        if record.artifact_refs.is_empty() {
+            return Err(anyhow!(
+                "research synthesis requires at least one persisted artifact"
+            ));
+        }
+        if record.synthesis_ref.is_some() && !input.replace_existing {
+            return Err(anyhow!(
+                "research already has a synthesis; rerun with explicit replace intent"
+            ));
+        }
+
+        let artifact_refs = if input.artifact_refs.is_empty() {
+            record.artifact_refs.clone()
+        } else {
+            let mut refs = Vec::new();
+            for artifact_ref in input.artifact_refs {
+                if !record
+                    .artifact_refs
+                    .iter()
+                    .any(|existing| existing == &artifact_ref)
+                {
+                    return Err(anyhow!(
+                        "research synthesis artifact_ref must reference a persisted research artifact: {artifact_ref}"
+                    ));
+                }
+                if !refs.iter().any(|existing| existing == &artifact_ref) {
+                    refs.push(artifact_ref);
+                }
+            }
+            refs
+        };
+
+        let synthesis = ResearchSynthesis {
+            id: new_id("synthesis"),
+            research_id: record.id.clone(),
+            outcome: input.outcome,
+            summary: input.summary,
+            artifact_refs,
+            supersedes_ref: record.synthesis_history_refs.last().cloned(),
+            follow_up_refs: input.follow_up_refs,
+            created_at: now_rfc3339(),
+        };
+        let syntheses_dir = record_path
+            .parent()
+            .unwrap_or(&self.paths.research_dir)
+            .join("syntheses");
+        fs::create_dir_all(&syntheses_dir)?;
+        let immutable_synthesis_path = syntheses_dir.join(format!("{}.json", synthesis.id));
+        write_json(&immutable_synthesis_path, &synthesis)?;
+        let immutable_synthesis_ref =
+            relative_ref(&self.paths.repo_root, &immutable_synthesis_path)?;
+        let synthesis_path = record_path
+            .parent()
+            .unwrap_or(&self.paths.research_dir)
+            .join("synthesis.json");
+        write_json(&synthesis_path, &synthesis)?;
+        let synthesis_ref = relative_ref(&self.paths.repo_root, &synthesis_path)?;
+        record.state = "synthesized".to_string();
+        record.synthesis_ref = Some(synthesis_ref);
+        record.synthesis_history_refs.push(immutable_synthesis_ref);
+        record.invalidated_synthesis_ref = None;
+        record.invalidation_artifact_ref = None;
+        record.outcome = Some(synthesis.outcome.clone());
+        record.updated_at = now_rfc3339();
+        write_json(&record_path, &record)?;
+        self.append_event(
+            &record.project_id,
+            None,
+            None,
+            None,
+            ModeId::Plot,
+            "research.synthesis_written",
+            Some(&immutable_synthesis_path),
+        )?;
+        self.inspect_research(research_id)
+    }
+
+    pub fn complete_research(&self, research_id: &str) -> Result<ResearchInspectView> {
+        let record_path = self.find_object_path(&self.paths.research_dir, research_id)?;
+        let mut record: ResearchRecord = read_json(&record_path)?;
+        let synthesis = require_research_synthesis(&self.paths.repo_root, &record)?;
+        if record.state != "synthesized" {
+            return Err(anyhow!(
+                "research can only be completed from the synthesized state"
+            ));
+        }
+        if synthesis.outcome == "escalate" {
+            return Err(anyhow!(
+                "research with outcome=escalate must use `punk research escalate`"
+            ));
+        }
+        record.state = "completed".to_string();
+        record.updated_at = now_rfc3339();
+        write_json(&record_path, &record)?;
+        self.append_event(
+            &record.project_id,
+            None,
+            None,
+            None,
+            ModeId::Plot,
+            "research.completed",
+            Some(&record_path),
+        )?;
+        self.inspect_research(research_id)
+    }
+
+    pub fn escalate_research(&self, research_id: &str) -> Result<ResearchInspectView> {
+        let record_path = self.find_object_path(&self.paths.research_dir, research_id)?;
+        let mut record: ResearchRecord = read_json(&record_path)?;
+        let synthesis = require_research_synthesis(&self.paths.repo_root, &record)?;
+        if record.state != "synthesized" {
+            return Err(anyhow!(
+                "research can only be escalated from the synthesized state"
+            ));
+        }
+        if synthesis.outcome != "escalate" {
+            return Err(anyhow!(
+                "research escalation requires synthesis outcome=escalate"
+            ));
+        }
+        record.state = "escalated".to_string();
+        record.updated_at = now_rfc3339();
+        write_json(&record_path, &record)?;
+        self.append_event(
+            &record.project_id,
+            None,
+            None,
+            None,
+            ModeId::Plot,
+            "research.escalated",
+            Some(&record_path),
+        )?;
+        self.inspect_research(research_id)
     }
 
     pub fn status(&self, id: Option<&str>) -> Result<StatusSnapshot> {
@@ -1124,6 +1590,7 @@ impl OrchService {
             &self.paths.runs_dir,
             &self.paths.decisions_dir,
             &self.paths.proofs_dir,
+            &self.paths.research_dir,
             &self.paths.autonomy_dir,
         ] {
             if let Ok(path) = self.find_object_path(dir, id) {
@@ -1142,6 +1609,39 @@ impl OrchService {
         read_json(&proof_path)
     }
 
+    pub fn inspect_research(&self, research_id: &str) -> Result<ResearchInspectView> {
+        let record_path = self.find_object_path(&self.paths.research_dir, research_id)?;
+        let record: ResearchRecord = read_json(&record_path)?;
+        let question: ResearchQuestion =
+            read_json(&self.paths.repo_root.join(&record.question_ref))?;
+        let packet: ResearchPacket = read_json(&self.paths.repo_root.join(&record.packet_ref))?;
+        let artifacts = record
+            .artifact_refs
+            .iter()
+            .map(|artifact_ref| read_json(&self.paths.repo_root.join(artifact_ref)))
+            .collect::<Result<Vec<ResearchArtifact>>>()?;
+        let synthesis = record
+            .synthesis_ref
+            .as_ref()
+            .map(|synthesis_ref| read_json(&self.paths.repo_root.join(synthesis_ref)))
+            .transpose()?;
+        let invalidation = build_research_invalidation_inspect(&record);
+        let synthesis_lineage = build_research_synthesis_lineage_inspect(
+            &self.paths.repo_root,
+            &record,
+            synthesis.as_ref(),
+        )?;
+        Ok(ResearchInspectView {
+            record,
+            question,
+            packet,
+            artifacts,
+            synthesis,
+            invalidation,
+            synthesis_lineage,
+        })
+    }
+
     pub fn inspect_work_ledger(&self, id: Option<&str>) -> Result<WorkLedgerView> {
         let project = self.bootstrap_project()?;
         let feature_id = match id {
@@ -1154,18 +1654,10 @@ impl OrchService {
     pub fn inspect_project_overlay(&self) -> Result<ProjectOverlay> {
         let project = self.bootstrap_project()?;
         let project_label = project_label(&self.paths.repo_root);
-        let bootstrap_path = self
-            .paths
-            .dot_punk
-            .join("bootstrap")
-            .join(format!("{project_label}-core.md"));
         let repo_agents_path = self.paths.repo_root.join("AGENTS.md");
         let agent_start_path = self.paths.dot_punk.join("AGENT_START.md");
 
-        let bootstrap_ref = bootstrap_path
-            .exists()
-            .then(|| relative_ref(&self.paths.repo_root, &bootstrap_path))
-            .transpose()?;
+        let bootstrap_ref = resolve_project_bootstrap_ref(&self.paths.repo_root, &project_label)?;
 
         let mut agent_guidance_ref = Vec::new();
         if repo_agents_path.exists() {
@@ -1185,7 +1677,39 @@ impl OrchService {
                 }
             };
 
-        let project_skill_refs = active_project_skill_refs(&project_label);
+        let repo_local_project_skill_refs =
+            match repo_local_project_skill_refs(&self.paths.repo_root) {
+                Ok(refs) => refs,
+                Err(error) => {
+                    local_constraints.push(format!(
+                        "unable to inspect repo-local project skills: {error}"
+                    ));
+                    Vec::new()
+                }
+            };
+        let (project_skill_refs, project_skill_resolution_mode, ambient_project_skill_refs) =
+            if !repo_local_project_skill_refs.is_empty() {
+                (
+                    repo_local_project_skill_refs,
+                    "repo_local".to_string(),
+                    Vec::new(),
+                )
+            } else {
+                let ambient_refs = ambient_project_skill_refs(&project_label);
+                if ambient_refs.is_empty() {
+                    (Vec::new(), "none".to_string(), Vec::new())
+                } else {
+                    local_constraints.push(
+                        "project skills resolved via ambient fallback; persist repo-local overlays under .punk/skills/overlays/"
+                            .to_string(),
+                    );
+                    (
+                        ambient_refs.clone(),
+                        "ambient_fallback".to_string(),
+                        ambient_refs,
+                    )
+                }
+            };
         if bootstrap_ref.is_none() {
             local_constraints.push("repo-local bootstrap guidance missing".to_string());
         }
@@ -1277,10 +1801,11 @@ impl OrchService {
         write_json(&self.paths.harness_spec_path, &persisted_harness_spec)?;
         let harness_spec: PersistedHarnessSpec = read_json(&self.paths.harness_spec_path)?;
         let harness_spec_ref = relative_ref(&self.paths.repo_root, &self.paths.harness_spec_path)?;
-
-        Ok(ProjectOverlay {
+        let overlay_ref = relative_ref(&self.paths.repo_root, &self.paths.project_overlay_path)?;
+        let overlay = ProjectOverlay {
             project_id: project.id.clone(),
             repo_root: project.path,
+            overlay_ref,
             vcs_mode,
             bootstrap_ref,
             agent_guidance_ref,
@@ -1288,12 +1813,16 @@ impl OrchService {
             harness_summary,
             harness_spec_ref,
             harness_spec,
+            project_skill_resolution_mode,
             project_skill_refs,
+            ambient_project_skill_refs,
             local_constraints,
             safe_default_checks,
             status_scope_mode: format!("project:{}", project.id),
             updated_at: project.updated_at,
-        })
+        };
+        write_json(&self.paths.project_overlay_path, &overlay)?;
+        read_json(&self.paths.project_overlay_path)
     }
 
     pub fn gc_stale_dry_run(&self) -> Result<StaleGcReport> {
@@ -1717,6 +2246,222 @@ impl OrchService {
     }
 }
 
+fn validate_research_start_input(repo_root: &Path, input: &ResearchStartInput) -> Result<()> {
+    if input.kind.trim().is_empty() {
+        return Err(anyhow!("research kind must not be empty"));
+    }
+    if input.question.trim().is_empty() {
+        return Err(anyhow!("research question must not be empty"));
+    }
+    if input.goal.trim().is_empty() {
+        return Err(anyhow!("research goal must not be empty"));
+    }
+    if input.success_criteria.is_empty()
+        || input
+            .success_criteria
+            .iter()
+            .all(|item| item.trim().is_empty())
+    {
+        return Err(anyhow!(
+            "research success criteria must include at least one non-empty item"
+        ));
+    }
+    if input.budget.max_rounds == 0 {
+        return Err(anyhow!(
+            "research budget max_rounds must be greater than zero"
+        ));
+    }
+    if input.budget.max_worker_slots == 0 {
+        return Err(anyhow!(
+            "research budget max_worker_slots must be greater than zero"
+        ));
+    }
+    if input.budget.max_duration_minutes == 0 {
+        return Err(anyhow!(
+            "research budget max_duration_minutes must be greater than zero"
+        ));
+    }
+    if input.budget.max_artifacts == 0 {
+        return Err(anyhow!(
+            "research budget max_artifacts must be greater than zero"
+        ));
+    }
+
+    if let Some(subject_ref) = input.subject_ref.as_deref() {
+        validate_repo_local_ref(repo_root, "subject_ref", subject_ref)?;
+    }
+    if let Some(contract_ref) = input.contract_ref.as_deref() {
+        validate_repo_local_ref(repo_root, "contract_ref", contract_ref)?;
+    }
+    if let Some(receipt_ref) = input.receipt_ref.as_deref() {
+        validate_repo_local_ref(repo_root, "receipt_ref", receipt_ref)?;
+    }
+    if let Some(skill_ref) = input.skill_ref.as_deref() {
+        validate_repo_local_ref(repo_root, "skill_ref", skill_ref)?;
+    }
+    if let Some(eval_ref) = input.eval_ref.as_deref() {
+        validate_repo_local_ref(repo_root, "eval_ref", eval_ref)?;
+    }
+    for context_ref in &input.context_refs {
+        validate_repo_local_ref(repo_root, "context_ref", context_ref)?;
+    }
+
+    Ok(())
+}
+
+fn validate_research_artifact_input(repo_root: &Path, input: &ResearchArtifactInput) -> Result<()> {
+    if input.kind.trim().is_empty() {
+        return Err(anyhow!("research artifact kind must not be empty"));
+    }
+    if input.summary.trim().is_empty() {
+        return Err(anyhow!("research artifact summary must not be empty"));
+    }
+    if let Some(source_ref) = input.source_ref.as_deref() {
+        validate_repo_local_ref(repo_root, "source_ref", source_ref)?;
+    }
+    Ok(())
+}
+
+fn validate_research_synthesis_input(
+    repo_root: &Path,
+    input: &ResearchSynthesisInput,
+) -> Result<()> {
+    if input.outcome.trim().is_empty() {
+        return Err(anyhow!("research synthesis outcome must not be empty"));
+    }
+    if input.summary.trim().is_empty() {
+        return Err(anyhow!("research synthesis summary must not be empty"));
+    }
+    for artifact_ref in &input.artifact_refs {
+        validate_repo_local_ref(repo_root, "artifact_ref", artifact_ref)?;
+    }
+    for follow_up_ref in &input.follow_up_refs {
+        validate_repo_local_ref(repo_root, "follow_up_ref", follow_up_ref)?;
+    }
+    Ok(())
+}
+
+fn ensure_research_not_terminal(record: &ResearchRecord) -> Result<()> {
+    if matches!(record.state.as_str(), "completed" | "escalated") {
+        return Err(anyhow!(
+            "research is already terminal and cannot accept more mutations"
+        ));
+    }
+    Ok(())
+}
+
+fn build_research_invalidation_inspect(record: &ResearchRecord) -> ResearchInvalidationInspectView {
+    let latest = record.invalidation_history.last().cloned();
+    let active = match (
+        record.invalidated_synthesis_ref.as_ref(),
+        record.invalidation_artifact_ref.as_ref(),
+    ) {
+        (Some(invalidated_synthesis_ref), Some(invalidating_artifact_ref)) => record
+            .invalidation_history
+            .iter()
+            .rev()
+            .find(|entry| {
+                &entry.invalidated_synthesis_ref == invalidated_synthesis_ref
+                    && &entry.invalidating_artifact_ref == invalidating_artifact_ref
+            })
+            .cloned()
+            .or_else(|| {
+                Some(ResearchInvalidationEntry {
+                    invalidated_synthesis_ref: invalidated_synthesis_ref.clone(),
+                    invalidating_artifact_ref: invalidating_artifact_ref.clone(),
+                    invalidated_at: record.updated_at.clone(),
+                })
+            }),
+        _ => None,
+    };
+
+    ResearchInvalidationInspectView {
+        active,
+        latest,
+        history_count: record.invalidation_history.len(),
+    }
+}
+
+fn build_research_synthesis_lineage_inspect(
+    repo_root: &Path,
+    record: &ResearchRecord,
+    active_synthesis: Option<&ResearchSynthesis>,
+) -> Result<ResearchSynthesisLineageInspectView> {
+    let history = record
+        .synthesis_history_refs
+        .iter()
+        .map(|identity_ref| {
+            let synthesis: ResearchSynthesis = read_json(&repo_root.join(identity_ref))?;
+            Ok(ResearchSynthesisLineageEntry {
+                identity_ref: identity_ref.clone(),
+                outcome: synthesis.outcome,
+                supersedes_ref: synthesis.supersedes_ref,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let active = match (record.synthesis_ref.as_ref(), active_synthesis) {
+        (Some(_), Some(_)) => history.last().cloned(),
+        _ => None,
+    };
+
+    let latest = history.last().cloned();
+    let has_active_current_view = active.is_some();
+    let has_replacements = history.len() > 1;
+    let latest_is_active = matches!(
+        (&active, &latest),
+        (Some(active), Some(latest)) if active.identity_ref == latest.identity_ref
+    );
+
+    Ok(ResearchSynthesisLineageInspectView {
+        active,
+        latest,
+        history_count: record.synthesis_history_refs.len(),
+        history,
+        has_active_current_view,
+        has_replacements,
+        latest_is_active,
+    })
+}
+
+fn require_research_synthesis(
+    repo_root: &Path,
+    record: &ResearchRecord,
+) -> Result<ResearchSynthesis> {
+    let synthesis_ref = record
+        .synthesis_ref
+        .as_ref()
+        .ok_or_else(|| anyhow!("research requires a persisted synthesis first"))?;
+    read_json(&repo_root.join(synthesis_ref))
+}
+
+fn validate_repo_local_ref(repo_root: &Path, field: &str, value: &str) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("{field} must not be empty"));
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return Err(anyhow!("{field} must be repo-local, not absolute"));
+    }
+    let resolved = repo_root.join(candidate);
+    if !resolved.exists() {
+        return Err(anyhow!(
+            "{field} does not exist under repo root: {}",
+            candidate.display()
+        ));
+    }
+    Ok(())
+}
+
+fn default_research_stop_rules() -> Vec<String> {
+    vec![
+        "stop_when_budget_exhausted".to_string(),
+        "stop_when_evidence_is_sufficient".to_string(),
+        "escalate_on_persistent_ambiguity".to_string(),
+    ]
+}
+
 fn attach_live_vcs(value: &mut serde_json::Value, live_vcs: serde_json::Value) {
     if let Some(object) = value.as_object_mut() {
         object.insert("live_vcs".to_string(), live_vcs);
@@ -1742,6 +2487,46 @@ fn project_label(root: &Path) -> String {
         .to_string()
 }
 
+fn find_bootstrap_docs(repo_root: &Path) -> Result<Vec<PathBuf>> {
+    let bootstrap_dir = repo_root.join(".punk").join("bootstrap");
+    if !bootstrap_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut docs = fs::read_dir(&bootstrap_dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("-core.md"))
+        })
+        .collect::<Vec<_>>();
+    docs.sort();
+    Ok(docs)
+}
+
+fn resolve_project_bootstrap_ref(
+    repo_root: &Path,
+    preferred_label: &str,
+) -> Result<Option<String>> {
+    let preferred = repo_root
+        .join(".punk")
+        .join("bootstrap")
+        .join(format!("{preferred_label}-core.md"));
+    if preferred.exists() {
+        return Ok(Some(relative_ref(repo_root, &preferred)?));
+    }
+
+    let docs = find_bootstrap_docs(repo_root)?;
+    if docs.len() == 1 {
+        return Ok(Some(relative_ref(repo_root, &docs[0])?));
+    }
+
+    Ok(None)
+}
+
 fn project_overlay_vcs_mode(repo_root: &Path) -> String {
     use punk_vcs::VcsMode;
 
@@ -1753,7 +2538,43 @@ fn project_overlay_vcs_mode(repo_root: &Path) -> String {
     }
 }
 
-fn active_project_skill_refs(project_label: &str) -> Vec<String> {
+fn repo_local_project_skill_refs(repo_root: &Path) -> Result<Vec<String>> {
+    let overlays_dir = repo_root.join(".punk/skills/overlays");
+    collect_repo_local_markdown_refs(repo_root, &overlays_dir)
+}
+
+fn collect_repo_local_markdown_refs(repo_root: &Path, root: &Path) -> Result<Vec<String>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut refs = Vec::new();
+    collect_repo_local_markdown_refs_recursive(repo_root, root, &mut refs)?;
+    refs.sort();
+    refs.dedup();
+    Ok(refs)
+}
+
+fn collect_repo_local_markdown_refs_recursive(
+    repo_root: &Path,
+    current: &Path,
+    refs: &mut Vec<String>,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_repo_local_markdown_refs_recursive(repo_root, &path, refs)?;
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        refs.push(relative_ref(repo_root, &path)?);
+    }
+    Ok(())
+}
+
+fn ambient_project_skill_refs(project_label: &str) -> Vec<String> {
     let bus_dir = std::env::var("PUNK_BUS_DIR")
         .map(PathBuf::from)
         .or_else(|_| {
@@ -3708,6 +4529,8 @@ fn normalize_proposal_scope(
     preserve_service_checks(prompt, scan, proposal);
     apply_prompt_exclusion_pruning(prompt, proposal);
     finalize_baseline_profile(repo_root, prompt, proposal);
+    let positive_prompt = prompt_positive_intent_text(prompt);
+    apply_explicit_prompt_overrides(repo_root, &positive_prompt, proposal);
     ensure_proposal_scope_covers_entry_points(proposal);
 }
 
@@ -3801,6 +4624,10 @@ fn detect_pubpunk_target_mode(
         return None;
     }
 
+    let core_only_prompt = lowered.contains("core-only")
+        || lowered.contains("edit only crates/pubpunk-core/src/lib.rs")
+        || lowered.contains("crates/pubpunk-core/src/lib.rs");
+
     let parseability_prompt = (lowered.contains("parse-check")
         || lowered.contains("parseability")
         || lowered.contains("style.toml")
@@ -3831,13 +4658,14 @@ fn detect_pubpunk_target_mode(
             })
     });
 
+    if core_only_prompt && !parseability_prompt {
+        return Some(PubpunkTargetMode::ValidateCoreOnly);
+    }
+
     if parseability_prompt || parseability_proposal {
         return Some(PubpunkTargetMode::ValidateParseabilityCoreAndTests);
     }
 
-    let core_only_prompt = lowered.contains("core-only")
-        || lowered.contains("edit only crates/pubpunk-core/src/lib.rs")
-        || lowered.contains("crates/pubpunk-core/src/lib.rs");
     let core_only_proposal = proposal.is_some_and(|proposal| {
         proposal
             .entry_points
@@ -4804,21 +5632,26 @@ fn timeout_seed_semantics(prompt: &str, entry_points: &[String]) -> (Vec<String>
     } else {
         semantic_prompt.trim()
     };
-    let expected_interface = match entry_points.first().map(String::as_str) {
+    let primary_entry_point = entry_points.first().map(String::as_str);
+    let expected_interface = match primary_entry_point {
         Some("Cargo.toml") => "initial Rust scaffold",
         Some("go.mod") => "initial Go scaffold",
         Some("pyproject.toml") => "initial Python scaffold",
         Some("package.json") => "initial TypeScript/Node scaffold",
         _ => "bounded implementation slice",
     };
+    let greenfield_scaffold_seed = matches!(
+        primary_entry_point,
+        Some("Cargo.toml" | "go.mod" | "pyproject.toml" | "package.json")
+    );
     let mut expected_interfaces = vec![expected_interface.to_string()];
     let mut behavior_requirements = vec![summarize_prompt(semantic_prompt)];
     let lowered = semantic_prompt.to_ascii_lowercase();
 
-    if lowered.contains(" init ")
+    let mentions_init_surface = lowered.contains(" init ")
         || lowered.starts_with("init ")
-        || lowered.contains("init command")
-    {
+        || lowered.contains("init command");
+    if !greenfield_scaffold_seed && mentions_init_surface {
         push_unique_string(
             &mut expected_interfaces,
             "CLI accepts an `init` command.".to_string(),
@@ -5251,7 +6084,10 @@ fn file_len(path: &Path) -> u64 {
 mod tests {
     use super::*;
     use punk_adapters::{ContractDrafter, ExecuteInput, ExecuteOutput};
-    use punk_domain::{DraftInput, RefineInput, RunVcs};
+    use punk_domain::{
+        DraftInput, RefineInput, ResearchArtifactInput, ResearchBudget, ResearchStartInput,
+        ResearchSynthesisInput, RunVcs,
+    };
     use std::ffi::OsString;
 
     struct EnvVarGuard {
@@ -6209,6 +7045,66 @@ mod tests {
             changed_files,
             vec!["carry.txt".to_string(), "demo.txt".to_string()]
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_run_persists_verification_context_for_run() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-verification-context-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&FakeDrafter, "add file").unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let (run, receipt) = service.cut_run(&FakeExecutor, &contract.id).unwrap();
+        let context_ref = run
+            .verification_context_ref
+            .as_ref()
+            .expect("verification context ref");
+        let context_path = root.join(context_ref);
+        assert!(context_path.exists());
+
+        let context: VerificationContext = read_json(&context_path).unwrap();
+        assert_eq!(context.identity.workspace_ref, run.vcs.workspace_ref);
+        assert_eq!(context.identity.change_ref, run.vcs.change_ref);
+        assert_eq!(context.identity.changed_files, receipt.changed_files);
+        assert!(context
+            .file_states
+            .iter()
+            .any(|state| state.path == "demo.txt" && state.exists));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -10464,19 +11360,9 @@ fn ok() {}
                 .unwrap()
                 .as_nanos()
         ));
-        let bus = std::env::temp_dir().join(format!(
-            "punk-orch-project-overlay-bus-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _bus_guard = EnvVarGuard::set("PUNK_BUS_DIR", &bus);
         let _ = fs::remove_dir_all(&base);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);
-        let _ = fs::remove_dir_all(&bus);
 
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
@@ -10532,12 +11418,11 @@ fn ok() {}
         fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
         fs::create_dir_all(root.join(".punk")).unwrap();
         fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
-
-        let skills_dir = bus.parent().unwrap().join("skills");
-        fs::create_dir_all(&skills_dir).unwrap();
+        let repo_skills_dir = root.join(".punk/skills/overlays/implementer");
+        fs::create_dir_all(&repo_skills_dir).unwrap();
         fs::write(
-            skills_dir.join("interviewcoach-core.md"),
-            "---\nname: interviewcoach-core\ndescription: Core rules\nproject: [\"interviewcoach\"]\n---\n\nUse existing architecture.\n",
+            repo_skills_dir.join("interviewcoach-core.md"),
+            "# Implementer overlay\n",
         )
         .unwrap();
 
@@ -10552,6 +11437,8 @@ fn ok() {}
             overlay.agent_guidance_ref,
             vec!["AGENTS.md", ".punk/AGENT_START.md"]
         );
+        assert_eq!(overlay.overlay_ref, ".punk/project/overlay.json");
+        assert_eq!(overlay.project_skill_resolution_mode, "repo_local");
         assert!(overlay
             .safe_default_checks
             .iter()
@@ -10563,7 +11450,8 @@ fn ok() {}
         assert!(overlay
             .project_skill_refs
             .iter()
-            .any(|path| path.ends_with("interviewcoach-core.md")));
+            .any(|path| path == ".punk/skills/overlays/implementer/interviewcoach-core.md"));
+        assert!(overlay.ambient_project_skill_refs.is_empty());
         assert!(overlay.capability_summary.bootstrap_ready);
         assert!(overlay.capability_summary.project_guidance_ready);
         assert!(overlay.capability_summary.staged_ready);
@@ -10609,6 +11497,9 @@ fn ok() {}
         let persisted: PersistedHarnessSpec =
             read_json(&root.join(".punk/project/harness.json")).unwrap();
         assert_eq!(persisted, overlay.harness_spec);
+        let persisted_overlay: ProjectOverlay =
+            read_json(&root.join(".punk/project/overlay.json")).unwrap();
+        assert_eq!(persisted_overlay, overlay);
         assert_eq!(
             overlay.status_scope_mode,
             format!("project:{}", overlay.project_id)
@@ -10617,7 +11508,146 @@ fn ok() {}
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&base);
         let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn inspect_project_overlay_uses_ambient_fallback_only_when_repo_local_skills_are_missing() {
+        let base = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-ambient-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = base.join("interviewcoach");
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-ambient-fallback-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bus = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-ambient-fallback-bus-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _bus_guard = EnvVarGuard::set("PUNK_BUS_DIR", &bus);
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
         let _ = fs::remove_dir_all(&bus);
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='interviewcoach'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        fs::write(root.join("Makefile"), "test:\n\tcargo test\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/interviewcoach-core.md"),
+            "Use existing architecture.\n",
+        )
+        .unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::create_dir_all(root.join(".punk")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+
+        let skills_dir = bus.parent().unwrap().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        fs::write(
+            skills_dir.join("interviewcoach-core.md"),
+            "---\nname: interviewcoach-core\ndescription: Core rules\nproject: [\"interviewcoach\"]\n---\n\nUse existing architecture.\n",
+        )
+        .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let overlay = service.inspect_project_overlay().unwrap();
+
+        assert_eq!(overlay.project_skill_resolution_mode, "ambient_fallback");
+        assert_eq!(
+            overlay.project_skill_refs,
+            overlay.ambient_project_skill_refs
+        );
+        assert!(overlay
+            .project_skill_refs
+            .iter()
+            .any(|path| path.ends_with("interviewcoach-core.md")));
+        assert!(overlay.local_constraints.iter().any(|constraint| constraint
+            == "project skills resolved via ambient fallback; persist repo-local overlays under .punk/skills/overlays/"));
+
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        let _ = fs::remove_dir_all(&bus);
+    }
+
+    #[test]
+    fn inspect_project_overlay_reuses_single_existing_bootstrap_doc() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-custom-bootstrap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-project-overlay-custom-bootstrap-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='interviewcoach'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
+        fs::write(
+            root.join(".punk/bootstrap/custom-project-core.md"),
+            "Use existing architecture.\n",
+        )
+        .unwrap();
+        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
+        fs::create_dir_all(root.join(".punk")).unwrap();
+        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let overlay = service.inspect_project_overlay().unwrap();
+
+        assert_eq!(
+            overlay.bootstrap_ref.as_deref(),
+            Some(".punk/bootstrap/custom-project-core.md")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
     }
 
     #[test]
@@ -10743,6 +11773,8 @@ fn ok() {}
             contract_ref: format!(".punk/contracts/{}/v1.json", run.feature_id),
             receipt_ref: format!(".punk/runs/{}/receipt.json", run.id),
             check_refs: Vec::new(),
+            verification_context_ref: run.verification_context_ref.clone(),
+            verification_context_identity: None,
             command_evidence: Vec::new(),
             declared_harness_evidence: Vec::new(),
             harness_evidence: Vec::new(),
@@ -10756,10 +11788,16 @@ fn ok() {}
             id: format!("proof_{}", decision.id.trim_start_matches("dec_")),
             decision_id: decision.id.clone(),
             run_id: run.id.clone(),
+            run_ref: Some(format!(".punk/runs/{}/run.json", run.id)),
             contract_ref: decision.contract_ref.clone(),
             receipt_ref: decision.receipt_ref.clone(),
             decision_ref: format!(".punk/decisions/{}.json", decision.id),
             check_refs: Vec::new(),
+            workspace_lineage: Some(run.vcs.clone()),
+            verification_context_ref: decision.verification_context_ref.clone(),
+            verification_context_identity: decision.verification_context_identity.clone(),
+            executor_identity: None,
+            reproducibility_claim: None,
             command_evidence: vec![
                 punk_domain::CommandEvidence {
                     evidence_type: "command".into(),
@@ -10983,6 +12021,7 @@ fn ok() {}
                 change_ref: "HEAD".into(),
                 base_ref: None,
             },
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: None,
         };
@@ -11087,6 +12126,7 @@ fn ok() {}
             status: RunStatus::Running,
             mode_origin: ModeId::Cut,
             vcs: good_run.vcs.clone(),
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: None,
         };
@@ -11203,6 +12243,7 @@ fn ok() {}
                 change_ref: "HEAD".into(),
                 base_ref: None,
             },
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: None,
         };
@@ -11323,6 +12364,7 @@ fn ok() {}
                 change_ref: "HEAD".into(),
                 base_ref: None,
             },
+            verification_context_ref: None,
             started_at: now_rfc3339(),
             ended_at: None,
         };
@@ -11437,6 +12479,8 @@ fn ok() {}
             contract_ref: format!(".punk/contracts/{}/v1.json", run.feature_id),
             receipt_ref: format!(".punk/runs/{}/receipt.json", run.id),
             check_refs: Vec::new(),
+            verification_context_ref: run.verification_context_ref.clone(),
+            verification_context_identity: None,
             command_evidence: Vec::new(),
             declared_harness_evidence: Vec::new(),
             harness_evidence: Vec::new(),
@@ -11450,10 +12494,16 @@ fn ok() {}
             id: format!("proof_{}", decision.id.trim_start_matches("dec_")),
             decision_id: decision.id.clone(),
             run_id: run.id.clone(),
+            run_ref: Some(format!(".punk/runs/{}/run.json", run.id)),
             contract_ref: decision.contract_ref.clone(),
             receipt_ref: decision.receipt_ref.clone(),
             decision_ref: format!(".punk/decisions/{}.json", decision.id),
             check_refs: Vec::new(),
+            workspace_lineage: Some(run.vcs.clone()),
+            verification_context_ref: decision.verification_context_ref.clone(),
+            verification_context_identity: decision.verification_context_identity.clone(),
+            executor_identity: None,
+            reproducibility_claim: None,
             command_evidence: Vec::new(),
             declared_harness_evidence: Vec::new(),
             harness_evidence: Vec::new(),
@@ -11523,6 +12573,1193 @@ fn ok() {}
             autonomy_inspect["recovery_contract_ref"].as_str(),
             Some(recovery_ref.as_str())
         );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_start_freezes_packet_and_inspects_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-start-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-start-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let view = service
+            .start_research(ResearchStartInput {
+                kind: "architecture".into(),
+                question: "Should research packets become first-class repo artifacts?".into(),
+                goal: "Freeze the bounded research question for later execution.".into(),
+                subject_ref: Some(".punk/project.json".into()),
+                constraints: vec!["Keep this advisory-only.".into()],
+                success_criteria: vec![
+                    "Packet captures an explicit budget.".into(),
+                    "Inspect can recover the frozen packet.".into(),
+                ],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 2,
+                    max_worker_slots: 3,
+                    max_cost_usd: Some(5.0),
+                    max_duration_minutes: 15,
+                    max_artifacts: 6,
+                },
+            })
+            .unwrap();
+
+        assert_eq!(view.record.project_id, project_id(&root).unwrap());
+        assert_eq!(view.record.state, "frozen");
+        assert_eq!(view.question.kind, "architecture");
+        assert_eq!(
+            view.packet.output_schema_ref,
+            "docs/product/RESEARCH.md#researchsynthesis"
+        );
+        assert_eq!(
+            view.packet.context_refs,
+            vec!["docs/product/RESEARCH.md".to_string()]
+        );
+        assert_eq!(view.packet.budget.max_rounds, 2);
+        assert_eq!(view.packet.budget.max_worker_slots, 3);
+        assert_eq!(view.packet.budget.max_cost_usd, Some(5.0));
+        assert_eq!(
+            view.packet.stop_rules,
+            vec![
+                "stop_when_budget_exhausted".to_string(),
+                "stop_when_evidence_is_sufficient".to_string(),
+                "escalate_on_persistent_ambiguity".to_string()
+            ]
+        );
+        assert_eq!(view.synthesis_lineage.history_count, 0);
+        assert!(view.synthesis_lineage.history.is_empty());
+        assert!(!view.synthesis_lineage.has_active_current_view);
+        assert!(!view.synthesis_lineage.has_replacements);
+        assert!(!view.synthesis_lineage.latest_is_active);
+
+        let record_path = root
+            .join(&view.record.packet_ref)
+            .parent()
+            .unwrap()
+            .join("record.json");
+        assert!(record_path.exists());
+        assert!(root.join(&view.record.question_ref).exists());
+        assert!(root.join(&view.record.packet_ref).exists());
+
+        let inspected = service.inspect_research(&view.record.id).unwrap();
+        assert_eq!(inspected, view);
+
+        let generic = service.inspect(&view.record.id).unwrap();
+        assert_eq!(generic["id"].as_str(), Some(view.record.id.as_str()));
+        assert_eq!(generic["state"].as_str(), Some("frozen"));
+
+        let events = service.event_store().load_all().unwrap();
+        let expected_payload_ref = format!(".punk/research/{}/record.json", view.record.id);
+        assert!(events.iter().any(|event| {
+            event.kind == "research.started"
+                && event.payload_ref.as_deref() == Some(expected_payload_ref.as_str())
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_artifact_write_updates_record_and_inspect_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-artifact-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-artifact-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "cleanup_impact".into(),
+                question: "What files would a cleanup remove?".into(),
+                goal: "Freeze cleanup-impact research first.".into(),
+                subject_ref: None,
+                constraints: vec!["Stay repo-local.".into()],
+                success_criteria: vec!["Artifact list stays inspectable.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+
+        let updated = service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Initial cleanup hypothesis captured.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.record.state, "gathering");
+        assert_eq!(updated.record.artifact_refs.len(), 1);
+        assert_eq!(updated.artifacts.len(), 1);
+        assert_eq!(updated.synthesis_lineage.history_count, 0);
+        assert!(updated.synthesis_lineage.history.is_empty());
+        assert!(!updated.synthesis_lineage.has_active_current_view);
+        assert!(!updated.synthesis_lineage.has_replacements);
+        assert!(!updated.synthesis_lineage.latest_is_active);
+        assert_eq!(updated.artifacts[0].kind, "note");
+        assert_eq!(
+            updated.artifacts[0].summary,
+            "Initial cleanup hypothesis captured."
+        );
+        assert_eq!(
+            updated.artifacts[0].source_ref.as_deref(),
+            Some("docs/product/RESEARCH.md")
+        );
+
+        let inspected = service.inspect_research(&started.record.id).unwrap();
+        assert_eq!(inspected, updated);
+
+        let artifact_value = service.inspect(&updated.artifacts[0].id).unwrap();
+        assert_eq!(
+            artifact_value["id"].as_str(),
+            Some(updated.artifacts[0].id.as_str())
+        );
+        assert_eq!(
+            artifact_value["research_id"].as_str(),
+            Some(started.record.id.as_str())
+        );
+
+        let events = service.event_store().load_all().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "research.artifact_written"
+                && event.payload_ref.as_deref() == Some(updated.record.artifact_refs[0].as_str())
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_synthesis_write_updates_record_and_inspect_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-synthesis-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-synthesis-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "migration_risk".into(),
+                question: "What is the smallest migration risk summary?".into(),
+                goal: "Attach evidence and synthesize a bounded recommendation.".into(),
+                subject_ref: None,
+                constraints: vec!["Stay inspectable.".into()],
+                success_criteria: vec!["Synthesis links back to gathered artifacts.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+
+        let gathered = service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "risk_note".into(),
+                    summary: "Captured the first migration constraint.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+
+        let updated = service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "risk_memo".into(),
+                    summary: "The migration should stay staged because only one bounded risk note exists so far.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: vec!["docs/product/RESEARCH.md".into()],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(updated.record.state, "synthesized");
+        assert_eq!(updated.record.outcome.as_deref(), Some("risk_memo"));
+        assert!(updated.record.synthesis_ref.is_some());
+        assert_eq!(updated.record.synthesis_history_refs.len(), 1);
+        assert!(updated.record.invalidated_synthesis_ref.is_none());
+        assert!(updated.record.invalidation_artifact_ref.is_none());
+        assert_eq!(updated.artifacts.len(), 1);
+        let synthesis = updated.synthesis.as_ref().expect("missing synthesis");
+        assert_eq!(synthesis.outcome, "risk_memo");
+        assert_eq!(
+            synthesis.summary,
+            "The migration should stay staged because only one bounded risk note exists so far."
+        );
+        assert_eq!(synthesis.artifact_refs, gathered.record.artifact_refs);
+        assert!(synthesis.supersedes_ref.is_none());
+        assert_eq!(synthesis.follow_up_refs, vec!["docs/product/RESEARCH.md"]);
+        assert!(updated.record.synthesis_history_refs[0]
+            .ends_with(&format!("syntheses/{}.json", synthesis.id)));
+        assert_eq!(updated.synthesis_lineage.history_count, 1);
+        assert_eq!(
+            updated
+                .synthesis_lineage
+                .active
+                .as_ref()
+                .map(|entry| entry.identity_ref.as_str()),
+            Some(updated.record.synthesis_history_refs[0].as_str())
+        );
+        assert_eq!(
+            updated
+                .synthesis_lineage
+                .latest
+                .as_ref()
+                .map(|entry| entry.outcome.as_str()),
+            Some("risk_memo")
+        );
+        assert_eq!(updated.synthesis_lineage.history.len(), 1);
+        assert_eq!(
+            updated.synthesis_lineage.history[0].identity_ref,
+            updated.record.synthesis_history_refs[0]
+        );
+        assert_eq!(updated.synthesis_lineage.history[0].outcome, "risk_memo");
+        assert!(updated.synthesis_lineage.history[0]
+            .supersedes_ref
+            .is_none());
+        assert!(updated.synthesis_lineage.has_active_current_view);
+        assert!(!updated.synthesis_lineage.has_replacements);
+        assert!(updated.synthesis_lineage.latest_is_active);
+
+        let inspected = service.inspect_research(&started.record.id).unwrap();
+        assert_eq!(inspected, updated);
+
+        let synthesis_value = service.inspect(&synthesis.id).unwrap();
+        assert_eq!(synthesis_value["id"].as_str(), Some(synthesis.id.as_str()));
+        assert_eq!(
+            synthesis_value["research_id"].as_str(),
+            Some(started.record.id.as_str())
+        );
+        assert_eq!(synthesis_value["outcome"].as_str(), Some("risk_memo"));
+
+        let events = service.event_store().load_all().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "research.synthesis_written"
+                && event.payload_ref.as_deref()
+                    == Some(updated.record.synthesis_history_refs[0].as_str())
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_synthesis_replace_requires_explicit_opt_in() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-synthesis-replace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-synthesis-replace-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "architecture".into(),
+                question: "Should synthesis replacement be explicit?".into(),
+                goal: "Require explicit replace intent.".into(),
+                subject_ref: None,
+                constraints: vec!["Stay bounded.".into()],
+                success_criteria: vec!["Repeated synthesis needs opt-in.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+        service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Captured the first note.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        let first = service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "adr_draft".into(),
+                    summary: "First bounded synthesis.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: vec!["docs/product/RESEARCH.md".into()],
+                },
+            )
+            .unwrap();
+        let first_id = first.synthesis.as_ref().unwrap().id.clone();
+
+        let err = service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "risk_memo".into(),
+                    summary: "Second synthesis without explicit replace.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: Vec::new(),
+                },
+            )
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("research already has a synthesis; rerun with explicit replace intent"));
+
+        let replaced = service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "risk_memo".into(),
+                    summary: "Second synthesis with explicit replace.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: true,
+                    follow_up_refs: vec!["docs/product/RESEARCH.md".into()],
+                },
+            )
+            .unwrap();
+        let replacement = replaced
+            .synthesis
+            .as_ref()
+            .expect("missing replacement synthesis");
+        assert_eq!(replaced.record.state, "synthesized");
+        assert_eq!(replaced.record.synthesis_history_refs.len(), 2);
+        assert_eq!(replacement.outcome, "risk_memo");
+        assert_eq!(
+            replacement.summary,
+            "Second synthesis with explicit replace."
+        );
+        assert_eq!(
+            replacement.supersedes_ref.as_deref(),
+            Some(first.record.synthesis_history_refs[0].as_str())
+        );
+        assert_eq!(replacement.follow_up_refs, vec!["docs/product/RESEARCH.md"]);
+        assert_ne!(replacement.id, first_id);
+        let expected_current_ref = format!(".punk/research/{}/synthesis.json", started.record.id);
+        assert_eq!(
+            replaced.record.synthesis_ref.as_deref(),
+            Some(expected_current_ref.as_str())
+        );
+        assert!(replaced.record.synthesis_history_refs[1]
+            .ends_with(&format!("syntheses/{}.json", replacement.id)));
+        assert_eq!(replaced.synthesis_lineage.history_count, 2);
+        assert_eq!(
+            replaced
+                .synthesis_lineage
+                .active
+                .as_ref()
+                .and_then(|entry| entry.supersedes_ref.as_deref()),
+            Some(first.record.synthesis_history_refs[0].as_str())
+        );
+        assert_eq!(
+            replaced
+                .synthesis_lineage
+                .latest
+                .as_ref()
+                .map(|entry| entry.identity_ref.as_str()),
+            Some(replaced.record.synthesis_history_refs[1].as_str())
+        );
+        assert_eq!(replaced.synthesis_lineage.history.len(), 2);
+        assert_eq!(
+            replaced.synthesis_lineage.history[0].identity_ref,
+            first.record.synthesis_history_refs[0]
+        );
+        assert_eq!(replaced.synthesis_lineage.history[0].outcome, "adr_draft");
+        assert!(replaced.synthesis_lineage.history[0]
+            .supersedes_ref
+            .is_none());
+        assert_eq!(
+            replaced.synthesis_lineage.history[1].identity_ref,
+            replaced.record.synthesis_history_refs[1]
+        );
+        assert_eq!(replaced.synthesis_lineage.history[1].outcome, "risk_memo");
+        assert_eq!(
+            replaced.synthesis_lineage.history[1]
+                .supersedes_ref
+                .as_deref(),
+            Some(first.record.synthesis_history_refs[0].as_str())
+        );
+        assert!(replaced.synthesis_lineage.has_active_current_view);
+        assert!(replaced.synthesis_lineage.has_replacements);
+        assert!(replaced.synthesis_lineage.latest_is_active);
+
+        let first_synthesis_value = service.inspect(&first_id).unwrap();
+        assert_eq!(
+            first_synthesis_value["id"].as_str(),
+            Some(first_id.as_str())
+        );
+        assert_eq!(first_synthesis_value["outcome"].as_str(), Some("adr_draft"));
+
+        let events = service.event_store().load_all().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "research.synthesis_written")
+                .count(),
+            2
+        );
+        let synthesis_event_refs = events
+            .iter()
+            .filter(|event| event.kind == "research.synthesis_written")
+            .filter_map(|event| event.payload_ref.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            synthesis_event_refs,
+            vec![
+                first.record.synthesis_history_refs[0].as_str(),
+                replaced.record.synthesis_history_refs[1].as_str()
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_artifact_after_synthesis_clears_mutable_current_view_but_keeps_history() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-artifact-invalidate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-artifact-invalidate-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "architecture".into(),
+                question: "How should current synthesis invalidation behave?".into(),
+                goal: "Keep mutable current view truthful after new evidence arrives.".into(),
+                subject_ref: None,
+                constraints: vec!["Keep history immutable.".into()],
+                success_criteria: vec!["Stale synthesis alias disappears.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+        service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Captured first note.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        let synthesized = service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "adr_draft".into(),
+                    summary: "First bounded synthesis.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        let synthesis = synthesized.synthesis.clone().expect("missing synthesis");
+        let synthesis_alias_path = root
+            .join(".punk")
+            .join("research")
+            .join(&started.record.id)
+            .join("synthesis.json");
+        assert!(synthesis_alias_path.exists());
+
+        let updated = service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Captured second note after synthesis.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.record.state, "gathering");
+        assert!(updated.record.synthesis_ref.is_none());
+        assert!(updated.record.outcome.is_none());
+        assert_eq!(updated.record.synthesis_history_refs.len(), 1);
+        assert_eq!(
+            updated.record.invalidated_synthesis_ref.as_deref(),
+            Some(synthesized.record.synthesis_history_refs[0].as_str())
+        );
+        assert_eq!(
+            updated.record.invalidation_artifact_ref.as_deref(),
+            Some(updated.record.artifact_refs[1].as_str())
+        );
+        assert_eq!(updated.record.invalidation_history.len(), 1);
+        assert_eq!(
+            updated.record.invalidation_history[0].invalidated_synthesis_ref,
+            synthesized.record.synthesis_history_refs[0]
+        );
+        assert_eq!(
+            updated.record.invalidation_history[0].invalidating_artifact_ref,
+            updated.record.artifact_refs[1]
+        );
+        assert_eq!(updated.invalidation.history_count, 1);
+        assert_eq!(
+            updated
+                .invalidation
+                .active
+                .as_ref()
+                .map(|entry| entry.invalidated_synthesis_ref.as_str()),
+            Some(synthesized.record.synthesis_history_refs[0].as_str())
+        );
+        assert_eq!(
+            updated
+                .invalidation
+                .latest
+                .as_ref()
+                .map(|entry| entry.invalidating_artifact_ref.as_str()),
+            Some(updated.record.artifact_refs[1].as_str())
+        );
+        assert_eq!(updated.synthesis_lineage.history_count, 1);
+        assert!(updated.synthesis_lineage.active.is_none());
+        assert_eq!(
+            updated
+                .synthesis_lineage
+                .latest
+                .as_ref()
+                .map(|entry| entry.identity_ref.as_str()),
+            Some(synthesized.record.synthesis_history_refs[0].as_str())
+        );
+        assert_eq!(
+            updated
+                .synthesis_lineage
+                .latest
+                .as_ref()
+                .map(|entry| entry.outcome.as_str()),
+            Some("adr_draft")
+        );
+        assert_eq!(updated.synthesis_lineage.history.len(), 1);
+        assert_eq!(
+            updated.synthesis_lineage.history[0].identity_ref,
+            synthesized.record.synthesis_history_refs[0]
+        );
+        assert!(!updated.synthesis_lineage.has_active_current_view);
+        assert!(!updated.synthesis_lineage.has_replacements);
+        assert!(!updated.synthesis_lineage.latest_is_active);
+        assert_eq!(updated.synthesis, None);
+        assert!(!synthesis_alias_path.exists());
+
+        let historical = service.inspect(&synthesis.id).unwrap();
+        assert_eq!(historical["id"].as_str(), Some(synthesis.id.as_str()));
+        assert_eq!(
+            historical["summary"].as_str(),
+            Some("First bounded synthesis.")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_resynthesis_clears_invalidation_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-resynthesis-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-resynthesis-clear-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "architecture".into(),
+                question: "How should invalidation notes clear?".into(),
+                goal: "Drop invalidation note after new synthesis.".into(),
+                subject_ref: None,
+                constraints: vec!["Stay bounded.".into()],
+                success_criteria: vec!["New synthesis clears invalidation metadata.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+        service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "First note.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "adr_draft".into(),
+                    summary: "First synthesis.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        let invalidated = service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Second note invalidates synthesis.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        assert!(invalidated.record.invalidated_synthesis_ref.is_some());
+        assert!(invalidated.record.invalidation_artifact_ref.is_some());
+        assert_eq!(invalidated.record.invalidation_history.len(), 1);
+
+        let resynthesized = service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "risk_memo".into(),
+                    summary: "Second synthesis.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(resynthesized.record.invalidated_synthesis_ref.is_none());
+        assert!(resynthesized.record.invalidation_artifact_ref.is_none());
+        assert_eq!(resynthesized.record.invalidation_history.len(), 1);
+        assert!(resynthesized.invalidation.active.is_none());
+        assert_eq!(resynthesized.invalidation.history_count, 1);
+        assert!(resynthesized.invalidation.latest.is_some());
+        assert_eq!(resynthesized.synthesis_lineage.history_count, 2);
+        assert_eq!(
+            resynthesized
+                .synthesis_lineage
+                .active
+                .as_ref()
+                .map(|entry| entry.identity_ref.as_str()),
+            Some(resynthesized.record.synthesis_history_refs[1].as_str())
+        );
+        assert_eq!(
+            resynthesized
+                .synthesis_lineage
+                .latest
+                .as_ref()
+                .map(|entry| entry.outcome.as_str()),
+            Some("risk_memo")
+        );
+        assert_eq!(resynthesized.synthesis_lineage.history.len(), 2);
+        assert_eq!(
+            resynthesized.synthesis_lineage.history[0].outcome,
+            "adr_draft"
+        );
+        assert_eq!(
+            resynthesized.synthesis_lineage.history[1].outcome,
+            "risk_memo"
+        );
+        assert_eq!(
+            resynthesized.synthesis_lineage.history[1]
+                .supersedes_ref
+                .as_deref(),
+            Some(resynthesized.record.synthesis_history_refs[0].as_str())
+        );
+        assert!(resynthesized.synthesis_lineage.has_active_current_view);
+        assert!(resynthesized.synthesis_lineage.has_replacements);
+        assert!(resynthesized.synthesis_lineage.latest_is_active);
+
+        let invalidated_again = service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Third note invalidates the second synthesis.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(invalidated_again.record.invalidation_history.len(), 2);
+        assert_eq!(
+            invalidated_again.record.invalidation_history[0].invalidated_synthesis_ref,
+            invalidated
+                .record
+                .invalidated_synthesis_ref
+                .clone()
+                .expect("first invalidated synthesis ref")
+        );
+        assert_eq!(
+            invalidated_again.record.invalidation_history[1].invalidated_synthesis_ref,
+            resynthesized.record.synthesis_history_refs[1]
+        );
+        assert_eq!(invalidated_again.invalidation.history_count, 2);
+        assert_eq!(
+            invalidated_again
+                .invalidation
+                .latest
+                .as_ref()
+                .map(|entry| entry.invalidated_synthesis_ref.as_str()),
+            Some(resynthesized.record.synthesis_history_refs[1].as_str())
+        );
+        assert_eq!(invalidated_again.synthesis_lineage.history_count, 2);
+        assert!(invalidated_again.synthesis_lineage.active.is_none());
+        assert_eq!(
+            invalidated_again
+                .synthesis_lineage
+                .latest
+                .as_ref()
+                .map(|entry| entry.identity_ref.as_str()),
+            Some(resynthesized.record.synthesis_history_refs[1].as_str())
+        );
+        assert_eq!(invalidated_again.synthesis_lineage.history.len(), 2);
+        assert_eq!(
+            invalidated_again.synthesis_lineage.history[0].identity_ref,
+            resynthesized.record.synthesis_history_refs[0]
+        );
+        assert_eq!(
+            invalidated_again.synthesis_lineage.history[1].identity_ref,
+            resynthesized.record.synthesis_history_refs[1]
+        );
+        assert!(!invalidated_again.synthesis_lineage.has_active_current_view);
+        assert!(invalidated_again.synthesis_lineage.has_replacements);
+        assert!(!invalidated_again.synthesis_lineage.latest_is_active);
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_complete_updates_terminal_state_and_blocks_more_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-complete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-complete-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "architecture".into(),
+                question: "What should we complete?".into(),
+                goal: "Reach a bounded research completion.".into(),
+                subject_ref: None,
+                constraints: vec!["Stay bounded.".into()],
+                success_criteria: vec!["Completion stays inspectable.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+        service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "note".into(),
+                    summary: "Captured the final architecture note.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "adr_draft".into(),
+                    summary: "The bounded architecture recommendation is ready.".into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: vec!["docs/product/RESEARCH.md".into()],
+                },
+            )
+            .unwrap();
+
+        let completed = service.complete_research(&started.record.id).unwrap();
+        assert_eq!(completed.record.state, "completed");
+        assert_eq!(completed.record.outcome.as_deref(), Some("adr_draft"));
+        assert!(completed.synthesis.is_some());
+
+        let err = service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "late_note".into(),
+                    summary: "Should be rejected after completion.".into(),
+                    source_ref: None,
+                },
+            )
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("research is already terminal and cannot accept more mutations"));
+
+        let events = service.event_store().load_all().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "research.completed"
+                && event
+                    .payload_ref
+                    .as_deref()
+                    .is_some_and(|payload| payload.ends_with("/record.json"))
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn research_escalate_requires_escalate_outcome_and_updates_terminal_state() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-research-escalate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-research-escalate-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget/\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/RESEARCH.md"), "# Research\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let started = service
+            .start_research(ResearchStartInput {
+                kind: "migration_risk".into(),
+                question: "What must be escalated?".into(),
+                goal: "Produce an explicit escalate outcome.".into(),
+                subject_ref: None,
+                constraints: vec!["Stay inspectable.".into()],
+                success_criteria: vec!["Escalation stays inspectable.".into()],
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                budget: ResearchBudget {
+                    max_rounds: 1,
+                    max_worker_slots: 1,
+                    max_cost_usd: None,
+                    max_duration_minutes: 10,
+                    max_artifacts: 4,
+                },
+            })
+            .unwrap();
+        service
+            .write_research_artifact(
+                &started.record.id,
+                ResearchArtifactInput {
+                    kind: "risk_note".into(),
+                    summary: "Captured the unresolved migration ambiguity.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                },
+            )
+            .unwrap();
+        service
+            .write_research_synthesis(
+                &started.record.id,
+                ResearchSynthesisInput {
+                    outcome: "escalate".into(),
+                    summary:
+                        "This migration needs escalation because ambiguity remains unresolved."
+                            .into(),
+                    artifact_refs: Vec::new(),
+                    replace_existing: false,
+                    follow_up_refs: vec!["docs/product/RESEARCH.md".into()],
+                },
+            )
+            .unwrap();
+
+        let escalated = service.escalate_research(&started.record.id).unwrap();
+        assert_eq!(escalated.record.state, "escalated");
+        assert_eq!(escalated.record.outcome.as_deref(), Some("escalate"));
+        assert!(escalated.synthesis.is_some());
+
+        let wrong = service.complete_research(&started.record.id).unwrap_err();
+        assert!(
+            wrong
+                .to_string()
+                .contains("research can only be completed from the synthesized state")
+                || wrong
+                    .to_string()
+                    .contains("research with outcome=escalate must use `punk research escalate`")
+        );
+
+        let events = service.event_store().load_all().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "research.escalated"
+                && event
+                    .payload_ref
+                    .as_deref()
+                    .is_some_and(|payload| payload.ends_with("/record.json"))
+        }));
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);

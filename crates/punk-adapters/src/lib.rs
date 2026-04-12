@@ -1,3 +1,13 @@
+//! Thin upstream-facing adapters for drafting and bounded execution.
+//!
+//! Boundary policy:
+//! - adapters normalize provider/runtime IO into local artifact shapes
+//! - adapters may add provider-specific preflight, guard rails, and failure classification
+//! - adapters must not own scope policy, gate semantics, proof semantics, or a parallel
+//!   universal agent runtime
+//! - when an upstream-native capability becomes clearly better, the adapter layer should
+//!   become thinner rather than growing new local machinery around it
+
 mod context_pack;
 pub mod council;
 
@@ -131,11 +141,21 @@ struct OrientationGuardEnv {
 }
 
 pub trait Executor {
+    /// Stable provider-agnostic port for bounded execution.
+    ///
+    /// Implementations may wrap vendor CLIs, SDKs, or managed runtimes, but they must return
+    /// local execution facts in `ExecuteOutput` rather than leaking provider-specific semantics
+    /// into the core runtime.
     fn name(&self) -> &'static str;
     fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput>;
 }
 
 pub trait ContractDrafter {
+    /// Stable provider-agnostic port for contract drafting and refinement.
+    ///
+    /// Implementations may use provider-native structured output, tools, or reasoning controls,
+    /// but they must normalize results into `DraftProposal` and must not become the source of
+    /// truth for local policy, scope law, or acceptance semantics.
     fn name(&self) -> &'static str;
     fn draft(&self, input: DraftInput) -> Result<DraftProposal>;
     fn refine(&self, input: RefineInput) -> Result<DraftProposal>;

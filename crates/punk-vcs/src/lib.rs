@@ -701,7 +701,10 @@ mod tests {
         assert!(isolated.base_ref.is_some());
         assert_ne!(isolated.base_ref.as_deref(), Some("HEAD"));
 
-        let root_head = GitBackend::new(&root).unwrap().current_change_ref().unwrap();
+        let root_head = GitBackend::new(&root)
+            .unwrap()
+            .current_change_ref()
+            .unwrap();
         assert!(!root_head.is_empty());
         assert_ne!(root_head, "HEAD");
 

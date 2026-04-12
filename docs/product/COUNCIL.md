@@ -238,6 +238,76 @@ But `gate` still alone writes:
 
 ---
 
+## Selective invocation threshold
+
+`council` is not a default tax on normal work.
+
+v1 selective invocation means **all** of the following must be true before a council run is justified:
+
+1. the core loop already works without council for this repo
+2. the repo is past bootstrap ambiguity
+3. the council family matches a real high-stakes ambiguity that deterministic checks alone do not resolve cleanly
+
+### Core-loop preconditions
+
+Treat council as eligible only when the repo can already stand on its own:
+
+- `ProjectOverlay.capability_summary.bootstrap_ready = true`
+- `ProjectOverlay.capability_summary.project_guidance_ready = true`
+- `ProjectOverlay.capability_summary.staged_ready = true`
+- `ProjectOverlay.capability_summary.proof_ready = true`
+
+For gate-side review, also require:
+
+- deterministic target/integrity checks already executed
+- `gate` still remains the only final writer
+
+If those preconditions are not met, fix the core loop first instead of adding council.
+
+### Family-specific triggers
+
+#### Architecture council
+
+Use only when a proposed change is both high-impact and structurally ambiguous, for example:
+
+- touches multiple top-level modules or crates
+- changes a product/kernel boundary or primitive ownership rule
+- carries migration/removal obligations that are not obviously one-path
+
+Do **not** use for routine bounded edits inside one already-settled subsystem.
+
+#### Contract council
+
+Use only before approving a risky contract when at least one of these is true:
+
+- contract `risk_level` is high
+- `allowed_scope` crosses multiple subsystems or crates
+- checks are materially weak, manual, or obviously incomplete
+- docs/cleanup obligations look uncertain enough that one drafter view is not trustworthy
+
+Do **not** use for low-risk, narrow, already-well-bounded contracts.
+
+#### Review council
+
+Use only after deterministic review when the result is materially ambiguous, for example:
+
+- `gate` would otherwise escalate
+- findings are high-severity but confidence is mixed
+- there are conflicting interpretations of the same evidence bundle
+
+Do **not** use for a clean deterministic `Accept` or `Block`.
+
+### Hard non-triggers
+
+Council should **not** be invoked just because:
+
+- the repo is still fighting bootstrap/init issues
+- the operator wants a second opinion on a routine bounded slice
+- deterministic checks have not run yet
+- someone wants council to replace `gate`
+
+---
+
 ## Storage and events
 
 ### Repo-local layout

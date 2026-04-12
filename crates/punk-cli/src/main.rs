@@ -6,8 +6,11 @@ use std::process::Command as ProcessCommand;
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use punk_adapters::{CodexCliContractDrafter, CodexCliExecutor};
+use punk_domain::Project;
 use punk_gate::GateService;
-use punk_orch::OrchService;
+use punk_orch::{
+    project_id as runtime_project_id, read_json, relative_ref, write_json, OrchService,
+};
 use punk_proof::ProofService;
 use punk_vcs::{
     current_snapshot_ref, detect_backend, detect_mode as detect_vcs_mode,
@@ -30,6 +33,7 @@ enum Command {
     Init(InitCommand),
     Go(GoCommand),
     Start(StartCommand),
+    Research(ResearchCommand),
     Plot(PlotCommand),
     Cut(CutCommand),
     Gate(GateCommand),
@@ -63,6 +67,87 @@ struct StartCommand {
     goal: String,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+struct ResearchCommand {
+    #[command(subcommand)]
+    action: ResearchAction,
+}
+
+#[derive(Subcommand)]
+enum ResearchAction {
+    Start {
+        question: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        goal: String,
+        #[arg(long = "success")]
+        success_criteria: Vec<String>,
+        #[arg(long = "constraint")]
+        constraints: Vec<String>,
+        #[arg(long)]
+        subject_ref: Option<String>,
+        #[arg(long = "context-ref")]
+        context_refs: Vec<String>,
+        #[arg(long)]
+        contract_ref: Option<String>,
+        #[arg(long)]
+        receipt_ref: Option<String>,
+        #[arg(long)]
+        skill_ref: Option<String>,
+        #[arg(long)]
+        eval_ref: Option<String>,
+        #[arg(long, default_value_t = 3)]
+        max_rounds: u32,
+        #[arg(long, default_value_t = 5)]
+        max_worker_slots: u32,
+        #[arg(long, default_value_t = 30)]
+        max_duration_minutes: u32,
+        #[arg(long, default_value_t = 12)]
+        max_artifacts: u32,
+        #[arg(long)]
+        max_cost_usd: Option<f64>,
+        #[arg(long)]
+        json: bool,
+    },
+    Artifact {
+        research_id: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long)]
+        source_ref: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    Synthesize {
+        research_id: String,
+        #[arg(long)]
+        outcome: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long = "artifact-ref")]
+        artifact_refs: Vec<String>,
+        #[arg(long = "follow-up-ref")]
+        follow_up_refs: Vec<String>,
+        #[arg(long)]
+        replace: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Complete {
+        research_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Escalate {
+        research_id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args)]
@@ -200,6 +285,100 @@ fn run() -> Result<()> {
             go.json,
         ),
         Command::Start(start) => cmd_start(&repo_root, &global_root, &start.goal, start.json),
+        Command::Research(research) => match research.action {
+            ResearchAction::Start {
+                question,
+                kind,
+                goal,
+                success_criteria,
+                constraints,
+                subject_ref,
+                context_refs,
+                contract_ref,
+                receipt_ref,
+                skill_ref,
+                eval_ref,
+                max_rounds,
+                max_worker_slots,
+                max_duration_minutes,
+                max_artifacts,
+                max_cost_usd,
+                json,
+            } => {
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let view = orch.start_research(punk_domain::ResearchStartInput {
+                    kind,
+                    question,
+                    goal,
+                    subject_ref,
+                    constraints,
+                    success_criteria,
+                    context_refs,
+                    contract_ref,
+                    receipt_ref,
+                    skill_ref,
+                    eval_ref,
+                    budget: punk_domain::ResearchBudget {
+                        max_rounds,
+                        max_worker_slots,
+                        max_cost_usd,
+                        max_duration_minutes,
+                        max_artifacts,
+                    },
+                })?;
+                render(json, &view, &format_research_summary(&view))
+            }
+            ResearchAction::Artifact {
+                research_id,
+                kind,
+                summary,
+                source_ref,
+                json,
+            } => {
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let view = orch.write_research_artifact(
+                    &research_id,
+                    punk_domain::ResearchArtifactInput {
+                        kind,
+                        summary,
+                        source_ref,
+                    },
+                )?;
+                render(json, &view, &format_research_summary(&view))
+            }
+            ResearchAction::Synthesize {
+                research_id,
+                outcome,
+                summary,
+                artifact_refs,
+                follow_up_refs,
+                replace,
+                json,
+            } => {
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let view = orch.write_research_synthesis(
+                    &research_id,
+                    punk_domain::ResearchSynthesisInput {
+                        outcome,
+                        summary,
+                        artifact_refs,
+                        replace_existing: replace,
+                        follow_up_refs,
+                    },
+                )?;
+                render(json, &view, &format_research_summary(&view))
+            }
+            ResearchAction::Complete { research_id, json } => {
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let view = orch.complete_research(&research_id)?;
+                render(json, &view, &format_research_summary(&view))
+            }
+            ResearchAction::Escalate { research_id, json } => {
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let view = orch.escalate_research(&research_id)?;
+                render(json, &view, &format_research_summary(&view))
+            }
+        },
         Command::Plot(plot) => match plot.action {
             PlotAction::Contract { prompt, json } => {
                 let orch = OrchService::new(&repo_root, &global_root)?;
@@ -307,9 +486,13 @@ fn run() -> Result<()> {
                 let proof = orch.inspect_proofpack(&inspect.target)?;
                 return render(false, &proof, &format_proofpack_summary(&proof));
             }
+            if inspect.id.is_none() && inspect.target.starts_with("research_") {
+                let research = orch.inspect_research(&inspect.target)?;
+                return render(inspect.json, &research, &format_research_summary(&research));
+            }
             if !inspect.json || inspect.id.is_some() {
                 return Err(anyhow!(
-                    "inspect for object ids currently requires `punk inspect <id> --json`; only `proof_<id>` currently supports human inspect output. Use `punk inspect project` or `punk inspect work [id]` for human inspect views"
+                    "inspect for object ids currently requires `punk inspect <id> --json`; only `proof_<id>` and `research_<id>` currently support human inspect output. Use `punk inspect project` or `punk inspect work [id]` for human inspect views"
                 ));
             }
             let value = orch.inspect(&inspect.target)?;
@@ -436,6 +619,15 @@ fn default_global_root() -> Result<PathBuf> {
     Ok(home.join(".punk"))
 }
 
+#[derive(Debug, Clone)]
+struct NativeBootstrapResult {
+    project_label: String,
+    project: Project,
+    bootstrap_ref: String,
+    agent_guidance_refs: Vec<String>,
+    vcs_mode: VcsMode,
+}
+
 fn maybe_auto_bootstrap_project(repo_root: &Path, command: &Command) -> Result<bool> {
     let Some(json) = bootstrap_json_mode(command) else {
         return Ok(false);
@@ -449,14 +641,10 @@ fn maybe_auto_bootstrap_project(repo_root: &Path, command: &Command) -> Result<b
         return Ok(false);
     }
 
-    match detect_punk_run_bootstrap_support(&project_root) {
-        BootstrapSupport::Supported => run_project_bootstrap(&project_root, &project_id, json)?,
-        BootstrapSupport::Unavailable(reason) | BootstrapSupport::Incompatible(reason) => {
-            if !json {
-                eprintln!("{}", format_bootstrap_skip_note(&project_id, &reason));
-            }
-            return Ok(false);
-        }
+    ensure_native_project_bootstrap(&project_root, &project_id, false, false)
+        .map_err(|err| anyhow!(format_bootstrap_error(&project_id, &err.to_string(),)))?;
+    if !json {
+        eprintln!("Bootstrap: wrote missing native punk guidance for `{project_id}`.");
     }
     Ok(true)
 }
@@ -468,6 +656,21 @@ fn bootstrap_json_mode(command: &Command) -> Option<bool> {
         }) => Some(*json),
         Command::Go(GoCommand { json, .. }) => Some(*json),
         Command::Start(StartCommand { json, .. }) => Some(*json),
+        Command::Research(ResearchCommand {
+            action: ResearchAction::Start { json, .. },
+        }) => Some(*json),
+        Command::Research(ResearchCommand {
+            action: ResearchAction::Artifact { json, .. },
+        }) => Some(*json),
+        Command::Research(ResearchCommand {
+            action: ResearchAction::Synthesize { json, .. },
+        }) => Some(*json),
+        Command::Research(ResearchCommand {
+            action: ResearchAction::Complete { json, .. },
+        }) => Some(*json),
+        Command::Research(ResearchCommand {
+            action: ResearchAction::Escalate { json, .. },
+        }) => Some(*json),
         _ => None,
     }
 }
@@ -494,87 +697,260 @@ fn project_bootstrap_file_path(project_root: &Path, project_id: &str) -> PathBuf
         .join(format!("{project_id}-core.md"))
 }
 
+fn existing_bootstrap_file_paths(project_root: &Path) -> Result<Vec<PathBuf>> {
+    let bootstrap_dir = project_root.join(".punk").join("bootstrap");
+    if !bootstrap_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut paths = fs::read_dir(&bootstrap_dir)
+        .with_context(|| format!("failed to read {}", bootstrap_dir.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("-core.md"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
+fn resolve_bootstrap_doc_path(project_root: &Path, project_id: &str) -> Result<PathBuf> {
+    let expected = project_bootstrap_file_path(project_root, project_id);
+    if expected.exists() {
+        return Ok(expected);
+    }
+
+    let existing = existing_bootstrap_file_paths(project_root)?;
+    if existing.len() == 1 {
+        return Ok(existing[0].clone());
+    }
+
+    Ok(expected)
+}
+
 fn needs_project_bootstrap(project_root: &Path, project_id: &str) -> bool {
-    !project_bootstrap_file_path(project_root, project_id).exists()
-}
+    let bootstrap_missing = resolve_bootstrap_doc_path(project_root, project_id)
+        .map(|path| !path.exists())
+        .unwrap_or(true);
+    let project_path = project_root.join(".punk").join("project.json");
+    let repo_agents_path = project_root.join("AGENTS.md");
+    let agent_start_path = project_root.join(".punk").join("AGENT_START.md");
 
-enum BootstrapSupport {
-    Supported,
-    Unavailable(String),
-    Incompatible(String),
-}
-
-fn detect_punk_run_bootstrap_support(project_root: &Path) -> BootstrapSupport {
-    let output = match ProcessCommand::new("punk-run")
-        .current_dir(project_root)
-        .arg("init")
-        .arg("--help")
-        .output()
-    {
-        Ok(output) => output,
-        Err(err) => {
-            return BootstrapSupport::Unavailable(format!("punk-run not available in PATH: {err}"));
-        }
-    };
-
-    let help = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if output.status.success() && help.contains("--project") && help.contains("--verify") {
-        BootstrapSupport::Supported
-    } else {
-        BootstrapSupport::Incompatible(
-            "compatible `punk-run init --project ... --verify` support not detected".to_string(),
-        )
-    }
-}
-
-fn run_project_bootstrap(project_root: &Path, project_id: &str, json: bool) -> Result<()> {
-    let output = ProcessCommand::new("punk-run")
-        .current_dir(project_root)
-        .arg("init")
-        .arg("--project")
-        .arg(project_id)
-        .arg("--verify")
-        .output()
-        .map_err(|err| {
-            anyhow!(format_bootstrap_error(
-                project_id,
-                &format!("failed to execute punk-run: {err}")
-            ))
-        })?;
-
-    if !json && !output.stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    }
-    if !json && !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    if output.status.success() {
-        ensure_default_gitignore_coverage(project_root)?;
-        return Ok(());
-    }
-
-    let reason = output
-        .status
-        .code()
-        .map(|code| format!("punk-run init exited with code {code}"))
-        .unwrap_or_else(|| "punk-run init terminated by signal".to_string());
-    Err(anyhow!(format_bootstrap_error(project_id, &reason)))
+    bootstrap_missing
+        || !project_path.exists()
+        || !repo_agents_path.exists()
+        || !agent_start_path.exists()
 }
 
 fn format_bootstrap_error(project_id: &str, reason: &str) -> String {
     format!(
-        "project bootstrap failed for `{project_id}`: {reason}. Run `punk-run init --project {project_id} --enable-jj --verify` manually and retry."
+        "project bootstrap failed for `{project_id}`: {reason}. Run `punk init --project {project_id} --enable-jj --verify` and retry."
     )
 }
 
-fn format_bootstrap_skip_note(project_id: &str, reason: &str) -> String {
+fn maybe_enable_jj_for_init(project_root: &Path, enable_jj: bool) -> Result<()> {
+    if !enable_jj {
+        return Ok(());
+    }
+
+    match detect_vcs_mode(&project_root.to_path_buf()) {
+        VcsMode::Jj => Ok(()),
+        VcsMode::GitWithJjAvailableButDisabled => enable_jj_for_repo(&project_root.to_path_buf()),
+        VcsMode::GitOnly => Err(anyhow!(
+            "jj is not installed; cannot enable jj for this repo"
+        )),
+        VcsMode::NoVcs => Err(anyhow!(
+            "no Git or jj repo detected in the current directory"
+        )),
+    }
+}
+
+fn write_text_if_missing(path: &Path, content: &str) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, content)?;
+    Ok(())
+}
+
+fn write_native_project_packet(project_root: &Path) -> Result<Project> {
+    fs::create_dir_all(project_root.join(".punk"))?;
+
+    let project_path = project_root.join(".punk").join("project.json");
+    let current_id = runtime_project_id(project_root)?;
+    let current_path = project_root.display().to_string();
+    let current_vcs_backend = detect_backend(project_root)
+        .ok()
+        .map(|backend| backend.kind());
+
+    if project_path.exists() {
+        let mut project: Project = read_json(&project_path)?;
+        let mut changed = false;
+        if project.id != current_id {
+            project.id = current_id.clone();
+            changed = true;
+        }
+        if project.path != current_path {
+            project.path = current_path.clone();
+            changed = true;
+        }
+        if project.vcs_backend != current_vcs_backend {
+            project.vcs_backend = current_vcs_backend.clone();
+            changed = true;
+        }
+        if changed {
+            project.updated_at = punk_domain::now_rfc3339();
+            write_json(&project_path, &project)?;
+        }
+        return Ok(project);
+    }
+
+    let project = Project {
+        id: current_id,
+        path: current_path,
+        vcs_backend: current_vcs_backend,
+        created_at: punk_domain::now_rfc3339(),
+        updated_at: punk_domain::now_rfc3339(),
+    };
+    write_json(&project_path, &project)?;
+    Ok(project)
+}
+
+fn render_agents_md(project_label: &str, bootstrap_ref: &str) -> String {
     format!(
-        "Bootstrap note: skipping optional project bootstrap for `{project_id}` because {reason}. If you need full onboarding, run `punk-run init --project {project_id} --enable-jj --verify` manually."
+        "# AI Contributor Guide for {project_label}\n\n\
+This repo is initialized for `punk`.\n\n\
+## First read\n\n\
+- `{bootstrap_ref}`\n\
+- `.punk/AGENT_START.md`\n\n\
+## Default work intake\n\n\
+For normal work, start with:\n\n\
+```bash\n\
+punk go --fallback-staged \"<goal>\"\n\
+```\n\n\
+Use staged/manual flow when autonomy is blocked or exact review is needed:\n\n\
+```bash\n\
+punk start \"<goal>\"\n\
+punk plot approve <contract-id>\n\
+punk cut run <contract-id>\n\
+punk gate run <run-id>\n\
+```\n\n\
+## Operating rules\n\n\
+- Keep one diff, one purpose.\n\
+- Prefer bounded scope over broad rewrites.\n\
+- Update docs in the same diff when behavior changes.\n\
+- Treat `plot` / `cut` / `gate` as expert/control surfaces, not the default user path.\n"
+    )
+}
+
+fn render_agent_start_md(project_label: &str, bootstrap_ref: &str) -> String {
+    format!(
+        "# punk agent start\n\n\
+Project: `{project_label}`\n\n\
+Read `{bootstrap_ref}` and `AGENTS.md` before changing code.\n\n\
+Default path:\n\n\
+```bash\n\
+punk go --fallback-staged \"<goal>\"\n\
+```\n"
+    )
+}
+
+fn render_bootstrap_core_md(project_label: &str) -> String {
+    format!(
+        "# {project_label} core bootstrap\n\n\
+Use existing architecture and naming before introducing new abstractions.\n\n\
+Prefer additive changes over rewrites.\n\n\
+Keep slices bounded:\n\
+- 1-3 files when possible\n\
+- one diff, one purpose\n\n\
+Prefer existing helpers, modules, and interfaces before creating new ones.\n\n\
+For behavior changes:\n\
+- preserve schemas unless acceptance explicitly changes them\n\
+- no silent broad refactors\n\n\
+For tests:\n\
+- prefer focused tests near changed behavior\n\
+- no change without verification\n\n\
+Fail closed instead of guessing.\n"
+    )
+}
+
+fn ensure_native_project_bootstrap(
+    project_root: &Path,
+    project_label: &str,
+    enable_jj: bool,
+    verify: bool,
+) -> Result<NativeBootstrapResult> {
+    maybe_enable_jj_for_init(project_root, enable_jj)?;
+
+    let bootstrap_path = resolve_bootstrap_doc_path(project_root, project_label)?;
+    let bootstrap_ref = relative_ref(project_root, &bootstrap_path)?;
+    write_text_if_missing(&bootstrap_path, &render_bootstrap_core_md(project_label))?;
+
+    let agents_path = project_root.join("AGENTS.md");
+    write_text_if_missing(
+        &agents_path,
+        &render_agents_md(project_label, &bootstrap_ref),
+    )?;
+    let agent_start_path = project_root.join(".punk").join("AGENT_START.md");
+    write_text_if_missing(
+        &agent_start_path,
+        &render_agent_start_md(project_label, &bootstrap_ref),
+    )?;
+
+    let project = write_native_project_packet(project_root)?;
+    ensure_default_gitignore_coverage(project_root)?;
+    let vcs_mode = detect_vcs_mode(&project_root.to_path_buf());
+
+    if verify {
+        let required_paths = [
+            project_root.join(".punk").join("project.json"),
+            agents_path.clone(),
+            agent_start_path.clone(),
+            bootstrap_path.clone(),
+        ];
+        for path in required_paths {
+            if !path.exists() {
+                return Err(anyhow!(
+                    "native bootstrap verification failed: missing {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    Ok(NativeBootstrapResult {
+        project_label: project_label.to_string(),
+        project,
+        bootstrap_ref,
+        agent_guidance_refs: vec![
+            relative_ref(project_root, &agents_path)?,
+            relative_ref(project_root, &agent_start_path)?,
+        ],
+        vcs_mode,
+    })
+}
+
+fn format_init_summary(result: &NativeBootstrapResult, verify: bool) -> String {
+    let verification = if verify {
+        "Verification: complete"
+    } else {
+        "Verification: skipped"
+    };
+    format!(
+        "Project: {project_label}\nProject id: {project_id}\n{vcs_status}\nBootstrap: {bootstrap_ref}\nGuidance: {guidance}\n{verification}",
+        project_label = result.project_label,
+        project_id = result.project.id,
+        vcs_status = format_vcs_status(result.vcs_mode),
+        bootstrap_ref = result.bootstrap_ref,
+        guidance = result.agent_guidance_refs.join(", "),
+        verification = verification,
     )
 }
 
@@ -635,26 +1011,10 @@ fn cmd_init(
 ) -> Result<()> {
     let project_root = resolve_project_root(repo_root);
     let project_id = resolve_init_project_id(&project_root, explicit_project)?;
-    let output = run_explicit_project_init(&project_root, &project_id, enable_jj, verify)?;
-
-    if !output.stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    }
-    if !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    if output.status.success() {
-        ensure_default_gitignore_coverage(&project_root)?;
-        return Ok(());
-    }
-
-    let reason = output
-        .status
-        .code()
-        .map(|code| format!("punk-run init exited with code {code}"))
-        .unwrap_or_else(|| "punk-run init terminated by signal".to_string());
-    Err(anyhow!(format_init_error(&project_id, &reason)))
+    let result = ensure_native_project_bootstrap(&project_root, &project_id, enable_jj, verify)
+        .map_err(|err| anyhow!(format_init_error(&project_id, &err.to_string())))?;
+    println!("{}", format_init_summary(&result, verify));
+    Ok(())
 }
 
 fn cmd_start(repo_root: &Path, global_root: &Path, goal: &str, json: bool) -> Result<()> {
@@ -732,8 +1092,14 @@ fn cmd_go(
     let executor = CodexCliExecutor::default();
     let gate = GateService::new(repo_root, global_root);
     let proof_service = ProofService::new(repo_root, global_root);
-    let initial_cycle =
-        run_go_cycle(&orch, &drafter, &executor, &gate, &proof_service, trimmed_goal)?;
+    let initial_cycle = run_go_cycle(
+        &orch,
+        &drafter,
+        &executor,
+        &gate,
+        &proof_service,
+        trimmed_goal,
+    )?;
     let follow_up_goal = if should_auto_chain_after_bootstrap(trimmed_goal, &initial_cycle) {
         Some(auto_chain_follow_up_goal(&project_root, trimmed_goal))
     } else {
@@ -1162,6 +1528,7 @@ fn format_go_error(
 }
 
 fn format_project_overlay_summary(overlay: &punk_orch::ProjectOverlay) -> String {
+    let overlay_ref = overlay.overlay_ref.as_str();
     let bootstrap = overlay.bootstrap_ref.as_deref().unwrap_or("missing");
     let guidance = if overlay.agent_guidance_ref.is_empty() {
         "missing".to_string()
@@ -1172,6 +1539,11 @@ fn format_project_overlay_summary(overlay: &punk_orch::ProjectOverlay) -> String
         "none".to_string()
     } else {
         overlay.project_skill_refs.join(", ")
+    };
+    let ambient_skills = if overlay.ambient_project_skill_refs.is_empty() {
+        "none".to_string()
+    } else {
+        overlay.ambient_project_skill_refs.join(", ")
     };
     let checks = if overlay.safe_default_checks.is_empty() {
         "none".to_string()
@@ -1190,14 +1562,17 @@ fn format_project_overlay_summary(overlay: &punk_orch::ProjectOverlay) -> String
     };
 
     format!(
-        "Project: {project_id}\nRepo root: {repo_root}\nVCS mode: {vcs_mode}\nStatus scope: {status_scope_mode}\nBootstrap: {bootstrap}\nGuidance: {guidance}\nProject skills: {skills}\nSafe default checks: {checks}\nCapabilities:\n  bootstrap_ready={bootstrap_ready}\n  project_guidance_ready={guidance_ready}\n  staged_ready={staged_ready}\n  autonomous_ready={autonomous_ready}\n  jj_ready={jj_ready}\n  proof_ready={proof_ready}\nHarness:\n  inspect_ready={inspect_ready}\n  bootable_per_workspace={bootable_per_workspace}\n  ui_legible={ui_legible}\n  logs_legible={logs_legible}\n  metrics_legible={metrics_legible}\n  traces_legible={traces_legible}\nHarness packet: {harness_spec_ref}\n  derivation_source={derivation_source}\n  profiles={profiles}\nLocal constraints:\n{constraints}",
+        "Project: {project_id}\nRepo root: {repo_root}\nProject overlay packet: {overlay_ref}\nVCS mode: {vcs_mode}\nStatus scope: {status_scope_mode}\nBootstrap: {bootstrap}\nGuidance: {guidance}\nProject skill resolution: {project_skill_resolution_mode}\nProject skills: {skills}\nAmbient fallback skills: {ambient_skills}\nSafe default checks: {checks}\nCapabilities:\n  bootstrap_ready={bootstrap_ready}\n  project_guidance_ready={guidance_ready}\n  staged_ready={staged_ready}\n  autonomous_ready={autonomous_ready}\n  jj_ready={jj_ready}\n  proof_ready={proof_ready}\nHarness:\n  inspect_ready={inspect_ready}\n  bootable_per_workspace={bootable_per_workspace}\n  ui_legible={ui_legible}\n  logs_legible={logs_legible}\n  metrics_legible={metrics_legible}\n  traces_legible={traces_legible}\nHarness packet: {harness_spec_ref}\n  derivation_source={derivation_source}\n  profiles={profiles}\nLocal constraints:\n{constraints}",
         project_id = overlay.project_id,
         repo_root = overlay.repo_root,
+        overlay_ref = overlay_ref,
         vcs_mode = overlay.vcs_mode,
         status_scope_mode = overlay.status_scope_mode,
         bootstrap = bootstrap,
         guidance = guidance,
+        project_skill_resolution_mode = overlay.project_skill_resolution_mode,
         skills = skills,
+        ambient_skills = ambient_skills,
         checks = checks,
         bootstrap_ready = overlay.capability_summary.bootstrap_ready,
         guidance_ready = overlay.capability_summary.project_guidance_ready,
@@ -1355,7 +1730,306 @@ fn format_declared_harness_evidence_target(source_ref: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+fn research_next_command(research: &punk_orch::ResearchInspectView) -> String {
+    match research.record.state.as_str() {
+        "frozen" => format!(
+            "punk research artifact {} --kind note --summary \"<summary>\"",
+            research.record.id
+        ),
+        "gathering" => format!(
+            "punk research synthesize {} --outcome <outcome> --summary \"<summary>\"",
+            research.record.id
+        ),
+        "synthesized" => {
+            if research.record.outcome.as_deref() == Some("escalate") {
+                format!("punk research escalate {}", research.record.id)
+            } else {
+                format!("punk research complete {}", research.record.id)
+            }
+        }
+        "completed" | "escalated" => {
+            if research
+                .synthesis
+                .as_ref()
+                .is_some_and(|synthesis| !synthesis.follow_up_refs.is_empty())
+            {
+                "terminal state reached; review follow-up refs".to_string()
+            } else {
+                "terminal state reached; no further research mutation".to_string()
+            }
+        }
+        _ => format!("punk inspect {} --json", research.record.id),
+    }
+}
+
+fn format_research_summary(research: &punk_orch::ResearchInspectView) -> String {
+    let snapshot = &research.packet.repo_snapshot_ref;
+    let budget = &research.packet.budget;
+    let snapshot_summary = format!(
+        "vcs={} head_ref={} dirty={}",
+        snapshot
+            .vcs
+            .as_ref()
+            .map(|kind| match kind {
+                punk_domain::VcsKind::Jj => "jj",
+                punk_domain::VcsKind::Git => "git",
+            })
+            .unwrap_or("none"),
+        snapshot.head_ref.as_deref().unwrap_or("missing"),
+        snapshot.dirty
+    );
+    let subject_ref = research.question.subject_ref.as_deref().unwrap_or("none");
+    let constraints = if research.question.constraints.is_empty() {
+        "none".to_string()
+    } else {
+        research
+            .question
+            .constraints
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let success_criteria = if research.question.success_criteria.is_empty() {
+        "none".to_string()
+    } else {
+        research
+            .question
+            .success_criteria
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let context_refs = if research.packet.context_refs.is_empty() {
+        "none".to_string()
+    } else {
+        research.packet.context_refs.join(", ")
+    };
+    let stop_rules = if research.packet.stop_rules.is_empty() {
+        "none".to_string()
+    } else {
+        research
+            .packet
+            .stop_rules
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let artifact_refs = if research.record.artifact_refs.is_empty() {
+        "none".to_string()
+    } else {
+        research
+            .record
+            .artifact_refs
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let synthesis_ref = research.record.synthesis_ref.as_deref().unwrap_or("none");
+    let synthesis_identity_ref = research
+        .record
+        .synthesis_ref
+        .as_ref()
+        .and_then(|_| research.record.synthesis_history_refs.last())
+        .map(String::as_str)
+        .unwrap_or("none");
+    let outcome = research.record.outcome.as_deref().unwrap_or("none");
+    let synthesis_summary = research
+        .synthesis
+        .as_ref()
+        .map(|synthesis| synthesis.summary.as_str())
+        .unwrap_or("none");
+    let supersedes_ref = research
+        .synthesis
+        .as_ref()
+        .and_then(|synthesis| synthesis.supersedes_ref.as_deref())
+        .unwrap_or("none");
+    let synthesis_artifact_refs = research
+        .synthesis
+        .as_ref()
+        .map(|synthesis| {
+            if synthesis.artifact_refs.is_empty() {
+                "none".to_string()
+            } else {
+                synthesis
+                    .artifact_refs
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        })
+        .unwrap_or_else(|| "none".to_string());
+    let synthesis_history_refs = if research.record.synthesis_history_refs.is_empty() {
+        "none".to_string()
+    } else {
+        research
+            .record
+            .synthesis_history_refs
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let follow_up_refs = research
+        .synthesis
+        .as_ref()
+        .map(|synthesis| {
+            if synthesis.follow_up_refs.is_empty() {
+                "none".to_string()
+            } else {
+                synthesis
+                    .follow_up_refs
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        })
+        .unwrap_or_else(|| "none".to_string());
+    let invalidation_note = if research.record.state == "gathering"
+        && research.record.invalidated_synthesis_ref.is_some()
+    {
+        "current synthesized view was cleared by a newer artifact".to_string()
+    } else {
+        "none".to_string()
+    };
+    let invalidated_synthesis_ref = if research.record.state == "gathering" {
+        research
+            .record
+            .invalidated_synthesis_ref
+            .as_deref()
+            .unwrap_or("none")
+    } else {
+        "none"
+    };
+    let invalidating_artifact_ref = if research.record.state == "gathering" {
+        research
+            .record
+            .invalidation_artifact_ref
+            .as_deref()
+            .unwrap_or("none")
+    } else {
+        "none"
+    };
+    let invalidation_history = if research.record.invalidation_history.is_empty() {
+        "none".to_string()
+    } else {
+        research
+            .record
+            .invalidation_history
+            .iter()
+            .map(|entry| {
+                format!(
+                    "- invalidated={} by={} at={}",
+                    entry.invalidated_synthesis_ref,
+                    entry.invalidating_artifact_ref,
+                    entry.invalidated_at
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let next_command = research_next_command(research);
+
+    format!(
+        "Research: {id}\nState: {state}\nKind: {kind}\nQuestion: {question}\nGoal: {goal}\nSubject ref: {subject_ref}\nQuestion ref: {question_ref}\nPacket ref: {packet_ref}\nSnapshot: {snapshot}\nBudget: rounds={max_rounds} worker_slots={max_worker_slots} duration_minutes={max_duration_minutes} artifacts={max_artifacts} cost_usd={max_cost_usd}\nArtifact count: {artifact_count}\nArtifact refs:\n{artifact_refs}\nOutcome: {outcome}\nSynthesis ref: {synthesis_ref}\nSynthesis identity ref: {synthesis_identity_ref}\nSupersedes synthesis ref: {supersedes_ref}\nSynthesis history refs:\n{synthesis_history_refs}\nSynthesis summary: {synthesis_summary}\nSynthesis artifact refs:\n{synthesis_artifact_refs}\nFollow-up refs:\n{follow_up_refs}\nInvalidation note: {invalidation_note}\nInvalidated synthesis ref: {invalidated_synthesis_ref}\nInvalidating artifact ref: {invalidating_artifact_ref}\nInvalidation history:\n{invalidation_history}\nContext refs: {context_refs}\nSuccess criteria:\n{success_criteria}\nConstraints:\n{constraints}\nStop rules:\n{stop_rules}\nOutput schema: {output_schema_ref}\nNext: {next_command}",
+        id = research.record.id,
+        state = research.record.state,
+        kind = research.question.kind,
+        question = research.question.question,
+        goal = research.question.goal,
+        subject_ref = subject_ref,
+        question_ref = research.record.question_ref,
+        packet_ref = research.record.packet_ref,
+        snapshot = snapshot_summary,
+        max_rounds = budget.max_rounds,
+        max_worker_slots = budget.max_worker_slots,
+        max_duration_minutes = budget.max_duration_minutes,
+        max_artifacts = budget.max_artifacts,
+        max_cost_usd = budget
+            .max_cost_usd
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "none".to_string()),
+        artifact_count = research.artifacts.len(),
+        artifact_refs = artifact_refs,
+        outcome = outcome,
+        synthesis_ref = synthesis_ref,
+        synthesis_identity_ref = synthesis_identity_ref,
+        supersedes_ref = supersedes_ref,
+        synthesis_history_refs = synthesis_history_refs,
+        synthesis_summary = synthesis_summary,
+        synthesis_artifact_refs = synthesis_artifact_refs,
+        follow_up_refs = follow_up_refs,
+        invalidation_note = invalidation_note,
+        invalidated_synthesis_ref = invalidated_synthesis_ref,
+        invalidating_artifact_ref = invalidating_artifact_ref,
+        invalidation_history = invalidation_history,
+        context_refs = context_refs,
+        success_criteria = success_criteria,
+        constraints = constraints,
+        stop_rules = stop_rules,
+        output_schema_ref = research.packet.output_schema_ref,
+        next_command = next_command,
+    )
+}
+
 fn format_proofpack_summary(proof: &punk_domain::Proofpack) -> String {
+    let run_ref = proof.run_ref.as_deref().unwrap_or("missing");
+    let workspace_lineage = proof
+        .workspace_lineage
+        .as_ref()
+        .map(|lineage| {
+            let backend = match lineage.backend {
+                punk_domain::VcsKind::Jj => "jj",
+                punk_domain::VcsKind::Git => "git",
+            };
+            format!(
+                "backend={} workspace={} change_ref={} base_ref={}",
+                backend,
+                lineage.workspace_ref,
+                lineage.change_ref,
+                lineage.base_ref.as_deref().unwrap_or("none")
+            )
+        })
+        .unwrap_or_else(|| "missing".to_string());
+    let executor_identity = proof
+        .executor_identity
+        .as_ref()
+        .map(|identity| match identity.version.as_deref() {
+            Some(version) => format!("{}@{}", identity.name, version),
+            None => format!("{}@unknown", identity.name),
+        })
+        .unwrap_or_else(|| "missing".to_string());
+    let reproducibility_claim = proof
+        .reproducibility_claim
+        .as_ref()
+        .map(|claim| format!("{}: {}", claim.level, claim.summary))
+        .unwrap_or_else(|| "missing".to_string());
+    let environment_digest = proof
+        .reproducibility_claim
+        .as_ref()
+        .and_then(|claim| claim.environment_digest_sha256.as_deref())
+        .unwrap_or("missing");
+    let claim_limits = proof
+        .reproducibility_claim
+        .as_ref()
+        .map(|claim| {
+            if claim.limits.is_empty() {
+                "none".to_string()
+            } else {
+                claim
+                    .limits
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        })
+        .unwrap_or_else(|| "none".to_string());
     let command_evidence = if proof.command_evidence.is_empty() {
         "none".to_string()
     } else {
@@ -1416,12 +2090,18 @@ fn format_proofpack_summary(proof: &punk_domain::Proofpack) -> String {
     };
 
     format!(
-        "Proof: {proof_id}\nRun: {run_id}\nDecision: {decision_id}\nContract: {contract_ref}\nReceipt: {receipt_ref}\nSummary: {summary}\nCommand evidence:\n{command_evidence}\nDeclared harness evidence:\n{declared_harness_evidence}\nHarness evidence:\n{harness_evidence}",
+        "Proof: {proof_id}\nRun: {run_id}\nRun record: {run_ref}\nDecision: {decision_id}\nContract: {contract_ref}\nReceipt: {receipt_ref}\nExecutor: {executor_identity}\nWorkspace lineage: {workspace_lineage}\nReproducibility claim: {reproducibility_claim}\nEnvironment digest: {environment_digest}\nClaim limits:\n{claim_limits}\nSummary: {summary}\nCommand evidence:\n{command_evidence}\nDeclared harness evidence:\n{declared_harness_evidence}\nHarness evidence:\n{harness_evidence}",
         proof_id = proof.id,
         run_id = proof.run_id,
+        run_ref = run_ref,
         decision_id = proof.decision_id,
         contract_ref = proof.contract_ref,
         receipt_ref = proof.receipt_ref,
+        executor_identity = executor_identity,
+        workspace_lineage = workspace_lineage,
+        reproducibility_claim = reproducibility_claim,
+        environment_digest = environment_digest,
+        claim_limits = claim_limits,
         summary = proof.summary,
         command_evidence = command_evidence,
         declared_harness_evidence = declared_harness_evidence,
@@ -1467,42 +2147,9 @@ fn resolve_init_project_id(project_root: &Path, explicit_project: Option<&str>) 
     })
 }
 
-fn run_explicit_project_init(
-    project_root: &Path,
-    project_id: &str,
-    enable_jj: bool,
-    verify: bool,
-) -> Result<std::process::Output> {
-    match detect_punk_run_bootstrap_support(project_root) {
-        BootstrapSupport::Supported => {
-            let mut command = ProcessCommand::new("punk-run");
-            command
-                .current_dir(project_root)
-                .arg("init")
-                .arg("--project")
-                .arg(project_id);
-            if enable_jj {
-                command.arg("--enable-jj");
-            }
-            if verify {
-                command.arg("--verify");
-            }
-            command.output().map_err(|err| {
-                anyhow!(format_init_error(
-                    project_id,
-                    &format!("failed to execute punk-run: {err}")
-                ))
-            })
-        }
-        BootstrapSupport::Unavailable(reason) | BootstrapSupport::Incompatible(reason) => {
-            Err(anyhow!(format_init_error(project_id, &reason)))
-        }
-    }
-}
-
 fn format_init_error(project_id: &str, reason: &str) -> String {
     format!(
-        "project init failed for `{project_id}`: {reason}. Ensure a compatible `punk-run init --project ...` is available and retry."
+        "project init failed for `{project_id}`: {reason}. Run `punk init --project {project_id} --enable-jj --verify` after `git init` if needed, then retry."
     )
 }
 
@@ -1685,6 +2332,7 @@ mod tests {
                 change_ref: "abc123".into(),
                 base_ref: Some("base123".into()),
             },
+            verification_context_ref: None,
             started_at: "now".into(),
             ended_at: Some("later".into()),
         };
@@ -1726,6 +2374,8 @@ mod tests {
             contract_ref: "ct.json".into(),
             receipt_ref: "rcpt.json".into(),
             check_refs: vec![],
+            verification_context_ref: None,
+            verification_context_identity: None,
             command_evidence: vec![],
             declared_harness_evidence: vec![],
             harness_evidence: vec![],
@@ -1825,9 +2475,7 @@ mod tests {
 
         assert!(needs_project_bootstrap(&root, "interviewcoach"));
 
-        let bootstrap = project_bootstrap_file_path(&root, "interviewcoach");
-        fs::create_dir_all(bootstrap.parent().unwrap()).unwrap();
-        fs::write(&bootstrap, "core rules\n").unwrap();
+        ensure_native_project_bootstrap(&root, "interviewcoach", false, false).unwrap();
 
         assert!(!needs_project_bootstrap(&root, "interviewcoach"));
 
@@ -1835,10 +2483,52 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_error_mentions_manual_recovery_command() {
-        let message = format_bootstrap_error("interviewcoach", "failed to execute punk-run");
+    fn bootstrap_error_mentions_native_recovery_command() {
+        let message = format_bootstrap_error("interviewcoach", "failed to write bootstrap files");
         assert!(message.contains("project bootstrap failed"));
-        assert!(message.contains("punk-run init --project interviewcoach --enable-jj --verify"));
+        assert!(message.contains("punk init --project interviewcoach --enable-jj --verify"));
+    }
+
+    #[test]
+    fn resolve_bootstrap_doc_path_reuses_existing_single_bootstrap_doc() {
+        let root = temp_test_dir("bootstrap-resolve");
+        let bootstrap = project_bootstrap_file_path(&root, "custom-project");
+        fs::create_dir_all(bootstrap.parent().unwrap()).unwrap();
+        fs::write(&bootstrap, "core rules\n").unwrap();
+
+        let resolved = resolve_bootstrap_doc_path(&root, "interviewcoach").unwrap();
+        assert_eq!(resolved, bootstrap);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_bootstrap_writes_project_packet_guidance_and_bootstrap_files() {
+        let root = temp_test_dir("native-bootstrap");
+
+        let result = ensure_native_project_bootstrap(&root, "interviewcoach", false, true).unwrap();
+
+        assert_eq!(result.project_label, "interviewcoach");
+        assert!(root.join(".punk/project.json").exists());
+        assert!(root.join("AGENTS.md").exists());
+        assert!(root.join(".punk/AGENT_START.md").exists());
+        assert!(root.join(".punk/bootstrap/interviewcoach-core.md").exists());
+        assert_eq!(
+            result.bootstrap_ref,
+            ".punk/bootstrap/interviewcoach-core.md"
+        );
+        assert_eq!(
+            result.agent_guidance_refs,
+            vec!["AGENTS.md", ".punk/AGENT_START.md"]
+        );
+
+        let agents = fs::read_to_string(root.join("AGENTS.md")).unwrap();
+        assert!(agents.contains("punk go --fallback-staged"));
+        let bootstrap =
+            fs::read_to_string(root.join(".punk/bootstrap/interviewcoach-core.md")).unwrap();
+        assert!(bootstrap.contains("Fail closed instead of guessing."));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1873,7 +2563,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_json_mode_supports_start_and_plot_contract() {
+    fn bootstrap_json_mode_supports_start_plot_and_research_commands() {
         let go = Command::Go(GoCommand {
             goal: "ship interview summary".into(),
             fallback_staged: false,
@@ -1889,6 +2579,61 @@ mod tests {
                 json: false,
             },
         });
+        let research_start = Command::Research(ResearchCommand {
+            action: ResearchAction::Start {
+                question: "freeze research".into(),
+                kind: "architecture".into(),
+                goal: "capture packet".into(),
+                success_criteria: vec!["packet exists".into()],
+                constraints: Vec::new(),
+                subject_ref: None,
+                context_refs: Vec::new(),
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                max_rounds: 3,
+                max_worker_slots: 5,
+                max_duration_minutes: 30,
+                max_artifacts: 12,
+                max_cost_usd: None,
+                json: true,
+            },
+        });
+        let research_artifact = Command::Research(ResearchCommand {
+            action: ResearchAction::Artifact {
+                research_id: "research_123".into(),
+                kind: "note".into(),
+                summary: "captured".into(),
+                source_ref: None,
+                json: false,
+            },
+        });
+        let research_synthesis = Command::Research(ResearchCommand {
+            action: ResearchAction::Synthesize {
+                research_id: "research_123".into(),
+                outcome: "risk_memo".into(),
+                summary: "synthesized".into(),
+                artifact_refs: vec![
+                    ".punk/research/research_123/artifacts/artifact_123.json".into()
+                ],
+                follow_up_refs: vec!["docs/product/RESEARCH.md".into()],
+                replace: false,
+                json: true,
+            },
+        });
+        let research_complete = Command::Research(ResearchCommand {
+            action: ResearchAction::Complete {
+                research_id: "research_123".into(),
+                json: false,
+            },
+        });
+        let research_escalate = Command::Research(ResearchCommand {
+            action: ResearchAction::Escalate {
+                research_id: "research_123".into(),
+                json: true,
+            },
+        });
         let status = Command::Status(StatusCommand {
             id: None,
             json: false,
@@ -1897,6 +2642,11 @@ mod tests {
         assert_eq!(bootstrap_json_mode(&go), Some(true));
         assert_eq!(bootstrap_json_mode(&start), Some(true));
         assert_eq!(bootstrap_json_mode(&plot), Some(false));
+        assert_eq!(bootstrap_json_mode(&research_start), Some(true));
+        assert_eq!(bootstrap_json_mode(&research_artifact), Some(false));
+        assert_eq!(bootstrap_json_mode(&research_synthesis), Some(true));
+        assert_eq!(bootstrap_json_mode(&research_complete), Some(false));
+        assert_eq!(bootstrap_json_mode(&research_escalate), Some(true));
         assert_eq!(bootstrap_json_mode(&status), None);
     }
 
@@ -2003,6 +2753,7 @@ mod tests {
         let overlay = punk_orch::ProjectOverlay {
             project_id: "interviewcoach-e5b92bb854".into(),
             repo_root: "/tmp/interviewcoach".into(),
+            overlay_ref: ".punk/project/overlay.json".into(),
             vcs_mode: "jj".into(),
             bootstrap_ref: Some(".punk/bootstrap/interviewcoach-core.md".into()),
             agent_guidance_ref: vec!["AGENTS.md".into(), ".punk/AGENT_START.md".into()],
@@ -2050,7 +2801,11 @@ mod tests {
                 derivation_source: "repo_markers_v1".into(),
                 updated_at: "2026-04-03T00:00:00Z".into(),
             },
-            project_skill_refs: vec!["/tmp/skills/interviewcoach-core.md".into()],
+            project_skill_resolution_mode: "repo_local".into(),
+            project_skill_refs: vec![
+                ".punk/skills/overlays/implementer/interviewcoach-core.md".into()
+            ],
+            ambient_project_skill_refs: Vec::new(),
             local_constraints: vec!["none".into()],
             safe_default_checks: vec!["make test".into()],
             status_scope_mode: "project:interviewcoach-e5b92bb854".into(),
@@ -2058,9 +2813,13 @@ mod tests {
         };
         let rendered = format_project_overlay_summary(&overlay);
         assert!(rendered.contains("Project: interviewcoach-e5b92bb854"));
+        assert!(rendered.contains("Project overlay packet: .punk/project/overlay.json"));
         assert!(rendered.contains("Bootstrap: .punk/bootstrap/interviewcoach-core.md"));
         assert!(rendered.contains("Guidance: AGENTS.md, .punk/AGENT_START.md"));
-        assert!(rendered.contains("Project skills: /tmp/skills/interviewcoach-core.md"));
+        assert!(rendered.contains("Project skill resolution: repo_local"));
+        assert!(rendered
+            .contains("Project skills: .punk/skills/overlays/implementer/interviewcoach-core.md"));
+        assert!(rendered.contains("Ambient fallback skills: none"));
         assert!(rendered.contains("Safe default checks: make test"));
         assert!(rendered.contains("autonomous_ready=true"));
         assert!(rendered.contains("Harness:"));
@@ -2127,10 +2886,33 @@ mod tests {
             id: "proof_789".into(),
             decision_id: "dec_789".into(),
             run_id: "run_789".into(),
+            run_ref: Some(".punk/runs/run_789/run.json".into()),
             contract_ref: ".punk/contracts/feat_789/v1.json".into(),
             receipt_ref: ".punk/runs/run_789/receipt.json".into(),
             decision_ref: ".punk/decisions/dec_789.json".into(),
             check_refs: vec![],
+            workspace_lineage: Some(punk_domain::RunVcs {
+                backend: punk_domain::VcsKind::Git,
+                workspace_ref: "/tmp/specpunk-worktree".into(),
+                change_ref: "HEAD".into(),
+                base_ref: Some("HEAD~1".into()),
+            }),
+            verification_context_ref: None,
+            verification_context_identity: None,
+            executor_identity: Some(punk_domain::ProofExecutorIdentity {
+                name: "codex-cli".into(),
+                version: None,
+            }),
+            reproducibility_claim: Some(punk_domain::ProofReproducibilityClaim {
+                level: "run_record_v0".into(),
+                summary: "Proof records run lineage and executor identity, but lacks a frozen verification-context digest.".into(),
+                environment_digest_sha256: None,
+                limits: vec![
+                    "v0 proof records verdict context and evidence but does not guarantee hermetic rebuilds".into(),
+                    "executor version is unavailable in the current receipt schema".into(),
+                    "frozen verification context identity is unavailable".into(),
+                ],
+            }),
             command_evidence: vec![
                 punk_domain::CommandEvidence {
                     evidence_type: "command".into(),
@@ -2182,6 +2964,14 @@ mod tests {
 
         let rendered = format_proofpack_summary(&proof);
         assert!(rendered.contains("Proof: proof_789"));
+        assert!(rendered.contains("Run record: .punk/runs/run_789/run.json"));
+        assert!(rendered.contains("Executor: codex-cli@unknown"));
+        assert!(rendered.contains(
+            "Workspace lineage: backend=git workspace=/tmp/specpunk-worktree change_ref=HEAD base_ref=HEAD~1"
+        ));
+        assert!(rendered.contains("Reproducibility claim: run_record_v0:"));
+        assert!(rendered.contains("Environment digest: missing"));
+        assert!(rendered.contains("Claim limits:"));
         assert!(rendered.contains("Command evidence:"));
         assert!(rendered.contains("- target pass: cargo test -p punk-cli"));
         assert!(rendered.contains("- integrity pass: cargo test --workspace"));
@@ -2196,15 +2986,344 @@ mod tests {
     }
 
     #[test]
+    fn research_summary_mentions_terminal_follow_up_refs() {
+        let research = punk_orch::ResearchInspectView {
+            record: punk_domain::ResearchRecord {
+                id: "research_123".into(),
+                project_id: "specpunk".into(),
+                kind: "architecture".into(),
+                state: "completed".into(),
+                question_ref: ".punk/research/research_123/question.json".into(),
+                packet_ref: ".punk/research/research_123/packet.json".into(),
+                artifact_refs: vec![
+                    ".punk/research/research_123/artifacts/artifact_123.json".into()
+                ],
+                synthesis_ref: Some(".punk/research/research_123/synthesis.json".into()),
+                synthesis_history_refs: vec![
+                    ".punk/research/research_123/syntheses/synthesis_001.json".into(),
+                    ".punk/research/research_123/syntheses/synthesis_123.json".into(),
+                ],
+                invalidated_synthesis_ref: None,
+                invalidation_artifact_ref: None,
+                invalidation_history: Vec::new(),
+                outcome: Some("adr_draft".into()),
+                created_at: "2026-04-11T00:00:00Z".into(),
+                updated_at: "2026-04-11T00:00:00Z".into(),
+            },
+            question: punk_domain::ResearchQuestion {
+                id: "rq_123".into(),
+                project_id: "specpunk".into(),
+                kind: "architecture".into(),
+                subject_ref: Some(".punk/project.json".into()),
+                question: "Should research packets become first-class repo artifacts?".into(),
+                goal: "Freeze a bounded research packet for later execution.".into(),
+                constraints: vec!["Keep it advisory-only.".into()],
+                success_criteria: vec![
+                    "Packet captures an explicit budget.".into(),
+                    "Inspect recovers the frozen packet.".into(),
+                ],
+                created_at: "2026-04-11T00:00:00Z".into(),
+            },
+            packet: punk_domain::ResearchPacket {
+                id: "rp_123".into(),
+                research_id: "research_123".into(),
+                question_ref: ".punk/research/research_123/question.json".into(),
+                repo_snapshot_ref: punk_domain::council::RepoSnapshotRef {
+                    vcs: Some(punk_domain::VcsKind::Git),
+                    head_ref: Some("HEAD".into()),
+                    dirty: false,
+                },
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                budget: punk_domain::ResearchBudget {
+                    max_rounds: 3,
+                    max_worker_slots: 5,
+                    max_cost_usd: Some(10.0),
+                    max_duration_minutes: 30,
+                    max_artifacts: 12,
+                },
+                stop_rules: vec![
+                    "stop_when_budget_exhausted".into(),
+                    "stop_when_evidence_is_sufficient".into(),
+                    "escalate_on_persistent_ambiguity".into(),
+                ],
+                output_schema_ref: "docs/product/RESEARCH.md#researchsynthesis".into(),
+                created_at: "2026-04-11T00:00:00Z".into(),
+            },
+            artifacts: vec![punk_domain::ResearchArtifact {
+                id: "artifact_123".into(),
+                research_id: "research_123".into(),
+                kind: "note".into(),
+                summary: "Captured the first bounded hypothesis.".into(),
+                source_ref: Some("docs/product/RESEARCH.md".into()),
+                created_at: "2026-04-11T00:10:00Z".into(),
+            }],
+            synthesis: Some(punk_domain::ResearchSynthesis {
+                id: "synthesis_123".into(),
+                research_id: "research_123".into(),
+                outcome: "adr_draft".into(),
+                summary: "The bounded architecture recommendation is complete.".into(),
+                artifact_refs: vec![
+                    ".punk/research/research_123/artifacts/artifact_123.json".into()
+                ],
+                supersedes_ref: Some(
+                    ".punk/research/research_123/syntheses/synthesis_001.json".into(),
+                ),
+                follow_up_refs: vec![
+                    "docs/product/ARCHITECTURE.md".into(),
+                    "docs/product/CLI.md".into(),
+                ],
+                created_at: "2026-04-11T00:20:00Z".into(),
+            }),
+            invalidation: punk_orch::ResearchInvalidationInspectView {
+                active: None,
+                latest: None,
+                history_count: 0,
+            },
+            synthesis_lineage: punk_orch::ResearchSynthesisLineageInspectView {
+                active: Some(punk_orch::ResearchSynthesisLineageEntry {
+                    identity_ref: ".punk/research/research_123/syntheses/synthesis_123.json".into(),
+                    outcome: "adr_draft".into(),
+                    supersedes_ref: Some(
+                        ".punk/research/research_123/syntheses/synthesis_001.json".into(),
+                    ),
+                }),
+                latest: Some(punk_orch::ResearchSynthesisLineageEntry {
+                    identity_ref: ".punk/research/research_123/syntheses/synthesis_123.json".into(),
+                    outcome: "adr_draft".into(),
+                    supersedes_ref: Some(
+                        ".punk/research/research_123/syntheses/synthesis_001.json".into(),
+                    ),
+                }),
+                history_count: 2,
+                history: vec![
+                    punk_orch::ResearchSynthesisLineageEntry {
+                        identity_ref: ".punk/research/research_123/syntheses/synthesis_001.json"
+                            .into(),
+                        outcome: "adr_draft".into(),
+                        supersedes_ref: None,
+                    },
+                    punk_orch::ResearchSynthesisLineageEntry {
+                        identity_ref: ".punk/research/research_123/syntheses/synthesis_123.json"
+                            .into(),
+                        outcome: "adr_draft".into(),
+                        supersedes_ref: Some(
+                            ".punk/research/research_123/syntheses/synthesis_001.json".into(),
+                        ),
+                    },
+                ],
+                has_active_current_view: true,
+                has_replacements: true,
+                latest_is_active: true,
+            },
+        };
+
+        let rendered = format_research_summary(&research);
+        assert!(rendered.contains("Research: research_123"));
+        assert!(rendered.contains("State: completed"));
+        assert!(rendered.contains("Kind: architecture"));
+        assert!(rendered.contains("Subject ref: .punk/project.json"));
+        assert!(rendered.contains("Snapshot: vcs=git head_ref=HEAD dirty=false"));
+        assert!(rendered.contains(
+            "Budget: rounds=3 worker_slots=5 duration_minutes=30 artifacts=12 cost_usd=10.00"
+        ));
+        assert!(rendered.contains("Artifact count: 1"));
+        assert!(rendered.contains("- .punk/research/research_123/artifacts/artifact_123.json"));
+        assert!(rendered.contains("Outcome: adr_draft"));
+        assert!(rendered.contains("Synthesis ref: .punk/research/research_123/synthesis.json"));
+        assert!(rendered.contains(
+            "Synthesis identity ref: .punk/research/research_123/syntheses/synthesis_123.json"
+        ));
+        assert!(rendered.contains(
+            "Supersedes synthesis ref: .punk/research/research_123/syntheses/synthesis_001.json"
+        ));
+        assert!(rendered.contains("Synthesis history refs:"));
+        assert!(rendered.contains("- .punk/research/research_123/syntheses/synthesis_001.json"));
+        assert!(rendered.contains("- .punk/research/research_123/syntheses/synthesis_123.json"));
+        assert!(rendered
+            .contains("Synthesis summary: The bounded architecture recommendation is complete."));
+        assert!(rendered.contains("Synthesis artifact refs:"));
+        assert!(rendered.contains("Follow-up refs:"));
+        assert!(rendered.contains("- docs/product/ARCHITECTURE.md"));
+        assert!(rendered.contains("- docs/product/CLI.md"));
+        assert!(rendered.contains("Invalidation note: none"));
+        assert!(rendered.contains("Invalidated synthesis ref: none"));
+        assert!(rendered.contains("Invalidating artifact ref: none"));
+        assert!(rendered.contains("Invalidation history:\nnone"));
+        assert!(rendered.contains("Context refs: docs/product/RESEARCH.md"));
+        assert!(rendered.contains("- Packet captures an explicit budget."));
+        assert!(rendered.contains("- Keep it advisory-only."));
+        assert!(rendered.contains("- stop_when_budget_exhausted"));
+        assert!(rendered.contains("Output schema: docs/product/RESEARCH.md#researchsynthesis"));
+        assert!(rendered.contains("Next: terminal state reached; review follow-up refs"));
+    }
+
+    #[test]
+    fn research_summary_mentions_invalidation_note_while_gathering() {
+        let research = punk_orch::ResearchInspectView {
+            record: punk_domain::ResearchRecord {
+                id: "research_456".into(),
+                project_id: "specpunk".into(),
+                kind: "architecture".into(),
+                state: "gathering".into(),
+                question_ref: ".punk/research/research_456/question.json".into(),
+                packet_ref: ".punk/research/research_456/packet.json".into(),
+                artifact_refs: vec![
+                    ".punk/research/research_456/artifacts/artifact_001.json".into(),
+                    ".punk/research/research_456/artifacts/artifact_002.json".into(),
+                ],
+                synthesis_ref: None,
+                synthesis_history_refs: vec![
+                    ".punk/research/research_456/syntheses/synthesis_001.json".into(),
+                ],
+                invalidated_synthesis_ref: Some(
+                    ".punk/research/research_456/syntheses/synthesis_001.json".into(),
+                ),
+                invalidation_artifact_ref: Some(
+                    ".punk/research/research_456/artifacts/artifact_002.json".into(),
+                ),
+                invalidation_history: vec![punk_domain::ResearchInvalidationEntry {
+                    invalidated_synthesis_ref:
+                        ".punk/research/research_456/syntheses/synthesis_001.json".into(),
+                    invalidating_artifact_ref:
+                        ".punk/research/research_456/artifacts/artifact_002.json".into(),
+                    invalidated_at: "2026-04-12T00:10:00Z".into(),
+                }],
+                outcome: None,
+                created_at: "2026-04-12T00:00:00Z".into(),
+                updated_at: "2026-04-12T00:00:00Z".into(),
+            },
+            question: punk_domain::ResearchQuestion {
+                id: "rq_456".into(),
+                project_id: "specpunk".into(),
+                kind: "architecture".into(),
+                subject_ref: None,
+                question: "Why was the previous synthesis cleared?".into(),
+                goal: "Show an explicit invalidation note.".into(),
+                constraints: vec!["Stay bounded.".into()],
+                success_criteria: vec!["Human inspect explains invalidation.".into()],
+                created_at: "2026-04-12T00:00:00Z".into(),
+            },
+            packet: punk_domain::ResearchPacket {
+                id: "rp_456".into(),
+                research_id: "research_456".into(),
+                question_ref: ".punk/research/research_456/question.json".into(),
+                repo_snapshot_ref: punk_domain::council::RepoSnapshotRef {
+                    vcs: Some(punk_domain::VcsKind::Git),
+                    head_ref: Some("HEAD".into()),
+                    dirty: true,
+                },
+                contract_ref: None,
+                receipt_ref: None,
+                skill_ref: None,
+                eval_ref: None,
+                context_refs: vec!["docs/product/RESEARCH.md".into()],
+                budget: punk_domain::ResearchBudget {
+                    max_rounds: 3,
+                    max_worker_slots: 5,
+                    max_cost_usd: None,
+                    max_duration_minutes: 30,
+                    max_artifacts: 12,
+                },
+                stop_rules: vec!["stop_when_evidence_is_sufficient".into()],
+                output_schema_ref: "docs/product/RESEARCH.md#researchsynthesis".into(),
+                created_at: "2026-04-12T00:00:00Z".into(),
+            },
+            artifacts: vec![
+                punk_domain::ResearchArtifact {
+                    id: "artifact_001".into(),
+                    research_id: "research_456".into(),
+                    kind: "note".into(),
+                    summary: "First note.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                    created_at: "2026-04-12T00:05:00Z".into(),
+                },
+                punk_domain::ResearchArtifact {
+                    id: "artifact_002".into(),
+                    research_id: "research_456".into(),
+                    kind: "note".into(),
+                    summary: "Second note invalidated the previous synthesis.".into(),
+                    source_ref: Some("docs/product/RESEARCH.md".into()),
+                    created_at: "2026-04-12T00:10:00Z".into(),
+                },
+            ],
+            synthesis: None,
+            invalidation: punk_orch::ResearchInvalidationInspectView {
+                active: Some(punk_domain::ResearchInvalidationEntry {
+                    invalidated_synthesis_ref:
+                        ".punk/research/research_456/syntheses/synthesis_001.json".into(),
+                    invalidating_artifact_ref:
+                        ".punk/research/research_456/artifacts/artifact_002.json".into(),
+                    invalidated_at: "2026-04-12T00:10:00Z".into(),
+                }),
+                latest: Some(punk_domain::ResearchInvalidationEntry {
+                    invalidated_synthesis_ref:
+                        ".punk/research/research_456/syntheses/synthesis_001.json".into(),
+                    invalidating_artifact_ref:
+                        ".punk/research/research_456/artifacts/artifact_002.json".into(),
+                    invalidated_at: "2026-04-12T00:10:00Z".into(),
+                }),
+                history_count: 1,
+            },
+            synthesis_lineage: punk_orch::ResearchSynthesisLineageInspectView {
+                active: None,
+                latest: Some(punk_orch::ResearchSynthesisLineageEntry {
+                    identity_ref: ".punk/research/research_456/syntheses/synthesis_001.json".into(),
+                    outcome: "adr_draft".into(),
+                    supersedes_ref: None,
+                }),
+                history_count: 1,
+                history: vec![punk_orch::ResearchSynthesisLineageEntry {
+                    identity_ref: ".punk/research/research_456/syntheses/synthesis_001.json".into(),
+                    outcome: "adr_draft".into(),
+                    supersedes_ref: None,
+                }],
+                has_active_current_view: false,
+                has_replacements: false,
+                latest_is_active: false,
+            },
+        };
+
+        let rendered = format_research_summary(&research);
+        assert!(rendered.contains("State: gathering"));
+        assert!(rendered.contains("Synthesis ref: none"));
+        assert!(rendered.contains(
+            "Invalidation note: current synthesized view was cleared by a newer artifact"
+        ));
+        assert!(rendered.contains(
+            "Invalidated synthesis ref: .punk/research/research_456/syntheses/synthesis_001.json"
+        ));
+        assert!(rendered.contains(
+            "Invalidating artifact ref: .punk/research/research_456/artifacts/artifact_002.json"
+        ));
+        assert!(rendered.contains("Invalidation history:"));
+        assert!(rendered.contains(
+            "- invalidated=.punk/research/research_456/syntheses/synthesis_001.json by=.punk/research/research_456/artifacts/artifact_002.json at=2026-04-12T00:10:00Z"
+        ));
+        assert!(rendered.contains(
+            "Next: punk research synthesize research_456 --outcome <outcome> --summary \"<summary>\""
+        ));
+    }
+
+    #[test]
     fn summarize_proof_harness_evidence_mentions_declared_and_executed_items() {
         let proof = punk_domain::Proofpack {
             id: "proof_789".into(),
             decision_id: "dec_789".into(),
             run_id: "run_789".into(),
+            run_ref: None,
             contract_ref: ".punk/contracts/feat_789/v1.json".into(),
             receipt_ref: ".punk/runs/run_789/receipt.json".into(),
             decision_ref: ".punk/decisions/dec_789.json".into(),
             check_refs: vec![],
+            workspace_lineage: None,
+            verification_context_ref: None,
+            verification_context_identity: None,
+            executor_identity: None,
+            reproducibility_claim: None,
             command_evidence: vec![],
             declared_harness_evidence: vec![punk_domain::DeclaredHarnessEvidence {
                 evidence_type: "log_query".into(),
@@ -2317,6 +3436,7 @@ mod tests {
                     change_ref: "change".into(),
                     base_ref: None,
                 },
+                verification_context_ref: None,
             },
             receipt: punk_domain::Receipt {
                 id: "rcpt_123".into(),
@@ -2348,6 +3468,8 @@ mod tests {
                 contract_ref: "ct_123".into(),
                 receipt_ref: "rcpt_123".into(),
                 check_refs: vec![],
+                verification_context_ref: None,
+                verification_context_identity: None,
                 command_evidence: vec![],
                 declared_harness_evidence: vec![],
                 harness_evidence: vec![],
@@ -2357,10 +3479,16 @@ mod tests {
                 id: "proof_123".into(),
                 decision_id: "dec_123".into(),
                 run_id: "run_123".into(),
+                run_ref: None,
                 contract_ref: "ct_123".into(),
                 receipt_ref: "rcpt_123".into(),
                 decision_ref: "dec_123".into(),
                 check_refs: vec![],
+                workspace_lineage: None,
+                verification_context_ref: None,
+                verification_context_identity: None,
+                executor_identity: None,
+                reproducibility_claim: None,
                 command_evidence: vec![],
                 declared_harness_evidence: vec![],
                 harness_evidence: vec![],
@@ -2444,13 +3572,14 @@ mod tests {
     }
 
     #[test]
-    fn init_error_mentions_punk_run_requirement() {
+    fn init_error_mentions_native_init_recovery() {
         let rendered = format_init_error(
             "interviewcoach",
-            "compatible `punk-run init --project ...` support not detected",
+            "no Git or jj repo detected in the current directory",
         );
         assert!(rendered.contains("project init failed"));
-        assert!(rendered.contains("compatible `punk-run init --project ...` support not detected"));
-        assert!(rendered.contains("Ensure a compatible `punk-run init --project ...` is available"));
+        assert!(rendered.contains("no Git or jj repo detected in the current directory"));
+        assert!(rendered.contains("punk init --project interviewcoach --enable-jj --verify"));
+        assert!(rendered.contains("after `git init` if needed"));
     }
 }
