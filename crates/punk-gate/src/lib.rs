@@ -3,11 +3,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use punk_core::{find_object_path, read_json, relative_ref, validate_check_command, write_json};
+use punk_core::{
+    find_object_path, line_count_for_path, read_json, relative_ref, scan_forbidden_path_dependency,
+    scope_roots, validate_check_command, write_json,
+};
 use punk_domain::{
-    now_rfc3339, CheckStatus, CommandEvidence, Contract, ContractStatus, Decision, DecisionObject,
-    DeclaredHarnessEvidence, DeterministicStatus, EventEnvelope, HarnessEvidence, ModeId, Receipt,
-    VerificationContext, VerificationContextFileState, VerificationContextIdentity,
+    now_rfc3339, ArchitectureAssessment, ArchitectureAssessmentOutcome,
+    ArchitectureFileLocAssessment, ArchitectureForbiddenPathDependencyAssessment,
+    ArchitectureSeverity, ArchitectureSignals, CheckStatus, CommandEvidence, Contract,
+    ContractStatus, Decision, DecisionObject, DeclaredHarnessEvidence, DeterministicStatus,
+    EventEnvelope, HarnessEvidence, ModeId, PersistedContract, Receipt, VerificationContext,
+    VerificationContextFileState, VerificationContextIdentity,
 };
 use punk_events::EventStore;
 use punk_orch::project_id;
@@ -39,6 +45,11 @@ struct VerificationContextOutcome {
     valid: bool,
 }
 
+struct ArchitectureAssessmentArtifact {
+    assessment: ArchitectureAssessment,
+    assessment_ref: String,
+}
+
 impl GateService {
     pub fn new(repo_root: impl AsRef<Path>, global_root: impl AsRef<Path>) -> Self {
         let repo_root = repo_root.as_ref().to_path_buf();
@@ -57,13 +68,22 @@ impl GateService {
         let receipt: Receipt = read_json(&receipt_path)?;
         let contract_path =
             find_object_path(&self.repo_root.join(".punk/contracts"), &run.contract_id)?;
-        let contract: Contract = read_json(&contract_path)?;
+        let persisted_contract: PersistedContract = read_json(&contract_path)?;
+        let contract: Contract = persisted_contract.contract.clone();
         if contract.status != ContractStatus::Approved {
             return Err(anyhow!("gate requires an approved contract"));
         }
         let verification_context = resolve_verification_context(&self.repo_root, &run);
         let declared_harness_evidence = load_declared_harness_evidence(&self.repo_root);
         let harness = run_harness_recipes(&self.repo_root)?;
+        let architecture = assess_architecture(
+            &self.repo_root,
+            &run,
+            &receipt,
+            &contract_path,
+            &persisted_contract,
+            verification_context.check_root.as_deref(),
+        )?;
 
         let mut decision_basis = Vec::new();
         let mut check_refs = Vec::new();
@@ -118,13 +138,25 @@ impl GateService {
         };
         check_refs.extend(target.refs.iter().cloned());
         check_refs.extend(integrity.refs.iter().cloned());
+        check_refs.push(architecture.assessment_ref.clone());
         decision_basis.extend(target.reasons.clone());
         decision_basis.extend(integrity.reasons.clone());
         decision_basis.extend(harness.reasons.clone());
+        decision_basis.extend(architecture.assessment.reasons.clone());
         command_evidence.extend(target.command_evidence);
         command_evidence.extend(integrity.command_evidence);
 
-        let (decision, deterministic_status, confidence_estimate) = if !receipt_ok
+        let architecture_blocks = matches!(
+            architecture.assessment.outcome,
+            ArchitectureAssessmentOutcome::Block
+        );
+        let architecture_escalates = matches!(
+            architecture.assessment.outcome,
+            ArchitectureAssessmentOutcome::Escalate
+        );
+
+        let (decision, deterministic_status, confidence_estimate) = if architecture_blocks
+            || !receipt_ok
             || !scope_ok
             || !verification_context.valid
             || target.status == CheckStatus::Fail
@@ -132,6 +164,8 @@ impl GateService {
             || harness.status == CheckStatus::Fail
         {
             (Decision::Block, DeterministicStatus::Fail, 0.9)
+        } else if architecture_escalates {
+            (Decision::Escalate, DeterministicStatus::Mixed, 0.5)
         } else if target.status == CheckStatus::Pass && integrity.status == CheckStatus::Pass {
             (Decision::Accept, DeterministicStatus::Pass, 1.0)
         } else {
@@ -178,6 +212,245 @@ impl GateService {
         self.events.append(&event)?;
         Ok(decision_object)
     }
+}
+
+fn assess_architecture(
+    repo_root: &Path,
+    run: &punk_domain::Run,
+    receipt: &Receipt,
+    contract_path: &Path,
+    persisted_contract: &PersistedContract,
+    check_root: Option<&Path>,
+) -> Result<ArchitectureAssessmentArtifact> {
+    let signals_ref = persisted_contract
+        .architecture_signals_ref
+        .clone()
+        .or_else(|| default_architecture_signals_ref(repo_root, contract_path));
+    let signals = signals_ref
+        .as_ref()
+        .map(|reference| read_json::<ArchitectureSignals>(&repo_root.join(reference)))
+        .transpose()?;
+    let severity = signals
+        .as_ref()
+        .map(|signals| signals.severity.clone())
+        .unwrap_or(ArchitectureSeverity::None);
+    let integrity = persisted_contract.architecture_integrity.as_ref();
+
+    let touched_files = architecture_changed_files(&receipt.changed_files);
+    let touched_roots = scope_roots(&touched_files);
+    let touched_root_count = touched_roots.len();
+
+    let mut reasons = Vec::new();
+    let mut reason_codes = Vec::new();
+    let mut file_loc_results = Vec::new();
+    let mut forbidden_path_dependency_results = Vec::new();
+    let mut blocked = false;
+    let mut escalated = false;
+
+    if matches!(severity, ArchitectureSeverity::Critical) && integrity.is_none() {
+        escalated = true;
+        reason_codes.push("critical_signals_missing_contract_architecture_integrity".to_string());
+        reasons.push(
+            "critical architecture signals require contract architecture integrity review, but the approved contract has none".to_string(),
+        );
+    }
+
+    if let Some(integrity) = integrity {
+        if let Some(max) = integrity.touched_roots_max {
+            if touched_root_count > max {
+                blocked = true;
+                reason_codes.push("touched_roots_max_exceeded".to_string());
+                reasons.push(format!(
+                    "architecture constraint failed: touched roots {} exceed touched_roots_max {}",
+                    touched_root_count, max
+                ));
+            }
+        }
+
+        for budget in &integrity.file_loc_budgets {
+            let (actual_loc, status, note) = match check_root {
+                Some(root) => match line_count_for_path(root, &budget.path) {
+                    Ok(actual_loc) if actual_loc > budget.max_after_loc => {
+                        blocked = true;
+                        reason_codes.push("file_loc_budget_exceeded".to_string());
+                        (
+                            actual_loc,
+                            CheckStatus::Fail,
+                            Some(format!(
+                                "architecture constraint failed: {} has {} LOC which exceeds the max_after_loc budget {}",
+                                budget.path, actual_loc, budget.max_after_loc
+                            )),
+                        )
+                    }
+                    Ok(actual_loc) => (actual_loc, CheckStatus::Pass, None),
+                    Err(error) => (
+                        0,
+                        CheckStatus::Unverified,
+                        Some(format!(
+                            "architecture file LOC budget for {} could not be verified: {}",
+                            budget.path, error
+                        )),
+                    ),
+                },
+                None => (
+                    0,
+                    CheckStatus::Unverified,
+                    Some(format!(
+                        "architecture file LOC budget for {} could not be verified because the frozen verification context is unavailable",
+                        budget.path
+                    )),
+                ),
+            };
+            if let Some(note) = note {
+                reasons.push(note);
+            }
+            file_loc_results.push(ArchitectureFileLocAssessment {
+                path: budget.path.clone(),
+                max_after_loc: budget.max_after_loc,
+                actual_loc,
+                status,
+            });
+        }
+
+        for rule in &integrity.forbidden_path_dependencies {
+            let (status, summary) = match check_root {
+                Some(root) => {
+                    let scan = scan_forbidden_path_dependency(
+                        root,
+                        &touched_files,
+                        &rule.from_glob,
+                        &rule.to_glob,
+                    )?;
+                    if !scan.violating_edges.is_empty() {
+                        blocked = true;
+                        reason_codes.push("forbidden_path_dependency_violated".to_string());
+                        let edges = scan
+                            .violating_edges
+                            .iter()
+                            .map(|edge| format!("{} -> {}", edge.from_path, edge.to_path))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        (
+                            CheckStatus::Fail,
+                            format!(
+                                "architecture constraint failed: forbidden dependency {} -> {} was observed in {}",
+                                rule.from_glob, rule.to_glob, edges
+                            ),
+                        )
+                    } else if !scan.unparsed_files.is_empty() {
+                        reason_codes.push("forbidden_path_dependency_unverified".to_string());
+                        (
+                            CheckStatus::Unverified,
+                            format!(
+                                "forbidden dependency {} -> {} matched files that are not yet deterministically parsed in v0: {}",
+                                rule.from_glob,
+                                rule.to_glob,
+                                scan.unparsed_files.join(", ")
+                            ),
+                        )
+                    } else if scan.matched_files.is_empty() {
+                        (
+                            CheckStatus::Pass,
+                            format!(
+                                "no touched files matched forbidden dependency rule {} -> {}",
+                                rule.from_glob, rule.to_glob
+                            ),
+                        )
+                    } else {
+                        (
+                            CheckStatus::Pass,
+                            format!(
+                                "checked {} touched file(s) for forbidden dependency rule {} -> {}; no violating edges found",
+                                scan.matched_files.len(),
+                                rule.from_glob,
+                                rule.to_glob
+                            ),
+                        )
+                    }
+                }
+                None => (
+                    CheckStatus::Unverified,
+                    format!(
+                        "forbidden dependency {} -> {} could not be verified because the frozen verification context is unavailable",
+                        rule.from_glob, rule.to_glob
+                    ),
+                ),
+            };
+
+            if !matches!(status, CheckStatus::Pass) {
+                reasons.push(summary.clone());
+            }
+            forbidden_path_dependency_results.push(ArchitectureForbiddenPathDependencyAssessment {
+                from_glob: rule.from_glob.clone(),
+                to_glob: rule.to_glob.clone(),
+                status,
+                summary,
+            });
+        }
+    }
+
+    let outcome = if blocked {
+        ArchitectureAssessmentOutcome::Block
+    } else if escalated {
+        ArchitectureAssessmentOutcome::Escalate
+    } else if signals.is_some() || integrity.is_some() {
+        if reasons.is_empty() {
+            reasons.push("architecture constraints satisfied".to_string());
+        }
+        ArchitectureAssessmentOutcome::Pass
+    } else {
+        ArchitectureAssessmentOutcome::NotApplicable
+    };
+
+    let assessment = ArchitectureAssessment {
+        run_id: run.id.clone(),
+        contract_id: run.contract_id.clone(),
+        signals_ref: signals_ref.clone(),
+        brief_ref: integrity.map(|integrity| integrity.brief_ref.clone()),
+        severity,
+        outcome,
+        review_required: integrity
+            .map(|integrity| integrity.review_required)
+            .unwrap_or(matches!(
+                signals.as_ref().map(|signals| &signals.severity),
+                Some(ArchitectureSeverity::Critical)
+            )),
+        contract_integrity_present: integrity.is_some(),
+        touched_root_count,
+        touched_roots,
+        file_loc_results,
+        forbidden_path_dependency_results,
+        reason_codes,
+        reasons,
+        assessed_at: now_rfc3339(),
+    };
+
+    let assessment_path = repo_root
+        .join(".punk/runs")
+        .join(&run.id)
+        .join("architecture-assessment.json");
+    write_json(&assessment_path, &assessment)?;
+
+    Ok(ArchitectureAssessmentArtifact {
+        assessment,
+        assessment_ref: relative_ref(repo_root, &assessment_path)?,
+    })
+}
+
+fn default_architecture_signals_ref(repo_root: &Path, contract_path: &Path) -> Option<String> {
+    let signals_path = contract_path.with_file_name("architecture-signals.json");
+    signals_path
+        .exists()
+        .then(|| relative_ref(repo_root, &signals_path).ok())
+        .flatten()
+}
+
+fn architecture_changed_files(changed_files: &[String]) -> Vec<String> {
+    changed_files
+        .iter()
+        .filter(|path| !is_controller_runtime_artifact(path))
+        .cloned()
+        .collect()
 }
 
 fn validate_scope(allowed_scope: &[String], changed_files: &[String]) -> bool {
@@ -803,7 +1076,10 @@ fn split_command_args(s: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use punk_core::write_json;
-    use punk_domain::{ReceiptArtifacts, RunStatus, VcsKind};
+    use punk_domain::{
+        ArchitectureFileLocBudget, ArchitectureSignals, ArchitectureThresholds,
+        ContractArchitectureIntegrity, PersistedContract, ReceiptArtifacts, RunStatus, VcsKind,
+    };
 
     fn normalized_decision_value(decision: &punk_domain::DecisionObject) -> serde_json::Value {
         let mut value = serde_json::to_value(decision).unwrap();
@@ -861,6 +1137,73 @@ mod tests {
             .join("verification-context.json");
         write_json(&context_path, &context).unwrap();
         run.verification_context_ref = Some(relative_ref(root, &context_path).unwrap());
+    }
+
+    fn architecture_test_root(label: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        (root, global)
+    }
+
+    fn commit_all(root: &Path, message: &str) {
+        let add = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(add.status.success(), "git add failed: {:?}", add);
+        let commit = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                message,
+            ])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "git commit failed: {:?}", commit);
+    }
+
+    fn write_persisted_contract(
+        root: &Path,
+        contract: Contract,
+        signals: Option<ArchitectureSignals>,
+        integrity: Option<ContractArchitectureIntegrity>,
+    ) {
+        let signals_ref = signals.as_ref().map(|_| {
+            let path = root.join(".punk/contracts/feat_1/architecture-signals.json");
+            let signals = signals.as_ref().unwrap();
+            write_json(&path, signals).unwrap();
+            relative_ref(root, &path).unwrap()
+        });
+        write_json(
+            &root.join(".punk/contracts/feat_1/v1.json"),
+            &PersistedContract {
+                contract,
+                architecture_signals_ref: signals_ref,
+                architecture_integrity: integrity,
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -947,6 +1290,393 @@ mod tests {
             .iter()
             .all(|item| item.evidence_type == "command"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gate_escalates_when_critical_architecture_review_is_missing() {
+        let (root, global) = architecture_test_root("missing-architecture-review");
+        fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "x".into(),
+            entry_points: vec!["tracked.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["tracked.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "medium".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_persisted_contract(
+            &root,
+            contract,
+            Some(ArchitectureSignals {
+                contract_id: "ct_1".into(),
+                feature_id: "feat_1".into(),
+                scope_roots: vec!["tracked.txt".into()],
+                oversized_files: vec![punk_domain::ArchitectureOversizedFile {
+                    path: "tracked.txt".into(),
+                    loc: 1300,
+                }],
+                distinct_scope_roots: 1,
+                entry_point_count: 1,
+                expected_interface_count: 1,
+                import_path_count: 0,
+                has_cleanup_obligations: false,
+                has_docs_obligations: false,
+                has_migration_sensitive_surfaces: false,
+                severity: ArchitectureSeverity::Critical,
+                trigger_reasons: vec!["oversized file tracked.txt has 1300 LOC".into()],
+                thresholds: ArchitectureThresholds {
+                    warn_file_loc: 600,
+                    critical_file_loc: 1200,
+                    critical_scope_roots: 1,
+                    warn_expected_interfaces: 2,
+                    warn_import_paths: 5,
+                },
+                computed_at: now_rfc3339(),
+            }),
+            None,
+        );
+
+        let mut run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "success".into(),
+            executor_name: "fake".into(),
+            changed_files: vec!["tracked.txt".into()],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec![],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "done".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        attach_verification_context(&root, &mut run, &["tracked.txt"]);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+
+        let gate = GateService::new(&root, &global);
+        let decision = gate.gate_run("run_1").unwrap();
+        assert_eq!(decision.decision, Decision::Escalate);
+        assert!(decision
+            .check_refs
+            .iter()
+            .any(|reference| reference.ends_with("/architecture-assessment.json")));
+
+        let assessment: ArchitectureAssessment =
+            read_json(&root.join(".punk/runs/run_1/architecture-assessment.json")).unwrap();
+        assert_eq!(assessment.outcome, ArchitectureAssessmentOutcome::Escalate);
+        assert!(assessment
+            .reason_codes
+            .contains(&"critical_signals_missing_contract_architecture_integrity".to_string()));
+    }
+
+    #[test]
+    fn gate_blocks_when_architecture_file_loc_budget_is_exceeded() {
+        let (root, global) = architecture_test_root("file-loc-budget");
+        let oversized = std::iter::repeat("line\n").take(20).collect::<String>();
+        fs::write(root.join("tracked.txt"), oversized).unwrap();
+        fs::write(
+            root.join(".punk/contracts/feat_1/architecture-brief.md"),
+            "# brief\n",
+        )
+        .unwrap();
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "x".into(),
+            entry_points: vec!["tracked.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["tracked.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "medium".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_persisted_contract(
+            &root,
+            contract,
+            Some(ArchitectureSignals {
+                contract_id: "ct_1".into(),
+                feature_id: "feat_1".into(),
+                scope_roots: vec!["tracked.txt".into()],
+                oversized_files: vec![punk_domain::ArchitectureOversizedFile {
+                    path: "tracked.txt".into(),
+                    loc: 20,
+                }],
+                distinct_scope_roots: 1,
+                entry_point_count: 1,
+                expected_interface_count: 1,
+                import_path_count: 0,
+                has_cleanup_obligations: false,
+                has_docs_obligations: false,
+                has_migration_sensitive_surfaces: false,
+                severity: ArchitectureSeverity::Warn,
+                trigger_reasons: vec!["oversized file tracked.txt has 20 LOC".into()],
+                thresholds: ArchitectureThresholds {
+                    warn_file_loc: 10,
+                    critical_file_loc: 100,
+                    critical_scope_roots: 1,
+                    warn_expected_interfaces: 2,
+                    warn_import_paths: 5,
+                },
+                computed_at: now_rfc3339(),
+            }),
+            Some(ContractArchitectureIntegrity {
+                review_required: true,
+                brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
+                touched_roots_max: Some(1),
+                file_loc_budgets: vec![ArchitectureFileLocBudget {
+                    path: "tracked.txt".into(),
+                    max_after_loc: 5,
+                }],
+                forbidden_path_dependencies: Vec::new(),
+            }),
+        );
+
+        let mut run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "success".into(),
+            executor_name: "fake".into(),
+            changed_files: vec!["tracked.txt".into()],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec![],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "done".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        attach_verification_context(&root, &mut run, &["tracked.txt"]);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+
+        let gate = GateService::new(&root, &global);
+        let decision = gate.gate_run("run_1").unwrap();
+        assert_eq!(decision.decision, Decision::Block);
+
+        let assessment: ArchitectureAssessment =
+            read_json(&root.join(".punk/runs/run_1/architecture-assessment.json")).unwrap();
+        assert_eq!(assessment.outcome, ArchitectureAssessmentOutcome::Block);
+        assert_eq!(assessment.file_loc_results[0].status, CheckStatus::Fail);
+        assert!(assessment
+            .reason_codes
+            .contains(&"file_loc_budget_exceeded".to_string()));
+    }
+
+    #[test]
+    fn gate_blocks_when_forbidden_path_dependency_is_violated() {
+        let (root, global) = architecture_test_root("forbidden-path-dependency");
+        fs::create_dir_all(root.join("crates/app-core/src")).unwrap();
+        fs::create_dir_all(root.join("crates/forbidden/src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app-core\", \"crates/forbidden\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/app-core/Cargo.toml"),
+            "[package]\nname = \"app-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/forbidden/Cargo.toml"),
+            "[package]\nname = \"forbidden\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/app-core/src/lib.rs"),
+            "pub fn ready() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/forbidden/src/api.rs"),
+            "pub struct Client;\n",
+        )
+        .unwrap();
+        commit_all(&root, "baseline");
+        fs::write(
+            root.join("crates/app-core/src/lib.rs"),
+            "use forbidden::api::Client;\npub fn build() -> Client { todo!() }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".punk/contracts/feat_1/architecture-brief.md"),
+            "# brief\n",
+        )
+        .unwrap();
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "x".into(),
+            entry_points: vec!["crates/app-core/src/lib.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["crates/app-core/src/lib.rs".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "medium".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_persisted_contract(
+            &root,
+            contract,
+            Some(ArchitectureSignals {
+                contract_id: "ct_1".into(),
+                feature_id: "feat_1".into(),
+                scope_roots: vec!["crates".into()],
+                oversized_files: Vec::new(),
+                distinct_scope_roots: 1,
+                entry_point_count: 1,
+                expected_interface_count: 1,
+                import_path_count: 0,
+                has_cleanup_obligations: false,
+                has_docs_obligations: false,
+                has_migration_sensitive_surfaces: false,
+                severity: ArchitectureSeverity::Warn,
+                trigger_reasons: vec!["dependency-direction review requested".into()],
+                thresholds: ArchitectureThresholds {
+                    warn_file_loc: 600,
+                    critical_file_loc: 1200,
+                    critical_scope_roots: 1,
+                    warn_expected_interfaces: 2,
+                    warn_import_paths: 5,
+                },
+                computed_at: now_rfc3339(),
+            }),
+            Some(ContractArchitectureIntegrity {
+                review_required: true,
+                brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
+                touched_roots_max: Some(1),
+                file_loc_budgets: Vec::new(),
+                forbidden_path_dependencies: vec![
+                    punk_domain::ArchitectureForbiddenPathDependency {
+                        from_glob: "crates/app-core/**".into(),
+                        to_glob: "crates/forbidden/**".into(),
+                    },
+                ],
+            }),
+        );
+
+        let mut run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "success".into(),
+            executor_name: "fake".into(),
+            changed_files: vec!["crates/app-core/src/lib.rs".into()],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec![],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "done".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        attach_verification_context(&root, &mut run, &["crates/app-core/src/lib.rs"]);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+
+        let gate = GateService::new(&root, &global);
+        let decision = gate.gate_run("run_1").unwrap();
+        assert_eq!(decision.decision, Decision::Block);
+
+        let assessment: ArchitectureAssessment =
+            read_json(&root.join(".punk/runs/run_1/architecture-assessment.json")).unwrap();
+        assert_eq!(assessment.outcome, ArchitectureAssessmentOutcome::Block);
+        assert_eq!(
+            assessment.forbidden_path_dependency_results[0].status,
+            CheckStatus::Fail
+        );
+        assert!(assessment
+            .reason_codes
+            .contains(&"forbidden_path_dependency_violated".to_string()));
     }
 
     #[test]

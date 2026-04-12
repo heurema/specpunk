@@ -200,6 +200,19 @@ punk gate run <run-id>
 punk gate proof <run-id|decision-id>
 ```
 
+For architecture-sensitive slices, `plot` can also force the deterministic review packet before approval:
+
+```bash
+punk plot contract --architecture on "<goal>"
+punk plot refine <contract-id> "<guidance>" --architecture on
+```
+
+Current v0 architecture steering stays inside the same `plot -> cut -> gate` slice:
+
+- `plot` always writes `.punk/contracts/<feature-id>/architecture-signals.json`
+- `plot` writes `.punk/contracts/<feature-id>/architecture-brief.md` and persists contract architecture integrity commitments when signals are critical, architecture mode is forced on, or the draft already carries architecture integrity constraints
+- `gate` writes `.punk/runs/<run-id>/architecture-assessment.json`, escalates if critical architecture review was required but missing from the approved contract, blocks on breached architecture constraints (including deterministic forbidden dependency edges when they are resolvable from touched files), and carries that assessment ref/hash into proof through `check_refs` / `hashes`
+
 If the workspace cannot auto-initialize Git, `punk start` should stop early and point back to:
 
 ```bash

@@ -83,6 +83,31 @@ If something can be recomposed from primitives without changing truth, it is not
 - `start` and `go` are shell mechanisms assembled from deeper lifecycle operations.
 - `proof` is a true primitive because it anchors verification truth.
 - `allowed_scope` is part of primitive safety semantics, not a UX nicety.
+- the new v0 architecture steering slice keeps `architecture-signals.json`, `architecture-brief.md`, and `architecture-assessment.json` as derived artifacts under `.punk/` instead of minting a new primitive alongside `Contract` or `Proofpack`
+
+## Architecture steering v0 implementation note
+
+- artifact paths:
+  - `.punk/contracts/<feature-id>/architecture-signals.json`
+  - `.punk/contracts/<feature-id>/architecture-brief.md`
+  - `.punk/runs/<run-id>/architecture-assessment.json`
+- default thresholds:
+  - `warn_file_loc >= 600`
+  - `critical_file_loc >= 1200`
+  - `critical_scope_roots > 1`
+  - `warn_expected_interfaces > 2`
+  - `warn_import_paths > 5`
+- trigger logic:
+  - `plot` always refreshes `architecture-signals.json`
+  - `plot` writes `architecture-brief.md` when signals are `critical`, `--architecture on` is used, or contract-side architecture integrity already exists
+  - enforceable commitments stay inside the persisted contract document under `architecture_integrity`
+- gate decision logic:
+  - `Escalate` if persisted architecture signals are `critical` and the approved contract has no `architecture_integrity`
+  - `Block` if `touched_roots_max`, `file_loc_budgets[]`, or deterministically verifiable `forbidden_path_dependencies[]` are breached
+  - keep the assessment in the proof chain through `check_refs` / hashed proof inputs
+- enforced now vs deferred:
+  - enforced now: touched-root budgets, file LOC budgets, direct local Rust dependency edges, direct local JS/TS relative imports
+  - deferred: broader language coverage and whole-repo dependency graph analysis
 
 ## Risks if left implicit
 
