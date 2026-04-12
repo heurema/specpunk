@@ -85,6 +85,7 @@ Recommended order unless a production bug forces reprioritization:
 - The first `plot -> cut -> gate` slice now also carries deterministic architecture steering without adding a fourth runtime mode.
 - `plot` should always persist `architecture-signals.json`, may persist `architecture-brief.md`, and should freeze any enforceable architecture commitments inside the contract document.
 - `gate` should write `architecture-assessment.json`, escalate when critical architecture review was required but missing from the approved contract, block on breached enforceable architecture commitments (including cheap deterministic forbidden dependency edges), and carry the assessment ref/hash into proof.
+- operators should be able to inspect the same architecture refs through existing surfaces (`punk inspect work`, contract JSON inspect, proof JSON inspect) instead of relying on transient shell output.
 - Keep this mechanism deterministic: repo scan, contract inspection, receipt/check output verification only. No council, hosted memory, or LLM-based runtime judging.
 
 ## Cross-cutting autonomy note

@@ -475,6 +475,27 @@ The persisted contract document may also carry deterministic architecture-steeri
   - optional `file_loc_budgets[]`
   - optional `forbidden_path_dependencies[]`
 
+### Architecture steering storage layout
+
+The storage/layout split must stay explicit:
+
+| Artifact | Path | Canonical or derived | Writer | Role |
+|---|---|---|---|---|
+| contract document | `.punk/contracts/<feature-id>/vN.json` | canonical | `plot` | approved/draft contract plus persisted `architecture_signals_ref` and optional `architecture_integrity` |
+| architecture signals | `.punk/contracts/<feature-id>/architecture-signals.json` | derived | `plot` | deterministic repo-scan summary for the current contract state |
+| architecture brief | `.punk/contracts/<feature-id>/architecture-brief.md` | derived | `plot` | reviewable deterministic brief for architecture-sensitive slices |
+| run receipt | `.punk/runs/<run-id>/receipt.json` | canonical | `cut` | execution truth consumed by `gate` |
+| architecture assessment | `.punk/runs/<run-id>/architecture-assessment.json` | derived | `gate` | deterministic assessment of frozen contract commitments vs receipt/check state |
+| decision object | `.punk/decisions/<decision-id>.json` | canonical | `gate` | final verdict; carries the architecture assessment ref through `check_refs` |
+| proofpack | `.punk/proofs/<decision-id>/proofpack.json` | canonical | `gate` | hash-linked proof chain; hashes the architecture assessment when present |
+
+That means there is still only one contract truth and one final verdict truth:
+
+- contract-side architecture commitments live in the persisted contract document
+- signals / brief / assessment stay derived and reviewable under `.punk/`
+- final accept/block/escalate still lives only in `DecisionObject`
+- final hash-linked chain still lives only in `Proofpack`
+
 Default v0 `ArchitectureSignals` thresholds are:
 
 - `warn_file_loc >= 600`
@@ -701,6 +722,15 @@ WorkLedgerView
   latest_autonomy_ref
   autonomy_outcome
   recovery_contract_ref
+  architecture
+    signals_ref
+    brief_ref
+    assessment_ref
+    severity
+    trigger_reasons[]
+    assessment_outcome
+    assessment_reasons[]
+    contract_integrity
   lifecycle_state
   blocked_reason
   next_action
@@ -727,6 +757,19 @@ The current bounded implementation surface is:
 `punk status` should now prefer this derived view for current work continuity fields instead of reconstructing latest state directly from raw events.
 
 This is still a derived repo-local view over existing artifacts, not a new persistence layer.
+
+Current architecture-steering inspect story should stay explicit and boring:
+
+- `punk status [id]` remains the terse lifecycle pointer (`work_id`, latest ids, next action, suggested command)
+- `punk inspect work [id]` is the stable derived work view for architecture refs:
+  - signals severity / trigger summary
+  - `signals_ref`
+  - `brief_ref`
+  - `assessment_ref`
+  - assessment outcome / summary
+  - copied contract-side `architecture_integrity`
+- `punk inspect <contract-id> --json` remains the full canonical contract view
+- `punk inspect <proof-id> --json` remains the full canonical proof-chain view
 
 ### Important rules
 

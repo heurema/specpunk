@@ -679,6 +679,34 @@ fn format_contract_architecture_summary(
     if let Some(brief_ref) = brief_ref {
         lines.push(format!("architecture brief: {brief_ref}"));
     }
+    if let Some(integrity) = persisted.get("architecture_integrity") {
+        let review_required = integrity
+            .get("review_required")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let touched_roots_max = integrity
+            .get("touched_roots_max")
+            .and_then(|value| value.as_u64())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let file_loc_budget_count = integrity
+            .get("file_loc_budgets")
+            .and_then(|value| value.as_array())
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let forbidden_dependency_count = integrity
+            .get("forbidden_path_dependencies")
+            .and_then(|value| value.as_array())
+            .map(|items| items.len())
+            .unwrap_or(0);
+        lines.push(format!(
+            "architecture integrity: review_required={} touched_roots_max={} file_loc_budgets={} forbidden_path_dependencies={}",
+            review_required,
+            touched_roots_max,
+            file_loc_budget_count,
+            forbidden_dependency_count
+        ));
+    }
     Some(lines.join("\n"))
 }
 
@@ -1811,6 +1839,7 @@ fn format_work_ledger_summary(
     let blocked_reason = ledger.blocked_reason.as_deref().unwrap_or("none");
     let next_action = ledger.next_action.as_deref().unwrap_or("none");
     let next_action_ref = ledger.next_action_ref.as_deref().unwrap_or("none");
+    let architecture = format_work_ledger_architecture(ledger.architecture.as_ref());
     let suggested_command = suggested_command_from_action(
         ledger.next_action.as_deref(),
         ledger.next_action_ref.as_deref(),
@@ -1834,7 +1863,7 @@ fn format_work_ledger_summary(
     };
 
     format!(
-        "Work: {work_id}\nProject: {project_id}\nLifecycle: {lifecycle_state}\nGoal: {goal}\nFeature: {feature_ref}\nContract: {contract}\nRun: {run}\nReceipt: {receipt}\nDecision: {decision}\nProof: {proof}\nLatest proof evidence:\n{latest_proof_evidence}\nLatest proof harness evidence:\n{latest_proof_harness_evidence}\nAutonomy: {autonomy}\nAutonomy outcome: {autonomy_outcome}\nRecovery status: {recovery_status}\nRecovery contract: {recovery_contract}\nBlocked reason: {blocked_reason}\nNext action: {next_action}\nNext action ref: {next_action_ref}\nSuggested command: {suggested_command}\nUpdated at: {updated_at}",
+        "Work: {work_id}\nProject: {project_id}\nLifecycle: {lifecycle_state}\nGoal: {goal}\nFeature: {feature_ref}\nContract: {contract}\nRun: {run}\nReceipt: {receipt}\nDecision: {decision}\nProof: {proof}\nArchitecture:\n{architecture}\nLatest proof evidence:\n{latest_proof_evidence}\nLatest proof harness evidence:\n{latest_proof_harness_evidence}\nAutonomy: {autonomy}\nAutonomy outcome: {autonomy_outcome}\nRecovery status: {recovery_status}\nRecovery contract: {recovery_contract}\nBlocked reason: {blocked_reason}\nNext action: {next_action}\nNext action ref: {next_action_ref}\nSuggested command: {suggested_command}\nUpdated at: {updated_at}",
         work_id = ledger.work_id,
         project_id = ledger.project_id,
         lifecycle_state = ledger.lifecycle_state,
@@ -1845,6 +1874,7 @@ fn format_work_ledger_summary(
         receipt = receipt,
         decision = decision,
         proof = proof,
+        architecture = architecture,
         latest_proof_evidence = latest_proof_evidence,
         latest_proof_harness_evidence = latest_proof_harness_evidence,
         autonomy = autonomy,
@@ -1856,6 +1886,49 @@ fn format_work_ledger_summary(
         next_action_ref = next_action_ref,
         suggested_command = suggested_command,
         updated_at = ledger.updated_at,
+    )
+}
+
+fn format_work_ledger_architecture(
+    architecture: Option<&punk_orch::WorkLedgerArchitectureView>,
+) -> String {
+    let Some(architecture) = architecture else {
+        return "  none".to_string();
+    };
+    let severity = architecture
+        .severity
+        .as_ref()
+        .map(architecture_severity_label)
+        .unwrap_or("none");
+    let signals = architecture.signals_ref.as_deref().unwrap_or("none");
+    let brief = architecture.brief_ref.as_deref().unwrap_or("none");
+    let assessment = architecture.assessment_ref.as_deref().unwrap_or("none");
+    let assessment_outcome = architecture
+        .assessment_outcome
+        .as_ref()
+        .map(architecture_assessment_outcome_label)
+        .unwrap_or("none");
+    let trigger_summary = summarize_architecture_reasons(&architecture.trigger_reasons);
+    let assessment_summary = summarize_architecture_reasons(&architecture.assessment_reasons);
+    let integrity = architecture
+        .contract_integrity
+        .as_ref()
+        .map(|integrity| {
+            format!(
+                "present review_required={} touched_roots_max={} file_loc_budgets={} forbidden_path_dependencies={}",
+                integrity.review_required,
+                integrity
+                    .touched_roots_max
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                integrity.file_loc_budgets.len(),
+                integrity.forbidden_path_dependencies.len(),
+            )
+        })
+        .unwrap_or_else(|| "none".to_string());
+
+    format!(
+        "  signals: {signals}\n  severity: {severity}\n  signals summary: {trigger_summary}\n  brief: {brief}\n  contract integrity: {integrity}\n  assessment: {assessment}\n  assessment outcome: {assessment_outcome}\n  assessment summary: {assessment_summary}"
     )
 }
 
@@ -2599,6 +2672,65 @@ mod tests {
     }
 
     #[test]
+    fn contract_architecture_summary_mentions_refs_and_integrity_counts() {
+        let root = temp_test_dir("contract-architecture-summary");
+        let signals_ref = ".punk/contracts/feat_1/architecture-signals.json";
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        punk_orch::write_json(
+            &root.join(signals_ref),
+            &punk_domain::ArchitectureSignals {
+                contract_id: "ct_1".into(),
+                feature_id: "feat_1".into(),
+                scope_roots: vec!["src".into()],
+                oversized_files: vec![punk_domain::ArchitectureOversizedFile {
+                    path: "src/lib.rs".into(),
+                    loc: 1300,
+                }],
+                distinct_scope_roots: 1,
+                entry_point_count: 1,
+                expected_interface_count: 1,
+                import_path_count: 0,
+                has_cleanup_obligations: false,
+                has_docs_obligations: false,
+                has_migration_sensitive_surfaces: false,
+                severity: punk_domain::ArchitectureSeverity::Critical,
+                trigger_reasons: vec!["oversized file src/lib.rs has 1300 LOC".into()],
+                thresholds: punk_domain::ArchitectureThresholds {
+                    warn_file_loc: 600,
+                    critical_file_loc: 1200,
+                    critical_scope_roots: 1,
+                    warn_expected_interfaces: 2,
+                    warn_import_paths: 5,
+                },
+                computed_at: "2026-04-12T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+
+        let persisted = serde_json::json!({
+            "architecture_signals_ref": signals_ref,
+            "architecture_integrity": {
+                "review_required": true,
+                "brief_ref": ".punk/contracts/feat_1/architecture-brief.md",
+                "touched_roots_max": 1,
+                "file_loc_budgets": [{"path": "src/lib.rs", "max_after_loc": 1200}],
+                "forbidden_path_dependencies": [{"from_glob": "src/**", "to_glob": "tests/**"}]
+            }
+        });
+
+        let rendered = format_contract_architecture_summary(&persisted, &root).unwrap();
+        assert!(rendered.contains("architecture: critical"));
+        assert!(rendered
+            .contains("architecture signals: .punk/contracts/feat_1/architecture-signals.json"));
+        assert!(
+            rendered.contains("architecture brief: .punk/contracts/feat_1/architecture-brief.md")
+        );
+        assert!(rendered.contains("architecture integrity: review_required=true touched_roots_max=1 file_loc_budgets=1 forbidden_path_dependencies=1"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn status_summary_mentions_work_lifecycle_and_next_action() {
         let snapshot = punk_orch::StatusSnapshot {
             project_id: "proj".into(),
@@ -3036,6 +3168,33 @@ mod tests {
             latest_autonomy_ref: Some(".punk/autonomy/feat_123/auto_456.json".into()),
             autonomy_outcome: Some("blocked".into()),
             recovery_contract_ref: Some(".punk/contracts/feat_789/v1.json".into()),
+            architecture: Some(punk_orch::WorkLedgerArchitectureView {
+                signals_ref: Some(".punk/contracts/feat_123/architecture-signals.json".into()),
+                brief_ref: Some(".punk/contracts/feat_123/architecture-brief.md".into()),
+                assessment_ref: Some(".punk/runs/run_456/architecture-assessment.json".into()),
+                severity: Some(punk_domain::ArchitectureSeverity::Critical),
+                trigger_reasons: vec![
+                    "oversized file src/lib.rs has 1300 LOC".into(),
+                    "slice spans multiple scope roots".into(),
+                ],
+                assessment_outcome: Some(punk_domain::ArchitectureAssessmentOutcome::Block),
+                assessment_reasons: vec!["architecture constraint failed".into()],
+                contract_integrity: Some(punk_domain::ContractArchitectureIntegrity {
+                    review_required: true,
+                    brief_ref: ".punk/contracts/feat_123/architecture-brief.md".into(),
+                    touched_roots_max: Some(1),
+                    file_loc_budgets: vec![punk_domain::ArchitectureFileLocBudget {
+                        path: "src/lib.rs".into(),
+                        max_after_loc: 1200,
+                    }],
+                    forbidden_path_dependencies: vec![
+                        punk_domain::ArchitectureForbiddenPathDependency {
+                            from_glob: "src/**".into(),
+                            to_glob: "tests/**".into(),
+                        },
+                    ],
+                }),
+            }),
             lifecycle_state: "accepted".into(),
             blocked_reason: None,
             latest_proof_command_evidence_summary: vec![
@@ -3057,6 +3216,13 @@ mod tests {
         assert!(rendered.contains("Goal: add trace export"));
         assert!(rendered.contains("Contract: .punk/contracts/feat_123/v1.json"));
         assert!(rendered.contains("Proof: .punk/proofs/dec_456/proofpack.json"));
+        assert!(rendered.contains("Architecture:"));
+        assert!(rendered.contains("signals: .punk/contracts/feat_123/architecture-signals.json"));
+        assert!(rendered.contains("severity: critical"));
+        assert!(rendered.contains("brief: .punk/contracts/feat_123/architecture-brief.md"));
+        assert!(rendered.contains("contract integrity: present review_required=true"));
+        assert!(rendered.contains("assessment: .punk/runs/run_456/architecture-assessment.json"));
+        assert!(rendered.contains("assessment outcome: block"));
         assert!(rendered.contains("Latest proof evidence:"));
         assert!(rendered.contains("- target pass: cargo test -p punk-cli"));
         assert!(rendered.contains("Latest proof harness evidence:"));
@@ -3070,6 +3236,61 @@ mod tests {
         assert!(rendered.contains("Next action: inspect_proof"));
         assert!(rendered.contains("Next action ref: proof_456"));
         assert!(rendered.contains("Suggested command: punk inspect proof_456 --json"));
+    }
+
+    #[test]
+    fn plot_architecture_examples_parse_with_documented_flags() {
+        let contract = Cli::try_parse_from([
+            "punk",
+            "plot",
+            "contract",
+            "--architecture",
+            "on",
+            "close architecture merge gap",
+        ])
+        .unwrap();
+        let refine = Cli::try_parse_from([
+            "punk",
+            "plot",
+            "refine",
+            "ct_123",
+            "keep the scope tighter",
+            "--architecture",
+            "off",
+        ])
+        .unwrap();
+
+        match contract.command {
+            Command::Plot(PlotCommand {
+                action:
+                    PlotAction::Contract {
+                        architecture,
+                        prompt,
+                        ..
+                    },
+            }) => {
+                assert_eq!(architecture, ArchitectureCliMode::On);
+                assert_eq!(prompt, "close architecture merge gap");
+            }
+            _ => panic!("expected plot contract command"),
+        }
+
+        match refine.command {
+            Command::Plot(PlotCommand {
+                action:
+                    PlotAction::Refine {
+                        contract_id,
+                        guidance,
+                        architecture,
+                        ..
+                    },
+            }) => {
+                assert_eq!(contract_id, "ct_123");
+                assert_eq!(guidance, "keep the scope tighter");
+                assert_eq!(architecture, ArchitectureCliMode::Off);
+            }
+            _ => panic!("expected plot refine command"),
+        }
     }
 
     #[test]
