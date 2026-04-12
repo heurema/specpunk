@@ -17,14 +17,14 @@ use punk_core::{
 };
 pub use punk_core::{find_object_path, read_json, relative_ref, write_json};
 use punk_domain::{
-    now_rfc3339, ArchitectureFileLocBudget, ArchitectureSeverity, ArchitectureSignals,
-    AutonomyOutcome, AutonomyRecord, Contract, ContractArchitectureIntegrity, ContractStatus,
-    DraftInput, DraftProposal, EventEnvelope, Feature, FeatureStatus, ModeId, PersistedContract,
-    Project, Receipt, ReceiptArtifacts, RefineInput, ResearchArtifact, ResearchArtifactInput,
-    ResearchInvalidationEntry, ResearchPacket, ResearchQuestion, ResearchRecord,
-    ResearchStartInput, ResearchSynthesis, ResearchSynthesisInput, Run, RunStatus, Task, TaskKind,
-    TaskStatus, VcsKind, VerificationContext, VerificationContextFileState,
-    VerificationContextIdentity,
+    now_rfc3339, ArchitectureAssessment, ArchitectureAssessmentOutcome, ArchitectureFileLocBudget,
+    ArchitectureSeverity, ArchitectureSignals, AutonomyOutcome, AutonomyRecord, Contract,
+    ContractArchitectureIntegrity, ContractStatus, DraftInput, DraftProposal, EventEnvelope,
+    Feature, FeatureStatus, ModeId, PersistedContract, Project, Receipt, ReceiptArtifacts,
+    RefineInput, ResearchArtifact, ResearchArtifactInput, ResearchInvalidationEntry,
+    ResearchPacket, ResearchQuestion, ResearchRecord, ResearchStartInput, ResearchSynthesis,
+    ResearchSynthesisInput, Run, RunStatus, Task, TaskKind, TaskStatus, VcsKind,
+    VerificationContext, VerificationContextFileState, VerificationContextIdentity,
 };
 use punk_events::EventStore;
 use punk_vcs::{current_snapshot_ref, detect_backend};
@@ -196,6 +196,26 @@ pub struct ProjectOverlay {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct WorkLedgerArchitectureView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signals_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brief_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assessment_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub severity: Option<ArchitectureSeverity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trigger_reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assessment_outcome: Option<ArchitectureAssessmentOutcome>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assessment_reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_integrity: Option<ContractArchitectureIntegrity>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkLedgerView {
     pub project_id: String,
     pub work_id: String,
@@ -209,6 +229,8 @@ pub struct WorkLedgerView {
     pub latest_autonomy_ref: Option<String>,
     pub autonomy_outcome: Option<String>,
     pub recovery_contract_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<WorkLedgerArchitectureView>,
     pub lifecycle_state: String,
     pub blocked_reason: Option<String>,
     pub latest_proof_command_evidence_summary: Vec<String>,
@@ -708,7 +730,7 @@ fn render_architecture_brief(
                 .join("\n")
         };
         let dependency_rules = if integrity.forbidden_path_dependencies.is_empty() {
-            "- none (deferred for v0 enforcement)".to_string()
+            "- none configured".to_string()
         } else {
             integrity
                 .forbidden_path_dependencies
@@ -2521,6 +2543,12 @@ impl OrchService {
             .as_ref()
             .map(|record| summarize_command_evidence(&record.proof.command_evidence))
             .unwrap_or_default();
+        let architecture = work_architecture_view(
+            &self.paths.repo_root,
+            active_contract.as_ref(),
+            latest_run.as_ref(),
+            latest_decision.as_ref(),
+        )?;
 
         Ok(WorkLedgerView {
             project_id: project.id.clone(),
@@ -2537,6 +2565,7 @@ impl OrchService {
             latest_autonomy_ref,
             autonomy_outcome,
             recovery_contract_ref,
+            architecture,
             lifecycle_state: lifecycle_state.to_string(),
             blocked_reason,
             latest_proof_command_evidence_summary,
@@ -3079,6 +3108,7 @@ fn skill_projects(content: &str) -> Vec<String> {
 #[derive(Debug)]
 struct ContractRecord {
     path: PathBuf,
+    persisted: PersistedContract,
     contract: Contract,
 }
 
@@ -3127,8 +3157,13 @@ fn work_contract_records(contracts_dir: &Path, feature_id: &str) -> Result<Vec<C
         if value.get("id").and_then(|value| value.as_str()).is_none() {
             continue;
         }
-        let contract: Contract = serde_json::from_value(value)?;
-        records.push(ContractRecord { path, contract });
+        let persisted: PersistedContract = serde_json::from_value(value)?;
+        let contract = persisted.contract.clone();
+        records.push(ContractRecord {
+            path,
+            persisted,
+            contract,
+        });
     }
     Ok(records)
 }
@@ -3557,6 +3592,84 @@ fn work_object_id_from_ref(
     } else {
         None
     }
+}
+
+fn work_architecture_view(
+    repo_root: &Path,
+    active_contract: Option<&ContractRecord>,
+    latest_run: Option<&RunRecord>,
+    latest_decision: Option<&DecisionRecord>,
+) -> Result<Option<WorkLedgerArchitectureView>> {
+    let signals_ref =
+        active_contract.and_then(|record| record.persisted.architecture_signals_ref.clone());
+    let contract_integrity =
+        active_contract.and_then(|record| record.persisted.architecture_integrity.clone());
+    let brief_ref = contract_integrity
+        .as_ref()
+        .map(|integrity| integrity.brief_ref.clone());
+    let signals = signals_ref
+        .as_ref()
+        .map(|reference| read_json::<ArchitectureSignals>(&repo_root.join(reference)))
+        .transpose()?;
+    let assessment_ref = work_architecture_assessment_ref(repo_root, latest_run, latest_decision)?;
+    let assessment = assessment_ref
+        .as_ref()
+        .map(|reference| read_json::<ArchitectureAssessment>(&repo_root.join(reference)))
+        .transpose()?;
+
+    if signals_ref.is_none()
+        && brief_ref.is_none()
+        && assessment_ref.is_none()
+        && contract_integrity.is_none()
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(WorkLedgerArchitectureView {
+        signals_ref,
+        brief_ref,
+        assessment_ref,
+        severity: signals.as_ref().map(|value| value.severity.clone()),
+        trigger_reasons: signals
+            .as_ref()
+            .map(|value| value.trigger_reasons.clone())
+            .unwrap_or_default(),
+        assessment_outcome: assessment.as_ref().map(|value| value.outcome.clone()),
+        assessment_reasons: assessment
+            .as_ref()
+            .map(|value| value.reasons.clone())
+            .unwrap_or_default(),
+        contract_integrity,
+    }))
+}
+
+fn work_architecture_assessment_ref(
+    repo_root: &Path,
+    latest_run: Option<&RunRecord>,
+    latest_decision: Option<&DecisionRecord>,
+) -> Result<Option<String>> {
+    if let Some(decision) = latest_decision {
+        if let Some(reference) = decision
+            .decision
+            .check_refs
+            .iter()
+            .find(|reference| reference.ends_with("/architecture-assessment.json"))
+        {
+            return Ok(Some(reference.clone()));
+        }
+    }
+
+    let Some(run_record) = latest_run else {
+        return Ok(None);
+    };
+    let Some(run_dir) = run_record.run_path.parent() else {
+        return Ok(None);
+    };
+    let assessment_path = run_dir.join("architecture-assessment.json");
+    if !assessment_path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(relative_ref(repo_root, &assessment_path)?))
 }
 
 fn summarize_decision_basis(basis: &[String]) -> String {
@@ -12533,6 +12646,149 @@ fn ok() {}
             status_for_project.work_id.as_deref(),
             Some(ledger.work_id.as_str())
         );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+    }
+
+    #[test]
+    fn inspect_work_ledger_surfaces_architecture_artifacts_and_integrity() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-work-ledger-architecture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-work-ledger-architecture-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let oversized = std::iter::repeat("pub fn critical() {}\n")
+            .take(1300)
+            .collect::<String>();
+        fs::write(root.join("src/lib.rs"), oversized).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let project = service.bootstrap_project().unwrap();
+        let proposal = DraftProposal {
+            title: "architecture steering".into(),
+            summary: "critical hotspot".into(),
+            entry_points: vec!["src/lib.rs".into()],
+            import_paths: vec!["src/lib.rs".into()],
+            expected_interfaces: vec!["architecture signals".into()],
+            behavior_requirements: vec!["keep the hotspot bounded".into()],
+            allowed_scope: vec!["src/lib.rs".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "medium".into(),
+        };
+
+        let (_feature, contract) = service
+            .persist_draft_contract(
+                &project,
+                "implement architecture steering",
+                &proposal,
+                ArchitectureMode::Auto,
+            )
+            .unwrap();
+        let approved = service.approve_contract(&contract.id).unwrap();
+        let persisted = service.inspect(&approved.id).unwrap();
+        let signals_ref = persisted["architecture_signals_ref"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let brief_ref = persisted["architecture_integrity"]["brief_ref"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (run, _receipt) = service.cut_run(&FakeExecutor, &approved.id).unwrap();
+        let assessment_ref = format!(".punk/runs/{}/architecture-assessment.json", run.id);
+        let assessment = ArchitectureAssessment {
+            run_id: run.id.clone(),
+            contract_id: approved.id.clone(),
+            signals_ref: Some(signals_ref.clone()),
+            brief_ref: Some(brief_ref.clone()),
+            severity: ArchitectureSeverity::Critical,
+            outcome: ArchitectureAssessmentOutcome::Pass,
+            review_required: true,
+            contract_integrity_present: true,
+            touched_root_count: 1,
+            touched_roots: vec!["src".into()],
+            file_loc_results: Vec::new(),
+            forbidden_path_dependency_results: Vec::new(),
+            reason_codes: vec!["architecture_constraints_satisfied".into()],
+            reasons: vec!["architecture constraints satisfied".into()],
+            assessed_at: now_rfc3339(),
+        };
+        write_json(&root.join(&assessment_ref), &assessment).unwrap();
+
+        let ledger = service.inspect_work_ledger(Some(&run.feature_id)).unwrap();
+        let architecture = ledger
+            .architecture
+            .expect("architecture summary should be present");
+        assert_eq!(
+            architecture.signals_ref.as_deref(),
+            Some(signals_ref.as_str())
+        );
+        assert_eq!(architecture.brief_ref.as_deref(), Some(brief_ref.as_str()));
+        assert_eq!(
+            architecture.assessment_ref.as_deref(),
+            Some(assessment_ref.as_str())
+        );
+        assert_eq!(architecture.severity, Some(ArchitectureSeverity::Critical));
+        assert_eq!(
+            architecture.assessment_outcome,
+            Some(ArchitectureAssessmentOutcome::Pass)
+        );
+        assert!(architecture
+            .trigger_reasons
+            .iter()
+            .any(|reason| reason.contains("src/lib.rs")));
+        let integrity = architecture
+            .contract_integrity
+            .expect("contract integrity should be surfaced");
+        assert!(integrity.review_required);
+        assert_eq!(integrity.brief_ref, brief_ref);
+        assert_eq!(integrity.file_loc_budgets.len(), 1);
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);

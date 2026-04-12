@@ -177,6 +177,19 @@ Current work-ledger inspect surface:
 - `punk inspect work <id>`
 - `punk inspect work <id> --json`
 
+Architecture steering should stay visible through these same existing read surfaces:
+
+- `punk status [id]` remains the terse lifecycle pointer
+- `punk inspect work [id]` should surface the derived architecture refs and summaries for the current work item:
+  - `signals_ref`
+  - `brief_ref`
+  - `assessment_ref`
+  - signal severity / trigger summary
+  - assessment outcome / summary
+  - copied contract-side `architecture_integrity`
+- `punk inspect <contract-id> --json` remains the canonical contract view, including persisted `architecture_signals_ref` and `architecture_integrity`
+- `punk inspect <proof-id> --json` remains the final proof-chain view, including the architecture assessment ref/hash when present
+
 Current proof inspect surface:
 
 - `punk inspect proof_<id> --json`
@@ -285,6 +298,8 @@ Current human-facing inspect expectations:
 - `punk inspect project` should show the persisted overlay packet ref, project-skill resolution mode, active project skill refs, and any ambient fallback refs when fallback mode is active
 - `punk inspect work` should show a concise latest-proof evidence summary when a latest proof exists
 - `punk inspect work` may also show a concise latest-proof harness summary derived from the latest proof's declared and executed harness evidence
+- `punk inspect work` should also show architecture signals / brief / assessment refs plus a concise architecture summary when those derived artifacts exist
+- `punk inspect work --json` should also expose a copied `architecture.contract_integrity` object so operators can inspect the frozen architecture commitments without first opening the raw contract JSON
 - declared harness evidence in human summaries should preserve any declared `source_ref` when the proof carries it
 - `punk inspect proof_<id>` should render a concise human summary for typed `command` evidence, `declared_harness_evidence`, and executed `harness_evidence` without requiring raw JSON reading
 - `punk inspect research_<id>` should render the frozen question, explicit budget, repo snapshot, stop rules, and the obvious next inspect command without requiring raw JSON reading
@@ -313,6 +328,7 @@ Current JSON artifact expectations:
 Current status behavior:
 
 - `punk status` now prefers `WorkLedgerView` for current work continuity fields
+- `punk status` should stay terse; for architecture-specific refs and summaries it should point operators toward `punk inspect work [id]` / contract JSON / proof JSON instead of becoming a second full inspect surface
 - recovery-oriented status should surface durable autonomy-linked fields such as `autonomy_outcome`, `recovery_contract_ref`, and a shell-level `suggested_command`
 - latest work/lifecycle/next-action data should come from the derived work view, not direct raw-event scanning
 - when choosing the implicit current work item, `punk status` / `punk inspect work` should prefer the feature with the latest ledger activity (`run` / `receipt` / `decision` / `proof` / autonomy record), not merely the most recently drafted feature timestamp
@@ -551,6 +567,11 @@ Writes:
 Architecture steering notes:
 
 - `plot contract` always writes a deterministic `architecture-signals.json` artifact next to the contract
+- one feature/run layout should stay explicit:
+  - canonical contract document: `.punk/contracts/<feature-id>/vN.json`
+  - derived signals artifact: `.punk/contracts/<feature-id>/architecture-signals.json`
+  - derived brief artifact: `.punk/contracts/<feature-id>/architecture-brief.md`
+  - derived gate assessment artifact: `.punk/runs/<run-id>/architecture-assessment.json`
 - default thresholds live in code and docs:
   - `warn_file_loc >= 600`
   - `critical_file_loc >= 1200`
@@ -688,6 +709,7 @@ Behavior notes:
   - approved contract document
   - persisted `architecture-signals.json`
   - receipt / verification context / trusted check outputs
+- `gate run` must write `.punk/runs/<run-id>/architecture-assessment.json` before serializing the final decision; that assessment stays derived while `DecisionObject` and `Proofpack` remain canonical
 - if architecture signals are `critical` but the approved contract document has no `architecture_integrity` section, `gate run` must return `Escalate` and record an explicit machine-readable reason in `.punk/runs/<run-id>/architecture-assessment.json`
 - if enforced architecture constraints are present and any are breached (for example `touched_roots_max` or `file_loc_budgets[]`), `gate run` must return `Block`
 - if enforced `forbidden_path_dependencies[]` are present, `gate run` must deterministically scan touched matching files for direct local dependency edges and return `Block` on a violated edge

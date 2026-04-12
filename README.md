@@ -209,9 +209,14 @@ punk plot refine <contract-id> "<guidance>" --architecture on
 
 Current v0 architecture steering stays inside the same `plot -> cut -> gate` slice:
 
-- `plot` always writes `.punk/contracts/<feature-id>/architecture-signals.json`
-- `plot` writes `.punk/contracts/<feature-id>/architecture-brief.md` and persists contract architecture integrity commitments when signals are critical, architecture mode is forced on, or the draft already carries architecture integrity constraints
-- `gate` writes `.punk/runs/<run-id>/architecture-assessment.json`, escalates if critical architecture review was required but missing from the approved contract, blocks on breached architecture constraints (including deterministic forbidden dependency edges when they are resolvable from touched files), and carries that assessment ref/hash into proof through `check_refs` / `hashes`
+- `plot contract` / `plot refine` / `plot approve` always refresh the derived `.punk/contracts/<feature-id>/architecture-signals.json` artifact from deterministic repo scan + current contract state
+- `plot` writes the derived `.punk/contracts/<feature-id>/architecture-brief.md` artifact when signals are `critical`, `--architecture on` is used, or the persisted contract already carries architecture integrity constraints
+- the approved contract document remains canonical and may persist:
+  - `architecture_signals_ref`
+  - optional `architecture_integrity { review_required, brief_ref, touched_roots_max?, file_loc_budgets[], forbidden_path_dependencies[] }`
+- `gate` reads only frozen persisted inputs, writes the derived `.punk/runs/<run-id>/architecture-assessment.json` artifact, escalates if critical review was required but missing from the approved contract, blocks on breached enforced constraints, and carries the assessment ref/hash into proof through `check_refs` / `hashes`
+- enforced now: touched-root budgets, file LOC budgets, deterministic Rust crate/module edges, deterministic JS/TS relative-import edges
+- deferred in v0: broader language coverage and whole-repo dependency graph analysis
 
 If the workspace cannot auto-initialize Git, `punk start` should stop early and point back to:
 
@@ -224,8 +229,16 @@ Read-only inspection:
 
 ```bash
 punk status [id]
-punk inspect <id> --json
+punk inspect work [id]
+punk inspect work [id] --json
+punk inspect <contract-id> --json
+punk inspect <proof-id> --json
 ```
+
+- `punk status [id]` is the concise lifecycle pointer: current work id, next action, suggested command, latest contract/run/decision ids
+- `punk inspect work [id]` is the stable human/json view for derived architecture refs: signals summary, brief ref, assessment ref/outcome, and a copied contract-side architecture integrity summary
+- `punk inspect <contract-id> --json` is the source for the full persisted contract shape, including `architecture_signals_ref` and the canonical `architecture_integrity` section when present
+- `punk inspect <proof-id> --json` is the source for the final proof chain, including the hashed architecture assessment ref when present
 
 What is explicitly out of scope for v0:
 - daemon

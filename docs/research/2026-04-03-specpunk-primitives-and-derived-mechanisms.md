@@ -101,6 +101,11 @@ If something can be recomposed from primitives without changing truth, it is not
   - `plot` always refreshes `architecture-signals.json`
   - `plot` writes `architecture-brief.md` when signals are `critical`, `--architecture on` is used, or contract-side architecture integrity already exists
   - enforceable commitments stay inside the persisted contract document under `architecture_integrity`
+- operator-visible inspection:
+  - `punk plot ...` human output summarizes architecture severity plus signals/brief refs when present
+  - `punk gate run ...` human output summarizes architecture outcome plus assessment ref when present
+  - `punk inspect work [id]` surfaces derived signals / brief / assessment refs and a copied `architecture_integrity` summary
+  - `punk inspect <contract-id> --json` remains the canonical contract view for the full persisted `architecture_integrity` shape
 - gate decision logic:
   - `Escalate` if persisted architecture signals are `critical` and the approved contract has no `architecture_integrity`
   - `Block` if `touched_roots_max`, `file_loc_budgets[]`, or deterministically verifiable `forbidden_path_dependencies[]` are breached
