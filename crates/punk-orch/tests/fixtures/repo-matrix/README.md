@@ -1,0 +1,10 @@
+# Repo fixture matrix pilot
+
+| Fixture id | Repo class | Failure family it protects | Tests |
+| --- | --- | --- | --- |
+| `greenfield-rust-scaffold-doc-noise` | active v0 greenfield Rust scaffold repo | Timeout fallback and scope selection must stay on scaffold anchors (`Cargo.toml`, `crates`, `tests`) instead of drifting into bootstrap/docs/archive noise. | `draft_contract_timeout_fallback_prefers_greenfield_rust_scaffold_scope_over_docs` |
+| `nested-node-backend-ui-generated-noise` | active v0 nested Node backend repo with noisy UI/generated surfaces present | Backend/service/session/API targeting must prefer backend anchors over `.astro`, `dist`, `.astro/`, and `packs/` noise. | `draft_contract_prefers_backend_service_anchors_over_astro_pages_for_nested_node_repo` |
+| `cut-run-blocked-file-slice-dirty-entrypoint` | active v0 Rust package with a pre-run dirty bounded entry point | Failed bounded execution must preserve the dirty entry-point contents and blocked failure truth instead of upgrading the slice to already-satisfied. | `cut_run_does_not_upgrade_blocked_file_slice_to_already_satisfied` |
+| `cut-run-cargo-lock-prune-workspace` | active v0 Rust workspace root with an out-of-scope generated side effect | Generated `Cargo.lock` written during execution must be pruned when it is outside the approved bounded scope. | `cut_run_prunes_generated_cargo_lock_when_out_of_scope` |
+| `cut-run-patch-apply-zero-byte-rollback` | active v0 Rust package with bounded patch/apply entry points | Previously non-empty entry-point files that become zero-byte during a failed patch/apply attempt must be restored to their pre-run contents. | `cut_run_patch_apply_zero_byte_failure_restores_entry_point_contents` |
+| `cut-run-patch-apply-late-failure-rollback` | active v0 Rust package with a tiny multi-file patch/apply slice | Earlier bounded edits must roll back to pre-run snapshots when a later patch/apply or validation step fails. | `cut_run_patch_apply_late_failure_rolls_back_pre_run_snapshots` |

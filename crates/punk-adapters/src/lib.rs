@@ -8553,6 +8553,108 @@ mod tests {
     }
 
     #[test]
+    fn patch_apply_executor_uses_effective_contract_for_directory_scope_symbol_checks() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-patch-effective-symbol-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "use std::collections::BTreeMap;\nuse std::path::Path;\n\nfn validate_toml_surface_dir(root: &Path) {\n    let _ = root;\n}\n\nfn parse_project_toml(contents: &str) -> Result<BTreeMap<String, String>, String> {\n    let _ = contents;\n    Ok(BTreeMap::new())\n}\n",
+        )
+        .unwrap();
+        let fake_bin = root.join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let fake_codex = fake_bin.join("codex");
+        fs::write(
+            &fake_codex,
+            "#!/bin/sh\nprintf '%s\n' '*** Begin Patch' '*** Update File: src/lib.rs' '@@' ' fn validate_toml_surface_dir(root: &Path) {' '     let _ = root;' ' }' '+' '+struct TargetInstanceConfig;' '+' '+' '+fn load_target_instances(root: &Path) {' '+' '+    let _ = parse_project_toml(\"target\");' '+' '+    let _ = root;' '+' '+}' '*** End Patch'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&fake_codex).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_codex, perms).unwrap();
+        }
+
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            std::env::join_paths(
+                [fake_bin.clone()]
+                    .into_iter()
+                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
+            )
+            .unwrap(),
+        );
+
+        let contract = Contract {
+            id: "ct_patch_symbols_effective".into(),
+            feature_id: "feat_patch_symbols_effective".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Private validate refactor only. Must add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path). Use parse_project_toml for existing target TOML loading. Keep behavior unchanged.".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "Private struct TargetInstanceConfig.".into(),
+                "Private function load_target_instances(root: &Path).".into(),
+            ],
+            behavior_requirements: vec![
+                "Add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path).".into(),
+                "Use parse_project_toml for existing target TOML loading.".into(),
+            ],
+            allowed_scope: vec!["src".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        let pid_path = root.join("executor.json");
+
+        let executor = CodexCliExecutor::default();
+        let output = executor
+            .execute_contract(ExecuteInput {
+                repo_root: root.clone(),
+                contract,
+                stdout_path,
+                stderr_path,
+                executor_pid_path: pid_path,
+            })
+            .unwrap();
+
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+
+        assert!(output.success, "{}", output.summary);
+        assert!(output.summary.contains(SUCCESSFUL_EXECUTION_SENTINEL));
+        let updated = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(updated.contains("TargetInstanceConfig"));
+        assert!(updated.contains("load_target_instances"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn patch_apply_retry_feedback_includes_summary_and_recent_logs() {
         let root = std::env::temp_dir().join(format!(
             "punk-adapters-patch-retry-feedback-{}-{}",
