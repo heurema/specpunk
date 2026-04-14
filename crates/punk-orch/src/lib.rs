@@ -7492,15 +7492,33 @@ fn extract_prompt_excluded_scope_prefixes(prompt: &str) -> Vec<String> {
 }
 
 fn normalize_prompt_scope_token(token: &str) -> Option<String> {
-    let mut trimmed = token
-        .trim_matches(|ch: char| {
+    let token = token
+        .trim_start_matches(|ch: char| {
             matches!(
                 ch,
-                ',' | ';' | ':' | '.' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | '`'
+                ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | '`'
             )
         })
-        .trim()
-        .to_string();
+        .trim_end_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | ';'
+                    | ':'
+                    | '.'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '"'
+                    | '\''
+                    | '`'
+            )
+        });
+    let mut trimmed = token.trim().to_string();
     if trimmed.is_empty() {
         return None;
     }
@@ -14016,6 +14034,23 @@ fn ok() {}
         assert!(excluded.contains(&"src/legacy.rs".to_string()));
         assert!(excluded.contains(&"tests/cleanup.rs".to_string()));
         assert!(!excluded.contains(&"src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn extract_prompt_excluded_scope_prefixes_preserves_hidden_path_prefixes() {
+        let prompt = "Edit only crates/pubpunk-core/src/lib.rs. Do not modify .pubpunk/targets or .punk/runs. Keep cargo test --workspace green.";
+        let excluded = extract_prompt_excluded_scope_prefixes(prompt);
+
+        assert!(excluded.contains(&".pubpunk/targets".to_string()));
+        assert!(excluded.contains(&".punk/runs".to_string()));
+        assert!(path_matches_excluded_prefixes(
+            ".pubpunk/targets/telegram-en.toml",
+            &excluded
+        ));
+        assert!(path_matches_excluded_prefixes(
+            ".punk/runs/run_20260414082049930/receipt.json",
+            &excluded
+        ));
     }
 
     #[test]

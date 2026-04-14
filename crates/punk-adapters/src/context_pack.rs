@@ -1226,7 +1226,7 @@ fn forbidden_contract_symbol_mentions(contract: &Contract) -> Vec<String> {
 
 fn contract_surface_forbidden_symbol_clause(surface: &str) -> Option<&str> {
     let lower = surface.to_ascii_lowercase();
-    [
+    let (idx, needle_len) = [
         "do not touch",
         "do not modify",
         "do not edit",
@@ -1240,9 +1240,61 @@ fn contract_surface_forbidden_symbol_clause(surface: &str) -> Option<&str> {
         "without modifying",
     ]
     .iter()
-    .filter_map(|needle| lower.find(needle))
-    .min()
-    .and_then(|idx| surface.get(idx..))
+    .filter_map(|needle| lower.find(needle).map(|idx| (idx, needle.len())))
+    .min_by_key(|(idx, _)| *idx)?;
+    let excluded_tail = surface.get(idx + needle_len..)?;
+    let clause_end = forbidden_clause_end_offset(excluded_tail);
+    surface.get(idx..idx + needle_len + clause_end)
+}
+
+fn forbidden_clause_end_offset(text: &str) -> usize {
+    let mut chars = text.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\n' | ';' => return idx + ch.len_utf8(),
+            ',' => {
+                let tail = text[idx + ch.len_utf8()..]
+                    .trim_start()
+                    .to_ascii_lowercase();
+                if forbidden_clause_stops_before_tail(&tail) {
+                    return idx + ch.len_utf8();
+                }
+            }
+            '.' | '!' | '?' => {
+                let next = chars.peek().map(|(_, next)| *next);
+                if next.is_none_or(|next| next.is_whitespace()) {
+                    return idx + ch.len_utf8();
+                }
+            }
+            _ => {}
+        }
+    }
+    text.len()
+}
+
+fn forbidden_clause_stops_before_tail(tail: &str) -> bool {
+    [
+        "add ",
+        "keep ",
+        "use ",
+        "reuse ",
+        "implement ",
+        "create ",
+        "replace ",
+        "preserve ",
+        "retain ",
+        "edit ",
+        "change ",
+        "scan ",
+        "load ",
+        "return ",
+        "let ",
+        "must ",
+        "then ",
+        "but ",
+    ]
+    .iter()
+    .any(|marker| tail.starts_with(marker))
 }
 
 fn collect_explicit_symbol_mentions(surface: &str, symbols: &mut Vec<String>) {
@@ -2615,6 +2667,32 @@ fn parse_project_toml_value(value: &str) -> Result<String, ()> {
             .targets
             .iter()
             .any(|target| target.symbol.contains("validate_report")));
+    }
+
+    #[test]
+    fn forbidden_contract_symbol_mentions_stop_before_positive_tail() {
+        let contract = Contract {
+            id: "ct_forbidden_positive_tail".into(),
+            feature_id: "feat_forbidden_positive_tail".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source:
+                "Without modifying validate_report, add load_target_instances(root: &Path).".into(),
+            entry_points: vec!["src/lib.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec![],
+            behavior_requirements: vec![],
+            allowed_scope: vec!["src/lib.rs".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let forbidden = forbidden_contract_symbol_mentions(&contract);
+
+        assert_eq!(forbidden, vec!["validate_report".to_string()]);
     }
 
     #[test]
