@@ -37,6 +37,7 @@ use context_pack::{
     ContextPlanTarget, EntryPointExcerptGuard,
 };
 use punk_domain::{Contract, DraftInput, DraftProposal, FrozenCapabilityResolution, RefineInput};
+use std::collections::BTreeSet;
 const BLOCKED_EXECUTION_SENTINEL: &str = "PUNK_EXECUTION_BLOCKED:";
 const SUCCESSFUL_EXECUTION_SENTINEL: &str = "PUNK_EXECUTION_COMPLETE:";
 
@@ -1147,6 +1148,27 @@ impl CodexCliExecutor {
                 }
             };
 
+            let missing_symbols =
+                missing_required_contract_symbols(&input.repo_root, &input.contract)?;
+            if !missing_symbols.is_empty() {
+                let output = maybe_rollback_failed_patch_lane_output(
+                    &input.repo_root,
+                    &patch_entry_point_snapshots,
+                    patched_worktree,
+                    ExecuteOutput {
+                        success: false,
+                        summary: format!(
+                            "patch/apply lane rejected semantically off-target success: missing explicit contract symbols after checks: {}",
+                            missing_symbols.join(", ")
+                        ),
+                        checks_run: Vec::new(),
+                        cost_usd: None,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    },
+                )?;
+                return Ok(output).and_then(finalize_output);
+            }
+
             return Ok(ExecuteOutput {
                 success: true,
                 summary: format!(
@@ -1729,6 +1751,188 @@ fn read_source_snippet_around_line(
         .collect::<Vec<_>>()
         .join("\n");
     Ok(format!("```rust\n{}\n```", snippet))
+}
+
+fn missing_required_contract_symbols(repo_root: &Path, contract: &Contract) -> Result<Vec<String>> {
+    let required = required_contract_symbols(contract);
+    if required.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut surfaces = Vec::new();
+    let mut seen_paths = BTreeSet::new();
+    for path in contract
+        .entry_points
+        .iter()
+        .chain(contract.allowed_scope.iter())
+    {
+        if !seen_paths.insert(path.clone()) {
+            continue;
+        }
+        let full_path = repo_root.join(path);
+        if !full_path.is_file() {
+            continue;
+        }
+        match fs::read_to_string(&full_path) {
+            Ok(source) => surfaces.push(source),
+            Err(_) => continue,
+        }
+    }
+
+    Ok(required
+        .into_iter()
+        .filter(|symbol| {
+            !surfaces
+                .iter()
+                .any(|source| source_contains_contract_symbol(source, symbol))
+        })
+        .collect())
+}
+
+fn required_contract_symbols(contract: &Contract) -> Vec<String> {
+    let mut symbols = Vec::new();
+    for surface in contract.expected_interfaces.iter().map(String::as_str) {
+        collect_required_contract_symbols(surface, &mut symbols);
+    }
+    for surface in std::iter::once(contract.prompt_source.as_str())
+        .chain(contract.behavior_requirements.iter().map(String::as_str))
+    {
+        let lower = surface.to_ascii_lowercase();
+        if contract_surface_forbids_symbol_additions(&lower) {
+            continue;
+        }
+        if contract_surface_might_require_symbol(&lower) {
+            collect_required_contract_symbols(surface, &mut symbols);
+        }
+    }
+    symbols
+}
+
+fn contract_surface_forbids_symbol_additions(surface_lower: &str) -> bool {
+    [
+        "do not touch",
+        "do not modify",
+        "do not edit",
+        "do not change",
+        "don't modify",
+        "must not touch",
+        "must not modify",
+        "must not edit",
+        "must not change",
+        "without touching",
+        "without modifying",
+    ]
+    .iter()
+    .any(|needle| surface_lower.contains(needle))
+}
+
+fn contract_surface_might_require_symbol(surface_lower: &str) -> bool {
+    [
+        "add ",
+        "must add",
+        "introduce",
+        "create ",
+        "implement ",
+        "use ",
+        "reuse ",
+        "symbol",
+        "struct",
+        "function",
+        "method",
+        "type",
+        "trait",
+        "fn ",
+    ]
+    .iter()
+    .any(|needle| surface_lower.contains(needle))
+}
+
+fn collect_required_contract_symbols(surface: &str, symbols: &mut Vec<String>) {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in surface.chars().chain(std::iter::once(' ')) {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch);
+            continue;
+        }
+        if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+
+    let mut previous: Option<String> = None;
+    for token in tokens {
+        if required_contract_symbol_candidate(&token, previous.as_deref())
+            && !symbols.iter().any(|existing| existing == &token)
+        {
+            symbols.push(token.clone());
+        }
+        previous = Some(token.to_ascii_lowercase());
+    }
+}
+
+fn required_contract_symbol_candidate(token: &str, previous: Option<&str>) -> bool {
+    let lowered = token.to_ascii_lowercase();
+    if required_contract_symbol_keyword(&lowered) {
+        return false;
+    }
+    if token.len() >= 4 && token.contains('_') {
+        return true;
+    }
+    if token_has_internal_uppercase(token) {
+        return true;
+    }
+    previous.is_some_and(|prev| required_contract_symbol_keyword(prev) && token.len() >= 3)
+}
+
+fn token_has_internal_uppercase(token: &str) -> bool {
+    let mut chars = token.chars();
+    let _ = chars.next();
+    chars.any(|ch| ch.is_ascii_uppercase()) && token.chars().any(|ch| ch.is_ascii_lowercase())
+}
+
+fn required_contract_symbol_keyword(token: &str) -> bool {
+    matches!(
+        token,
+        "fn" | "function"
+            | "method"
+            | "struct"
+            | "enum"
+            | "type"
+            | "trait"
+            | "symbol"
+            | "symbols"
+            | "interface"
+            | "interfaces"
+    )
+}
+
+fn source_contains_contract_symbol(source: &str, symbol: &str) -> bool {
+    source
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| !line.starts_with("//"))
+        .any(|line| line_contains_symbol_token(line, symbol))
+}
+
+fn line_contains_symbol_token(line: &str, symbol: &str) -> bool {
+    let mut start = 0usize;
+    while let Some(offset) = line[start..].find(symbol) {
+        let absolute = start + offset;
+        let before = if absolute == 0 {
+            None
+        } else {
+            line[..absolute].chars().next_back()
+        };
+        let after = line[absolute + symbol.len()..].chars().next();
+        let before_ok = before.is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+        let after_ok = after.is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+        if before_ok && after_ok {
+            return true;
+        }
+        start = absolute + symbol.len();
+    }
+    false
 }
 
 fn build_patch_plan_prompt(contract: &Contract, context_pack: &ContextPack) -> String {
@@ -8166,6 +8370,186 @@ mod tests {
                 "PUNK_EXECUTION_BLOCKED: waiting on missing interface details".to_string()
             )
         );
+    }
+
+    #[test]
+    fn required_contract_symbols_capture_private_loader_symbols() {
+        let contract = Contract {
+            id: "ct_symbols".into(),
+            feature_id: "feat_symbols".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Edit only src/lib.rs. Private refactor only. Must add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path). Use parse_project_toml for existing target TOML loading. Do not touch validate_report.".into(),
+            entry_points: vec!["src/lib.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "Private struct TargetInstanceConfig.".into(),
+                "Private function load_target_instances(root: &Path).".into(),
+            ],
+            behavior_requirements: vec![
+                "Add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path).".into(),
+                "Use parse_project_toml for existing target TOML loading.".into(),
+            ],
+            allowed_scope: vec!["src/lib.rs".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let symbols = required_contract_symbols(&contract);
+
+        assert!(symbols
+            .iter()
+            .any(|symbol| symbol == "TargetInstanceConfig"));
+        assert!(symbols
+            .iter()
+            .any(|symbol| symbol == "load_target_instances"));
+        assert!(symbols.iter().any(|symbol| symbol == "parse_project_toml"));
+        assert!(!symbols.iter().any(|symbol| symbol == "validate_report"));
+    }
+
+    #[test]
+    fn required_contract_symbols_ignore_do_not_modify_validate_report() {
+        let contract = Contract {
+            id: "ct_symbols_modify".into(),
+            feature_id: "feat_symbols_modify".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Edit only src/lib.rs. Private refactor only. Must add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path). Use parse_project_toml for existing target TOML loading. Do not modify validate_report.".into(),
+            entry_points: vec!["src/lib.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "Private struct TargetInstanceConfig.".into(),
+                "Private function load_target_instances(root: &Path).".into(),
+            ],
+            behavior_requirements: vec![
+                "Add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path).".into(),
+                "Use parse_project_toml for existing target TOML loading.".into(),
+            ],
+            allowed_scope: vec!["src/lib.rs".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let symbols = required_contract_symbols(&contract);
+
+        assert!(symbols
+            .iter()
+            .any(|symbol| symbol == "TargetInstanceConfig"));
+        assert!(symbols
+            .iter()
+            .any(|symbol| symbol == "load_target_instances"));
+        assert!(symbols.iter().any(|symbol| symbol == "parse_project_toml"));
+        assert!(!symbols.iter().any(|symbol| symbol == "validate_report"));
+    }
+
+    #[test]
+    fn patch_apply_executor_rejects_success_when_explicit_symbols_are_missing() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-patch-explicit-symbol-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "use std::collections::BTreeMap;\nuse std::path::Path;\n\npub fn validate_report() {}\n\nfn extend_toml_surface_issues(root: &Path) {\n    validate_toml_surface_dir(root);\n}\n\nfn validate_toml_surface_dir(root: &Path) {\n    let _ = root;\n}\n\nfn parse_project_toml(contents: &str) -> Result<BTreeMap<String, String>, String> {\n    let _ = contents;\n    Ok(BTreeMap::new())\n}\n",
+        )
+        .unwrap();
+        let fake_bin = root.join("bin");
+        fs::create_dir_all(&fake_bin).unwrap();
+        let fake_codex = fake_bin.join("codex");
+        fs::write(
+            &fake_codex,
+            "#!/bin/sh\nprintf '%s\n' '*** Begin Patch' '*** Update File: src/lib.rs' '@@' ' pub fn validate_report() {}' '+' '+fn push_missing_directory_issues() {}' '*** End Patch'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&fake_codex).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_codex, perms).unwrap();
+        }
+
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var(
+            "PATH",
+            std::env::join_paths(
+                [fake_bin.clone()]
+                    .into_iter()
+                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
+            )
+            .unwrap(),
+        );
+
+        let contract = Contract {
+            id: "ct_patch_symbols".into(),
+            feature_id: "feat_patch_symbols".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Edit only src/lib.rs. Private refactor only. Must add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path). Use parse_project_toml for existing target TOML loading. Reuse this only inside extend_toml_surface_issues/validate_toml_surface_dir. Do not touch validate_report.".into(),
+            entry_points: vec!["src/lib.rs".into()],
+            import_paths: vec!["src/lib.rs".into()],
+            expected_interfaces: vec![
+                "Private struct TargetInstanceConfig.".into(),
+                "Private function load_target_instances(root: &Path).".into(),
+            ],
+            behavior_requirements: vec![
+                "Add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path).".into(),
+                "Use parse_project_toml for existing target TOML loading.".into(),
+            ],
+            allowed_scope: vec!["src/lib.rs".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        let pid_path = root.join("executor.json");
+
+        let executor = CodexCliExecutor::default();
+        let output = executor
+            .execute_contract(ExecuteInput {
+                repo_root: root.clone(),
+                contract,
+                stdout_path,
+                stderr_path,
+                executor_pid_path: pid_path,
+            })
+            .unwrap();
+
+        if let Some(path) = old_path {
+            std::env::set_var("PATH", path);
+        } else {
+            std::env::remove_var("PATH");
+        }
+
+        assert!(!output.success);
+        assert!(
+            output
+                .summary
+                .contains("missing explicit contract symbols after checks"),
+            "{}",
+            output.summary
+        );
+        assert!(output.summary.contains("TargetInstanceConfig"));
+        assert!(output.summary.contains("load_target_instances"));
+        let restored = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(!restored.contains("push_missing_directory_issues"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
