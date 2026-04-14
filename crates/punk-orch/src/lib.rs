@@ -5757,20 +5757,46 @@ fn prompt_positive_intent_text(prompt: &str) -> String {
 
     let mut parts = Vec::new();
     for clause in prompt.split(['\n', ';']) {
-        let lowered = clause.to_ascii_lowercase();
-        let truncate_at = EXCLUSION_MARKERS
-            .iter()
-            .filter_map(|marker| lowered.find(marker))
-            .min();
-        let kept = match truncate_at {
-            Some(idx) => clause[..idx].trim(),
-            None => clause.trim(),
-        };
-        if !kept.is_empty() {
-            parts.push(kept.to_string());
+        let mut remaining = clause.trim();
+        while !remaining.is_empty() {
+            let lowered = remaining.to_ascii_lowercase();
+            let Some((marker_idx, marker_len)) = EXCLUSION_MARKERS
+                .iter()
+                .filter_map(|marker| lowered.find(marker).map(|idx| (idx, marker.len())))
+                .min_by_key(|(idx, _)| *idx)
+            else {
+                parts.push(remaining.to_string());
+                break;
+            };
+
+            let kept = remaining[..marker_idx].trim();
+            if !kept.is_empty() {
+                parts.push(kept.to_string());
+            }
+
+            let excluded_tail = remaining[marker_idx + marker_len..].trim_start();
+            let clause_end = exclusion_clause_end_offset(excluded_tail);
+            remaining = excluded_tail[clause_end..].trim_start();
         }
     }
     parts.join(" ")
+}
+
+fn exclusion_clause_end_offset(text: &str) -> usize {
+    let mut chars = text.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\n' | ';' => return idx + ch.len_utf8(),
+            '.' | '!' | '?' => {
+                let next = chars.peek().map(|(_, next)| *next);
+                if next.is_none_or(|next| next.is_whitespace()) {
+                    return idx + ch.len_utf8();
+                }
+            }
+            _ => {}
+        }
+    }
+    text.len()
 }
 
 fn scan_has_rust_service_surface(scan: &punk_domain::RepoScanSummary) -> bool {
@@ -5911,23 +5937,28 @@ fn extract_prompt_excluded_scope_prefixes(prompt: &str) -> Vec<String> {
     ];
     let mut prefixes = Vec::new();
     for line in prompt.lines() {
-        let lowered = line.to_ascii_lowercase();
-        let Some(start) = EXCLUSION_MARKERS
-            .iter()
-            .filter_map(|marker| lowered.find(marker).map(|idx| (idx, marker.len())))
-            .map(|(idx, len)| idx + len)
-            .min()
-        else {
-            continue;
-        };
-        let excluded_segment = line[start..].trim();
-        for token in excluded_segment.split_whitespace() {
-            let Some(prefix) = normalize_prompt_scope_token(token) else {
-                continue;
+        let mut remaining = line;
+        loop {
+            let lowered = remaining.to_ascii_lowercase();
+            let Some((marker_idx, marker_len)) = EXCLUSION_MARKERS
+                .iter()
+                .filter_map(|marker| lowered.find(marker).map(|idx| (idx, marker.len())))
+                .min_by_key(|(idx, _)| *idx)
+            else {
+                break;
             };
-            if !prefixes.iter().any(|existing| existing == &prefix) {
-                prefixes.push(prefix);
+            let excluded_tail = remaining[marker_idx + marker_len..].trim_start();
+            let clause_end = exclusion_clause_end_offset(excluded_tail);
+            let excluded_segment = excluded_tail[..clause_end].trim();
+            for token in excluded_segment.split_whitespace() {
+                let Some(prefix) = normalize_prompt_scope_token(token) else {
+                    continue;
+                };
+                if !prefixes.iter().any(|existing| existing == &prefix) {
+                    prefixes.push(prefix);
+                }
             }
+            remaining = excluded_tail[clause_end..].trim_start();
         }
     }
     prefixes
@@ -5938,7 +5969,7 @@ fn normalize_prompt_scope_token(token: &str) -> Option<String> {
         .trim_matches(|ch: char| {
             matches!(
                 ch,
-                ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | '`'
+                ',' | ';' | ':' | '.' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | '`'
             )
         })
         .trim()
@@ -11561,6 +11592,27 @@ fn ok() {}
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prompt_positive_intent_text_preserves_tail_after_do_not_modify_clause() {
+        let prompt = "Edit only crates/pubpunk-core/src/lib.rs. Add private TargetInstanceConfig. Do not modify tests, CLI code, init behavior, JSON output, or project.toml validation. Keep cargo test --workspace green.";
+        let positive = prompt_positive_intent_text(prompt);
+
+        assert!(positive.contains("Edit only crates/pubpunk-core/src/lib.rs."));
+        assert!(positive.contains("Add private TargetInstanceConfig."));
+        assert!(positive.contains("Keep cargo test --workspace green."));
+        assert!(!positive.contains("Do not modify tests"));
+    }
+
+    #[test]
+    fn extract_prompt_excluded_scope_prefixes_stops_before_positive_tail() {
+        let prompt = "Edit only src/lib.rs. Do not modify src/legacy.rs or tests/cleanup.rs. Keep src/lib.rs compile-ready.";
+        let excluded = extract_prompt_excluded_scope_prefixes(prompt);
+
+        assert!(excluded.contains(&"src/legacy.rs".to_string()));
+        assert!(excluded.contains(&"tests/cleanup.rs".to_string()));
+        assert!(!excluded.contains(&"src/lib.rs".to_string()));
     }
 
     #[test]

@@ -1,0 +1,7 @@
+{
+  "name": "baseline-site",
+  "scripts": {
+    "check": "echo check",
+    "build:web": "echo build"
+  }
+}
