@@ -1898,11 +1898,155 @@ fn required_contract_symbol_keyword(token: &str) -> bool {
 }
 
 fn source_contains_contract_symbol(source: &str, symbol: &str) -> bool {
-    source
+    strip_non_code_rust_segments(source)
         .lines()
         .map(str::trim_start)
-        .filter(|line| !line.starts_with("//"))
         .any(|line| line_contains_symbol_token(line, symbol))
+}
+
+fn strip_non_code_rust_segments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut output = String::with_capacity(source.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"//") {
+            output.push(' ');
+            output.push(' ');
+            i += 2;
+            while i < bytes.len() {
+                if bytes[i] == b'\n' {
+                    output.push('\n');
+                    i += 1;
+                    break;
+                }
+                output.push(' ');
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i..].starts_with(b"/*") {
+            output.push(' ');
+            output.push(' ');
+            i += 2;
+            let mut depth = 1usize;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i..].starts_with(b"/*") {
+                    output.push(' ');
+                    output.push(' ');
+                    i += 2;
+                    depth += 1;
+                    continue;
+                }
+                if bytes[i..].starts_with(b"*/") {
+                    output.push(' ');
+                    output.push(' ');
+                    i += 2;
+                    depth = depth.saturating_sub(1);
+                    continue;
+                }
+                push_masked_rust_byte(&mut output, bytes[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if let Some((prefix_len, hash_count)) = raw_string_prefix(bytes, i) {
+            for _ in 0..prefix_len {
+                output.push(' ');
+            }
+            i += prefix_len;
+            while i < bytes.len() {
+                if bytes[i] == b'"' && raw_string_closes(bytes, i + 1, hash_count) {
+                    output.push(' ');
+                    i += 1;
+                    for _ in 0..hash_count {
+                        output.push(' ');
+                        i += 1;
+                    }
+                    break;
+                }
+                push_masked_rust_byte(&mut output, bytes[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(prefix_len) = string_prefix(bytes, i) {
+            for _ in 0..prefix_len {
+                output.push(' ');
+            }
+            i += prefix_len;
+            let mut escaped = false;
+            while i < bytes.len() {
+                let byte = bytes[i];
+                push_masked_rust_byte(&mut output, byte);
+                i += 1;
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if byte == b'\\' {
+                    escaped = true;
+                    continue;
+                }
+                if byte == b'"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        push_code_rust_byte(&mut output, bytes[i]);
+        i += 1;
+    }
+    output
+}
+
+fn push_masked_rust_byte(output: &mut String, byte: u8) {
+    if byte == b'\n' {
+        output.push('\n');
+    } else {
+        output.push(' ');
+    }
+}
+
+fn push_code_rust_byte(output: &mut String, byte: u8) {
+    if byte.is_ascii() {
+        output.push(byte as char);
+    } else {
+        output.push(' ');
+    }
+}
+
+fn raw_string_prefix(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
+    let mut idx = start;
+    if bytes.get(idx) == Some(&b'b') {
+        idx += 1;
+    }
+    if bytes.get(idx) != Some(&b'r') {
+        return None;
+    }
+    idx += 1;
+    let mut hashes = 0usize;
+    while bytes.get(idx) == Some(&b'#') {
+        hashes += 1;
+        idx += 1;
+    }
+    if bytes.get(idx) != Some(&b'"') {
+        return None;
+    }
+    Some((idx - start + 1, hashes))
+}
+
+fn raw_string_closes(bytes: &[u8], start: usize, hashes: usize) -> bool {
+    (0..hashes).all(|offset| bytes.get(start + offset) == Some(&b'#'))
+}
+
+fn string_prefix(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) == Some(&b'"') {
+        Some(1)
+    } else if bytes.get(start) == Some(&b'b') && bytes.get(start + 1) == Some(&b'"') {
+        Some(2)
+    } else {
+        None
+    }
 }
 
 fn line_contains_symbol_token(line: &str, symbol: &str) -> bool {
@@ -8204,6 +8348,58 @@ mod tests {
             .any(|symbol| symbol == "load_target_instances"));
         assert!(symbols.iter().any(|symbol| symbol == "parse_project_toml"));
         assert!(!symbols.iter().any(|symbol| symbol == "validate_report"));
+    }
+
+    #[test]
+    fn missing_required_contract_symbols_ignore_strings_and_block_comments() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-required-symbol-non-code-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "const NOTE: &str = \"TargetInstanceConfig load_target_instances\";\n/* TargetInstanceConfig\nload_target_instances */\nfn parse_project_toml() {}\n",
+        )
+        .unwrap();
+        let contract = Contract {
+            id: "ct_symbols_non_code".into(),
+            feature_id: "feat_symbols_non_code".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Edit only src/lib.rs. Add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path).".into(),
+            entry_points: vec!["src/lib.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "Private struct TargetInstanceConfig.".into(),
+                "Private function load_target_instances(root: &Path).".into(),
+            ],
+            behavior_requirements: vec![
+                "Add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path).".into(),
+            ],
+            allowed_scope: vec!["src/lib.rs".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let missing = missing_required_contract_symbols(&root, &contract).unwrap();
+
+        assert!(missing
+            .iter()
+            .any(|symbol| symbol == "TargetInstanceConfig"));
+        assert!(missing
+            .iter()
+            .any(|symbol| symbol == "load_target_instances"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
