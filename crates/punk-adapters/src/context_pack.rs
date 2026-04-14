@@ -571,7 +571,7 @@ fn derive_plan_targets(contract: &Contract, file: &ContextFileExcerpt) -> Vec<Sc
     let anchors = highest_confidence_symbols(contract, file);
     let mut targets = anchors
         .iter()
-        .take(2)
+        .take(3)
         .filter(|anchor| {
             anchor.score > 0
                 && !(is_thin_module_facade(file)
@@ -1150,6 +1150,7 @@ fn highest_confidence_symbols(contract: &Contract, file: &ContextFileExcerpt) ->
     let contract_terms = contract_terms(contract);
     let contract_surface = contract_surface(contract);
     let explicit_symbols = explicit_contract_symbol_mentions(contract);
+    let forbidden_symbols = forbidden_contract_symbol_mentions(contract);
     let mut anchors: Vec<_> = file
         .content
         .lines()
@@ -1164,6 +1165,7 @@ fn highest_confidence_symbols(contract: &Contract, file: &ContextFileExcerpt) ->
                 &contract_terms,
                 &contract_surface,
                 &explicit_symbols,
+                &forbidden_symbols,
                 &file.path,
             );
             Some(SymbolAnchor {
@@ -1209,21 +1211,99 @@ fn explicit_contract_symbol_mentions(contract: &Contract) -> Vec<String> {
     symbols
 }
 
+fn forbidden_contract_symbol_mentions(contract: &Contract) -> Vec<String> {
+    let mut symbols = Vec::new();
+    for surface in std::iter::once(contract.prompt_source.as_str())
+        .chain(contract.expected_interfaces.iter().map(String::as_str))
+        .chain(contract.behavior_requirements.iter().map(String::as_str))
+    {
+        if let Some(clause) = contract_surface_forbidden_symbol_clause(surface) {
+            collect_explicit_symbol_mentions(clause, &mut symbols);
+        }
+    }
+    symbols
+}
+
+fn contract_surface_forbidden_symbol_clause(surface: &str) -> Option<&str> {
+    let lower = surface.to_ascii_lowercase();
+    [
+        "do not touch",
+        "do not modify",
+        "do not edit",
+        "do not change",
+        "don't modify",
+        "must not touch",
+        "must not modify",
+        "must not edit",
+        "must not change",
+        "without touching",
+        "without modifying",
+    ]
+    .iter()
+    .filter_map(|needle| lower.find(needle))
+    .min()
+    .and_then(|idx| surface.get(idx..))
+}
+
 fn collect_explicit_symbol_mentions(surface: &str, symbols: &mut Vec<String>) {
+    let mut tokens = Vec::new();
     let mut current = String::new();
     for ch in surface.chars().chain(std::iter::once(' ')) {
         if ch.is_ascii_alphanumeric() || ch == '_' {
-            current.push(ch.to_ascii_lowercase());
+            current.push(ch);
             continue;
         }
-        if current.len() >= 4
-            && current.contains('_')
-            && !symbols.iter().any(|existing| existing == &current)
-        {
-            symbols.push(current.clone());
+        if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
         }
-        current.clear();
     }
+
+    let mut previous: Option<String> = None;
+    for token in tokens {
+        let lowered = token.to_ascii_lowercase();
+        if explicit_symbol_candidate(&token, previous.as_deref())
+            && !symbols.iter().any(|existing| existing == &lowered)
+        {
+            symbols.push(lowered.clone());
+        }
+        previous = Some(lowered);
+    }
+}
+
+fn explicit_symbol_candidate(token: &str, previous: Option<&str>) -> bool {
+    let lowered = token.to_ascii_lowercase();
+    if explicit_symbol_keyword(&lowered) {
+        return false;
+    }
+    if token.len() >= 4 && token.contains('_') {
+        return true;
+    }
+    if token_has_internal_uppercase(token) {
+        return true;
+    }
+    previous.is_some_and(|prev| explicit_symbol_keyword(prev) && token.len() >= 3)
+}
+
+fn token_has_internal_uppercase(token: &str) -> bool {
+    let mut chars = token.chars();
+    let _ = chars.next();
+    chars.any(|ch| ch.is_ascii_uppercase()) && token.chars().any(|ch| ch.is_ascii_lowercase())
+}
+
+fn explicit_symbol_keyword(token: &str) -> bool {
+    matches!(
+        token,
+        "fn" | "function"
+            | "method"
+            | "struct"
+            | "enum"
+            | "type"
+            | "trait"
+            | "symbol"
+            | "symbols"
+            | "interface"
+            | "interfaces"
+    )
 }
 
 fn contract_surface(contract: &Contract) -> String {
@@ -1254,6 +1334,7 @@ fn anchor_score(
     contract_terms: &[String],
     contract_surface: &str,
     explicit_symbols: &[String],
+    forbidden_symbols: &[String],
     path: &str,
 ) -> usize {
     let signature_lc = signature.to_ascii_lowercase();
@@ -1268,13 +1349,17 @@ fn anchor_score(
             score += 1;
         }
     }
-    let exact_symbol_name = anchor_symbol_name(signature);
-    let matches_explicit_symbol_exactly =
-        exact_symbol_name.is_some_and(|name| explicit_symbols.iter().any(|symbol| symbol == name));
+    let exact_symbol_name_lc = anchor_symbol_name(signature).map(|name| name.to_ascii_lowercase());
+    let matches_explicit_symbol_exactly = exact_symbol_name_lc
+        .as_deref()
+        .is_some_and(|name| explicit_symbols.iter().any(|symbol| symbol == name));
     let mentions_explicit_symbol = matches_explicit_symbol_exactly
         || explicit_symbols
             .iter()
             .any(|symbol| signature_lc.contains(symbol));
+    let matches_forbidden_symbol_exactly = exact_symbol_name_lc
+        .as_deref()
+        .is_some_and(|name| forbidden_symbols.iter().any(|symbol| symbol == name));
     for symbol in explicit_symbols {
         if signature_lc.contains(symbol) {
             score += 8;
@@ -1291,6 +1376,14 @@ fn anchor_score(
     }
     if signature.starts_with("impl ") {
         score += 1;
+    }
+    if matches_forbidden_symbol_exactly {
+        score = score.saturating_sub(40);
+    } else if forbidden_symbols
+        .iter()
+        .any(|symbol| signature_lc.contains(symbol))
+    {
+        score = score.saturating_sub(20);
     }
     if path_lc.ends_with("main.rs")
         && signature_lc.contains("cmd_status")
@@ -2276,6 +2369,255 @@ fn parse_project_toml_value(value: &str) -> Result<String, ()> {
         assert!(seed.targets[0].anchor_excerpt.contains("validate_report"));
     }
 
+    #[test]
+    fn derive_plan_seed_avoids_do_not_touch_validate_report_for_target_loader_refactor() {
+        let contract = Contract {
+            id: "ct_pubpunk_target_loader".into(),
+            feature_id: "feat_pubpunk_target_loader".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Edit only crates/pubpunk-core/src/lib.rs. Private refactor only. Must add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path). Use parse_project_toml for existing .pubpunk/targets/*.toml. Each loaded target instance must keep filename-stem id, repo-relative path, and parsed key/value data. Reuse this only for the .pubpunk/targets branch inside extend_toml_surface_issues/validate_toml_surface_dir area. No behavior change. Do not touch validate_report, project.toml validation, style/review/lint branches, CLI, init, JSON, or tests. Existing tests only. Keep cargo test --workspace green.".into(),
+            entry_points: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            expected_interfaces: vec![
+                "Private struct TargetInstanceConfig.".into(),
+                "Private function load_target_instances(root: &Path).".into(),
+            ],
+            behavior_requirements: vec![
+                "Private refactor only inside crates/pubpunk-core/src/lib.rs.".into(),
+                "Add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path).".into(),
+                "Use parse_project_toml for existing .pubpunk/targets/*.toml loading.".into(),
+                "Each loaded target instance must retain filename-stem id, repo-relative path, and parsed key/value data.".into(),
+                "Reuse the new loader only for the .pubpunk/targets branch inside extend_toml_surface_issues/validate_toml_surface_dir area.".into(),
+                "Preserve existing behavior; no functional changes.".into(),
+                "Use existing tests only.".into(),
+            ],
+            allowed_scope: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            target_checks: vec!["cargo test -p pubpunk-core".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let pack = ContextPack {
+            files: vec![ContextFileExcerpt {
+                path: "crates/pubpunk-core/src/lib.rs".into(),
+                start_line: 239,
+                end_line: 631,
+                truncated_at_test_boundary: false,
+                content: r#"pub fn validate_report(root: &Path) -> ValidateReport {
+    let mut issues = Vec::new();
+    extend_toml_surface_issues(root, &mut issues);
+    ValidateReport { root: root.to_path_buf(), issues }
+}
+
+fn extend_toml_surface_issues(root: &Path, issues: &mut Vec<ValidateIssue>) {
+    validate_toml_surface_dir(root, ".pubpunk/targets", "unreadable_target_toml", "unparseable_target_toml", issues);
+}
+
+fn validate_toml_surface_dir(
+    root: &Path,
+    relative_dir: &str,
+    unreadable_code: &'static str,
+    unparseable_code: &'static str,
+    issues: &mut Vec<ValidateIssue>,
+) {
+    for relative in [format!("{relative_dir}/forem.toml")] {
+        validate_toml_surface_file(root, &relative, unreadable_code, unparseable_code, issues);
+    }
+}
+
+fn validate_toml_surface_file(
+    root: &Path,
+    relative: &str,
+    unreadable_code: &'static str,
+    unparseable_code: &'static str,
+    issues: &mut Vec<ValidateIssue>,
+) {
+    let path = root.join(relative);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            issues.push(ValidateIssue {
+                code: unreadable_code,
+                path: Some(PathBuf::from(relative)),
+                message: format!("unable to read {}: {err}", path.display()),
+            });
+            return;
+        }
+    };
+    if let Err(message) = parse_project_toml(&contents) {
+        issues.push(ValidateIssue {
+            code: unparseable_code,
+            path: Some(PathBuf::from(relative)),
+            message: format!("{} is not parseable TOML: {message}", relative),
+        });
+    }
+}
+
+fn parse_project_toml(contents: &str) -> Result<BTreeMap<String, String>, String> {
+    let value = parse_project_toml_value(contents)?;
+    Ok(BTreeMap::from([(String::from("project_id"), value)]))
+}
+
+fn parse_project_toml_value(value: &str) -> Result<String, ()> {
+    Ok(value.to_string())
+}
+"#
+                .into(),
+            }],
+            missing_paths: vec![],
+            recipe_seed: None,
+            patch_seed: None,
+            plan_seed: None,
+        };
+
+        let seed = derive_plan_seed(&contract, &pack);
+
+        assert_eq!(seed.targets.len(), 3);
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "crates/pubpunk-core/src/lib.rs"
+                && target.symbol.contains("extend_toml_surface_issues")
+        }));
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "crates/pubpunk-core/src/lib.rs"
+                && target.symbol.contains("validate_toml_surface_dir")
+        }));
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "crates/pubpunk-core/src/lib.rs"
+                && target.symbol.contains("parse_project_toml")
+        }));
+        assert!(!seed
+            .targets
+            .iter()
+            .any(|target| target.symbol.contains("validate_report")));
+    }
+
+    #[test]
+    fn derive_plan_seed_avoids_do_not_modify_validate_report_for_target_loader_refactor() {
+        let contract = Contract {
+            id: "ct_pubpunk_target_loader_modify".into(),
+            feature_id: "feat_pubpunk_target_loader_modify".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Edit only crates/pubpunk-core/src/lib.rs. Private refactor only. Must add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path). Use parse_project_toml for existing .pubpunk/targets/*.toml. Each loaded target instance must keep filename-stem id, repo-relative path, and parsed key/value data. Reuse this only for the .pubpunk/targets branch inside extend_toml_surface_issues/validate_toml_surface_dir area. No behavior change. Do not modify validate_report, project.toml validation, style/review/lint branches, CLI, init, JSON, or tests. Existing tests only. Keep cargo test --workspace green.".into(),
+            entry_points: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            import_paths: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            expected_interfaces: vec![
+                "Private struct TargetInstanceConfig.".into(),
+                "Private function load_target_instances(root: &Path).".into(),
+            ],
+            behavior_requirements: vec![
+                "Private refactor only inside crates/pubpunk-core/src/lib.rs.".into(),
+                "Add private symbol TargetInstanceConfig and private symbol load_target_instances(root: &Path).".into(),
+                "Use parse_project_toml for existing .pubpunk/targets/*.toml loading.".into(),
+                "Each loaded target instance must retain filename-stem id, repo-relative path, and parsed key/value data.".into(),
+                "Reuse the new loader only for the .pubpunk/targets branch inside extend_toml_surface_issues/validate_toml_surface_dir area.".into(),
+                "Preserve existing behavior; no functional changes.".into(),
+                "Use existing tests only.".into(),
+            ],
+            allowed_scope: vec!["crates/pubpunk-core/src/lib.rs".into()],
+            target_checks: vec!["cargo test -p pubpunk-core".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let pack = ContextPack {
+            files: vec![ContextFileExcerpt {
+                path: "crates/pubpunk-core/src/lib.rs".into(),
+                start_line: 239,
+                end_line: 631,
+                truncated_at_test_boundary: false,
+                content: r#"pub fn validate_report(root: &Path) -> ValidateReport {
+    let mut issues = Vec::new();
+    extend_toml_surface_issues(root, &mut issues);
+    ValidateReport { root: root.to_path_buf(), issues }
+}
+
+fn extend_toml_surface_issues(root: &Path, issues: &mut Vec<ValidateIssue>) {
+    validate_toml_surface_dir(root, ".pubpunk/targets", "unreadable_target_toml", "unparseable_target_toml", issues);
+}
+
+fn validate_toml_surface_dir(
+    root: &Path,
+    relative_dir: &str,
+    unreadable_code: &'static str,
+    unparseable_code: &'static str,
+    issues: &mut Vec<ValidateIssue>,
+) {
+    for relative in [format!("{relative_dir}/forem.toml")] {
+        validate_toml_surface_file(root, &relative, unreadable_code, unparseable_code, issues);
+    }
+}
+
+fn validate_toml_surface_file(
+    root: &Path,
+    relative: &str,
+    unreadable_code: &'static str,
+    unparseable_code: &'static str,
+    issues: &mut Vec<ValidateIssue>,
+) {
+    let path = root.join(relative);
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            issues.push(ValidateIssue {
+                code: unreadable_code,
+                path: Some(PathBuf::from(relative)),
+                message: format!("unable to read {}: {err}", path.display()),
+            });
+            return;
+        }
+    };
+    if let Err(message) = parse_project_toml(&contents) {
+        issues.push(ValidateIssue {
+            code: unparseable_code,
+            path: Some(PathBuf::from(relative)),
+            message: format!("{} is not parseable TOML: {message}", relative),
+        });
+    }
+}
+
+fn parse_project_toml(contents: &str) -> Result<BTreeMap<String, String>, String> {
+    let value = parse_project_toml_value(contents)?;
+    Ok(BTreeMap::from([(String::from("project_id"), value)]))
+}
+
+fn parse_project_toml_value(value: &str) -> Result<String, ()> {
+    Ok(value.to_string())
+}
+"#
+                .into(),
+            }],
+            missing_paths: vec![],
+            recipe_seed: None,
+            patch_seed: None,
+            plan_seed: None,
+        };
+
+        let seed = derive_plan_seed(&contract, &pack);
+
+        assert_eq!(seed.targets.len(), 3);
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "crates/pubpunk-core/src/lib.rs"
+                && target.symbol.contains("extend_toml_surface_issues")
+        }));
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "crates/pubpunk-core/src/lib.rs"
+                && target.symbol.contains("validate_toml_surface_dir")
+        }));
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "crates/pubpunk-core/src/lib.rs"
+                && target.symbol.contains("parse_project_toml")
+        }));
+        assert!(!seed
+            .targets
+            .iter()
+            .any(|target| target.symbol.contains("validate_report")));
+    }
+
+    #[test]
     fn derive_plan_seed_prefers_resolver_and_cli_ambiguity_surfaces() {
         let contract = Contract {
             id: "ct_resolver_ambiguity".into(),

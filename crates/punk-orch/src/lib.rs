@@ -5738,6 +5738,9 @@ fn prompt_intent_lower(prompt: &str) -> String {
 
 fn prompt_positive_intent_text(prompt: &str) -> String {
     const EXCLUSION_MARKERS: &[&str] = &[
+        "do not modify",
+        "don't modify",
+        "must not modify",
         "do not touch",
         "don't touch",
         "must not touch",
@@ -5890,6 +5893,9 @@ fn apply_prompt_exclusion_pruning(prompt: &str, proposal: &mut DraftProposal) {
 
 fn extract_prompt_excluded_scope_prefixes(prompt: &str) -> Vec<String> {
     const EXCLUSION_MARKERS: &[&str] = &[
+        "do not modify",
+        "don't modify",
+        "must not modify",
         "exclude",
         "excluding",
         "do not touch",
@@ -6665,6 +6671,131 @@ mod tests {
         }
     }
 
+    struct FixtureRepo {
+        root: PathBuf,
+        global: PathBuf,
+    }
+
+    impl Drop for FixtureRepo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn temp_fixture_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "punk-orch-fixture-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn repo_fixture_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/repo-matrix")
+    }
+
+    fn load_repo_fixture(fixture_id: &str) -> FixtureRepo {
+        let fixture_root = repo_fixture_root().join(fixture_id);
+        assert!(
+            fixture_root.exists(),
+            "missing repo fixture `{fixture_id}` at {}",
+            fixture_root.display()
+        );
+        let root = temp_fixture_dir(fixture_id);
+        copy_fixture_tree(&fixture_root, &root);
+        init_git_repo(&root);
+        FixtureRepo {
+            global: root.join("global"),
+            root,
+        }
+    }
+
+    fn copy_fixture_tree(source: &Path, dest: &Path) {
+        fs::create_dir_all(dest).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let entry_path = entry.path();
+            let destination = dest.join(entry.file_name());
+            let file_type = entry.file_type().unwrap();
+            if file_type.is_dir() {
+                copy_fixture_tree(&entry_path, &destination);
+            } else if file_type.is_file() {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+                fs::copy(&entry_path, &destination).unwrap();
+            } else {
+                panic!("unsupported fixture entry type at {}", entry_path.display());
+            }
+        }
+    }
+
+    fn init_git_repo(root: &Path) {
+        let output = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git init failed for {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_add_and_commit_all(root: &Path, message: &str) {
+        let add = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            add.status.success(),
+            "git add failed for {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&add.stderr)
+        );
+
+        let commit = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                message,
+            ])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "git commit failed for {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&commit.stderr)
+        );
+    }
+
+    fn persist_and_approve_contract(
+        service: &OrchService,
+        prompt: &str,
+        proposal: DraftProposal,
+    ) -> Contract {
+        let project = service.bootstrap_project().unwrap();
+        let (_feature, contract) = service
+            .persist_draft_contract(&project, prompt, &proposal, ArchitectureMode::Auto)
+            .unwrap();
+        service.approve_contract(&contract.id).unwrap()
+    }
+
     struct FakeExecutor;
 
     impl Executor for FakeExecutor {
@@ -6894,6 +7025,68 @@ mod tests {
                 success: true,
                 summary: "done".into(),
                 checks_run: vec!["cargo test --workspace".into()],
+                cost_usd: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    struct PatchApplyZeroByteRollbackExecutor;
+
+    impl Executor for PatchApplyZeroByteRollbackExecutor {
+        fn name(&self) -> &'static str {
+            "patch-apply-zero-byte-rollback"
+        }
+
+        fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+            let lib_path = input.repo_root.join("src/lib.rs");
+            let cleanup_path = input.repo_root.join("tests/cleanup.rs");
+            let original_lib = fs::read_to_string(&lib_path)?;
+            let original_cleanup = fs::read_to_string(&cleanup_path)?;
+
+            fs::write(&lib_path, "")?;
+            fs::write(&cleanup_path, "")?;
+            fs::write(&lib_path, &original_lib)?;
+            fs::write(&cleanup_path, &original_cleanup)?;
+
+            let summary = "PUNK_EXECUTION_BLOCKED: patch/apply aborted because src/lib.rs and tests/cleanup.rs became zero-byte; original contents were restored";
+            fs::write(&input.stdout_path, format!("{summary}\n"))?;
+            fs::write(&input.stderr_path, b"")?;
+            Ok(ExecuteOutput {
+                success: false,
+                summary: summary.into(),
+                checks_run: Vec::new(),
+                cost_usd: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    struct PatchApplyLateFailureRollbackExecutor;
+
+    impl Executor for PatchApplyLateFailureRollbackExecutor {
+        fn name(&self) -> &'static str {
+            "patch-apply-late-failure-rollback"
+        }
+
+        fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+            let a_path = input.repo_root.join("src/a.rs");
+            let b_path = input.repo_root.join("src/b.rs");
+            let original_a = fs::read_to_string(&a_path)?;
+            let original_b = fs::read_to_string(&b_path)?;
+
+            fs::write(&a_path, "pub fn a_changed() {}\n")?;
+            fs::write(&b_path, "pub fn b_changed() {\n")?;
+            fs::write(&a_path, &original_a)?;
+            fs::write(&b_path, &original_b)?;
+
+            let summary = "failed bounded patch/apply changes were rolled back for src/a.rs, src/b.rs; original outcome: patch/apply lane check failed: cargo test --workspace: compile failed";
+            fs::write(&input.stdout_path, format!("{summary}\n"))?;
+            fs::write(&input.stderr_path, b"compile failed\n")?;
+            Ok(ExecuteOutput {
+                success: false,
+                summary: summary.into(),
+                checks_run: Vec::new(),
                 cost_usd: None,
                 duration_ms: 1,
             })
@@ -7977,50 +8170,12 @@ mod tests {
 
     #[test]
     fn cut_run_does_not_upgrade_blocked_file_slice_to_already_satisfied() {
-        let root = std::env::temp_dir().join(format!(
-            "punk-orch-blocked-not-already-satisfied-{}",
-            std::process::id()
-        ));
-        let global = root.join("global");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname='demo'\nversion='0.1.0'\n",
-        )
-        .unwrap();
-        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.name=Punk Test",
-                "-c",
-                "user.email=punk@example.com",
-                "commit",
-                "-m",
-                "initial",
-            ])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        fs::write(
-            root.join("src/lib.rs"),
-            "pub fn demo() { println!(\"done\"); }\n",
-        )
-        .unwrap();
+        let repo = load_repo_fixture("cut-run-blocked-file-slice-dirty-entrypoint");
+        git_add_and_commit_all(&repo.root, "initial");
+        let dirty_entry_point = "pub fn demo() { println!(\"done\"); }\n";
+        fs::write(repo.root.join("src/lib.rs"), dirty_entry_point).unwrap();
 
-        let service = OrchService::new(&root, &global).unwrap();
+        let service = OrchService::new(&repo.root, &repo.global).unwrap();
         let contract = service
             .draft_contract(&AlreadySatisfiedDrafter, "demo cleanup slice")
             .unwrap();
@@ -8031,8 +8186,10 @@ mod tests {
         assert_eq!(receipt.status, "failure");
         assert!(receipt.changed_files.is_empty());
         assert!(receipt.summary.starts_with("PUNK_EXECUTION_BLOCKED:"));
-
-        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            fs::read_to_string(repo.root.join("src/lib.rs")).unwrap(),
+            dirty_entry_point
+        );
     }
 
     #[test]
@@ -8189,42 +8346,10 @@ mod tests {
 
     #[test]
     fn cut_run_prunes_generated_cargo_lock_when_out_of_scope() {
-        let root =
-            std::env::temp_dir().join(format!("punk-orch-cargo-lock-prune-{}", std::process::id()));
-        let global = root.join("global");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("Cargo.toml"),
-            "[workspace]\nmembers=[]\nresolver='2'\n",
-        )
-        .unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        fs::write(root.join(".gitignore"), ".punk/\ntarget\n").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.name=Punk Test",
-                "-c",
-                "user.email=punk@example.com",
-                "commit",
-                "-m",
-                "initial",
-            ])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        let repo = load_repo_fixture("cut-run-cargo-lock-prune-workspace");
+        git_add_and_commit_all(&repo.root, "initial");
 
-        let service = OrchService::new(&root, &global).unwrap();
+        let service = OrchService::new(&repo.root, &repo.global).unwrap();
         let contract = service
             .draft_contract(&CargoLockDrafter, "bounded rust bootstrap")
             .unwrap();
@@ -8235,9 +8360,95 @@ mod tests {
             .changed_files
             .iter()
             .any(|path| path == "Cargo.lock"));
-        assert!(!root.join("Cargo.lock").exists());
+        assert!(!repo.root.join("Cargo.lock").exists());
+    }
 
-        let _ = fs::remove_dir_all(&root);
+    #[test]
+    fn cut_run_patch_apply_zero_byte_failure_restores_entry_point_contents() {
+        let repo = load_repo_fixture("cut-run-patch-apply-zero-byte-rollback");
+        git_add_and_commit_all(&repo.root, "initial");
+
+        let service = OrchService::new(&repo.root, &repo.global).unwrap();
+        let original_lib = fs::read_to_string(repo.root.join("src/lib.rs")).unwrap();
+        let original_cleanup = fs::read_to_string(repo.root.join("tests/cleanup.rs")).unwrap();
+        let approved = persist_and_approve_contract(
+            &service,
+            "patch/apply cleanup rollback slice",
+            DraftProposal {
+                title: "patch/apply cleanup rollback".into(),
+                summary: "patch/apply cleanup rollback".into(),
+                entry_points: vec!["src/lib.rs".into(), "tests/cleanup.rs".into()],
+                import_paths: vec!["src/lib.rs".into(), "tests/cleanup.rs".into()],
+                expected_interfaces: vec!["cleanup slice".into()],
+                behavior_requirements: vec!["restore zero-byte damaged entry points".into()],
+                allowed_scope: vec!["src/lib.rs".into(), "tests/cleanup.rs".into()],
+                target_checks: vec!["cargo test --workspace".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "low".into(),
+            },
+        );
+
+        let (run, receipt) = service
+            .cut_run(&PatchApplyZeroByteRollbackExecutor, &approved.id)
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(receipt.status, "failure");
+        assert!(receipt.changed_files.is_empty());
+        assert!(receipt.summary.starts_with("PUNK_EXECUTION_BLOCKED:"));
+        assert!(receipt.summary.contains("original contents were restored"));
+        assert_eq!(
+            fs::read_to_string(repo.root.join("src/lib.rs")).unwrap(),
+            original_lib
+        );
+        assert_eq!(
+            fs::read_to_string(repo.root.join("tests/cleanup.rs")).unwrap(),
+            original_cleanup
+        );
+    }
+
+    #[test]
+    fn cut_run_patch_apply_late_failure_rolls_back_pre_run_snapshots() {
+        let repo = load_repo_fixture("cut-run-patch-apply-late-failure-rollback");
+        git_add_and_commit_all(&repo.root, "initial");
+
+        let service = OrchService::new(&repo.root, &repo.global).unwrap();
+        let original_a = fs::read_to_string(repo.root.join("src/a.rs")).unwrap();
+        let original_b = fs::read_to_string(repo.root.join("src/b.rs")).unwrap();
+        let approved = persist_and_approve_contract(
+            &service,
+            "patch/apply rollback after later validation failure",
+            DraftProposal {
+                title: "patch/apply later failure rollback".into(),
+                summary: "patch/apply later failure rollback".into(),
+                entry_points: vec!["src/a.rs".into(), "src/b.rs".into()],
+                import_paths: vec!["src/a.rs".into(), "src/b.rs".into()],
+                expected_interfaces: vec!["bounded patch/apply slice".into()],
+                behavior_requirements: vec![
+                    "rollback earlier bounded edits after a later validation failure".into(),
+                ],
+                allowed_scope: vec!["src/a.rs".into(), "src/b.rs".into()],
+                target_checks: vec!["cargo test --workspace".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "low".into(),
+            },
+        );
+
+        let (run, receipt) = service
+            .cut_run(&PatchApplyLateFailureRollbackExecutor, &approved.id)
+            .unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(receipt.status, "failure");
+        assert!(receipt.changed_files.is_empty());
+        assert!(receipt.summary.contains("rolled back"));
+        assert!(receipt.summary.contains("cargo test --workspace"));
+        assert_eq!(
+            fs::read_to_string(repo.root.join("src/a.rs")).unwrap(),
+            original_a
+        );
+        assert_eq!(
+            fs::read_to_string(repo.root.join("src/b.rs")).unwrap(),
+            original_b
+        );
     }
 
     #[test]
@@ -8718,84 +8929,13 @@ mod tests {
 
     #[test]
     fn draft_contract_prefers_backend_service_anchors_over_astro_pages_for_nested_node_repo() {
-        let suffix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "punk-orch-backend-service-anchors-{suffix}-{}",
-            std::process::id()
-        ));
-        let global = root.join("global");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("baseline-site/src/components")).unwrap();
-        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
-        fs::create_dir_all(root.join("baseline-site/src/pages")).unwrap();
-        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
-        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
-        fs::write(
-            root.join("baseline-site/package.json"),
-            r#"{
-  "name": "baseline-site",
-  "scripts": {
-    "check": "echo check",
-    "build:web": "echo build"
-  }
-}
-"#,
-        )
-        .unwrap();
-        fs::write(
-            root.join("baseline-site/src/pages/dispatch.astro"),
-            "---\n---\n<div>dispatch</div>\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("baseline-site/src/components/SiteHeader.astro"),
-            "---\n---\n<header />\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("baseline-site/src/components/SiteFooter.astro"),
-            "---\n---\n<footer />\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
-            "export async function post() {}\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("baseline-site/src/lib/services/enrollments.ts"),
-            "export async function enroll() {}\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("baseline-site/src/lib/services/dispatch.ts"),
-            "export async function dispatch() {}\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("baseline-site/src/lib/session/operator.ts"),
-            "export function operatorSession() {}\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("baseline-site/src/lib/session/cookies.ts"),
-            "export function readCookies() {}\n",
-        )
-        .unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        let repo = load_repo_fixture("nested-node-backend-ui-generated-noise");
 
         let prompt =
             "implement services/session/runtime handshake around enrollment activation in the Astro server backend";
 
-        let mut scan = scan_repo(&root, prompt).unwrap();
-        apply_prompt_targeting_bias(&root, prompt, &mut scan);
+        let mut scan = scan_repo(&repo.root, prompt).unwrap();
+        apply_prompt_targeting_bias(&repo.root, prompt, &mut scan);
 
         assert!(scan
             .candidate_entry_points
@@ -8817,9 +8957,12 @@ mod tests {
             path.ends_with("dispatch.astro")
                 || path.ends_with("SiteHeader.astro")
                 || path.ends_with("SiteFooter.astro")
+                || path.contains("/dist/")
+                || path.contains("/.astro/")
+                || path.starts_with("packs/")
         }));
 
-        let service = OrchService::new(&root, &global).unwrap();
+        let service = OrchService::new(&repo.root, &repo.global).unwrap();
         let contract = service.draft_contract(&FakeDrafter, prompt).unwrap();
 
         assert!(contract.allowed_scope.iter().any(|path| {
@@ -8840,9 +8983,10 @@ mod tests {
             path.ends_with("dispatch.astro")
                 || path.ends_with("SiteHeader.astro")
                 || path.ends_with("SiteFooter.astro")
+                || path.contains("/dist/")
+                || path.contains("/.astro/")
+                || path.starts_with("packs/")
         }));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -10523,40 +10667,9 @@ fn ok() {}
 
     #[test]
     fn draft_contract_timeout_fallback_prefers_greenfield_rust_scaffold_scope_over_docs() {
-        let root = std::env::temp_dir().join(format!(
-            "punk-orch-greenfield-rust-scope-timeout-{}",
-            std::process::id()
-        ));
-        let global = root.join("global");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join(".punk/bootstrap")).unwrap();
-        fs::create_dir_all(root.join("docs")).unwrap();
-        fs::create_dir_all(root.join("archive")).unwrap();
-        fs::write(root.join(".punk/AGENT_START.md"), "# Agent start\n").unwrap();
-        fs::write(root.join("AGENTS.md"), "# AGENTS\n").unwrap();
-        fs::write(
-            root.join(".punk/bootstrap/pubpunk-core.md"),
-            "bootstrap guidance\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("docs/PUBPUNK_DEVELOPMENT_HANDOFF.md"),
-            "scaffold Rust workspace and implement pubpunk init + validate\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("docs/IMPLEMENTATION_PLAN.md"),
-            "workspace scaffold validate init plan\n",
-        )
-        .unwrap();
-        fs::write(root.join("archive/pubpunk-docs.zip"), "zip placeholder\n").unwrap();
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
+        let repo = load_repo_fixture("greenfield-rust-scaffold-doc-noise");
 
-        let service = OrchService::new(&root, &global).unwrap();
+        let service = OrchService::new(&repo.root, &repo.global).unwrap();
         let contract = service
             .draft_contract(
                 &TimeoutDrafter,
@@ -10595,8 +10708,6 @@ fn ok() {}
             .allowed_scope
             .iter()
             .all(|path| !path.starts_with("docs/") && !path.starts_with("archive/")));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -11448,6 +11559,162 @@ fn ok() {}
             contract.integrity_checks,
             vec!["cargo test --workspace".to_string()]
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_exact_pubpunk_target_instance_prompt_stays_core_only() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-pubpunk-target-instance-core-only-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname=\"pubpunk-cli\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname=\"pubpunk-core\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn extend_toml_surface_issues() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tests/validate_json.rs"),
+            "#[test]\nfn validate_json() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let prompt = "Edit only crates/pubpunk-core/src/lib.rs. Add private TargetInstanceConfig and private load_target_instances(root: &Path, issues: &mut Vec<ValidateIssue>) -> Vec<TargetInstanceConfig>. Use sorted_toml_surface_paths(root, \".pubpunk/targets\") and parse_project_toml. Preserve unreadable_target_toml and unparseable_target_toml messages and codes. In extend_toml_surface_issues replace only the targets validate_toml_surface_dir call with let _target_instances = load_target_instances(root, issues). Keep style, review, and lint branches unchanged. Do not modify tests, CLI code, init behavior, JSON output, or project.toml validation. Keep cargo test --workspace green.";
+        let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
+
+        assert_eq!(
+            contract.entry_points,
+            vec!["crates/pubpunk-core/src/lib.rs".to_string()]
+        );
+        assert_eq!(
+            contract.allowed_scope,
+            vec!["crates/pubpunk-core/src/lib.rs".to_string()]
+        );
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test -p pubpunk-core".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert!(contract.expected_interfaces.iter().all(|line| {
+            let lowered = line.to_ascii_lowercase();
+            !lowered.contains("init") && !lowered.contains("scaffold")
+        }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn draft_contract_pubpunk_target_instance_prompt_prunes_init_scaffold_noise() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-pubpunk-target-instance-prune-{}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/pubpunk-core/src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/Cargo.toml"),
+            "[package]\nname=\"pubpunk-cli\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/Cargo.toml"),
+            "[package]\nname=\"pubpunk-core\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/pubpunk-core/src/lib.rs"),
+            "pub fn extend_toml_surface_issues() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("tests/validate_json.rs"),
+            "#[test]\nfn validate_json() {}\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let prompt = "Edit only crates/pubpunk-core/src/lib.rs. Add private TargetInstanceConfig and private load_target_instances(root: &Path, issues: &mut Vec<ValidateIssue>) -> Vec<TargetInstanceConfig>. Use sorted_toml_surface_paths(root, \".pubpunk/targets\") and parse_project_toml. Preserve unreadable_target_toml and unparseable_target_toml messages and codes. In extend_toml_surface_issues replace only the targets validate_toml_surface_dir call with let _target_instances = load_target_instances(root, issues). Keep style, review, and lint branches unchanged. Do not modify tests, CLI code, init behavior, JSON output, or project.toml validation. Keep cargo test --workspace green.";
+        let contract = service
+            .draft_contract(&ContaminatedPubpunkValidateDrafter, prompt)
+            .unwrap();
+
+        assert_eq!(
+            contract.entry_points,
+            vec!["crates/pubpunk-core/src/lib.rs".to_string()]
+        );
+        assert_eq!(
+            contract.allowed_scope,
+            vec!["crates/pubpunk-core/src/lib.rs".to_string()]
+        );
+        assert!(contract
+            .import_paths
+            .iter()
+            .all(|path| path == "crates/pubpunk-core/src/lib.rs"));
+        assert_eq!(
+            contract.target_checks,
+            vec!["cargo test -p pubpunk-core".to_string()]
+        );
+        assert_eq!(
+            contract.integrity_checks,
+            vec!["cargo test --workspace".to_string()]
+        );
+        assert!(contract.expected_interfaces.iter().all(|line| {
+            let lowered = line.to_ascii_lowercase();
+            !lowered.contains("init") && !lowered.contains("scaffold")
+        }));
 
         let _ = fs::remove_dir_all(&root);
     }
