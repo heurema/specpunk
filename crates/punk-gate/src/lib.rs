@@ -76,7 +76,8 @@ impl GateService {
         if contract.status != ContractStatus::Approved {
             return Err(anyhow!("gate requires an approved contract"));
         }
-        let verification_context = resolve_verification_context(&self.repo_root, &run);
+        let verification_context =
+            resolve_verification_context(&self.repo_root, &run, &persisted_contract);
         let declared_harness_evidence = load_declared_harness_evidence(&self.repo_root);
         let harness = run_harness_recipes(&self.repo_root)?;
         let architecture = assess_architecture(
@@ -561,6 +562,8 @@ fn snapshot_verification_file_state(
 
 fn verification_context_fingerprint(
     identity: &VerificationContextIdentity,
+    capability_resolution_ref: Option<&str>,
+    capability_resolution_sha256: Option<&str>,
     file_states: &[VerificationContextFileState],
 ) -> String {
     use sha2::{Digest, Sha256};
@@ -576,6 +579,14 @@ fn verification_context_fingerprint(
     for path in &identity.changed_files {
         hasher.update(format!("changed:{path}\n"));
     }
+    hasher.update(format!(
+        "capability_ref:{}\n",
+        capability_resolution_ref.unwrap_or("")
+    ));
+    hasher.update(format!(
+        "capability_sha256:{}\n",
+        capability_resolution_sha256.unwrap_or("")
+    ));
     for state in file_states {
         hasher.update(format!(
             "file:{}:{}:{}\n",
@@ -621,6 +632,7 @@ fn normalize_verification_changed_files(
 fn resolve_verification_context(
     repo_root: &Path,
     run: &punk_domain::Run,
+    persisted_contract: &PersistedContract,
 ) -> VerificationContextOutcome {
     let Some(context_ref) = run.verification_context_ref.clone() else {
         return VerificationContextOutcome {
@@ -666,6 +678,7 @@ fn resolve_verification_context(
     };
 
     let mut reasons = Vec::new();
+    let event_store = EventStore::new(repo_root);
     if context.identity.workspace_ref != run.vcs.workspace_ref {
         reasons.push("frozen verification context workspace_ref does not match run".to_string());
     }
@@ -677,6 +690,55 @@ fn resolve_verification_context(
     }
     if context.identity.backend != run.vcs.backend {
         reasons.push("frozen verification context backend does not match run".to_string());
+    }
+    match (
+        persisted_contract.capability_resolution_ref.as_deref(),
+        context.capability_resolution_ref.as_deref(),
+    ) {
+        (Some(expected), Some(actual)) if actual != expected => reasons.push(format!(
+            "frozen verification capability_resolution_ref drifted: {actual} != {expected}"
+        )),
+        (Some(expected), None) => reasons.push(format!(
+            "frozen verification context missing capability resolution ref from approved contract: {expected}"
+        )),
+        (None, Some(actual)) => reasons.push(format!(
+            "frozen verification context recorded unexpected capability resolution ref: {actual}"
+        )),
+        _ => {}
+    }
+    match persisted_contract.capability_resolution_ref.as_deref() {
+        Some(expected_ref) => {
+            let capability_path = repo_root.join(expected_ref);
+            if !capability_path.exists() {
+                reasons.push(format!(
+                    "approved contract capability resolution missing at {}",
+                    capability_path.display()
+                ));
+            } else {
+                match event_store.file_sha256(&capability_path) {
+                    Ok(actual_sha256) => match context.capability_resolution_sha256.as_deref() {
+                        Some(stored_sha256) if stored_sha256 != actual_sha256 => reasons.push(
+                            format!(
+                                "frozen verification capability resolution hash drifted: {stored_sha256} != {actual_sha256}"
+                            ),
+                        ),
+                        Some(_) => {}
+                        None => reasons.push(
+                            "frozen verification context missing capability resolution hash"
+                                .to_string(),
+                        ),
+                    },
+                    Err(err) => reasons.push(format!(
+                        "unable to read approved contract capability resolution hash: {err}"
+                    )),
+                }
+            }
+        }
+        None if context.capability_resolution_sha256.is_some() => reasons.push(
+            "frozen verification context recorded unexpected capability resolution hash"
+                .to_string(),
+        ),
+        None => {}
     }
 
     let check_root = PathBuf::from(&context.identity.workspace_ref);
@@ -751,7 +813,6 @@ fn resolve_verification_context(
         ));
     }
 
-    let event_store = EventStore::new(repo_root);
     let mut current_file_states = Vec::new();
     for state in &context.file_states {
         match snapshot_verification_file_state(&check_root, &state.path, &event_store) {
@@ -770,14 +831,22 @@ fn resolve_verification_context(
             )),
         }
     }
-    if verification_context_fingerprint(&context.identity, &context.file_states)
-        != context.identity.fingerprint_sha256
+    if verification_context_fingerprint(
+        &context.identity,
+        context.capability_resolution_ref.as_deref(),
+        context.capability_resolution_sha256.as_deref(),
+        &context.file_states,
+    ) != context.identity.fingerprint_sha256
     {
         reasons.push("stored frozen verification fingerprint is invalid".to_string());
     }
     if reasons.is_empty()
-        && verification_context_fingerprint(&context.identity, &current_file_states)
-            != context.identity.fingerprint_sha256
+        && verification_context_fingerprint(
+            &context.identity,
+            context.capability_resolution_ref.as_deref(),
+            context.capability_resolution_sha256.as_deref(),
+            &current_file_states,
+        ) != context.identity.fingerprint_sha256
     {
         reasons.push("frozen verification fingerprint drifted".to_string());
     }
@@ -1116,6 +1185,16 @@ mod tests {
         run: &mut punk_domain::Run,
         changed_files: &[&str],
     ) {
+        attach_verification_context_with_capability(root, run, changed_files, None, None);
+    }
+
+    fn attach_verification_context_with_capability(
+        root: &Path,
+        run: &mut punk_domain::Run,
+        changed_files: &[&str],
+        capability_resolution_ref: Option<String>,
+        capability_resolution_sha256: Option<String>,
+    ) {
         let workspace_root = PathBuf::from(&run.vcs.workspace_ref);
         if let Ok(backend) = detect_backend(&workspace_root) {
             run.vcs.backend = backend.kind();
@@ -1146,15 +1225,20 @@ mod tests {
             changed_files,
             fingerprint_sha256: String::new(),
         };
-        let fingerprint_sha256 = verification_context_fingerprint(&identity, &file_states);
+        let fingerprint_sha256 = verification_context_fingerprint(
+            &identity,
+            capability_resolution_ref.as_deref(),
+            capability_resolution_sha256.as_deref(),
+            &file_states,
+        );
         let context = VerificationContext {
             identity: VerificationContextIdentity {
                 fingerprint_sha256,
                 ..identity
             },
             file_states,
-            capability_resolution_ref: None,
-            capability_resolution_sha256: None,
+            capability_resolution_ref,
+            capability_resolution_sha256,
             captured_at: now_rfc3339(),
         };
         let context_path = root
@@ -2419,6 +2503,9 @@ mod tests {
             },
         )
         .unwrap();
+        let capability_sha256 = EventStore::new(&root)
+            .file_sha256(root.join(&capability_ref))
+            .unwrap();
 
         let mut run = punk_domain::Run {
             id: "run_1".into(),
@@ -2438,13 +2525,13 @@ mod tests {
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
-        attach_verification_context(&root, &mut run, &["tracked.txt"]);
-        let context_ref = run.verification_context_ref.clone().unwrap();
-        let context_path = root.join(&context_ref);
-        let mut context: VerificationContext = read_json(&context_path).unwrap();
-        context.capability_resolution_ref = Some(capability_ref.clone());
-        context.capability_resolution_sha256 = Some("cap-sha".into());
-        write_json(&context_path, &context).unwrap();
+        attach_verification_context_with_capability(
+            &root,
+            &mut run,
+            &["tracked.txt"],
+            Some(capability_ref.clone()),
+            Some(capability_sha256),
+        );
         write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
         write_json(
             &root.join(".punk/runs/run_1/receipt.json"),
@@ -2481,6 +2568,123 @@ mod tests {
                 "capability resolution frozen at .punk/contracts/feat_1/capability-resolution.json",
             )
         }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gate_blocks_when_verification_context_capability_hash_drifts() {
+        let (root, global) = architecture_test_root("capability-hash-drift");
+        fs::create_dir_all(root.join(".punk/project")).unwrap();
+        fs::write(
+            root.join(".punk/project/capabilities.json"),
+            "{ \"active\": [{\"id\": \"rust-cargo\"}] }\n",
+        )
+        .unwrap();
+        fs::write(root.join("tracked.txt"), "ok\n").unwrap();
+        commit_all(&root, "initial");
+        fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "stabilize tracked file".into(),
+            entry_points: vec!["tracked.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["tracked file stays stable".into()],
+            behavior_requirements: vec!["keep tracked file intact".into()],
+            allowed_scope: vec!["tracked.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        let capability_ref = ".punk/contracts/feat_1/capability-resolution.json".to_string();
+        write_json(
+            &root.join(&capability_ref),
+            &serde_json::json!({
+                "schema": "specpunk/contract-capability-resolution/v1",
+                "version": 1,
+                "contract_id": "ct_1",
+                "project_capability_index_ref": ".punk/project/capabilities.json",
+                "project_capability_index_sha256": "idx-sha",
+                "selected_capabilities": [{"id": "rust-cargo"}],
+                "ignore_rules": ["target"],
+                "scope_seeds": {"entry_points": ["Cargo.toml"]},
+                "target_checks": ["true"],
+                "integrity_checks": ["true"],
+                "generated_at": now_rfc3339()
+            }),
+        )
+        .unwrap();
+        write_json(
+            &root.join(".punk/contracts/feat_1/v1.json"),
+            &PersistedContract {
+                contract,
+                architecture_signals_ref: None,
+                architecture_integrity: None,
+                capability_resolution_ref: Some(capability_ref.clone()),
+            },
+        )
+        .unwrap();
+
+        let mut run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        attach_verification_context_with_capability(
+            &root,
+            &mut run,
+            &["tracked.txt"],
+            Some(capability_ref.clone()),
+            Some("stale-capability-hash".into()),
+        );
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        write_json(
+            &root.join(".punk/runs/run_1/receipt.json"),
+            &Receipt {
+                id: "rcpt_1".into(),
+                run_id: "run_1".into(),
+                task_id: "task_1".into(),
+                status: "success".into(),
+                executor_name: "test-executor".into(),
+                changed_files: vec!["tracked.txt".into()],
+                artifacts: ReceiptArtifacts {
+                    stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                    stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+                },
+                checks_run: vec!["true".into()],
+                duration_ms: 1,
+                cost_usd: None,
+                summary: "ok".into(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .unwrap();
+
+        let decision = GateService::new(&root, &global).gate_run("run_1").unwrap();
+        assert_eq!(decision.decision, Decision::Block);
+        assert!(decision
+            .decision_basis
+            .iter()
+            .any(|reason| { reason.contains("capability resolution hash drifted") }));
 
         let _ = fs::remove_dir_all(&root);
     }

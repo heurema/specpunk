@@ -327,6 +327,8 @@ fn verification_context_fingerprint(
     change_ref: &str,
     base_ref: Option<&str>,
     changed_files: &[String],
+    capability_resolution_ref: Option<&str>,
+    capability_resolution_sha256: Option<&str>,
     file_states: &[VerificationContextFileState],
 ) -> String {
     let mut hasher = Sha256::new();
@@ -337,6 +339,14 @@ fn verification_context_fingerprint(
     for path in changed_files {
         hasher.update(format!("changed:{path}\n"));
     }
+    hasher.update(format!(
+        "capability_ref:{}\n",
+        capability_resolution_ref.unwrap_or("")
+    ));
+    hasher.update(format!(
+        "capability_sha256:{}\n",
+        capability_resolution_sha256.unwrap_or("")
+    ));
     for state in file_states {
         hasher.update(format!(
             "file:{}:{}:{}\n",
@@ -367,6 +377,8 @@ fn build_verification_context(
         &run.vcs.change_ref,
         run.vcs.base_ref.as_deref(),
         &changed_files,
+        capability_resolution_ref.as_deref(),
+        capability_resolution_sha256.as_deref(),
         &file_states,
     );
     Ok(VerificationContext {
@@ -873,6 +885,7 @@ impl OrchService {
         contract: &Contract,
         architecture_mode: ArchitectureMode,
         existing: Option<&PersistedContract>,
+        capability_resolution_ref_override: Option<&str>,
     ) -> Result<()> {
         let previous_signals = existing
             .and_then(|doc| doc.architecture_signals_ref.as_ref())
@@ -918,8 +931,9 @@ impl OrchService {
             contract: contract.clone(),
             architecture_signals_ref: Some(signals_ref.clone()),
             architecture_integrity: integrity.clone(),
-            capability_resolution_ref: existing
-                .and_then(|doc| doc.capability_resolution_ref.clone()),
+            capability_resolution_ref: capability_resolution_ref_override
+                .map(str::to_string)
+                .or_else(|| existing.and_then(|doc| doc.capability_resolution_ref.clone())),
         };
         write_json(contract_path, &persisted)?;
         Ok(())
@@ -1316,6 +1330,7 @@ impl OrchService {
             &refined,
             architecture_mode,
             Some(&current_doc),
+            None,
         )?;
         self.append_event(
             &project.id,
@@ -1350,15 +1365,6 @@ impl OrchService {
                 format_validation_guidance(&errors)
             ));
         }
-        contract.status = ContractStatus::Approved;
-        contract.approved_at = Some(now_rfc3339());
-        self.write_contract_document(
-            &contract_path,
-            &contract,
-            ArchitectureMode::Auto,
-            Some(&persisted),
-        )?;
-        let mut approved_doc = read_persisted_contract_doc(&contract_path)?;
         let (
             project_capability_index,
             project_capability_index_ref,
@@ -1373,11 +1379,17 @@ impl OrchService {
         )?;
         let capability_resolution_path = capability_resolution_artifact_path(&contract_path);
         write_json(&capability_resolution_path, &frozen_capability_resolution)?;
-        approved_doc.capability_resolution_ref = Some(relative_ref(
-            &self.paths.repo_root,
-            &capability_resolution_path,
-        )?);
-        write_json(&contract_path, &approved_doc)?;
+        let capability_resolution_ref =
+            relative_ref(&self.paths.repo_root, &capability_resolution_path)?;
+        contract.status = ContractStatus::Approved;
+        contract.approved_at = Some(now_rfc3339());
+        self.write_contract_document(
+            &contract_path,
+            &contract,
+            ArchitectureMode::Auto,
+            Some(&persisted),
+            Some(&capability_resolution_ref),
+        )?;
         self.append_event(
             &project.id,
             Some(&contract.feature_id),
@@ -1445,7 +1457,7 @@ impl OrchService {
         let contract_dir = self.paths.contracts_dir.join(&feature.id);
         fs::create_dir_all(&contract_dir)?;
         let contract_path = contract_dir.join("v1.json");
-        self.write_contract_document(&contract_path, &contract, architecture_mode, None)?;
+        self.write_contract_document(&contract_path, &contract, architecture_mode, None, None)?;
         Ok((feature, contract))
     }
 
@@ -1499,6 +1511,8 @@ impl OrchService {
             &self.paths.repo_root,
             &workspace_root,
             &preexisting_changed_files,
+            &contract,
+            frozen_capability_resolution.as_ref(),
         )?;
         let isolated_backend = detect_backend(&workspace_root)?;
         let run_id = new_id("run");
@@ -3969,6 +3983,8 @@ fn sync_present_repo_root_changes_to_isolated_workspace(
     repo_root: &Path,
     workspace_root: &Path,
     changed_files: &[String],
+    contract: &Contract,
+    frozen_capability_resolution: Option<&FrozenCapabilityResolution>,
 ) -> Result<()> {
     if repo_root == workspace_root {
         return Ok(());
@@ -3990,7 +4006,195 @@ fn sync_present_repo_root_changes_to_isolated_workspace(
         }
         fs::copy(&source, &destination)?;
     }
+    sync_local_execution_support_to_isolated_workspace(
+        repo_root,
+        workspace_root,
+        contract,
+        frozen_capability_resolution,
+    )?;
     Ok(())
+}
+
+fn sync_local_execution_support_to_isolated_workspace(
+    repo_root: &Path,
+    workspace_root: &Path,
+    contract: &Contract,
+    frozen_capability_resolution: Option<&FrozenCapabilityResolution>,
+) -> Result<()> {
+    if repo_root == workspace_root {
+        return Ok(());
+    }
+    let support_roots: BTreeSet<&'static str> =
+        local_execution_support_roots(contract, frozen_capability_resolution)
+            .into_iter()
+            .collect();
+    if support_roots.is_empty() {
+        return Ok(());
+    }
+    sync_local_execution_support_dirs_recursive(
+        repo_root,
+        repo_root,
+        workspace_root,
+        &support_roots,
+    )
+}
+
+fn sync_local_execution_support_dirs_recursive(
+    repo_root: &Path,
+    current: &Path,
+    workspace_root: &Path,
+    support_roots: &BTreeSet<&'static str>,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let source = entry.path();
+        let relative = source
+            .strip_prefix(repo_root)
+            .map_err(|_| anyhow!("path escaped repo root"))?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let relative_path = relative.to_string_lossy().replace('\\', "/");
+        let file_type = entry.file_type()?;
+        if file_type.is_dir()
+            && support_roots.contains(entry.file_name().to_string_lossy().as_ref())
+        {
+            copy_tree_preserving_symlinks(&source, &workspace_root.join(relative))?;
+            continue;
+        }
+        if repo_relative_path_is_repo_walk_excluded(&relative_path) {
+            continue;
+        }
+        if file_type.is_dir() {
+            sync_local_execution_support_dirs_recursive(
+                repo_root,
+                &source,
+                workspace_root,
+                support_roots,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_tree_preserving_symlinks(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        copy_symlink(source, destination)?;
+        return Ok(());
+    }
+    if file_type.is_dir() {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_tree_preserving_symlinks(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, destination)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let target = fs::read_link(source)?;
+    std::os::unix::fs::symlink(&target, destination)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let target = fs::read_link(source)?;
+    let source_metadata = fs::metadata(source)?;
+    if source_metadata.is_dir() {
+        std::os::windows::fs::symlink_dir(&target, destination)?;
+    } else {
+        std::os::windows::fs::symlink_file(&target, destination)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn copy_symlink(_source: &Path, _destination: &Path) -> Result<()> {
+    Err(anyhow!("symlink copy is not supported on this platform"))
+}
+
+fn local_execution_support_roots(
+    contract: &Contract,
+    frozen_capability_resolution: Option<&FrozenCapabilityResolution>,
+) -> Vec<&'static str> {
+    let mut roots = Vec::new();
+    if local_execution_support_needed_for_capability(
+        frozen_capability_resolution,
+        "node-package-scripts",
+    ) || contract_uses_node_runtime_support(contract)
+    {
+        roots.push("node_modules");
+    }
+    if local_execution_support_needed_for_capability(
+        frozen_capability_resolution,
+        "python-pyproject-pytest",
+    ) || contract_uses_python_runtime_support(contract)
+    {
+        roots.push(".venv");
+    }
+    roots
+}
+
+fn local_execution_support_needed_for_capability(
+    frozen_capability_resolution: Option<&FrozenCapabilityResolution>,
+    capability_id: &str,
+) -> bool {
+    frozen_capability_resolution.is_some_and(|resolution| {
+        resolution
+            .selected_capabilities
+            .iter()
+            .any(|candidate| candidate.id == capability_id)
+    })
+}
+
+fn contract_uses_node_runtime_support(contract: &Contract) -> bool {
+    contract
+        .target_checks
+        .iter()
+        .chain(contract.integrity_checks.iter())
+        .any(|check| {
+            let lowered = check.to_ascii_lowercase();
+            lowered.contains("npm ")
+                || lowered.contains("pnpm ")
+                || lowered.contains("yarn ")
+                || lowered.contains("bun ")
+                || lowered.contains("node ")
+        })
+}
+
+fn contract_uses_python_runtime_support(contract: &Contract) -> bool {
+    contract
+        .target_checks
+        .iter()
+        .chain(contract.integrity_checks.iter())
+        .any(|check| {
+            let lowered = check.to_ascii_lowercase();
+            lowered.contains("pytest")
+                || lowered.starts_with("python ")
+                || lowered.contains(" python ")
+        })
 }
 
 fn ensure_default_gitignore_coverage(project_root: &Path) -> Result<()> {
@@ -8092,6 +8296,75 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn approve_contract_keeps_draft_when_capability_artifact_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-capability-freeze-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&FakeDrafter, "add file").unwrap();
+        let feature_dir = root.join(".punk/contracts").join(&contract.feature_id);
+        let original_permissions = fs::metadata(&feature_dir).unwrap().permissions();
+        let mut readonly_permissions = original_permissions.clone();
+        readonly_permissions.set_mode(0o555);
+        fs::set_permissions(&feature_dir, readonly_permissions).unwrap();
+
+        let approval = service.approve_contract(&contract.id);
+
+        fs::set_permissions(&feature_dir, original_permissions).unwrap();
+
+        assert!(approval.is_err());
+        let persisted = read_persisted_contract_doc(
+            &root
+                .join(".punk/contracts")
+                .join(&contract.feature_id)
+                .join("v1.json"),
+        )
+        .unwrap();
+        assert_eq!(persisted.contract.status, ContractStatus::Draft);
+        assert!(persisted.capability_resolution_ref.is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn cut_run_succeeds_when_bounded_diff_is_already_satisfied_before_dispatch() {
         let root = std::env::temp_dir().join(format!(
@@ -10247,6 +10520,23 @@ mod tests {
             "{\"ok\":true}\n",
         )
         .unwrap();
+        let rust_contract = Contract {
+            id: "ct_sync_rust".into(),
+            feature_id: "feat_sync_rust".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "stabilize rust workspace".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["workspace remains stable".into()],
+            behavior_requirements: vec!["keep rust scope bounded".into()],
+            allowed_scope: vec!["Cargo.toml".into(), "crates".into(), "tests".into()],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
 
         sync_present_repo_root_changes_to_isolated_workspace(
             &root,
@@ -10267,6 +10557,8 @@ mod tests {
                 ".build/debug.txt".into(),
                 ".playwright-mcp/state/session.json".into(),
             ],
+            &rust_contract,
+            None,
         )
         .unwrap();
 
@@ -10301,6 +10593,85 @@ mod tests {
     }
 
     #[test]
+    fn sync_present_repo_root_changes_to_isolated_workspace_copies_needed_local_execution_support()
+    {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-sync-support-root-{}-{suffix}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/node_modules/react")).unwrap();
+        fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::create_dir_all(root.join(".pytest_cache/v")).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export const ready = true;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/node_modules/react/index.js"),
+            "module.exports = {};\n",
+        )
+        .unwrap();
+        fs::write(root.join(".venv/bin/python"), "python\n").unwrap();
+        fs::write(root.join("dist/app.js"), "noise\n").unwrap();
+        fs::write(root.join(".pytest_cache/v/cache"), "noise\n").unwrap();
+
+        let node_python_contract = Contract {
+            id: "ct_sync_support".into(),
+            feature_id: "feat_sync_support".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "stabilize node and python checks".into(),
+            entry_points: vec!["baseline-site/package.json".into(), "pyproject.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["local checks keep working in isolated workspace".into()],
+            behavior_requirements: vec!["preserve local dependency support".into()],
+            allowed_scope: vec!["baseline-site/src/lib/services".into()],
+            target_checks: vec![
+                "npm --prefix baseline-site run check".into(),
+                "pytest".into(),
+            ],
+            integrity_checks: vec![
+                "npm --prefix baseline-site run check".into(),
+                "pytest".into(),
+            ],
+            risk_level: "medium".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+
+        sync_present_repo_root_changes_to_isolated_workspace(
+            &root,
+            &workspace,
+            &["baseline-site/src/lib/services/enrollments.ts".into()],
+            &node_python_contract,
+            None,
+        )
+        .unwrap();
+
+        assert!(workspace
+            .join("baseline-site/src/lib/services/enrollments.ts")
+            .exists());
+        assert!(workspace
+            .join("baseline-site/node_modules/react/index.js")
+            .exists());
+        assert!(workspace.join(".venv/bin/python").exists());
+        assert!(!workspace.join("dist/app.js").exists());
+        assert!(!workspace.join(".pytest_cache/v/cache").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn sync_present_repo_root_changes_to_isolated_workspace_skips_self_copy() {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -10323,6 +10694,24 @@ mod tests {
             &root,
             &root,
             &["crates/pubpunk-core/src/lib.rs".into()],
+            &Contract {
+                id: "ct_sync_self".into(),
+                feature_id: "feat_sync_self".into(),
+                version: 1,
+                status: ContractStatus::Approved,
+                prompt_source: "keep self copy stable".into(),
+                entry_points: vec!["crates/pubpunk-core/src/lib.rs".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["self copy remains stable".into()],
+                behavior_requirements: vec!["avoid self copy drift".into()],
+                allowed_scope: vec!["crates/pubpunk-core/src/lib.rs".into()],
+                target_checks: vec!["cargo test --workspace".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "low".into(),
+                created_at: now_rfc3339(),
+                approved_at: Some(now_rfc3339()),
+            },
+            None,
         )
         .unwrap();
 
