@@ -32,6 +32,7 @@ But these pieces still behave more like adjacent utilities than one coherent pro
 
 - no explicit project overlay packet
 - no canonical project capability summary
+- no inspectable project-level repo-kind candidate graph
 - no durable project memory packet inside runtime state
 - no clear line between repo-local instructions and runtime project policy
 
@@ -59,6 +60,7 @@ ProjectOverlay
   bootstrap_ref
   agent_guidance_ref
   capability_summary
+  capability_resolution
   project_skill_refs
   local_constraints
   safe_default_checks
@@ -74,10 +76,28 @@ ProjectOverlay
 - `bootstrap_ref` — repo-local bootstrap file or packet ref
 - `agent_guidance_ref` — repo-root `AGENTS.md` and/or `.punk/AGENT_START.md`
 - `capability_summary` — what the repo is ready to do safely right now
+- `capability_resolution` — concise summary plus ref to the detailed capability index
 - `project_skill_refs` — active project-scoped skill refs
 - `local_constraints` — repo-specific rules or caveats
 - `safe_default_checks` — default checks this project expects for bounded work
 - `status_scope_mode` — how `status` should resolve and present the repo
+
+The detailed built-in repo-kind graph should live in a sibling packet:
+
+```text
+.punk/project/capabilities.json
+```
+
+That packet should hold:
+
+- detected candidates
+- active candidates
+- suppressed/conflicted candidates
+- advisory ambient candidates
+- resolution mode/source
+- semantic ids / versions / hashes
+
+The coarse compatibility field such as `project_kind` can stay, but it should no longer be the only inspectable repo-kind truth.
 
 ## Proposed capability summary
 
@@ -123,6 +143,7 @@ It should answer in one place:
 - `.punk/AGENT_START.md`
 - project-scoped skills
 - project-specific default checks
+- project-level capability resolution summary/ref
 
 The main goal is to stop making agents assemble project state from scattered special cases.
 
@@ -137,6 +158,14 @@ That means:
 - `go` should use it for safe defaults
 - contributor agents should inspect it instead of guessing local conventions
 
+When work is approved, the project-level capability graph should narrow into a contract-scoped frozen capability packet under:
+
+```text
+.punk/contracts/<feature-id>/capability-resolution.json
+```
+
+That frozen packet is the semantic input `cut`, `gate`, and `proof` should trust, rather than live ambient repo re-resolution.
+
 ## Anti-goals
 
 - do not turn project intelligence into opaque hidden heuristics
@@ -148,13 +177,15 @@ That means:
 
 1. define a `ProjectOverlay` packet shape
 2. add `punk inspect project` or equivalent
-3. unify bootstrap file, generated instructions, and project-scoped skill metadata under one inspectable model
-4. make `status` and `init` explicitly read/write the same project-intelligence packet
+3. add a separate inspectable project capability index for mixed-repo candidate graphs
+4. unify bootstrap file, generated instructions, project-scoped skill metadata, and capability-summary refs under one inspectable model
+5. freeze narrowed capability semantics into approved contracts
 
 ## Acceptance evidence
 
 This track is done when:
 - project bootstrap no longer feels like a collection of special cases
 - agents can inspect one project packet instead of piecing together conventions from multiple files
+- mixed repo-kind candidates are inspectable without turning ambient state into hidden truth
 - project-specific behavior is explicit and testable
 - shell-facing project status can be explained from one inspectable source

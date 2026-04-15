@@ -165,6 +165,18 @@ SpecPunk still lacks a native bootstrap path that makes the repo self-describing
 - `DecisionObject` and `Proofpack` can be traced to the same execution context
 - the system fails closed if the run context cannot be trusted
 
+### Current bounded progress
+
+The current v0 implementation should also keep one shared repo-relative path classifier across:
+
+- repo scan
+- VCS provenance
+- isolated workspace sync
+- verification-context capture
+- `gate` scope / architecture filtering
+
+This strengthens the same frozen-context workstream without adding a new subsystem.
+
 ### Files to update
 
 - `crates/punk-orch/src/lib.rs`

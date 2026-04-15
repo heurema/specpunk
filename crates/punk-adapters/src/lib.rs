@@ -36,13 +36,14 @@ use context_pack::{
     restore_stale_entry_point_masks, scaffold_only_entry_points, ContextPack, ContextPlanSeed,
     ContextPlanTarget, EntryPointExcerptGuard,
 };
-use punk_domain::{Contract, DraftInput, DraftProposal, RefineInput};
+use punk_domain::{Contract, DraftInput, DraftProposal, FrozenCapabilityResolution, RefineInput};
 const BLOCKED_EXECUTION_SENTINEL: &str = "PUNK_EXECUTION_BLOCKED:";
 const SUCCESSFUL_EXECUTION_SENTINEL: &str = "PUNK_EXECUTION_COMPLETE:";
 
 pub struct ExecuteInput {
     pub repo_root: PathBuf,
     pub contract: Contract,
+    pub capability_resolution: Option<FrozenCapabilityResolution>,
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
     pub executor_pid_path: PathBuf,
@@ -308,6 +309,7 @@ impl Executor for CodexCliExecutor {
         let effective_input = ExecuteInput {
             repo_root: input.repo_root.clone(),
             contract: effective_contract,
+            capability_resolution: input.capability_resolution.clone(),
             stdout_path: input.stdout_path.clone(),
             stderr_path: input.stderr_path.clone(),
             executor_pid_path: input.executor_pid_path.clone(),
@@ -369,12 +371,9 @@ impl Executor for CodexCliExecutor {
         } else {
             Vec::new()
         };
-        let created_bootstrap_scaffold = materialize_rust_workspace_bootstrap_scaffold(
-            &effective_input.repo_root,
-            &effective_input.contract,
-        )?;
-        let bootstrap_scaffold_paths =
-            controller_bootstrap_scaffold_paths(&effective_input.contract);
+        let created_bootstrap_scaffold =
+            materialize_controller_bootstrap_scaffold(&effective_input)?;
+        let bootstrap_scaffold_paths = controller_bootstrap_scaffold_paths(&effective_input);
         let mut created_scaffold_paths = created_entry_points.clone();
         extend_unique_paths(&mut created_scaffold_paths, &created_bootstrap_scaffold);
         let mut attempt =
@@ -679,7 +678,7 @@ impl CodexCliExecutor {
         let mut patch_progress_probe_paths = materialized_entry_points.clone();
         extend_unique_paths(
             &mut patch_progress_probe_paths,
-            &controller_bootstrap_scaffold_paths(&input.contract),
+            &controller_bootstrap_scaffold_paths(&input),
         );
         let patch_entry_point_snapshots =
             if should_capture_progress_snapshots(&input.contract, &patch_progress_probe_paths) {
@@ -1253,7 +1252,7 @@ impl CodexCliExecutor {
         let mut progress_probe_paths = created_scaffold_paths.to_vec();
         extend_unique_paths(
             &mut progress_probe_paths,
-            &controller_bootstrap_scaffold_paths(&input.contract),
+            &controller_bootstrap_scaffold_paths(input),
         );
         let entry_point_snapshots = if should_capture_progress_snapshots(
             &input.contract,
@@ -1339,11 +1338,7 @@ impl CodexCliExecutor {
                     &input.contract,
                     created_scaffold_paths,
                 );
-                let _ = restore_rust_workspace_bootstrap_scaffold(
-                    &input.repo_root,
-                    &input.contract,
-                    created_scaffold_paths,
-                );
+                let _ = restore_controller_bootstrap_scaffold(input, created_scaffold_paths);
                 return Err(err);
             }
         };
@@ -1353,11 +1348,8 @@ impl CodexCliExecutor {
             &input.contract,
             created_scaffold_paths,
         )?;
-        let restored_bootstrap_paths = restore_rust_workspace_bootstrap_scaffold(
-            &input.repo_root,
-            &input.contract,
-            created_scaffold_paths,
-        )?;
+        let restored_bootstrap_paths =
+            restore_controller_bootstrap_scaffold(input, created_scaffold_paths)?;
         let mut restored_paths = restored_paths;
         extend_unique_paths(&mut restored_paths, &restored_bootstrap_paths);
         Ok(AttemptOutcome {
@@ -1905,19 +1897,16 @@ fn codex_patch_lane_timeout() -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn materialize_rust_workspace_bootstrap_scaffold(
-    repo_root: &Path,
-    contract: &Contract,
-) -> Result<Vec<String>> {
-    let Some(files) = rust_workspace_bootstrap_templates(contract) else {
+fn materialize_controller_bootstrap_scaffold(input: &ExecuteInput) -> Result<Vec<String>> {
+    let Some(files) = controller_bootstrap_scaffold_templates(input) else {
         return Ok(Vec::new());
     };
     let mut created = Vec::new();
     for (path, contents) in files {
-        if !path_is_in_allowed_scope(&path, &contract.allowed_scope) {
+        if !path_is_in_allowed_scope(&path, &input.contract.allowed_scope) {
             continue;
         }
-        let file_path = repo_root.join(&path);
+        let file_path = input.repo_root.join(&path);
         if file_path.exists() {
             continue;
         }
@@ -1932,12 +1921,11 @@ fn materialize_rust_workspace_bootstrap_scaffold(
     Ok(created)
 }
 
-fn restore_rust_workspace_bootstrap_scaffold(
-    repo_root: &Path,
-    contract: &Contract,
+fn restore_controller_bootstrap_scaffold(
+    input: &ExecuteInput,
     created_paths: &[String],
 ) -> Result<Vec<String>> {
-    let Some(files) = rust_workspace_bootstrap_templates(contract) else {
+    let Some(files) = controller_bootstrap_scaffold_templates(input) else {
         return Ok(Vec::new());
     };
     let template_map = files
@@ -1948,7 +1936,7 @@ fn restore_rust_workspace_bootstrap_scaffold(
         let Some(contents) = template_map.get(path) else {
             continue;
         };
-        let file_path = repo_root.join(path);
+        let file_path = input.repo_root.join(path);
         if file_path.exists() {
             continue;
         }
@@ -1961,6 +1949,46 @@ fn restore_rust_workspace_bootstrap_scaffold(
         restored.push(path.clone());
     }
     Ok(restored)
+}
+
+fn controller_bootstrap_scaffold_kind(input: &ExecuteInput) -> Option<&str> {
+    input
+        .capability_resolution
+        .as_ref()
+        .and_then(|resolution| resolution.controller_scaffold_kind.as_deref())
+}
+
+fn controller_bootstrap_scaffold_templates(input: &ExecuteInput) -> Option<Vec<(String, String)>> {
+    match controller_bootstrap_scaffold_kind(input) {
+        Some("rust-cargo") => rust_workspace_bootstrap_templates(&input.contract),
+        Some("go-mod") => go_module_bootstrap_templates(&input.contract),
+        Some("python-pyproject-pytest") => python_package_bootstrap_templates(&input.contract),
+        Some(_) => None,
+        None => legacy_controller_bootstrap_scaffold_templates(&input.contract),
+    }
+}
+
+fn legacy_controller_bootstrap_scaffold_templates(
+    contract: &Contract,
+) -> Option<Vec<(String, String)>> {
+    rust_workspace_bootstrap_templates(contract)
+        .or_else(|| go_module_bootstrap_templates(contract))
+        .or_else(|| python_package_bootstrap_templates(contract))
+}
+
+#[allow(dead_code)]
+fn materialize_rust_workspace_bootstrap_scaffold(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Result<Vec<String>> {
+    materialize_controller_bootstrap_scaffold(&ExecuteInput {
+        repo_root: repo_root.to_path_buf(),
+        contract: contract.clone(),
+        capability_resolution: None,
+        stdout_path: PathBuf::new(),
+        stderr_path: PathBuf::new(),
+        executor_pid_path: PathBuf::new(),
+    })
 }
 
 fn rust_workspace_bootstrap_templates(contract: &Contract) -> Option<Vec<(String, String)>> {
@@ -2019,6 +2047,85 @@ fn rust_workspace_bootstrap_templates(contract: &Contract) -> Option<Vec<(String
     }
 
     Some(files)
+}
+
+fn go_module_bootstrap_templates(contract: &Contract) -> Option<Vec<(String, String)>> {
+    if contract.entry_points != vec!["go.mod".to_string()] {
+        return None;
+    }
+    if !contract_has_check(contract, "go test ./...") {
+        return None;
+    }
+    if !contract.allowed_scope.iter().any(|scope| scope == "cmd") {
+        return None;
+    }
+    let slug = infer_rust_bootstrap_app_slug(contract).unwrap_or_else(|| "app".to_string());
+    let module_slug = normalize_go_module_slug(&slug);
+    let command_dir = contract
+        .allowed_scope
+        .iter()
+        .find(|scope| scope.starts_with("cmd/") && !scope.contains('.'))
+        .cloned()
+        .unwrap_or_else(|| format!("cmd/{slug}"));
+    let mut files = vec![
+        (
+            "go.mod".to_string(),
+            render_go_module_manifest(&module_slug),
+        ),
+        (
+            format!("{command_dir}/main.go"),
+            "package main\n\nfunc main() {}\n".to_string(),
+        ),
+    ];
+    if contract
+        .allowed_scope
+        .iter()
+        .any(|scope| scope == "internal")
+    {
+        files.push((
+            "internal/bootstrap/bootstrap.go".to_string(),
+            "package bootstrap\n\nfunc Ready() bool {\n\treturn true\n}\n".to_string(),
+        ));
+    }
+    if contract.allowed_scope.iter().any(|scope| scope == "pkg") {
+        files.push((
+            "pkg/bootstrap/bootstrap.go".to_string(),
+            "package bootstrap\n\nfunc Ready() bool {\n\treturn true\n}\n".to_string(),
+        ));
+    }
+    Some(files)
+}
+
+fn python_package_bootstrap_templates(contract: &Contract) -> Option<Vec<(String, String)>> {
+    if contract.entry_points != vec!["pyproject.toml".to_string()] {
+        return None;
+    }
+    if !contract_has_check(contract, "pytest") {
+        return None;
+    }
+    if !contract.allowed_scope.iter().any(|scope| scope == "src")
+        || !contract.allowed_scope.iter().any(|scope| scope == "tests")
+    {
+        return None;
+    }
+    let slug = infer_rust_bootstrap_app_slug(contract).unwrap_or_else(|| "app".to_string());
+    let distribution_name = slug.replace('-', "_");
+    Some(vec![
+        (
+            "pyproject.toml".to_string(),
+            render_python_pyproject(&distribution_name),
+        ),
+        (
+            format!("src/{distribution_name}/__init__.py"),
+            "__all__ = [\"ready\"]\n\n\ndef ready() -> bool:\n    return True\n".to_string(),
+        ),
+        (
+            "tests/test_bootstrap.py".to_string(),
+            format!(
+                "from {distribution_name} import ready\n\n\ndef test_bootstrap_smoke() -> None:\n    assert ready() is True\n"
+            ),
+        ),
+    ])
 }
 
 fn rust_workspace_bootstrap_crate_dirs(contract: &Contract) -> Vec<String> {
@@ -2157,8 +2264,14 @@ fn is_viable_bootstrap_app_slug(value: &str) -> bool {
         .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
 }
 
-fn controller_bootstrap_scaffold_paths(contract: &Contract) -> Vec<String> {
-    rust_workspace_bootstrap_templates(contract)
+fn controller_bootstrap_scaffold_paths(input: &ExecuteInput) -> Vec<String> {
+    controller_bootstrap_scaffold_templates(input)
+        .map(|files| files.into_iter().map(|(path, _)| path).collect())
+        .unwrap_or_default()
+}
+
+fn legacy_controller_bootstrap_scaffold_paths(contract: &Contract) -> Vec<String> {
+    legacy_controller_bootstrap_scaffold_templates(contract)
         .map(|files| files.into_iter().map(|(path, _)| path).collect())
         .unwrap_or_default()
 }
@@ -2211,6 +2324,28 @@ fn render_rust_member_source(
 
     "pub fn init() -> &'static str {\n    \"pubpunk initialized\"\n}\n\npub fn validate() -> bool {\n    true\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn bootstrap_smoke() {\n        assert_eq!(init(), \"pubpunk initialized\");\n        assert!(validate());\n    }\n}\n"
         .to_string()
+}
+
+fn render_go_module_manifest(module_slug: &str) -> String {
+    format!("module example.com/{module_slug}\n\ngo 1.22\n")
+}
+
+fn normalize_go_module_slug(slug: &str) -> String {
+    slug.trim().trim_matches('/').replace('_', "-")
+}
+
+fn render_python_pyproject(distribution_name: &str) -> String {
+    format!(
+        "[build-system]\nrequires = [\"setuptools>=68\"]\nbuild-backend = \"setuptools.build_meta\"\n\n[project]\nname = \"{distribution_name}\"\nversion = \"0.1.0\"\ndependencies = []\n\n[tool.pytest.ini_options]\npythonpath = [\"src\"]\n"
+    )
+}
+
+fn contract_has_check(contract: &Contract, expected: &str) -> bool {
+    contract
+        .target_checks
+        .iter()
+        .chain(contract.integrity_checks.iter())
+        .any(|check| check.trim() == expected)
 }
 
 fn maybe_execute_controller_pubpunk_init_recipe(
@@ -4192,7 +4327,7 @@ fn effective_execution_contract(repo_root: &Path, contract: &Contract) -> Result
         return Ok(contract.clone());
     }
     let needs_creatable_tests_scope = contract_needs_creatable_tests_scope(repo_root, contract)?;
-    let bootstrap_scaffold_paths = controller_bootstrap_scaffold_paths(contract);
+    let bootstrap_scaffold_paths = legacy_controller_bootstrap_scaffold_paths(contract);
     if !bootstrap_scaffold_paths.is_empty()
         && bootstrap_scaffold_paths
             .iter()
@@ -6722,6 +6857,7 @@ mod tests {
                 candidate_target_checks: vec!["true".into()],
                 candidate_integrity_checks: vec!["true".into()],
                 notes: vec![],
+                capability_resolution: None,
             },
         };
 
@@ -6809,6 +6945,7 @@ mod tests {
                 candidate_target_checks: vec!["true".into()],
                 candidate_integrity_checks: vec!["true".into()],
                 notes: vec![],
+                capability_resolution: None,
             },
         };
 
@@ -6891,6 +7028,7 @@ mod tests {
                 candidate_target_checks: vec!["true".into()],
                 candidate_integrity_checks: vec!["true".into()],
                 notes: vec![],
+                capability_resolution: None,
             },
         };
 
@@ -6973,6 +7111,7 @@ mod tests {
                 candidate_target_checks: vec!["true".into()],
                 candidate_integrity_checks: vec!["true".into()],
                 notes: vec![],
+                capability_resolution: None,
             },
         };
 
@@ -7541,6 +7680,7 @@ mod tests {
             .execute_contract(ExecuteInput {
                 repo_root: root.clone(),
                 contract,
+                capability_resolution: None,
                 stdout_path: root.join("stdout.log"),
                 stderr_path: root.join("stderr.log"),
                 executor_pid_path: root.join("executor.json"),
@@ -8585,6 +8725,7 @@ mod tests {
                 candidate_target_checks: vec!["cargo test".into()],
                 candidate_integrity_checks: vec!["cargo test".into()],
                 notes: vec![],
+                capability_resolution: None,
             },
         };
         let prompt = build_draft_prompt(&input);
@@ -8612,6 +8753,7 @@ mod tests {
                 ],
                 candidate_integrity_checks: vec!["cargo test --workspace".into()],
                 notes: vec!["extra note".into()],
+                capability_resolution: None,
             },
         };
         let primary = build_draft_prompt(&input);
@@ -8653,6 +8795,7 @@ mod tests {
                 ],
                 candidate_integrity_checks: vec!["cargo test --workspace".into()],
                 notes: vec!["extra note".into()],
+                capability_resolution: None,
             },
         };
         let primary = build_refine_prompt(&input);
@@ -9694,6 +9837,128 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn materialize_controller_bootstrap_scaffold_uses_frozen_go_kind() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-go-bootstrap-materialize-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let created = materialize_controller_bootstrap_scaffold(&ExecuteInput {
+            repo_root: root.clone(),
+            contract: Contract {
+                id: "ct_go".into(),
+                feature_id: "feat_go".into(),
+                version: 1,
+                status: punk_domain::ContractStatus::Approved,
+                prompt_source: "bootstrap initial Go module for pubpunk".into(),
+                entry_points: vec!["go.mod".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["initial Go scaffold".into()],
+                behavior_requirements: vec!["bootstrap project".into()],
+                allowed_scope: vec!["go.mod".into(), "cmd".into(), "internal".into()],
+                target_checks: vec!["go test ./...".into()],
+                integrity_checks: vec!["go test ./...".into()],
+                risk_level: "medium".into(),
+                created_at: "now".into(),
+                approved_at: Some("now".into()),
+            },
+            capability_resolution: Some(punk_domain::FrozenCapabilityResolution {
+                schema: "specpunk/contract-capability-resolution/v1".into(),
+                version: 1,
+                contract_id: "ct_go".into(),
+                project_capability_index_ref: ".punk/project/capabilities.json".into(),
+                project_capability_index_sha256: "idx-sha".into(),
+                selected_capabilities: Vec::new(),
+                ignore_rules: Vec::new(),
+                scope_seeds: punk_domain::CapabilityScopeSeeds::default(),
+                target_checks: vec!["go test ./...".into()],
+                integrity_checks: vec!["go test ./...".into()],
+                controller_scaffold_kind: Some("go-mod".into()),
+                generated_at: "now".into(),
+            }),
+            stdout_path: root.join("stdout.log"),
+            stderr_path: root.join("stderr.log"),
+            executor_pid_path: root.join("executor.json"),
+        })
+        .unwrap();
+        assert!(created.iter().any(|path| path == "go.mod"));
+        assert!(created
+            .iter()
+            .any(|path| path.starts_with("cmd/") && path.ends_with("/main.go")));
+        assert!(created
+            .iter()
+            .any(|path| path == "internal/bootstrap/bootstrap.go"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn materialize_controller_bootstrap_scaffold_uses_frozen_python_kind() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-python-bootstrap-materialize-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let created = materialize_controller_bootstrap_scaffold(&ExecuteInput {
+            repo_root: root.clone(),
+            contract: Contract {
+                id: "ct_py".into(),
+                feature_id: "feat_py".into(),
+                version: 1,
+                status: punk_domain::ContractStatus::Approved,
+                prompt_source: "bootstrap initial Python package for pubpunk".into(),
+                entry_points: vec!["pyproject.toml".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["initial Python scaffold".into()],
+                behavior_requirements: vec!["bootstrap project".into()],
+                allowed_scope: vec!["pyproject.toml".into(), "src".into(), "tests".into()],
+                target_checks: vec!["pytest".into()],
+                integrity_checks: vec!["pytest".into()],
+                risk_level: "medium".into(),
+                created_at: "now".into(),
+                approved_at: Some("now".into()),
+            },
+            capability_resolution: Some(punk_domain::FrozenCapabilityResolution {
+                schema: "specpunk/contract-capability-resolution/v1".into(),
+                version: 1,
+                contract_id: "ct_py".into(),
+                project_capability_index_ref: ".punk/project/capabilities.json".into(),
+                project_capability_index_sha256: "idx-sha".into(),
+                selected_capabilities: Vec::new(),
+                ignore_rules: Vec::new(),
+                scope_seeds: punk_domain::CapabilityScopeSeeds::default(),
+                target_checks: vec!["pytest".into()],
+                integrity_checks: vec!["pytest".into()],
+                controller_scaffold_kind: Some("python-pyproject-pytest".into()),
+                generated_at: "now".into(),
+            }),
+            stdout_path: root.join("stdout.log"),
+            stderr_path: root.join("stderr.log"),
+            executor_pid_path: root.join("executor.json"),
+        })
+        .unwrap();
+        assert!(created.iter().any(|path| path == "pyproject.toml"));
+        assert!(created.iter().any(|path| path == "tests/test_bootstrap.py"));
+        assert!(created
+            .iter()
+            .any(|path| path.starts_with("src/") && path.ends_with("/__init__.py")));
 
         let _ = fs::remove_dir_all(&root);
     }

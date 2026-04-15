@@ -12,17 +12,23 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use punk_adapters::{ContractDrafter, ExecuteInput, Executor};
 use punk_core::{
-    apply_explicit_prompt_overrides, build_bounded_fallback_proposal, canonicalize_draft_proposal,
-    compute_architecture_signals, scan_repo, validate_draft_proposal, ArchitectureSignalInput,
+    apply_explicit_prompt_overrides, build_bounded_fallback_proposal,
+    build_project_capability_index, canonicalize_draft_proposal, capability_generated_noise_path,
+    compute_architecture_signals, freeze_contract_capability_resolution,
+    repo_relative_path_is_generated_noise, repo_relative_path_is_product_change,
+    repo_relative_path_is_repo_walk_excluded, repo_relative_path_is_runtime_artifact, scan_repo,
+    scope_seeds_for_entry_point, scope_seeds_for_entry_point_with_prompt, validate_draft_proposal,
+    ArchitectureSignalInput,
 };
 pub use punk_core::{find_object_path, read_json, relative_ref, write_json};
 use punk_domain::{
     now_rfc3339, ArchitectureAssessment, ArchitectureAssessmentOutcome, ArchitectureFileLocBudget,
-    ArchitectureSeverity, ArchitectureSignals, AutonomyOutcome, AutonomyRecord, Contract,
-    ContractArchitectureIntegrity, ContractStatus, DraftInput, DraftProposal, EventEnvelope,
-    Feature, FeatureStatus, ModeId, PersistedContract, Project, Receipt, ReceiptArtifacts,
-    RefineInput, ResearchArtifact, ResearchArtifactInput, ResearchInvalidationEntry,
-    ResearchPacket, ResearchQuestion, ResearchRecord, ResearchStartInput, ResearchSynthesis,
+    ArchitectureSeverity, ArchitectureSignals, AutonomyOutcome, AutonomyRecord,
+    CapabilityCandidateView, Contract, ContractArchitectureIntegrity, ContractStatus, DraftInput,
+    DraftProposal, EventEnvelope, Feature, FeatureStatus, FrozenCapabilityResolution, ModeId,
+    PersistedContract, Project, ProjectCapabilityIndex, Receipt, ReceiptArtifacts, RefineInput,
+    ResearchArtifact, ResearchArtifactInput, ResearchInvalidationEntry, ResearchPacket,
+    ResearchQuestion, ResearchRecord, ResearchStartInput, ResearchSynthesis,
     ResearchSynthesisInput, Run, RunStatus, Task, TaskKind, TaskStatus, VcsKind,
     VerificationContext, VerificationContextFileState, VerificationContextIdentity,
 };
@@ -47,6 +53,7 @@ pub struct RepoPaths {
     pub project_dir: PathBuf,
     pub harness_spec_path: PathBuf,
     pub project_overlay_path: PathBuf,
+    pub project_capability_index_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,6 +138,23 @@ pub struct ProjectCapabilitySummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectCapabilityResolutionSummary {
+    pub capability_index_ref: String,
+    pub resolution_source: String,
+    pub resolution_mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active: Vec<CapabilityCandidateView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed: Vec<CapabilityCandidateView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicted: Vec<CapabilityCandidateView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisory: Vec<CapabilityCandidateView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectHarnessSummary {
     pub inspect_ready: bool,
     pub bootable_per_workspace: bool,
@@ -182,6 +206,7 @@ pub struct ProjectOverlay {
     pub bootstrap_ref: Option<String>,
     pub agent_guidance_ref: Vec<String>,
     pub capability_summary: ProjectCapabilitySummary,
+    pub capability_resolution: ProjectCapabilityResolutionSummary,
     pub harness_summary: ProjectHarnessSummary,
     pub harness_spec_ref: String,
     pub harness_spec: PersistedHarnessSpec,
@@ -255,7 +280,7 @@ fn repo_has_any(repo_root: &Path, rel_paths: &[&str]) -> bool {
 }
 
 fn is_verification_context_runtime_artifact(path: &str) -> bool {
-    path.starts_with(".punk/")
+    !repo_relative_path_is_product_change(path)
 }
 
 fn filtered_verification_context_paths(changed_files: &[String]) -> Vec<String> {
@@ -302,6 +327,8 @@ fn verification_context_fingerprint(
     change_ref: &str,
     base_ref: Option<&str>,
     changed_files: &[String],
+    capability_resolution_ref: Option<&str>,
+    capability_resolution_sha256: Option<&str>,
     file_states: &[VerificationContextFileState],
 ) -> String {
     let mut hasher = Sha256::new();
@@ -312,6 +339,14 @@ fn verification_context_fingerprint(
     for path in changed_files {
         hasher.update(format!("changed:{path}\n"));
     }
+    hasher.update(format!(
+        "capability_ref:{}\n",
+        capability_resolution_ref.unwrap_or("")
+    ));
+    hasher.update(format!(
+        "capability_sha256:{}\n",
+        capability_resolution_sha256.unwrap_or("")
+    ));
     for state in file_states {
         hasher.update(format!(
             "file:{}:{}:{}\n",
@@ -327,6 +362,8 @@ fn build_verification_context(
     run: &Run,
     workspace_root: &Path,
     changed_files: &[String],
+    capability_resolution_ref: Option<String>,
+    capability_resolution_sha256: Option<String>,
 ) -> Result<VerificationContext> {
     let changed_files = filtered_verification_context_paths(changed_files);
     let mut file_states = changed_files
@@ -340,6 +377,8 @@ fn build_verification_context(
         &run.vcs.change_ref,
         run.vcs.base_ref.as_deref(),
         &changed_files,
+        capability_resolution_ref.as_deref(),
+        capability_resolution_sha256.as_deref(),
         &file_states,
     );
     Ok(VerificationContext {
@@ -352,6 +391,8 @@ fn build_verification_context(
             fingerprint_sha256,
         },
         file_states,
+        capability_resolution_ref,
+        capability_resolution_sha256,
         captured_at: now_rfc3339(),
     })
 }
@@ -441,6 +482,10 @@ fn architecture_signals_artifact_path(contract_path: &Path) -> PathBuf {
 
 fn architecture_brief_artifact_path(contract_path: &Path) -> PathBuf {
     contract_path.with_file_name("architecture-brief.md")
+}
+
+fn capability_resolution_artifact_path(contract_path: &Path) -> PathBuf {
+    contract_path.with_file_name("capability-resolution.json")
 }
 
 fn read_persisted_contract_doc(path: &Path) -> Result<PersistedContract> {
@@ -787,6 +832,7 @@ impl OrchService {
             project_dir: project_dir.clone(),
             harness_spec_path: project_dir.join("harness.json"),
             project_overlay_path: project_dir.join("overlay.json"),
+            project_capability_index_path: project_dir.join("capabilities.json"),
         };
         let events = EventStore::new(paths.global_root.clone());
         let service = Self { paths, events };
@@ -803,12 +849,43 @@ impl OrchService {
         &self.events
     }
 
+    fn persist_project_capability_index(
+        &self,
+        prompt: &str,
+    ) -> Result<(ProjectCapabilityIndex, String, String)> {
+        let project = self.bootstrap_project()?;
+        let scan = scan_repo(&self.paths.repo_root, prompt)?;
+        let index =
+            build_project_capability_index(&project.id, scan.capability_resolution.as_ref());
+        write_json(&self.paths.project_capability_index_path, &index)?;
+        let index_ref = relative_ref(
+            &self.paths.repo_root,
+            &self.paths.project_capability_index_path,
+        )?;
+        let index_sha256 = sha256_file(&self.paths.project_capability_index_path)?;
+        Ok((index, index_ref, index_sha256))
+    }
+
+    fn load_frozen_capability_resolution(
+        &self,
+        persisted_contract: &PersistedContract,
+    ) -> Result<Option<FrozenCapabilityResolution>> {
+        persisted_contract
+            .capability_resolution_ref
+            .as_ref()
+            .map(|reference| {
+                read_json::<FrozenCapabilityResolution>(&self.paths.repo_root.join(reference))
+            })
+            .transpose()
+    }
+
     fn write_contract_document(
         &self,
         contract_path: &Path,
         contract: &Contract,
         architecture_mode: ArchitectureMode,
         existing: Option<&PersistedContract>,
+        capability_resolution_ref_override: Option<&str>,
     ) -> Result<()> {
         let previous_signals = existing
             .and_then(|doc| doc.architecture_signals_ref.as_ref())
@@ -854,6 +931,9 @@ impl OrchService {
             contract: contract.clone(),
             architecture_signals_ref: Some(signals_ref.clone()),
             architecture_integrity: integrity.clone(),
+            capability_resolution_ref: capability_resolution_ref_override
+                .map(str::to_string)
+                .or_else(|| existing.and_then(|doc| doc.capability_resolution_ref.clone())),
         };
         write_json(contract_path, &persisted)?;
         Ok(())
@@ -1250,6 +1330,7 @@ impl OrchService {
             &refined,
             architecture_mode,
             Some(&current_doc),
+            None,
         )?;
         self.append_event(
             &project.id,
@@ -1284,6 +1365,22 @@ impl OrchService {
                 format_validation_guidance(&errors)
             ));
         }
+        let (
+            project_capability_index,
+            project_capability_index_ref,
+            project_capability_index_sha256,
+        ) = self.persist_project_capability_index("project overlay safe default checks")?;
+        let frozen_capability_resolution = freeze_contract_capability_resolution(
+            &self.paths.repo_root,
+            &contract,
+            &project_capability_index,
+            &project_capability_index_ref,
+            &project_capability_index_sha256,
+        )?;
+        let capability_resolution_path = capability_resolution_artifact_path(&contract_path);
+        write_json(&capability_resolution_path, &frozen_capability_resolution)?;
+        let capability_resolution_ref =
+            relative_ref(&self.paths.repo_root, &capability_resolution_path)?;
         contract.status = ContractStatus::Approved;
         contract.approved_at = Some(now_rfc3339());
         self.write_contract_document(
@@ -1291,6 +1388,7 @@ impl OrchService {
             &contract,
             ArchitectureMode::Auto,
             Some(&persisted),
+            Some(&capability_resolution_ref),
         )?;
         self.append_event(
             &project.id,
@@ -1359,17 +1457,20 @@ impl OrchService {
         let contract_dir = self.paths.contracts_dir.join(&feature.id);
         fs::create_dir_all(&contract_dir)?;
         let contract_path = contract_dir.join("v1.json");
-        self.write_contract_document(&contract_path, &contract, architecture_mode, None)?;
+        self.write_contract_document(&contract_path, &contract, architecture_mode, None, None)?;
         Ok((feature, contract))
     }
 
     pub fn cut_run(&self, executor: &dyn Executor, contract_id: &str) -> Result<(Run, Receipt)> {
         let project = self.bootstrap_project()?;
         let contract_path = self.find_object_path(&self.paths.contracts_dir, contract_id)?;
-        let contract: Contract = read_json(&contract_path)?;
+        let persisted_contract = read_persisted_contract_doc(&contract_path)?;
+        let contract: Contract = persisted_contract.contract.clone();
         if contract.status != ContractStatus::Approved {
             return Err(anyhow!("cut run requires an approved contract"));
         }
+        let frozen_capability_resolution =
+            self.load_frozen_capability_resolution(&persisted_contract)?;
 
         let task = Task {
             id: new_id("task"),
@@ -1410,6 +1511,8 @@ impl OrchService {
             &self.paths.repo_root,
             &workspace_root,
             &preexisting_changed_files,
+            &contract,
+            frozen_capability_resolution.as_ref(),
         )?;
         let isolated_backend = detect_backend(&workspace_root)?;
         let run_id = new_id("run");
@@ -1499,6 +1602,7 @@ impl OrchService {
             executor.execute_contract(ExecuteInput {
                 repo_root: workspace_root.clone(),
                 contract: contract.clone(),
+                capability_resolution: frozen_capability_resolution.clone(),
                 stdout_path: stdout_path.clone(),
                 stderr_path: stderr_path.clone(),
                 executor_pid_path: executor_pid_path.clone(),
@@ -1589,8 +1693,18 @@ impl OrchService {
                 ensure_default_gitignore_coverage(&self.paths.repo_root)?;
             }
         }
-        let verification_context =
-            build_verification_context(&run, &workspace_root, &changed_files)?;
+        let capability_resolution_ref = persisted_contract.capability_resolution_ref.clone();
+        let capability_resolution_sha256 = capability_resolution_ref
+            .as_ref()
+            .map(|reference| sha256_file(&self.paths.repo_root.join(reference)))
+            .transpose()?;
+        let verification_context = build_verification_context(
+            &run,
+            &workspace_root,
+            &changed_files,
+            capability_resolution_ref.clone(),
+            capability_resolution_sha256,
+        )?;
         let verification_context_path = run_dir.join("verification-context.json");
         write_json(&verification_context_path, &verification_context)?;
         run.verification_context_ref = Some(relative_ref(
@@ -2125,14 +2239,23 @@ impl OrchService {
         }
 
         let mut local_constraints = Vec::new();
-        let safe_default_checks =
-            match scan_repo(&self.paths.repo_root, "project overlay safe default checks") {
-                Ok(scan) => scan.candidate_integrity_checks,
-                Err(error) => {
-                    local_constraints.push(format!("unable to infer safe default checks: {error}"));
-                    Vec::new()
-                }
-            };
+        let (project_capability_index, capability_index_ref, safe_default_checks) = match self
+            .persist_project_capability_index("project overlay safe default checks")
+        {
+            Ok((index, index_ref, _)) => {
+                let scan = scan_repo(&self.paths.repo_root, "project overlay safe default checks")?;
+                (index, index_ref, scan.candidate_integrity_checks)
+            }
+            Err(error) => {
+                local_constraints
+                    .push(format!("unable to infer project capability index: {error}"));
+                (
+                    build_project_capability_index(&project.id, None),
+                    ".punk/project/capabilities.json".to_string(),
+                    Vec::new(),
+                )
+            }
+        };
 
         let repo_local_project_skill_refs =
             match repo_local_project_skill_refs(&self.paths.repo_root) {
@@ -2194,6 +2317,20 @@ impl OrchService {
             jj_ready: vcs_mode == "jj",
             proof_ready: staged_ready,
             project_guidance_ready,
+        };
+        let capability_resolution = ProjectCapabilityResolutionSummary {
+            capability_index_ref,
+            resolution_source: project_capability_index.source_kind.clone(),
+            resolution_mode: project_capability_index.resolution_mode.clone(),
+            active_ids: project_capability_index
+                .active
+                .iter()
+                .map(|candidate| candidate.id.clone())
+                .collect(),
+            active: project_capability_index.active.clone(),
+            suppressed: project_capability_index.suppressed.clone(),
+            conflicted: project_capability_index.conflicted.clone(),
+            advisory: project_capability_index.advisory.clone(),
         };
         let ui_legible = repo_has_any(
             &self.paths.repo_root,
@@ -2267,6 +2404,7 @@ impl OrchService {
             bootstrap_ref,
             agent_guidance_ref,
             capability_summary,
+            capability_resolution,
             harness_summary,
             harness_spec_ref,
             harness_spec,
@@ -3821,11 +3959,10 @@ fn sync_present_isolated_changes_to_repo_root(
     if repo_root == workspace_root {
         return Ok(());
     }
-    for path in changed_files.iter().filter(|path| {
-        !path.starts_with(".punk/")
-            && !path.starts_with("target/")
-            && !path.starts_with(".playwright-mcp/")
-    }) {
+    for path in changed_files
+        .iter()
+        .filter(|path| repo_relative_path_is_product_change(path))
+    {
         let source = workspace_root.join(path);
         if !source.is_file() {
             continue;
@@ -3846,15 +3983,16 @@ fn sync_present_repo_root_changes_to_isolated_workspace(
     repo_root: &Path,
     workspace_root: &Path,
     changed_files: &[String],
+    contract: &Contract,
+    frozen_capability_resolution: Option<&FrozenCapabilityResolution>,
 ) -> Result<()> {
     if repo_root == workspace_root {
         return Ok(());
     }
-    for path in changed_files.iter().filter(|path| {
-        !path.starts_with(".punk/")
-            && !path.starts_with("target/")
-            && !path.starts_with(".playwright-mcp/")
-    }) {
+    for path in changed_files
+        .iter()
+        .filter(|path| repo_relative_path_is_product_change(path))
+    {
         let source = repo_root.join(path);
         if !source.is_file() {
             continue;
@@ -3868,7 +4006,195 @@ fn sync_present_repo_root_changes_to_isolated_workspace(
         }
         fs::copy(&source, &destination)?;
     }
+    sync_local_execution_support_to_isolated_workspace(
+        repo_root,
+        workspace_root,
+        contract,
+        frozen_capability_resolution,
+    )?;
     Ok(())
+}
+
+fn sync_local_execution_support_to_isolated_workspace(
+    repo_root: &Path,
+    workspace_root: &Path,
+    contract: &Contract,
+    frozen_capability_resolution: Option<&FrozenCapabilityResolution>,
+) -> Result<()> {
+    if repo_root == workspace_root {
+        return Ok(());
+    }
+    let support_roots: BTreeSet<&'static str> =
+        local_execution_support_roots(contract, frozen_capability_resolution)
+            .into_iter()
+            .collect();
+    if support_roots.is_empty() {
+        return Ok(());
+    }
+    sync_local_execution_support_dirs_recursive(
+        repo_root,
+        repo_root,
+        workspace_root,
+        &support_roots,
+    )
+}
+
+fn sync_local_execution_support_dirs_recursive(
+    repo_root: &Path,
+    current: &Path,
+    workspace_root: &Path,
+    support_roots: &BTreeSet<&'static str>,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let source = entry.path();
+        let relative = source
+            .strip_prefix(repo_root)
+            .map_err(|_| anyhow!("path escaped repo root"))?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let relative_path = relative.to_string_lossy().replace('\\', "/");
+        let file_type = entry.file_type()?;
+        if file_type.is_dir()
+            && support_roots.contains(entry.file_name().to_string_lossy().as_ref())
+        {
+            copy_tree_preserving_symlinks(&source, &workspace_root.join(relative))?;
+            continue;
+        }
+        if repo_relative_path_is_repo_walk_excluded(&relative_path) {
+            continue;
+        }
+        if file_type.is_dir() {
+            sync_local_execution_support_dirs_recursive(
+                repo_root,
+                &source,
+                workspace_root,
+                support_roots,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_tree_preserving_symlinks(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        copy_symlink(source, destination)?;
+        return Ok(());
+    }
+    if file_type.is_dir() {
+        fs::create_dir_all(destination)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_tree_preserving_symlinks(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, destination)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let target = fs::read_link(source)?;
+    std::os::unix::fs::symlink(&target, destination)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let target = fs::read_link(source)?;
+    let source_metadata = fs::metadata(source)?;
+    if source_metadata.is_dir() {
+        std::os::windows::fs::symlink_dir(&target, destination)?;
+    } else {
+        std::os::windows::fs::symlink_file(&target, destination)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn copy_symlink(_source: &Path, _destination: &Path) -> Result<()> {
+    Err(anyhow!("symlink copy is not supported on this platform"))
+}
+
+fn local_execution_support_roots(
+    contract: &Contract,
+    frozen_capability_resolution: Option<&FrozenCapabilityResolution>,
+) -> Vec<&'static str> {
+    let mut roots = Vec::new();
+    if local_execution_support_needed_for_capability(
+        frozen_capability_resolution,
+        "node-package-scripts",
+    ) || contract_uses_node_runtime_support(contract)
+    {
+        roots.push("node_modules");
+    }
+    if local_execution_support_needed_for_capability(
+        frozen_capability_resolution,
+        "python-pyproject-pytest",
+    ) || contract_uses_python_runtime_support(contract)
+    {
+        roots.push(".venv");
+    }
+    roots
+}
+
+fn local_execution_support_needed_for_capability(
+    frozen_capability_resolution: Option<&FrozenCapabilityResolution>,
+    capability_id: &str,
+) -> bool {
+    frozen_capability_resolution.is_some_and(|resolution| {
+        resolution
+            .selected_capabilities
+            .iter()
+            .any(|candidate| candidate.id == capability_id)
+    })
+}
+
+fn contract_uses_node_runtime_support(contract: &Contract) -> bool {
+    contract
+        .target_checks
+        .iter()
+        .chain(contract.integrity_checks.iter())
+        .any(|check| {
+            let lowered = check.to_ascii_lowercase();
+            lowered.contains("npm ")
+                || lowered.contains("pnpm ")
+                || lowered.contains("yarn ")
+                || lowered.contains("bun ")
+                || lowered.contains("node ")
+        })
+}
+
+fn contract_uses_python_runtime_support(contract: &Contract) -> bool {
+    contract
+        .target_checks
+        .iter()
+        .chain(contract.integrity_checks.iter())
+        .any(|check| {
+            let lowered = check.to_ascii_lowercase();
+            lowered.contains("pytest")
+                || lowered.starts_with("python ")
+                || lowered.contains(" python ")
+        })
 }
 
 fn ensure_default_gitignore_coverage(project_root: &Path) -> Result<()> {
@@ -4082,16 +4408,11 @@ fn nested_package_manager_run(
 }
 
 fn ignored_nested_name(name: &str) -> bool {
-    matches!(
-        name,
-        ".git" | ".jj" | ".punk" | "target" | "node_modules" | ".playwright-mcp"
-    )
+    repo_relative_path_is_repo_walk_excluded(name)
 }
 
 fn ignored_nested_relative_path(relative: &Path) -> bool {
-    relative.starts_with("docs/reference-repos")
-        || relative.starts_with("docs/research/_delve_runs")
-        || relative.starts_with(".build")
+    repo_relative_path_is_repo_walk_excluded(&relative.to_string_lossy())
 }
 
 fn apply_prompt_targeting_bias(
@@ -4815,7 +5136,10 @@ fn prompt_mentions_generated_surface(prompt: &str) -> bool {
 
 fn path_is_generated_noise(path: &str) -> bool {
     let lowered = path.to_ascii_lowercase();
-    lowered == "dist"
+    repo_relative_path_is_generated_noise(path)
+        || repo_relative_path_is_runtime_artifact(path)
+        || capability_generated_noise_path(path)
+        || lowered == "dist"
         || lowered == "packs"
         || lowered == ".astro"
         || lowered.starts_with("dist/")
@@ -5091,6 +5415,9 @@ fn apply_baseline_profile_to_proposal(
     prompt: &str,
     proposal: &mut DraftProposal,
 ) {
+    if !prompt_mentions_named_baseline_repo(prompt) {
+        return;
+    }
     let Some(mode) = detect_baseline_target_mode(repo_root, prompt, Some(proposal)) else {
         return;
     };
@@ -5132,6 +5459,9 @@ fn apply_baseline_profile_to_proposal(
 }
 
 fn finalize_baseline_profile(repo_root: &Path, prompt: &str, proposal: &mut DraftProposal) {
+    if !prompt_mentions_named_baseline_repo(prompt) {
+        return;
+    }
     let Some(mode) = detect_baseline_target_mode(repo_root, prompt, Some(proposal)) else {
         return;
     };
@@ -5690,11 +6020,11 @@ fn prompt_requests_mixed_service_scope(prompt: &str, scan: &punk_domain::RepoSca
         "package.json",
         "astro",
         "typescript",
-        "ts",
         "server layer",
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
+        || (lowered.contains("baseline-site") && scan_has_node_service_surface(scan))
         || (lowered.contains("server") && scan_has_node_service_surface(scan));
 
     mentions_rust && mentions_node
@@ -5967,7 +6297,9 @@ fn prompt_declares_explicit_touch_set(prompt: &str) -> bool {
         "touch exactly",
         "exact touch set",
         "requested touch set",
-        "scope bounded to",
+        "scope bounded exactly to",
+        "scope bounded to these",
+        "scope bounded only to",
     ]
     .iter()
     .any(|marker| lowered.contains(marker))
@@ -6067,23 +6399,25 @@ fn timeout_service_seed_proposal(
     prompt: &str,
     scan: &punk_domain::RepoScanSummary,
 ) -> Option<DraftProposal> {
-    if let Some(mode) = detect_baseline_target_mode(repo_root, prompt, None) {
-        let profile = build_baseline_targeting_profile(repo_root, mode);
-        if !profile.entry_points.is_empty() && !profile.allowed_scope.is_empty() {
-            let (expected_interfaces, behavior_requirements) =
-                timeout_seed_semantics(prompt, &profile.entry_points);
-            return Some(DraftProposal {
-                title: summarize_prompt(prompt),
-                summary: summarize_prompt(prompt),
-                entry_points: profile.entry_points,
-                import_paths: Vec::new(),
-                expected_interfaces,
-                behavior_requirements,
-                allowed_scope: profile.allowed_scope,
-                target_checks: profile.target_checks,
-                integrity_checks: profile.integrity_checks,
-                risk_level: "medium".to_string(),
-            });
+    if prompt_mentions_named_baseline_repo(prompt) {
+        if let Some(mode) = detect_baseline_target_mode(repo_root, prompt, None) {
+            let profile = build_baseline_targeting_profile(repo_root, mode);
+            if !profile.entry_points.is_empty() && !profile.allowed_scope.is_empty() {
+                let (expected_interfaces, behavior_requirements) =
+                    timeout_seed_semantics(prompt, &profile.entry_points);
+                return Some(DraftProposal {
+                    title: summarize_prompt(prompt),
+                    summary: summarize_prompt(prompt),
+                    entry_points: profile.entry_points,
+                    import_paths: Vec::new(),
+                    expected_interfaces,
+                    behavior_requirements,
+                    allowed_scope: profile.allowed_scope,
+                    target_checks: profile.target_checks,
+                    integrity_checks: profile.integrity_checks,
+                    risk_level: "medium".to_string(),
+                });
+            }
         }
     }
 
@@ -6177,6 +6511,14 @@ fn timeout_service_seed_proposal(
     })
 }
 
+fn prompt_mentions_named_baseline_repo(prompt: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    lowered.contains("baseline")
+        || lowered.contains("baseline-site")
+        || lowered.contains("baseline-cli")
+        || lowered.contains("dispatch mvp")
+}
+
 fn timeout_seed_semantics(prompt: &str, entry_points: &[String]) -> (Vec<String>, Vec<String>) {
     let semantic_prompt = prompt_positive_intent_text(prompt);
     let semantic_prompt = if semantic_prompt.trim().is_empty() {
@@ -6262,39 +6604,52 @@ fn timeout_greenfield_scaffold_scope(
     if !prompt_requests_timeout_greenfield_scaffold(prompt, &manifest) {
         return None;
     }
-
-    let preferred_directories: &[&str] = match manifest.as_str() {
-        "Cargo.toml" => &["crates", "src", "tests"],
-        "go.mod" => &["cmd", "internal", "pkg"],
-        "pyproject.toml" => &["src", "tests"],
-        "package.json" => &["packages", "apps", "src", "tests"],
-        _ => &[],
-    };
-    let preferred_files: &[&str] = match manifest.as_str() {
-        "package.json" => &["tsconfig.json"],
-        _ => &[],
-    };
-    if preferred_directories.is_empty() {
-        return None;
-    }
+    let scope_seeds = scope_seeds_for_entry_point_with_prompt(&manifest, prompt)
+        .or_else(|| scope_seeds_for_entry_point(&manifest))?;
 
     let entry_points = vec![manifest.clone()];
-    let mut allowed_scope = entry_points.clone();
-    for candidate in &scan.candidate_file_scope_paths {
-        if preferred_files.contains(&candidate.as_str())
+    let mut allowed_scope = Vec::new();
+    for candidate in scan
+        .candidate_file_scope_paths
+        .iter()
+        .chain(scan.candidate_directory_scope_paths.iter())
+    {
+        if (scope_seeds.file_paths.iter().any(|path| path == candidate)
+            || scope_seeds
+                .directory_paths
+                .iter()
+                .any(|path| path == candidate))
             && !allowed_scope.iter().any(|existing| existing == candidate)
         {
             allowed_scope.push(candidate.clone());
         }
     }
-    for candidate in &scan.candidate_directory_scope_paths {
-        if preferred_directories.contains(&candidate.as_str())
-            && !allowed_scope.iter().any(|existing| existing == candidate)
-        {
+    for entry_point in &entry_points {
+        if !allowed_scope.iter().any(|existing| existing == entry_point) {
+            allowed_scope.push(entry_point.clone());
+        }
+    }
+    for candidate in &scope_seeds.file_paths {
+        if !allowed_scope.iter().any(|existing| existing == candidate) {
             allowed_scope.push(candidate.clone());
         }
     }
-
+    for candidate in &scope_seeds.directory_paths {
+        if !allowed_scope.iter().any(|existing| existing == candidate) {
+            allowed_scope.push(candidate.clone());
+        }
+    }
+    if manifest == "Cargo.toml"
+        && prompt
+            .to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| matches!(token, "test" | "tests"))
+    {
+        if let Some(index) = allowed_scope.iter().position(|path| path == "tests") {
+            let tests = allowed_scope.remove(index);
+            allowed_scope.insert(0, tests);
+        }
+    }
     Some((entry_points, allowed_scope))
 }
 
@@ -6955,6 +7310,7 @@ mod tests {
             assert_ne!(second_progress, third_progress);
             assert_eq!(third["stdout_bytes"].as_u64(), Some(8));
 
+            fs::write(input.repo_root.join("demo.txt"), b"ok")?;
             fs::write(&input.stdout_path, b"done")?;
             fs::write(&input.stderr_path, b"")?;
             Ok(ExecuteOutput {
@@ -7785,6 +8141,23 @@ mod tests {
     }
 
     #[test]
+    fn filtered_verification_context_paths_drops_generated_noise_and_runtime_artifacts() {
+        let filtered = filtered_verification_context_paths(&[
+            "src/lib.rs".to_string(),
+            ".punk/runs/run_1/stdout.log".to_string(),
+            ".playwright-mcp/state/session.json".to_string(),
+            "dist/app.js".to_string(),
+            "node_modules/react/index.js".to_string(),
+            ".venv/bin/python".to_string(),
+            ".pytest_cache/v/cache".to_string(),
+            "Packages/App/.build/debug/App".to_string(),
+            "src/lib.rs".to_string(),
+        ]);
+
+        assert_eq!(filtered, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
     fn cut_run_persists_verification_context_for_run() {
         let root = std::env::temp_dir().join(format!(
             "punk-orch-verification-context-{}",
@@ -7836,10 +8209,158 @@ mod tests {
         assert_eq!(context.identity.workspace_ref, run.vcs.workspace_ref);
         assert_eq!(context.identity.change_ref, run.vcs.change_ref);
         assert_eq!(context.identity.changed_files, receipt.changed_files);
+        assert_eq!(
+            context.capability_resolution_ref.as_deref(),
+            Some(
+                format!(
+                    ".punk/contracts/{}/capability-resolution.json",
+                    contract.feature_id
+                )
+                .as_str()
+            )
+        );
+        assert!(context.capability_resolution_sha256.is_some());
         assert!(context
             .file_states
             .iter()
             .any(|state| state.path == "demo.txt" && state.exists));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn approve_contract_persists_frozen_capability_resolution_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-capability-freeze-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&FakeDrafter, "add file").unwrap();
+        service.approve_contract(&contract.id).unwrap();
+
+        let persisted = read_persisted_contract_doc(
+            &root
+                .join(".punk/contracts")
+                .join(&contract.feature_id)
+                .join("v1.json"),
+        )
+        .unwrap();
+        let capability_ref = persisted
+            .capability_resolution_ref
+            .expect("frozen capability resolution ref");
+        let frozen: FrozenCapabilityResolution = read_json(&root.join(&capability_ref)).unwrap();
+        assert_eq!(frozen.contract_id, contract.id);
+        assert_eq!(
+            frozen.project_capability_index_ref,
+            ".punk/project/capabilities.json"
+        );
+        assert!(frozen
+            .selected_capabilities
+            .iter()
+            .any(|candidate| candidate.id == "rust-cargo"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approve_contract_keeps_draft_when_capability_artifact_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-capability-freeze-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let service = OrchService::new(&root, &global).unwrap();
+        let contract = service.draft_contract(&FakeDrafter, "add file").unwrap();
+        let feature_dir = root.join(".punk/contracts").join(&contract.feature_id);
+        let original_permissions = fs::metadata(&feature_dir).unwrap().permissions();
+        let mut readonly_permissions = original_permissions.clone();
+        readonly_permissions.set_mode(0o555);
+        fs::set_permissions(&feature_dir, readonly_permissions).unwrap();
+
+        let approval = service.approve_contract(&contract.id);
+
+        fs::set_permissions(&feature_dir, original_permissions).unwrap();
+
+        assert!(approval.is_err());
+        let persisted = read_persisted_contract_doc(
+            &root
+                .join(".punk/contracts")
+                .join(&contract.feature_id)
+                .join("v1.json"),
+        )
+        .unwrap();
+        assert_eq!(persisted.contract.status, ContractStatus::Draft);
+        assert!(persisted.capability_resolution_ref.is_none());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -9634,7 +10155,6 @@ mod tests {
 
         let service = OrchService::new(&root, &global).unwrap();
         let contract = service.draft_contract(&TimeoutDrafter, prompt).unwrap();
-        eprintln!("services contract entry_points={:?} allowed_scope={:?} target_checks={:?} integrity_checks={:?}", contract.entry_points, contract.allowed_scope, contract.target_checks, contract.integrity_checks);
 
         assert!(contract
             .entry_points
@@ -9890,6 +10410,11 @@ mod tests {
         let workspace = root.join("workspace");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(workspace.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(workspace.join("dist")).unwrap();
+        fs::create_dir_all(workspace.join("node_modules/react")).unwrap();
+        fs::create_dir_all(workspace.join(".venv/bin")).unwrap();
+        fs::create_dir_all(workspace.join(".pytest_cache/v")).unwrap();
+        fs::create_dir_all(workspace.join(".build")).unwrap();
         fs::create_dir_all(workspace.join(".punk/runs/run_1")).unwrap();
         fs::create_dir_all(workspace.join(".playwright-mcp/state")).unwrap();
         fs::write(
@@ -9897,6 +10422,11 @@ mod tests {
             "fn main() {}\n",
         )
         .unwrap();
+        fs::write(workspace.join("dist/app.js"), "noise\n").unwrap();
+        fs::write(workspace.join("node_modules/react/index.js"), "noise\n").unwrap();
+        fs::write(workspace.join(".venv/bin/python"), "noise\n").unwrap();
+        fs::write(workspace.join(".pytest_cache/v/cache"), "noise\n").unwrap();
+        fs::write(workspace.join(".build/debug.txt"), "noise\n").unwrap();
         fs::write(workspace.join(".punk/runs/run_1/stdout.log"), "noise\n").unwrap();
         fs::write(
             workspace.join(".playwright-mcp/state/session.json"),
@@ -9909,6 +10439,11 @@ mod tests {
             &workspace,
             &[
                 "crates/pubpunk-cli/src/main.rs".into(),
+                "dist/app.js".into(),
+                "node_modules/react/index.js".into(),
+                ".venv/bin/python".into(),
+                ".pytest_cache/v/cache".into(),
+                ".build/debug.txt".into(),
                 ".punk/runs/run_1/stdout.log".into(),
                 ".playwright-mcp/state/session.json".into(),
             ],
@@ -9916,6 +10451,11 @@ mod tests {
         .unwrap();
 
         assert!(root.join("crates/pubpunk-cli/src/main.rs").exists());
+        assert!(!root.join("dist/app.js").exists());
+        assert!(!root.join("node_modules/react/index.js").exists());
+        assert!(!root.join(".venv/bin/python").exists());
+        assert!(!root.join(".pytest_cache/v/cache").exists());
+        assert!(!root.join(".build/debug.txt").exists());
         assert!(!root.join(".punk/runs/run_1/stdout.log").exists());
         assert!(!root.join(".playwright-mcp/state/session.json").exists());
 
@@ -9939,6 +10479,11 @@ mod tests {
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
         fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::create_dir_all(root.join("node_modules/react")).unwrap();
+        fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        fs::create_dir_all(root.join(".pytest_cache/v")).unwrap();
+        fs::create_dir_all(root.join(".build")).unwrap();
         fs::create_dir_all(root.join(".playwright-mcp/state")).unwrap();
         fs::create_dir_all(&workspace).unwrap();
         fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
@@ -9965,11 +10510,33 @@ mod tests {
         fs::write(root.join("tests/README.md"), "tests\n").unwrap();
         fs::write(root.join(".punk/runs/run_1/stdout.log"), "noise\n").unwrap();
         fs::write(root.join("target/debug/app"), "bin\n").unwrap();
+        fs::write(root.join("dist/app.js"), "noise\n").unwrap();
+        fs::write(root.join("node_modules/react/index.js"), "noise\n").unwrap();
+        fs::write(root.join(".venv/bin/python"), "noise\n").unwrap();
+        fs::write(root.join(".pytest_cache/v/cache"), "noise\n").unwrap();
+        fs::write(root.join(".build/debug.txt"), "noise\n").unwrap();
         fs::write(
             root.join(".playwright-mcp/state/session.json"),
             "{\"ok\":true}\n",
         )
         .unwrap();
+        let rust_contract = Contract {
+            id: "ct_sync_rust".into(),
+            feature_id: "feat_sync_rust".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "stabilize rust workspace".into(),
+            entry_points: vec!["Cargo.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["workspace remains stable".into()],
+            behavior_requirements: vec!["keep rust scope bounded".into()],
+            allowed_scope: vec!["Cargo.toml".into(), "crates".into(), "tests".into()],
+            target_checks: vec!["cargo test --workspace".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
 
         sync_present_repo_root_changes_to_isolated_workspace(
             &root,
@@ -9983,8 +10550,15 @@ mod tests {
                 "tests/README.md".into(),
                 ".punk/runs/run_1/stdout.log".into(),
                 "target/debug/app".into(),
+                "dist/app.js".into(),
+                "node_modules/react/index.js".into(),
+                ".venv/bin/python".into(),
+                ".pytest_cache/v/cache".into(),
+                ".build/debug.txt".into(),
                 ".playwright-mcp/state/session.json".into(),
             ],
+            &rust_contract,
+            None,
         )
         .unwrap();
 
@@ -10006,9 +10580,93 @@ mod tests {
         );
         assert!(!workspace.join(".punk/runs/run_1/stdout.log").exists());
         assert!(!workspace.join("target/debug/app").exists());
+        assert!(!workspace.join("dist/app.js").exists());
+        assert!(!workspace.join("node_modules/react/index.js").exists());
+        assert!(!workspace.join(".venv/bin/python").exists());
+        assert!(!workspace.join(".pytest_cache/v/cache").exists());
+        assert!(!workspace.join(".build/debug.txt").exists());
         assert!(!workspace
             .join(".playwright-mcp/state/session.json")
             .exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_present_repo_root_changes_to_isolated_workspace_copies_needed_local_execution_support()
+    {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-sync-support-root-{}-{suffix}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/node_modules/react")).unwrap();
+        fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::create_dir_all(root.join(".pytest_cache/v")).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export const ready = true;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/node_modules/react/index.js"),
+            "module.exports = {};\n",
+        )
+        .unwrap();
+        fs::write(root.join(".venv/bin/python"), "python\n").unwrap();
+        fs::write(root.join("dist/app.js"), "noise\n").unwrap();
+        fs::write(root.join(".pytest_cache/v/cache"), "noise\n").unwrap();
+
+        let node_python_contract = Contract {
+            id: "ct_sync_support".into(),
+            feature_id: "feat_sync_support".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "stabilize node and python checks".into(),
+            entry_points: vec!["baseline-site/package.json".into(), "pyproject.toml".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["local checks keep working in isolated workspace".into()],
+            behavior_requirements: vec!["preserve local dependency support".into()],
+            allowed_scope: vec!["baseline-site/src/lib/services".into()],
+            target_checks: vec![
+                "npm --prefix baseline-site run check".into(),
+                "pytest".into(),
+            ],
+            integrity_checks: vec![
+                "npm --prefix baseline-site run check".into(),
+                "pytest".into(),
+            ],
+            risk_level: "medium".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+
+        sync_present_repo_root_changes_to_isolated_workspace(
+            &root,
+            &workspace,
+            &["baseline-site/src/lib/services/enrollments.ts".into()],
+            &node_python_contract,
+            None,
+        )
+        .unwrap();
+
+        assert!(workspace
+            .join("baseline-site/src/lib/services/enrollments.ts")
+            .exists());
+        assert!(workspace
+            .join("baseline-site/node_modules/react/index.js")
+            .exists());
+        assert!(workspace.join(".venv/bin/python").exists());
+        assert!(!workspace.join("dist/app.js").exists());
+        assert!(!workspace.join(".pytest_cache/v/cache").exists());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -10036,6 +10694,24 @@ mod tests {
             &root,
             &root,
             &["crates/pubpunk-core/src/lib.rs".into()],
+            &Contract {
+                id: "ct_sync_self".into(),
+                feature_id: "feat_sync_self".into(),
+                version: 1,
+                status: ContractStatus::Approved,
+                prompt_source: "keep self copy stable".into(),
+                entry_points: vec!["crates/pubpunk-core/src/lib.rs".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["self copy remains stable".into()],
+                behavior_requirements: vec!["avoid self copy drift".into()],
+                allowed_scope: vec!["crates/pubpunk-core/src/lib.rs".into()],
+                target_checks: vec!["cargo test --workspace".into()],
+                integrity_checks: vec!["cargo test --workspace".into()],
+                risk_level: "low".into(),
+                created_at: now_rfc3339(),
+                approved_at: Some(now_rfc3339()),
+            },
+            None,
         )
         .unwrap();
 
@@ -12191,6 +12867,20 @@ fn ok() {}
         assert!(overlay.capability_summary.project_guidance_ready);
         assert!(overlay.capability_summary.staged_ready);
         assert!(overlay.capability_summary.autonomous_ready);
+        assert_eq!(
+            overlay.capability_resolution.capability_index_ref,
+            ".punk/project/capabilities.json"
+        );
+        assert_eq!(
+            overlay.capability_resolution.resolution_mode,
+            "builtin_only_v1"
+        );
+        assert!(overlay
+            .capability_resolution
+            .active_ids
+            .iter()
+            .any(|id| id == "rust-cargo"));
+        assert!(overlay.capability_resolution.advisory.is_empty());
         assert!(overlay.harness_summary.inspect_ready);
         assert!(overlay.harness_summary.bootable_per_workspace);
         assert!(overlay.harness_summary.ui_legible);
@@ -12235,6 +12925,16 @@ fn ok() {}
         let persisted_overlay: ProjectOverlay =
             read_json(&root.join(".punk/project/overlay.json")).unwrap();
         assert_eq!(persisted_overlay, overlay);
+        let persisted_capability_index: ProjectCapabilityIndex =
+            read_json(&root.join(".punk/project/capabilities.json")).unwrap();
+        assert_eq!(
+            persisted_capability_index.resolution_mode,
+            "builtin_only_v1"
+        );
+        assert!(persisted_capability_index
+            .active
+            .iter()
+            .any(|candidate| candidate.id == "rust-cargo"));
         assert_eq!(
             overlay.status_scope_mode,
             format!("project:{}", overlay.project_id)
