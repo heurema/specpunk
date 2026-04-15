@@ -178,3 +178,4 @@ The current implemented regression set also now covers:
 - built-in capability resolution for all five v0 repo kinds
 - generated-noise exclusion for SwiftPM, JS, and Python repos
 - mixed Node+Rust candidate detection in project intelligence
+- shared path-classifier adoption across scan, VCS provenance, isolated sync, verification-context capture, and `gate`

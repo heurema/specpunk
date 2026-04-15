@@ -5,6 +5,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use punk_core::repo_relative_path_is_product_change;
 use punk_domain::VcsKind;
 
 pub mod snapshot;
@@ -165,11 +166,12 @@ impl VcsBackend for JjBackend {
         .to_string())
     }
     fn changed_files(&self) -> Result<Vec<String>> {
-        Ok(lines(run_capture(
-            &self.root,
-            "jj",
-            &["diff", "--name-only"],
-        )?))
+        Ok(
+            lines(run_capture(&self.root, "jj", &["diff", "--name-only"])?)
+                .into_iter()
+                .filter(|path| repo_relative_path_is_product_change(path))
+                .collect(),
+        )
     }
     fn diff(&self) -> Result<String> {
         run_capture(&self.root, "jj", &["diff"])
@@ -234,7 +236,7 @@ impl ProvenanceBaseline {
         let mut snapshots = BTreeMap::new();
         for path in changed_files
             .iter()
-            .filter(|path| !is_generated_target_path(path))
+            .filter(|path| repo_relative_path_is_product_change(path))
         {
             snapshots.insert(path.clone(), snapshot_file(root, path)?);
         }
@@ -245,7 +247,7 @@ impl ProvenanceBaseline {
         let mut changed = Vec::new();
         for path in current
             .into_iter()
-            .filter(|path| !is_generated_target_path(path))
+            .filter(|path| repo_relative_path_is_product_change(path))
         {
             let current_snapshot = snapshot_file(root, &path)?;
             match self.snapshots.get(&path) {
@@ -332,17 +334,15 @@ impl VcsBackend for GitBackend {
                     .collect()
             }
         };
+        changed.retain(|path| repo_relative_path_is_product_change(path));
         for path in lines(run_capture(
             &self.root,
             "git",
-            &[
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                "--",
-                ":(exclude)target",
-            ],
+            &["ls-files", "--others", "--exclude-standard"],
         )?) {
+            if !repo_relative_path_is_product_change(&path) {
+                continue;
+            }
             push_unique(&mut changed, path);
         }
         Ok(changed)
@@ -402,13 +402,6 @@ fn push_unique(paths: &mut Vec<String>, path: String) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
     }
-}
-
-fn is_generated_target_path(relative: &str) -> bool {
-    matches!(
-        Path::new(relative).components().next(),
-        Some(std::path::Component::Normal(first)) if first == "target"
-    )
 }
 
 fn snapshot_file(root: &Path, relative: &str) -> Result<FileSnapshot> {
@@ -553,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn git_provenance_only_filters_top_level_target_paths() {
+    fn git_provenance_preserves_nested_product_paths() {
         let root = std::env::temp_dir().join(format!(
             "punk-vcs-git-provenance-target-scope-{}-{}",
             std::process::id(),
@@ -577,15 +570,15 @@ mod tests {
 
         fs::create_dir_all(root.join("target/debug")).unwrap();
         fs::write(root.join("target/debug/build.log"), "generated\n").unwrap();
-        fs::create_dir_all(root.join("nested/target")).unwrap();
-        fs::write(root.join("nested/target/output.txt"), "keep-me\n").unwrap();
+        fs::create_dir_all(root.join("nested/product")).unwrap();
+        fs::write(root.join("nested/product/output.txt"), "keep-me\n").unwrap();
 
         let raw_changed = backend
             .changed_files()
             .unwrap()
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let expected_raw = ["nested/target/output.txt"]
+        let expected_raw = ["nested/product/output.txt"]
             .into_iter()
             .map(str::to_string)
             .collect::<BTreeSet<_>>();
@@ -596,7 +589,69 @@ mod tests {
             .unwrap()
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let expected_provenance = ["nested/target/output.txt"]
+        let expected_provenance = ["nested/product/output.txt"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(provenance_changed, expected_provenance);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_changed_files_and_provenance_exclude_shared_generated_noise() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-vcs-git-shared-noise-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        run_capture(&root, "git", &["init"]).unwrap();
+        run_capture(&root, "git", &["config", "user.name", "Test User"]).unwrap();
+        run_capture(&root, "git", &["config", "user.email", "test@example.com"]).unwrap();
+
+        fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        run_capture(&root, "git", &["add", "tracked.txt"]).unwrap();
+        run_capture(&root, "git", &["commit", "-m", "init"]).unwrap();
+
+        let backend = GitBackend::new(&root).unwrap();
+        let baseline = backend.capture_provenance_baseline().unwrap();
+
+        fs::write(root.join("tracked.txt"), "base\nupdated\n").unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::create_dir_all(root.join("node_modules/react")).unwrap();
+        fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        fs::create_dir_all(root.join(".pytest_cache/v")).unwrap();
+        fs::create_dir_all(root.join(".build")).unwrap();
+        fs::create_dir_all(root.join("nested/product")).unwrap();
+        fs::write(root.join("dist/app.js"), "generated\n").unwrap();
+        fs::write(root.join("node_modules/react/index.js"), "generated\n").unwrap();
+        fs::write(root.join(".venv/bin/python"), "generated\n").unwrap();
+        fs::write(root.join(".pytest_cache/v/cache"), "generated\n").unwrap();
+        fs::write(root.join(".build/debug.txt"), "generated\n").unwrap();
+        fs::write(root.join("nested/product/output.txt"), "keep-me\n").unwrap();
+
+        let raw_changed = backend
+            .changed_files()
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let expected_raw = ["nested/product/output.txt", "tracked.txt"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(raw_changed, expected_raw);
+
+        let provenance_changed = backend
+            .changed_files_since(&baseline)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let expected_provenance = ["nested/product/output.txt", "tracked.txt"]
             .into_iter()
             .map(str::to_string)
             .collect::<BTreeSet<_>>();

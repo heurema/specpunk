@@ -14,7 +14,9 @@ use punk_adapters::{ContractDrafter, ExecuteInput, Executor};
 use punk_core::{
     apply_explicit_prompt_overrides, build_bounded_fallback_proposal,
     build_project_capability_index, canonicalize_draft_proposal, capability_generated_noise_path,
-    compute_architecture_signals, freeze_contract_capability_resolution, scan_repo,
+    compute_architecture_signals, freeze_contract_capability_resolution,
+    repo_relative_path_is_generated_noise, repo_relative_path_is_product_change,
+    repo_relative_path_is_repo_walk_excluded, repo_relative_path_is_runtime_artifact, scan_repo,
     scope_seeds_for_entry_point, scope_seeds_for_entry_point_with_prompt, validate_draft_proposal,
     ArchitectureSignalInput,
 };
@@ -278,7 +280,7 @@ fn repo_has_any(repo_root: &Path, rel_paths: &[&str]) -> bool {
 }
 
 fn is_verification_context_runtime_artifact(path: &str) -> bool {
-    path.starts_with(".punk/")
+    !repo_relative_path_is_product_change(path)
 }
 
 fn filtered_verification_context_paths(changed_files: &[String]) -> Vec<String> {
@@ -3943,11 +3945,10 @@ fn sync_present_isolated_changes_to_repo_root(
     if repo_root == workspace_root {
         return Ok(());
     }
-    for path in changed_files.iter().filter(|path| {
-        !path.starts_with(".punk/")
-            && !path.starts_with("target/")
-            && !path.starts_with(".playwright-mcp/")
-    }) {
+    for path in changed_files
+        .iter()
+        .filter(|path| repo_relative_path_is_product_change(path))
+    {
         let source = workspace_root.join(path);
         if !source.is_file() {
             continue;
@@ -3972,11 +3973,10 @@ fn sync_present_repo_root_changes_to_isolated_workspace(
     if repo_root == workspace_root {
         return Ok(());
     }
-    for path in changed_files.iter().filter(|path| {
-        !path.starts_with(".punk/")
-            && !path.starts_with("target/")
-            && !path.starts_with(".playwright-mcp/")
-    }) {
+    for path in changed_files
+        .iter()
+        .filter(|path| repo_relative_path_is_product_change(path))
+    {
         let source = repo_root.join(path);
         if !source.is_file() {
             continue;
@@ -4204,16 +4204,11 @@ fn nested_package_manager_run(
 }
 
 fn ignored_nested_name(name: &str) -> bool {
-    matches!(
-        name,
-        ".git" | ".jj" | ".punk" | "target" | "node_modules" | ".playwright-mcp"
-    )
+    repo_relative_path_is_repo_walk_excluded(name)
 }
 
 fn ignored_nested_relative_path(relative: &Path) -> bool {
-    relative.starts_with("docs/reference-repos")
-        || relative.starts_with("docs/research/_delve_runs")
-        || relative.starts_with(".build")
+    repo_relative_path_is_repo_walk_excluded(&relative.to_string_lossy())
 }
 
 fn apply_prompt_targeting_bias(
@@ -4937,7 +4932,9 @@ fn prompt_mentions_generated_surface(prompt: &str) -> bool {
 
 fn path_is_generated_noise(path: &str) -> bool {
     let lowered = path.to_ascii_lowercase();
-    capability_generated_noise_path(path)
+    repo_relative_path_is_generated_noise(path)
+        || repo_relative_path_is_runtime_artifact(path)
+        || capability_generated_noise_path(path)
         || lowered == "dist"
         || lowered == "packs"
         || lowered == ".astro"
@@ -7940,6 +7937,23 @@ mod tests {
     }
 
     #[test]
+    fn filtered_verification_context_paths_drops_generated_noise_and_runtime_artifacts() {
+        let filtered = filtered_verification_context_paths(&[
+            "src/lib.rs".to_string(),
+            ".punk/runs/run_1/stdout.log".to_string(),
+            ".playwright-mcp/state/session.json".to_string(),
+            "dist/app.js".to_string(),
+            "node_modules/react/index.js".to_string(),
+            ".venv/bin/python".to_string(),
+            ".pytest_cache/v/cache".to_string(),
+            "Packages/App/.build/debug/App".to_string(),
+            "src/lib.rs".to_string(),
+        ]);
+
+        assert_eq!(filtered, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
     fn cut_run_persists_verification_context_for_run() {
         let root = std::env::temp_dir().join(format!(
             "punk-orch-verification-context-{}",
@@ -10123,6 +10137,11 @@ mod tests {
         let workspace = root.join("workspace");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(workspace.join("crates/pubpunk-cli/src")).unwrap();
+        fs::create_dir_all(workspace.join("dist")).unwrap();
+        fs::create_dir_all(workspace.join("node_modules/react")).unwrap();
+        fs::create_dir_all(workspace.join(".venv/bin")).unwrap();
+        fs::create_dir_all(workspace.join(".pytest_cache/v")).unwrap();
+        fs::create_dir_all(workspace.join(".build")).unwrap();
         fs::create_dir_all(workspace.join(".punk/runs/run_1")).unwrap();
         fs::create_dir_all(workspace.join(".playwright-mcp/state")).unwrap();
         fs::write(
@@ -10130,6 +10149,11 @@ mod tests {
             "fn main() {}\n",
         )
         .unwrap();
+        fs::write(workspace.join("dist/app.js"), "noise\n").unwrap();
+        fs::write(workspace.join("node_modules/react/index.js"), "noise\n").unwrap();
+        fs::write(workspace.join(".venv/bin/python"), "noise\n").unwrap();
+        fs::write(workspace.join(".pytest_cache/v/cache"), "noise\n").unwrap();
+        fs::write(workspace.join(".build/debug.txt"), "noise\n").unwrap();
         fs::write(workspace.join(".punk/runs/run_1/stdout.log"), "noise\n").unwrap();
         fs::write(
             workspace.join(".playwright-mcp/state/session.json"),
@@ -10142,6 +10166,11 @@ mod tests {
             &workspace,
             &[
                 "crates/pubpunk-cli/src/main.rs".into(),
+                "dist/app.js".into(),
+                "node_modules/react/index.js".into(),
+                ".venv/bin/python".into(),
+                ".pytest_cache/v/cache".into(),
+                ".build/debug.txt".into(),
                 ".punk/runs/run_1/stdout.log".into(),
                 ".playwright-mcp/state/session.json".into(),
             ],
@@ -10149,6 +10178,11 @@ mod tests {
         .unwrap();
 
         assert!(root.join("crates/pubpunk-cli/src/main.rs").exists());
+        assert!(!root.join("dist/app.js").exists());
+        assert!(!root.join("node_modules/react/index.js").exists());
+        assert!(!root.join(".venv/bin/python").exists());
+        assert!(!root.join(".pytest_cache/v/cache").exists());
+        assert!(!root.join(".build/debug.txt").exists());
         assert!(!root.join(".punk/runs/run_1/stdout.log").exists());
         assert!(!root.join(".playwright-mcp/state/session.json").exists());
 
@@ -10172,6 +10206,11 @@ mod tests {
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
         fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::create_dir_all(root.join("node_modules/react")).unwrap();
+        fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        fs::create_dir_all(root.join(".pytest_cache/v")).unwrap();
+        fs::create_dir_all(root.join(".build")).unwrap();
         fs::create_dir_all(root.join(".playwright-mcp/state")).unwrap();
         fs::create_dir_all(&workspace).unwrap();
         fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
@@ -10198,6 +10237,11 @@ mod tests {
         fs::write(root.join("tests/README.md"), "tests\n").unwrap();
         fs::write(root.join(".punk/runs/run_1/stdout.log"), "noise\n").unwrap();
         fs::write(root.join("target/debug/app"), "bin\n").unwrap();
+        fs::write(root.join("dist/app.js"), "noise\n").unwrap();
+        fs::write(root.join("node_modules/react/index.js"), "noise\n").unwrap();
+        fs::write(root.join(".venv/bin/python"), "noise\n").unwrap();
+        fs::write(root.join(".pytest_cache/v/cache"), "noise\n").unwrap();
+        fs::write(root.join(".build/debug.txt"), "noise\n").unwrap();
         fs::write(
             root.join(".playwright-mcp/state/session.json"),
             "{\"ok\":true}\n",
@@ -10216,6 +10260,11 @@ mod tests {
                 "tests/README.md".into(),
                 ".punk/runs/run_1/stdout.log".into(),
                 "target/debug/app".into(),
+                "dist/app.js".into(),
+                "node_modules/react/index.js".into(),
+                ".venv/bin/python".into(),
+                ".pytest_cache/v/cache".into(),
+                ".build/debug.txt".into(),
                 ".playwright-mcp/state/session.json".into(),
             ],
         )
@@ -10239,6 +10288,11 @@ mod tests {
         );
         assert!(!workspace.join(".punk/runs/run_1/stdout.log").exists());
         assert!(!workspace.join("target/debug/app").exists());
+        assert!(!workspace.join("dist/app.js").exists());
+        assert!(!workspace.join("node_modules/react/index.js").exists());
+        assert!(!workspace.join(".venv/bin/python").exists());
+        assert!(!workspace.join(".pytest_cache/v/cache").exists());
+        assert!(!workspace.join(".build/debug.txt").exists());
         assert!(!workspace
             .join(".playwright-mcp/state/session.json")
             .exists());

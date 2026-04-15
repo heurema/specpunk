@@ -985,6 +985,31 @@ This is an internal unification slice, not a public pack system:
 
 Resolution is frozen at `plot approve` into the contract-scoped capability packet, then copied by ref/hash into the run verification context. `gate` and `proof` must verify against that frozen packet, not against live repo scans or ambient state.
 
+### Shared repo-relative path classification
+
+The current v0 loop must not maintain separate truth for repo-relative path classes.
+
+`punk-core` owns the shared classifier for:
+
+- `Product`
+- `GeneratedNoise`
+- `RuntimeArtifact`
+- `ScanOnlyExcluded`
+
+Current required consumers of that same classifier:
+
+- repo scan and scope-candidate walks
+- VCS changed-file / provenance filtering
+- isolated workspace sync into and out of repo root
+- verification-context capture and drift validation
+- `gate` scope and architecture changed-file filtering
+
+Rule:
+
+- `ScanOnlyExcluded` paths are excluded from repo walks, but they are **not** global non-product truth
+- `GeneratedNoise` and `RuntimeArtifact` paths must not pollute provenance, sync, frozen verification context, or `gate` scope judgments
+- product-facing invariants should be strengthened by reusing this classifier, not by adding more per-layer special cases
+
 ---
 
 ## 10. VCS substrate

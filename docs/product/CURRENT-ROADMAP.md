@@ -57,6 +57,7 @@ Includes:
 - candidate ranking
 - source-vs-generated pruning
 - mixed-surface targeting quality
+- one shared repo-relative path classifier across scan, provenance, sync, verification, and gate
 
 Done means:
 - contracts select the right source surfaces with minimal manual correction

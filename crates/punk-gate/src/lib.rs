@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use punk_core::{
-    find_object_path, line_count_for_path, read_json, relative_ref, scan_forbidden_path_dependency,
-    scope_roots, validate_check_command, write_json,
+    find_object_path, line_count_for_path, read_json, relative_ref,
+    repo_relative_path_is_product_change, scan_forbidden_path_dependency, scope_roots,
+    validate_check_command, write_json,
 };
 use punk_domain::{
     now_rfc3339, ArchitectureAssessment, ArchitectureAssessmentOutcome,
@@ -463,7 +464,7 @@ fn default_architecture_signals_ref(repo_root: &Path, contract_path: &Path) -> O
 fn architecture_changed_files(changed_files: &[String]) -> Vec<String> {
     changed_files
         .iter()
-        .filter(|path| !is_controller_runtime_artifact(path))
+        .filter(|path| repo_relative_path_is_product_change(path))
         .cloned()
         .collect()
 }
@@ -473,7 +474,7 @@ fn validate_scope(allowed_scope: &[String], changed_files: &[String]) -> bool {
         return false;
     }
     changed_files.iter().all(|file| {
-        if is_controller_runtime_artifact(file) {
+        if !repo_relative_path_is_product_change(file) {
             return true;
         }
         allowed_scope
@@ -505,10 +506,6 @@ fn is_non_manifest_entry_point(path: &str) -> bool {
             path,
             "Cargo.toml" | "Cargo.lock" | "README.md" | "rust-toolchain.toml"
         )
-}
-
-fn is_controller_runtime_artifact(path: &str) -> bool {
-    path.starts_with(".punk/runs/")
 }
 
 fn invalid_verification_check_summary(kind: &str) -> CheckRunSummary {
@@ -591,7 +588,7 @@ fn verification_context_fingerprint(
 }
 
 fn is_verification_context_runtime_artifact(path: &str) -> bool {
-    path.starts_with(".punk/")
+    !repo_relative_path_is_product_change(path)
 }
 
 fn normalize_verification_changed_files(
@@ -2089,6 +2086,21 @@ mod tests {
     }
 
     #[test]
+    fn architecture_changed_files_filters_generated_noise_and_runtime_artifacts() {
+        let filtered = architecture_changed_files(&[
+            "src/lib.rs".into(),
+            ".punk/runs/run_1/run.json".into(),
+            ".playwright-mcp/state/session.json".into(),
+            "dist/app.js".into(),
+            "node_modules/react/index.js".into(),
+            ".venv/bin/python".into(),
+            ".pytest_cache/v/cache".into(),
+            "Packages/App/.build/debug/App".into(),
+        ]);
+        assert_eq!(filtered, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
     fn validate_scope_ignores_controller_runtime_artifacts() {
         assert!(validate_scope(
             &["Cargo.toml".into()],
@@ -2104,6 +2116,26 @@ mod tests {
                 ".punk/runs/run_1/stdout.log".into(),
                 "not-allowed.txt".into(),
             ]
+        ));
+    }
+
+    #[test]
+    fn validate_scope_ignores_generated_noise_and_runtime_artifacts() {
+        assert!(validate_scope(
+            &["src/lib.rs".into()],
+            &[
+                "src/lib.rs".into(),
+                "dist/app.js".into(),
+                "node_modules/react/index.js".into(),
+                ".venv/bin/python".into(),
+                ".pytest_cache/v/cache".into(),
+                "Packages/App/.build/debug/App".into(),
+                ".playwright-mcp/state/session.json".into(),
+            ]
+        ));
+        assert!(!validate_scope(
+            &["src/lib.rs".into()],
+            &["src/lib.rs".into(), "not-allowed.txt".into()]
         ));
     }
 
@@ -2173,6 +2205,12 @@ mod tests {
                 ".punk/runs/run_1/run.json".into(),
                 ".punk/runs/run_1/stdout.log".into(),
                 ".punk/runs/run_1/stderr.log".into(),
+                ".playwright-mcp/state/session.json".into(),
+                "dist/app.js".into(),
+                "node_modules/react/index.js".into(),
+                ".venv/bin/python".into(),
+                ".pytest_cache/v/cache".into(),
+                "Packages/App/.build/debug/App".into(),
             ],
             artifacts: ReceiptArtifacts {
                 stdout_ref: ".punk/runs/run_1/stdout.log".into(),

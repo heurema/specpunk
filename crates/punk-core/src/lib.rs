@@ -21,6 +21,14 @@ pub use capabilities::{
     scope_seeds_for_entry_point_with_prompt,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoRelativePathClass {
+    Product,
+    GeneratedNoise,
+    RuntimeArtifact,
+    ScanOnlyExcluded,
+}
+
 struct ScopeCandidates {
     files: Vec<String>,
     directories: Vec<String>,
@@ -42,6 +50,67 @@ pub(crate) struct GreenfieldScaffoldSeed {
 fn is_swiftpm_build_path(path: &Path) -> bool {
     path.components()
         .any(|component| matches!(component, Component::Normal(name) if name == ".build"))
+}
+
+fn normalize_repo_relative_path(path: &str) -> String {
+    path.trim()
+        .trim_matches('`')
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_string()
+}
+
+pub fn classify_repo_relative_path(path: &str) -> RepoRelativePathClass {
+    let normalized = normalize_repo_relative_path(path);
+    if normalized.is_empty() {
+        return RepoRelativePathClass::Product;
+    }
+    if normalized.starts_with("docs/reference-repos/")
+        || normalized == "docs/reference-repos"
+        || normalized.starts_with("docs/research/_delve_runs/")
+        || normalized == "docs/research/_delve_runs"
+    {
+        return RepoRelativePathClass::ScanOnlyExcluded;
+    }
+
+    let components = normalized
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    if components
+        .first()
+        .is_some_and(|component| matches!(*component, ".git" | ".jj" | ".punk" | ".playwright-mcp"))
+    {
+        return RepoRelativePathClass::RuntimeArtifact;
+    }
+
+    if capabilities::capability_generated_noise_path(&normalized) {
+        return RepoRelativePathClass::GeneratedNoise;
+    }
+
+    RepoRelativePathClass::Product
+}
+
+pub fn repo_relative_path_is_generated_noise(path: &str) -> bool {
+    classify_repo_relative_path(path) == RepoRelativePathClass::GeneratedNoise
+}
+
+pub fn repo_relative_path_is_runtime_artifact(path: &str) -> bool {
+    classify_repo_relative_path(path) == RepoRelativePathClass::RuntimeArtifact
+}
+
+pub fn repo_relative_path_is_product_change(path: &str) -> bool {
+    matches!(
+        classify_repo_relative_path(path),
+        RepoRelativePathClass::Product | RepoRelativePathClass::ScanOnlyExcluded
+    )
+}
+
+pub fn repo_relative_path_is_repo_walk_excluded(path: &str) -> bool {
+    !matches!(
+        classify_repo_relative_path(path),
+        RepoRelativePathClass::Product
+    )
 }
 
 pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
@@ -444,11 +513,7 @@ fn collect_scope_candidates(repo_root: &Path, prompt: &str) -> Result<ScopeCandi
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if ignored_name(&name)
-            || ignored_relative_path(Path::new(&name))
-            || capabilities::capability_ignore_name(&name)
-            || capabilities::capability_ignored_relative_path(Path::new(&name))
-        {
+        if repo_relative_path_is_repo_walk_excluded(&name) {
             continue;
         }
         if path.is_dir() {
@@ -499,15 +564,11 @@ fn walk_repo(
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if ignored_name(&name) {
-            continue;
-        }
         let relative_path = path
             .strip_prefix(repo_root)
             .map_err(|_| anyhow!("path escaped repo root"))?;
-        if ignored_relative_path(relative_path)
-            || capabilities::capability_ignored_relative_path(relative_path)
-        {
+        let relative = relative_path.to_string_lossy().to_string();
+        if ignored_name(&name) || repo_relative_path_is_repo_walk_excluded(&relative) {
             continue;
         }
         if path.is_dir() {
@@ -520,7 +581,6 @@ fn walk_repo(
             )?;
             continue;
         }
-        let relative = relative_path.to_string_lossy().to_string();
         let score = relevance_score(&relative, tokens)
             + content_relevance_score(repo_root, &relative, tokens, false)
             + entry_point_hint_score(repo_root, &relative, tokens);
@@ -2156,10 +2216,7 @@ fn prompt_declares_explicit_touch_set(prompt: &str) -> bool {
 }
 
 fn is_generated_runtime_artifact_path(path: &str) -> bool {
-    let normalized = path.trim().trim_matches('`').replace('\\', "/");
-    normalized == ".punk/project/harness.json"
-        || normalized.starts_with(".punk/project/")
-        || normalized.contains("/.punk/project/")
+    repo_relative_path_is_runtime_artifact(path)
 }
 
 fn is_top_level_scaffold_dir(path: &str) -> bool {
@@ -2861,6 +2918,50 @@ mod tests {
         assert!(active_ids.contains("swiftpm"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repo_relative_path_classifier_distinguishes_product_noise_runtime_and_scan_only() {
+        assert_eq!(
+            classify_repo_relative_path("src/lib.rs"),
+            RepoRelativePathClass::Product
+        );
+        assert_eq!(
+            classify_repo_relative_path("node_modules/react/index.js"),
+            RepoRelativePathClass::GeneratedNoise
+        );
+        assert_eq!(
+            classify_repo_relative_path("dist/app.js"),
+            RepoRelativePathClass::GeneratedNoise
+        );
+        assert_eq!(
+            classify_repo_relative_path(".venv/bin/python"),
+            RepoRelativePathClass::GeneratedNoise
+        );
+        assert_eq!(
+            classify_repo_relative_path(".pytest_cache/state"),
+            RepoRelativePathClass::GeneratedNoise
+        );
+        assert_eq!(
+            classify_repo_relative_path("Packages/App/.build/debug/App"),
+            RepoRelativePathClass::GeneratedNoise
+        );
+        assert_eq!(
+            classify_repo_relative_path(".playwright-mcp/state.json"),
+            RepoRelativePathClass::RuntimeArtifact
+        );
+        assert_eq!(
+            classify_repo_relative_path(".punk/project/harness.json"),
+            RepoRelativePathClass::RuntimeArtifact
+        );
+        assert_eq!(
+            classify_repo_relative_path("docs/reference-repos/demo/README.md"),
+            RepoRelativePathClass::ScanOnlyExcluded
+        );
+        assert_eq!(
+            classify_repo_relative_path("docs/research/_delve_runs/run-1/note.md"),
+            RepoRelativePathClass::ScanOnlyExcluded
+        );
     }
 
     #[test]

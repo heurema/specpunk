@@ -441,6 +441,7 @@ name = "punk-vcs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "punk-core",
  "punk-domain",
 ]
 

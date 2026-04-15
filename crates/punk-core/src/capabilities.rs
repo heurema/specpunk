@@ -144,25 +144,6 @@ pub(crate) fn capability_ignore_name(name: &str) -> bool {
         .any(|candidate| candidate == name)
 }
 
-pub(crate) fn capability_ignored_relative_path(relative: &Path) -> bool {
-    let components = relative
-        .components()
-        .map(super::component_to_string)
-        .collect::<Vec<_>>();
-    if components
-        .iter()
-        .any(|component| capability_ignore_name(component))
-    {
-        return true;
-    }
-    components.starts_with(&["docs".to_string(), "reference-repos".to_string()])
-        || components.starts_with(&[
-            "docs".to_string(),
-            "research".to_string(),
-            "_delve_runs".to_string(),
-        ])
-}
-
 pub fn scope_seeds_for_entry_point(entry_point: &str) -> Option<CapabilityScopeSeeds> {
     builtin_specs()
         .into_iter()
@@ -541,10 +522,9 @@ fn collect_manifest_hits_inner(
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if super::ignored_name(&name) || capability_ignore_name(&name) {
-            continue;
-        }
-        if capability_ignored_relative_path(relative) || super::ignored_relative_path(relative) {
+        if super::ignored_name(&name)
+            || super::repo_relative_path_is_repo_walk_excluded(&relative.to_string_lossy())
+        {
             continue;
         }
         if path.is_dir() {

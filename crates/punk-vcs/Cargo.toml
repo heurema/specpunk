@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 punk-domain = { path = "../punk-domain" }
+punk-core = { path = "../punk-core" }
