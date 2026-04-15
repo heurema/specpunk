@@ -22,7 +22,8 @@ This repo is in a **design reset / rebuild** phase.
   - **active v0 surface**
   - **in-tree but inactive**
   - **planned only**
-- the current crate map lives in `docs/product/REPO-STATUS.md`
+- the short crate-status note lives in `docs/product/REPO-STATUS.md`
+- the full crate/capability/operator-surface matrix lives in `docs/product/IMPLEMENTATION-STATUS.md`
 
 No backward compatibility is required. The project has not launched, so the repo is being reshaped toward the cleanest final design.
 
@@ -35,9 +36,10 @@ If you are orienting in the repo or choosing the next bounded slice, read in thi
 3. `docs/product/CLI.md`
 4. `docs/product/ARCHITECTURE.md`
 5. `docs/product/ADR-provider-alignment.md`
-6. `docs/product/VISION.md`
-7. `docs/product/ACTION-PLAN.md`
-8. `docs/product/NORTH-ROADMAP.md`
+6. `docs/product/IMPLEMENTATION-STATUS.md`
+7. `docs/product/VISION.md`
+8. `docs/product/ACTION-PLAN.md`
+9. `docs/product/NORTH-ROADMAP.md`
 
 Short version:
 
@@ -78,6 +80,8 @@ Project
             -> Proofpack
 ```
 
+`Goal` remains part of the target chain, but the current v0 domain/runtime does **not** persist a standalone `Goal` object yet. Today `punk start` and `punk go --fallback-staged` are derived shell mechanisms over plain goal text.
+
 Key rules:
 - **one CLI**: `punk`
 - **one vocabulary**: `plot / cut / gate`
@@ -104,7 +108,7 @@ It is meant to ensure AI agents do not merely write code, but leave the project 
 The current usable flow is split into:
 
 - **project bootstrap** — explicit admin action
-- **goal-only intake** — user describes the goal, `punk` drafts/contracts internally
+- **goal-only shell intake** — user describes the goal, `punk` drafts/contracts internally
 - **mode-level control** — `plot / cut / gate` remain available when you want manual staging
 
 ### Project bootstrap
@@ -186,6 +190,8 @@ goal -> draft -> approve -> cut -> gate -> proof
 
 If the first accepted cycle only proves a controller-created bootstrap scaffold and the same goal still clearly asks for implementation work, `punk go` should immediately continue into one bounded follow-up cycle instead of stopping at the bootstrap proof. For greenfield Rust bootstrap+implementation goals, that follow-up should narrow toward the implementation files instead of rerunning the broad bootstrap prompt unchanged.
 
+For bootstrapped greenfield Rust, Go, and Python repos, scaffold-first goals may also synthesize manifest-first checks/scope and controller-owned starter files inside `allowed_scope` so execution can begin from concrete source surfaces instead of blocking on an empty repo layout.
+
 If autonomy blocks or escalates, `punk` prepares a staged recovery contract and returns a non-zero exit.
 
 If the blocked or escalated proof looks like a `punk` runtime failure rather than a normal project check failure, the shell may also suggest:
@@ -235,6 +241,11 @@ The intended operator experience is:
 Longer-term, blocked or escalated autonomy should also be durable and inspectable through runtime state, not only visible in one shell invocation.
 
 `plot / cut / gate` remain available, but they are expert/control surfaces rather than the default path a normal operator must learn first.
+
+Current reality note:
+
+- `punk go --fallback-staged` already exists today as the default shell mechanism for initialized repos
+- that does **not** mean the later standalone `Goal` primitive is already active in the v0 domain/runtime
 
 ### Staged/manual path
 
@@ -288,6 +299,26 @@ punk inspect <proof-id> --json
 - `punk inspect <contract-id> --json` is the source for the full persisted contract shape, including `architecture_signals_ref` and the canonical `architecture_integrity` section when present
 - `punk inspect <proof-id> --json` is the source for the final proof chain, including the hashed architecture assessment ref when present
 
+### Bounded research expert/control surface
+
+The current CLI already exposes a bounded research slice:
+
+```bash
+punk research start "<question>" --kind <kind> --goal "<goal>" --success "<criterion>"
+punk research artifact <research-id> --kind note --summary "<summary>"
+punk research synthesize <research-id> --outcome <outcome> --summary "<summary>"
+punk research complete <research-id>
+punk research escalate <research-id>
+```
+
+Current reality:
+
+- this capability already lives in `punk-cli` + `punk-orch` + `punk-domain`
+- it is an **expert/control surface**, not the default operator path
+- it freezes repo-local research packets, artifacts, synthesis, and terminal state
+- it does **not** imply that a separate `punk-research` crate already exists
+- worker orchestration, critique loops, and deeper research execution remain later-stage work
+
 What is explicitly out of scope for v0:
 - daemon
 - queue
@@ -311,6 +342,7 @@ Core product docs:
 - `docs/product/ACTION-PLAN.md` — current bounded execution plan derived from the 2026-04-11 architecture review
 - `docs/product/NORTH-ROADMAP.md` — durable strategic backlog and linked research tracks
 - `docs/product/DOCS-SYSTEM.md` — how repo docs and public docs map together
+- `docs/product/IMPLEMENTATION-STATUS.md` — canonical matrix for crate reality, capability reality, and operator-surface reality
 - `docs/product/COUNCIL.md` — advisory multi-model deliberation protocols
 - `docs/product/SKILLS.md` — skill packets, overlays, and candidate skill patches
 - `docs/product/EVAL.md` — task eval, skill eval, and promotion decisions
@@ -374,8 +406,11 @@ Also note:
 
 - active v0 surface today: `punk-cli`, `punk-domain`, `punk-events`, `punk-vcs`, `punk-core`, `punk-orch`, `punk-gate`, `punk-proof`, `punk-adapters`
 - `crates/punk-council/` is **in-tree but inactive**: it stays buildable in the workspace, but is **not** part of the active v0 operator surface yet
-- `punk-shell`, `punk-skills`, `punk-eval`, and `punk-research` are **planned only**
-- the exact repo truth is tracked in `docs/product/REPO-STATUS.md`
+- `punk-shell`, `punk-skills`, `punk-eval`, and `punk-research` are **planned only** as separate crates
+- `punk go --fallback-staged` and `punk start` already exist today as shell mechanisms in `punk-cli`, while the standalone `Goal` primitive remains deferred
+- `punk research ...` commands already exist today in the active CLI/orch/domain surface, while the dedicated `punk-research` crate remains planned only
+- the short crate-status note lives in `docs/product/REPO-STATUS.md`
+- the full current-truth matrix lives in `docs/product/IMPLEMENTATION-STATUS.md`
 
 ## License
 

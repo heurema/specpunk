@@ -2,9 +2,17 @@
 
 ## Summary
 
-`punk-skills` composes a **reproducible skill packet** for a worker under a specific role, project, and task.
+Target-shape `punk-skills` composes a **reproducible skill packet** for a worker under a specific role, project, and task.
 
 It is not just a directory of markdown files and not a self-mutating memory blob.
+
+Current status:
+- canonical current-truth matrix: `docs/product/IMPLEMENTATION-STATUS.md`
+- crate status: dedicated `punk-skills` crate is **planned only**
+- capability status: some project-skill refs and resolution fields already surface through `ProjectOverlay` / `punk inspect project`, but that is not the full `punk-skills` subsystem
+- operator-surface status: skills are **not** a current operator-default active surface
+
+This doc mainly defines the target-shape subsystem and its future integration boundaries.
 
 Core rule:
 - skills may improve
@@ -239,20 +247,22 @@ Minimum candidate patch packet should therefore be reviewable with:
 
 ## Integration
 
-### With `punk-orch`
+These are target-shape integration points for later activation. They do **not** mean `punk-skills` is active in today's normal operator path.
+
+### With later `punk-orch` skill-packet integration
 Examples:
 - `plot contract` -> `ContractDrafter` packet
 - `cut run` -> `Implementer` packet
 - later council slots -> role-specific packets
 
-### With `punk-council`
+### With later `punk-council` activation
 Council assignments request packets by:
 - role
 - model family
 - project
 - frozen task/council context
 
-### With `punk-eval`
+### With later `punk-eval` activation
 `punk-skills` does not decide promotions.
 It exposes:
 - active layers

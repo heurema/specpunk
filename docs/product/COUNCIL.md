@@ -6,6 +6,15 @@
 
 It does not make final ship/block decisions. It produces structured deliberation artifacts that feed `plot` and `gate`.
 
+This doc describes the target-shape council subsystem and the activation bar, not a current operator-default surface.
+
+Current status:
+- canonical current-truth matrix: `docs/product/IMPLEMENTATION-STATUS.md`
+- crate status: `punk-council` is **in-tree but inactive**
+- capability status: council is a designed subsystem and some code may already exist in-tree
+- operator-surface status: council is **not** part of the current normal operator path or active v0 surface
+- final decision truth still belongs only to `gate`
+
 Core rule:
 - `council` is advisory only
 - only `gate` writes final `DecisionObject`

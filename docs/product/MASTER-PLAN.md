@@ -17,12 +17,12 @@ The target product is a **stewarded multi-agent engineering runtime** with four 
 
 Implementation sequence:
 
-1. v0 core loop
-2. shell
-3. council / diverge
-4. orchestration depth
+1. v0 core loop + current shell mechanisms
+2. dedicated shell crate
+3. council activation / diverge
+4. orchestration depth + standalone `Goal` primitive
 5. skills + eval ratchet
-6. deep research mode
+6. research crate extraction + deeper research execution
 7. benchmark/eval expansion
 
 Current bounded execution plan:
@@ -36,7 +36,8 @@ Repo-status vocabulary for this plan:
 - **in-tree but inactive** = workspace member kept buildable before its stage is promoted
 - **planned only** = target-shape crate not in today's workspace membership
 
-Canonical repo-status note: `docs/product/REPO-STATUS.md`
+Canonical terms: `docs/product/REPO-STATUS.md`
+Canonical full matrix: `docs/product/IMPLEMENTATION-STATUS.md`
 
 Kernel rules that stay fixed across all stages:
 
@@ -68,6 +69,15 @@ v0 is:
 - native `punk init` bootstrap (`.punk/project.json`, `AGENTS.md`, `.punk/AGENT_START.md`, `.punk/bootstrap/<project>-core.md`)
 - no daemon, queue, goals UI, council, or benchmark subsystem
 - strict gate against frozen approved contract + persisted receipt
+- current shell entrypoints already include `punk go --fallback-staged`, `punk start`, `punk status`, and `punk inspect`
+- current bounded research commands already exist as an expert/control surface in the active CLI/orch/domain slice
+
+Important distinction:
+
+- `punk go --fallback-staged` is already real today as a shell mechanism
+- the standalone `Goal` primitive is still later-stage work
+- `punk research ...` is already real today as a bounded capability
+- the separate `punk-research` crate is still later-stage work
 
 ## v0 operational rules
 
@@ -133,6 +143,20 @@ and never a fresh reinterpretation of the task prompt.
 
 ## v0 command surface
 
+Current operator/default shell surface:
+
+```bash
+punk init --enable-jj --verify
+punk go --fallback-staged "<goal>"
+punk start "<goal>"
+punk status [id]
+punk inspect project
+punk inspect work [id]
+punk inspect <id> --json
+```
+
+Current expert/control surface on the same active CLI:
+
 ```bash
 punk plot contract "<prompt>"
 punk plot refine <contract-id> "<guidance>"
@@ -140,14 +164,22 @@ punk plot approve <contract-id>
 punk cut run <contract-id>
 punk gate run <run-id>
 punk gate proof <run-id|decision-id>
-punk status [id]
-punk inspect <id> --json
+punk research start "<question>" --kind <kind> --goal "<goal>" --success "<criterion>"
+punk research artifact <research-id> --kind note --summary "<summary>"
+punk research synthesize <research-id> --outcome <outcome> --summary "<summary>"
+punk research complete <research-id>
+punk research escalate <research-id>
 ```
 
 ## Post-v0 stages
 
 ### Stage 1 — thin shell
-Add thin `punk` shell over the same services.
+Add a dedicated `punk-shell` crate over the same services.
+
+Current note:
+
+- the repo already has shell mechanisms in `punk-cli`
+- this stage is about extracting the dedicated shell crate, not inventing the shell path from zero
 
 ### Stage 2 — council / diverge
 Detailed spec: `docs/product/COUNCIL.md`
@@ -176,7 +208,12 @@ Stage-boundary note:
 - `punk-shell`, `punk-skills`, `punk-eval`, and `punk-research` remain planned only until their stages
 
 ### Stage 3 — orchestration depth
-Add `Goal`, project registry, queue, daemon, and higher-order orchestration.
+Promote standalone `Goal`, then add project registry, queue, daemon, and higher-order orchestration.
+
+Current note:
+
+- `punk go --fallback-staged` and `punk start` already exist today as shell mechanisms over plain goal text
+- this stage is where `Goal` becomes a first-class runtime primitive instead of staying deferred
 
 ### Stage 4 — skills + eval ratchet
 Detailed specs:
@@ -194,9 +231,13 @@ Rules:
 - task eval and skill eval remain separate
 - project-specific competence is first-class
 
-### Stage 5 — deep research mode
+### Stage 5 — research crate extraction + deeper research mode
 Detailed spec: `docs/product/RESEARCH.md`
-Add bounded research workflows (`delve`-style) for hard problems.
+
+Current note:
+
+- the bounded research packet/artifact/synthesis surface already exists today in `punk-cli` + `punk-orch` + `punk-domain`
+- this stage is about extracting/expanding that behavior into a dedicated `punk-research` crate and deeper execution loops
 
 Rules:
 - research runs under frozen questions/contracts

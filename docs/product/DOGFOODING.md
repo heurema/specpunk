@@ -6,6 +6,13 @@
 
 But this must be done as **bounded self-hosting**, not blind self-trust.
 
+Current status:
+- canonical current-truth matrix: `docs/product/IMPLEMENTATION-STATUS.md`
+- active v0 surface today for dogfooding is the existing `punk` CLI path: `init`, `go --fallback-staged`, `start`, `plot / cut / gate`, `status`, and `inspect`
+- `punk-council` is **in-tree but inactive**
+- `punk-shell`, `punk-skills`, `punk-eval`, and `punk-research` are **planned only** as separate crates
+- bounded `punk research ...` is already a current expert/control capability, but it is not the default operator path and does not imply a dedicated `punk-research` crate
+
 Core rule:
 - `punk` may operate on `specpunk`
 - but `punk` must not become the sole unquestioned authority over its own meta-level changes
@@ -52,6 +59,11 @@ Use `punk` on `specpunk`, but under **split trust**.
 - skill candidate generation
 - eval evidence collection
 - research packet generation
+
+Current active-v0 note:
+
+- today, dogfooding primarily runs through the existing `punk` shell mechanisms and `plot / cut / gate` surfaces
+- later-stage council / skills / eval crates are not current operator defaults
 
 ### Not trusted by default
 `punk` must not fully self-authorize changes to:
@@ -118,8 +130,8 @@ Rules:
 - no auto-promotion
 - no silent trust-model changes
 
-### Stage B — council-assisted self-hosting
-After `punk-council` exists, use councils for:
+### Stage B — later council-assisted self-hosting
+After `punk-council` moves from **in-tree but inactive** to an active operator capability, use councils for:
 - architecture changes
 - risky refactors
 - contract hardening
@@ -130,8 +142,8 @@ Rules:
 - gate remains final
 - no council may self-certify core policy changes alone
 
-### Stage C — skill-ratchet self-improvement
-After `punk-skills` and `punk-eval` exist, allow dogfood runs to generate:
+### Stage C — later skill-ratchet self-improvement
+After `punk-skills` and `punk-eval` move from **planned only** target-shape crates into active capability, allow dogfood runs to generate:
 - candidate skill patches
 - project overlays
 - eval evidence
@@ -142,7 +154,12 @@ Rules:
 - rollback remains mandatory
 
 ### Stage D — bounded research-on-self
-After `punk-research` exists, allow controlled research on `punk` itself for:
+Current bounded slice:
+- bounded `punk research ...` already allows operator-triggered research packets, artifacts, synthesis, and terminal advisory records on `specpunk`
+- this is a current expert/control capability in the active CLI/orch/domain surface
+- the dedicated `punk-research` crate and deeper worker execution loops remain **planned only**
+
+Allow controlled research on `punk` itself for:
 - architecture questions
 - migration risks
 - cleanup impact

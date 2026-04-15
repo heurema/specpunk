@@ -9,39 +9,61 @@ cd ~/personal/heurema/specpunk
 
 Read these files in order:
 1. README.md
-2. docs/product/VISION.md
-3. docs/product/ARCHITECTURE.md
-4. docs/product/MASTER-PLAN.md
-5. docs/product/COUNCIL.md
-6. docs/product/SKILLS.md
-7. docs/product/EVAL.md
-8. docs/product/RESEARCH.md
-9. docs/product/DOGFOODING.md
-10. docs/product/CLI.md
+2. docs/product/CURRENT-ROADMAP.md
+3. docs/product/ADR-provider-alignment.md
+4. docs/product/ARCHITECTURE.md
+5. docs/product/CLI.md
+6. docs/product/VISION.md
+7. docs/product/IMPLEMENTATION-STATUS.md
+8. docs/product/REPO-STATUS.md
+9. docs/product/ACTION-PLAN.md
+10. docs/product/NORTH-ROADMAP.md
+11. docs/product/MASTER-PLAN.md
 
-Current state:
-- This repo is in a clean-cut redesign phase.
-- Public product surface is `punk`, not `punk-run`.
+Only then open subsystem specs if your slice actually touches them:
+- docs/product/COUNCIL.md
+- docs/product/SKILLS.md
+- docs/product/EVAL.md
+- docs/product/RESEARCH.md
+- docs/product/DOGFOODING.md
+
+Current repo truth:
+- Public product surface is `punk`.
+- One vocabulary: `plot / cut / gate`.
 - No backward compatibility is required.
 - Legacy code under `punk/` is source material for extraction, not target architecture.
 
-Target product:
-- one CLI: `punk`
-- canonical modes: `plot`, `cut`, `gate`
-- local-first
-- `jj` preferred, `git` fallback
-- event log as runtime source of truth
-- feature-centric flow, not PR-centric flow
-- long-term shape: stewarded multi-agent engineering runtime
+Status vocabulary:
+- active v0 surface
+- in-tree but inactive
+- planned only
 
-Four pillars:
-1. Kernel — small stable Rust core with replaceable edges
-2. Stewardship — cleanup, docs parity, no drift, coherent project state
-3. Council — selective multi-model and multi-role deliberation for high-stakes work
-4. Skill/Eval ratchet — project-specific skills that improve through evidence and promotion
+Current crates:
+- active v0 surface: `punk-cli`, `punk-domain`, `punk-events`, `punk-vcs`, `punk-core`, `punk-orch`, `punk-gate`, `punk-proof`, `punk-adapters`
+- in-tree but inactive: `punk-council`
+- planned only as separate crates: `punk-shell`, `punk-skills`, `punk-eval`, `punk-research`
 
-Canonical object chain:
-Project -> Goal -> Feature -> Contract -> Task -> Run -> Receipt -> DecisionObject -> Proofpack
+Current operator/default path:
+- `punk init --enable-jj --verify`
+- `punk go --fallback-staged "<goal>"`
+- `punk status [id]`
+- `punk inspect project`
+- `punk inspect work [id]`
+
+Current expert/control surfaces:
+- `punk start "<goal>"`
+- `punk plot ...`
+- `punk cut run ...`
+- `punk gate ...`
+- `punk research start|artifact|synthesize|complete|escalate`
+
+Important distinctions:
+- `punk go --fallback-staged` already exists today as a shell mechanism.
+- The standalone `Goal` primitive is still deferred from the current v0 domain/runtime.
+- `punk research ...` already exists today as a bounded capability in `punk-cli` + `punk-orch` + `punk-domain`.
+- The dedicated `punk-research` crate is still planned only.
+- `punk-council` is buildable in-tree but inactive and not part of the current default operator path.
+- The future interactive `punk-shell` crate does not exist yet.
 
 Critical laws:
 1. One CLI: `punk`
@@ -55,49 +77,14 @@ Critical laws:
 9. Skills evolve through curated ratchet, not silent mutation
 10. Self-hosting is bounded; meta-level changes require stronger review than ordinary feature work
 
-Current implemented baseline:
-- repo-root Cargo workspace
-- crates/
-  - punk-cli
-  - punk-domain
-  - punk-events
-  - punk-vcs
-  - punk-core
-  - punk-orch
-  - punk-gate
-  - punk-proof
-  - punk-adapters
-- `plot contract`, `plot refine`, `plot approve`
-- `cut run`
-- `gate run`
-- `gate proof`
-- `status`
-- `inspect --json`
-- event log + repo-local artifacts
-- hybrid `plot` drafting: deterministic scan + Codex structured draft + validation + one repair pass
-
-Storage split:
-- ~/.punk/ = global config, event log, materialized views
-- .punk/ = repo-local contracts, runs, decisions, proofs
-
-Near-term implementation order:
-1. Keep improving the base `plot -> cut -> gate` loop
-2. Add thin `punk-shell` over the same services
-3. Add `punk-council` for architecture/contract/review protocols
-4. Add skills/eval ratchet subsystem
-5. Add bounded deep research mode
-
-Detailed subsystem specs now exist in:
-- docs/product/COUNCIL.md
-- docs/product/SKILLS.md
-- docs/product/EVAL.md
-- docs/product/RESEARCH.md
-
 Do not:
 - preserve `punk-run` public surface
+- describe planned-only crates as current operator surface
+- describe in-tree but inactive council as active default behavior
+- describe `punk go` as proof that the standalone `Goal` primitive already exists
+- describe current `punk research ...` commands as proof that `punk-research` already exists as a crate
 - reintroduce old daemon-first architecture into v0
 - let council write final decisions
 - let skills mutate silently from task success alone
-- let the system self-certify sensitive meta-level changes without stronger review
 - invent second vocabularies like `plan/forge/proof`
 ```

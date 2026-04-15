@@ -2,7 +2,17 @@
 
 ## Summary
 
-`punk-research` is a **bounded deep-research subsystem** for hard, ambiguous, or high-risk engineering questions.
+Target-shape `punk-research` is a **bounded deep-research subsystem** for hard, ambiguous, or high-risk engineering questions.
+
+This doc covers both:
+- the target-shape `punk-research` crate
+- the already-implemented bounded research capability in the active CLI/orch/domain surface
+
+Current status:
+- canonical current-truth matrix: `docs/product/IMPLEMENTATION-STATUS.md`
+- crate status: dedicated `punk-research` crate is **planned only**
+- capability status: bounded `punk research ...` commands already exist today in `punk-cli` + `punk-orch` + `punk-domain`
+- operator-surface status: bounded research is a current **expert/control surface**, not the default operator path
 
 It is not endless autoresearch.
 It is a controlled protocol with:
@@ -24,7 +34,7 @@ v1 covers:
 - skill improvement research
 - model/protocol comparison research
 
-Current implemented slice:
+Current active v0 capability:
 - `punk research start` freezes a repo-local `ResearchQuestion`, `ResearchPacket`, and `ResearchRecord`
 - `punk research artifact <research-id> ...` appends structured repo-local `ResearchArtifact` records
 - `punk research synthesize <research-id> ...` writes one structured repo-local `ResearchSynthesis`
@@ -33,6 +43,7 @@ Current implemented slice:
 - `punk inspect research_<id> --json` may also carry a derived invalidation projection (`active`, `latest`, `history_count`) for downstream tooling
 - `punk inspect research_<id> --json` may also carry a derived synthesis-lineage projection (`active`, `latest`, `history_count`, `history[]`, `has_active_current_view`, `has_replacements`, `latest_is_active`) built from immutable synthesis history for downstream tooling
 - worker orchestration and critique loops are still later-stage work
+- this does **not** mean the dedicated `punk-research` crate already exists
 
 ---
 
@@ -216,13 +227,13 @@ Research may prepare:
 - contract patch proposals
 - risk memos
 
-### With `punk-council`
+### With later `punk-council` activation
 Research may prepare better council packets, but does not replace council.
 
-### With `punk-skills`
+### With later `punk-skills` activation
 Research may generate candidate skill patches or overlay proposals, but they remain candidates.
 
-### With `punk-eval`
+### With later `punk-eval` activation
 Research may generate eval-suite patch proposals or failure hypotheses, but does not write promotion decisions.
 
 ### With `punk-gate`

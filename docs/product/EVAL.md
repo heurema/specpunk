@@ -2,7 +2,7 @@
 
 ## Summary
 
-`punk-eval` is the **evidence-based ratchet layer**.
+Target-shape `punk-eval` is the **evidence-based ratchet layer**.
 
 It evaluates:
 - concrete task outcomes
@@ -14,6 +14,14 @@ And it writes:
 Core rule:
 - `gate` decides whether a run is acceptable now
 - `eval` decides whether the system got better over time
+
+Current status:
+- canonical current-truth matrix: `docs/product/IMPLEMENTATION-STATUS.md`
+- crate status: dedicated `punk-eval` crate is **planned only**
+- capability status: eval philosophy and future storage/scoring model are defined, and current runtime artifacts can later seed replayable suites
+- operator-surface status: eval is **not** a current active operator subsystem or default runtime loop
+
+This doc defines the target-shape eval layer, not a current operator-default surface.
 
 v1 covers:
 - task eval
@@ -275,7 +283,9 @@ If those refs are missing, the case can still be archived as research context, b
 
 ## Integration
 
-### With `punk-skills`
+These are later-stage integration points for the target-shape eval layer. They do **not** mean `punk-eval` is active in today's normal operator path.
+
+### With later `punk-skills` activation
 Consumes:
 - active layers
 - candidate patches
@@ -293,7 +303,7 @@ May be triggered after important runs to create:
 - `gate`: should this run be accepted?
 - `eval`: did this system change improve future work?
 
-### With `punk-research`
+### With later `punk-research` activation
 Research may propose:
 - candidate skill patches
 - eval suite patches

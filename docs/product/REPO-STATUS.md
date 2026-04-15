@@ -1,16 +1,26 @@
 # Repo Status
 
-This note is the small source-of-truth for **what is real today** vs **what is only target shape**.
+Use this note for the short status vocabulary only.
 
-Use this exact vocabulary everywhere in the repo:
+Keep these three axes separate:
+
+- **crate status** — workspace membership today
+- **capability status** — whether behavior already exists somewhere in the active codebase
+- **operator-surface status** — whether something is the default path, an expert/control surface, or target-shape only
+
+For the full matrix, read:
+
+- `docs/product/IMPLEMENTATION-STATUS.md`
+
+## Crate-status vocabulary
 
 | Status | Meaning |
 |---|---|
-| **active v0 surface** | Exists in the current workspace and is part of today's operator/runtime surface. |
-| **in-tree but inactive** | Exists in the current workspace, but is not part of today's normal v0 operator path yet. |
-| **planned only** | Part of the target product shape, but not a current workspace member yet. |
+| **active v0 surface** | Present in the workspace and part of today's active v0 implementation surface |
+| **in-tree but inactive** | Present/buildable in the workspace, but not part of today's normal operator path |
+| **planned only** | Target-shape crate, not present in today's workspace membership |
 
-## Current workspace truth
+## Current crate reality
 
 ### Active v0 surface
 
@@ -24,22 +34,9 @@ Use this exact vocabulary everywhere in the repo:
 - `punk-proof`
 - `punk-adapters`
 
-These crates define the current working loop:
-
-`init -> start/go -> plot -> cut -> gate -> proof`
-
 ### In-tree but inactive
 
 - `punk-council`
-
-`punk-council` is intentionally kept as a workspace member and buildable in-tree, but it is **not** part of the active v0 operator surface.
-
-Until Stage 2 is promoted:
-
-- council remains advisory-only
-- council is not required for the core acceptance loop
-- the normal operator path must remain usable without council
-- selective council is only justified after the repo already has a usable bootstrap + staged + proof-ready core loop
 
 ### Planned only
 
@@ -48,16 +45,8 @@ Until Stage 2 is promoted:
 - `punk-eval`
 - `punk-research`
 
-These are target-shape crates, not current workspace members.
+## Short truth reminders
 
-## Legacy extraction note
-
-The nested legacy workspace under `punk/` is still present as extraction material.
-
-It is **not** the target architecture and **not** the current public operator surface.
-
-Treat it as:
-
-- source material to extract
-- code to relocate
-- code to delete once replaced
+- capability reality can lead crate extraction: `punk research ...` is already real today even though `punk-research` is still planned only
+- operator-surface reality can differ from crate reality: `punk-council` is buildable in-tree but not part of the active v0 operator path
+- current shell behavior can exist before a later primitive exists: `punk go` is real today, while the standalone `Goal` primitive remains deferred

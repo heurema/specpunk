@@ -10,7 +10,8 @@ Repo-status vocabulary used in this doc:
 - **in-tree but inactive** = present/buildable in workspace, but not part of the current operator path
 - **planned only** = target shape, not current workspace surface
 
-Canonical repo-status note: `docs/product/REPO-STATUS.md`
+Canonical terms: `docs/product/REPO-STATUS.md`
+Canonical full matrix: `docs/product/IMPLEMENTATION-STATUS.md`
 
 ---
 
@@ -82,17 +83,19 @@ That means:
 
 The commands below are not all ontology-level primitives.
 
-- `Project`, `Goal`, `Contract`, `Scope`, `Workspace`, `Run`, `DecisionObject`, `Proofpack`, and `Ledger` are the deeper primitives.
+- the long-term object chain includes `Project`, `Goal`, `Contract`, `Scope`, `Workspace`, `Run`, `DecisionObject`, `Proofpack`, and `Ledger`
+- the current v0 domain/runtime does **not** yet persist a standalone `Goal` object
+- `punk start` and `punk go --fallback-staged` are current shell mechanisms over plain goal text and later work-ledger projections
 - shell commands such as `init`, `start`, `go`, `status`, and `inspect` are mechanisms built over those primitives.
 - `plot`, `cut`, and `gate` are best understood as permission boundaries over primitive operations.
 
 ### Command-to-primitive map
 
-| Command/mechanism | Type | Primary primitives touched |
+| Command/mechanism | Type | Current v0 touch / target primitive relation |
 |---|---|---|
 | `punk init` | shell bootstrap | `Project`, `Ledger` |
-| `punk start` | staged shell intake | `Goal`, `Contract`, `Scope` |
-| `punk go --fallback-staged` | autonomous shell intake | `Goal`, `Contract`, `Run`, `DecisionObject`, `Proofpack`, `Ledger` |
+| `punk start` | staged shell intake | plain goal text -> `Contract`, `Scope` today; standalone `Goal` later |
+| `punk go --fallback-staged` | autonomous shell intake | plain goal text -> `Contract`, `Run`, `DecisionObject`, `Proofpack`, `Ledger` today; standalone `Goal` later |
 | `punk plot ...` | substrate permission boundary | `Contract`, `Scope` |
 | `punk cut run ...` | substrate permission boundary | `Workspace`, `Run`, `Receipt` |
 | `punk gate ...` | substrate permission boundary | `DecisionObject`, `Proofpack` |
@@ -291,6 +294,11 @@ Current research inspect surface:
 - `punk inspect research_<id> --json`
 - `punk inspect research_<id>`
 
+Current implementation note:
+
+- this bounded research capability already lives in `punk-cli` + `punk-orch` + `punk-domain`
+- it is real today even though the dedicated `punk-research` crate is still **planned only**
+
 Current research-start semantics:
 
 - `punk research start` is an expert/control surface, not the default user path
@@ -408,6 +416,11 @@ Default shell expectation:
 - this is the normal initialized-repo path
 - the operator should receive one concise shell summary
 - lower-level commands should only be needed for debugging, review, or explicit control
+
+Status note:
+
+- `punk go --fallback-staged` is already part of the active v0 shell path today
+- that does **not** mean the later standalone `Goal` primitive or dedicated `punk-shell` crate already exists
 
 ### Staged/manual intake
 
@@ -711,6 +724,8 @@ Behavior notes:
 - if that same greenfield missing-manifest bootstrap case later degrades into timeout, stall, or orphan classification, `cut run` should still collapse it into the same deterministic blocked summary instead of flapping between blocked and stall-style failures
 - for an approved Rust workspace bootstrap contract that explicitly names crate directories under `crates/...`, `cut run` may materialize a minimal controller-owned workspace scaffold inside `allowed_scope` before dispatch so execution starts from concrete files instead of immediately blocking on an empty layout
 - for generic Rust workspace bootstrap contracts whose scope is only `Cargo.toml`, `crates`, and `tests`, `cut run` may infer bounded crate members from the contract semantics (for example a named CLI like `pubpunk`) and materialize the corresponding minimal workspace scaffold inside `allowed_scope`
+- for a manifest-only greenfield Go bootstrap contract whose scope includes `go.mod` plus `cmd`/`internal`/`pkg`, `cut run` may materialize a minimal controller-owned Go module scaffold inside `allowed_scope` so `go test ./...` starts from concrete files instead of an empty module root
+- for a manifest-only greenfield Python bootstrap contract whose scope includes `pyproject.toml`, `src`, and `tests`, `cut run` may materialize a minimal controller-owned package scaffold inside `allowed_scope` so `pytest` starts from concrete package/test files instead of an empty project root
 - when cargo-based bounded execution would generate a new `Cargo.lock` outside `allowed_scope`, `cut run` should prune that generated side effect before writing the receipt so the project is not left with avoidable out-of-scope dirt, even for file-scoped follow-up Rust slices
 - when bounded execution only performs inspection/check commands inside allowed scope, makes no product-file changes, and then stalls without emitting a sentinel, `cut run` should normalize that case into deterministic no-progress failure instead of surfacing raw noisy stall tails like `mcp: ...` or `succeeded in ...`
 - executor prompts should include the original approved goal text alongside condensed behavior requirements so bounded slices do not lose critical implementation details when drafter requirements are abbreviated

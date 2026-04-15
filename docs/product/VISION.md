@@ -146,7 +146,11 @@ The runtime must support project-specific competence that improves through:
 | Skill/Eval | project overlays, eval loops, promotion/rollback |
 | Research | bounded deep-research protocols for hard questions |
 
-For v0, only a subset is implemented. Council, skill ratchet, and research are later layers, but they are part of the target product shape.
+For v0, only a subset is implemented.
+
+- council and skill ratchet are later layers
+- bounded `punk research ...` commands already exist today as an expert/control surface in the active CLI/orch/domain slice
+- the dedicated `punk-research` crate and deeper research execution remain later
 
 Repo-status vocabulary:
 
@@ -154,7 +158,8 @@ Repo-status vocabulary:
 - **in-tree but inactive** = present/buildable in the workspace, but not part of the current operator path
 - **planned only** = target-shape crate not yet present in today's workspace
 
-Canonical repo-status note: `docs/product/REPO-STATUS.md`
+Canonical terms: `docs/product/REPO-STATUS.md`
+Canonical full matrix: `docs/product/IMPLEMENTATION-STATUS.md`
 
 Detailed subsystem specs live in:
 - `docs/product/COUNCIL.md`

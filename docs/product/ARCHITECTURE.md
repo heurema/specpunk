@@ -111,7 +111,7 @@ See also:
 The substrate owns durable truth and safety invariants:
 
 - `Project` identity
-- normalized `Goal` intake record
+- plain goal intake today; standalone `Goal` record later
 - `Contract`
 - `Scope`
 - isolated `Workspace`
@@ -160,12 +160,12 @@ Hard rules:
 
 If something can be recomposed from deeper objects without changing truth, it is not a primitive.
 
-Current candidate primitives are:
+Target-shape primitives are:
 
 | Primitive | Why it is primitive |
 |---|---|
 | `Project` | identity and repo boundary |
-| `Goal` | normalized user intent anchor |
+| `Goal` | normalized user intent anchor in the long-term chain; deferred in current v0 |
 | `Contract` | executable bounded spec |
 | `Scope` | safety boundary for execution |
 | `Workspace` | isolated mutation context |
@@ -189,15 +189,21 @@ Derived mechanisms are compositions over those primitives:
 
 Harness engineering should be treated the same way: it is a derived harness/evidence plane over existing primitives, not a new primitive truth object.
 
+Current implementation note:
+
+- the v0 runtime already exposes `punk start` and `punk go --fallback-staged`
+- those are derived shell mechanisms over plain goal text today
+- they do **not** mean the standalone `Goal` primitive is already active in the implemented domain/runtime
+
 ### Derived mechanism map
 
 The first practical mapping should stay explicit:
 
-| Mechanism | Type | Primary primitives touched |
+| Mechanism | Type | Current v0 touch / target primitive relation |
 |---|---|---|
 | `init` | shell bootstrap | `Project`, `Ledger` |
-| `start` | staged shell intake | `Goal`, `Contract`, `Scope` |
-| `go` | autonomous shell intake | `Goal`, `Contract`, `Run`, `DecisionObject`, `Proofpack`, `Ledger` |
+| `start` | staged shell intake | plain goal text -> `Contract`, `Scope` today; standalone `Goal` later |
+| `go` | autonomous shell intake | plain goal text -> `Contract`, `Run`, `DecisionObject`, `Proofpack`, `Ledger` today; standalone `Goal` later |
 | staged fallback | shell recovery | `Contract`, `DecisionObject`, `Ledger` |
 | `plot` | substrate permission boundary | `Contract`, `Scope` |
 | `cut` | substrate permission boundary | `Workspace`, `Run` |
@@ -298,7 +304,8 @@ Repo-status vocabulary used below:
 - **in-tree but inactive** = workspace member kept buildable, but not part of the current operator path
 - **planned only** = target-shape crate not in today's workspace membership
 
-Canonical repo-status note: `docs/product/REPO-STATUS.md`
+Canonical terms: `docs/product/REPO-STATUS.md`
+Canonical full matrix: `docs/product/IMPLEMENTATION-STATUS.md`
 
 Current workspace members in the active v0 surface:
 
@@ -347,7 +354,7 @@ Stage-boundary note:
 - workspace membership is not the same thing as active operator surface
 - a crate may exist in-tree before its stage is active
 - `punk-council` is the current example: it remains a workspace member, but it is still in-tree but inactive until Stage 2 is promoted
-- before a dedicated `punk-research` crate exists, the first frozen research-packet slice may live in `punk-cli` + `punk-orch` + `punk-domain` without promoting full research execution into the active runtime surface
+- capability reality can lead crate extraction: the current frozen research-packet slice already lives in `punk-cli` + `punk-orch` + `punk-domain` even though `punk-research` remains planned only
 
 Traits are only required where real backend choice exists.
 
@@ -434,7 +441,7 @@ Not every object in the chain is equally primitive.
 | Object | Role |
 |---|---|
 | `Project` | primitive |
-| `Goal` | primitive |
+| `Goal` | target primitive; deferred in current v0 |
 | `Feature` | durable workstream grouping; important, but can evolve as ledger design sharpens |
 | `Contract` | primitive |
 | `Task` | orchestration unit derived from approved work planning |
@@ -1310,7 +1317,12 @@ Example uses:
 - skill-improvement research
 - model/protocol comparison research
 
-This is the long-term role of `punk-research` and `delve`-style workflows.
+This is the long-term role of a dedicated `punk-research` crate and `delve`-style workflows.
+
+Current status note:
+
+- the dedicated `punk-research` crate is still **planned only**
+- the bounded `punk research ...` capability below is already real today in `punk-cli` + `punk-orch` + `punk-domain`
 
 Current implemented boundary:
 
