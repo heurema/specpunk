@@ -271,7 +271,121 @@ pub struct VerificationContextIdentity {
 pub struct VerificationContext {
     pub identity: VerificationContextIdentity,
     pub file_states: Vec<VerificationContextFileState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_resolution_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_resolution_sha256: Option<String>,
     pub captured_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CapabilityScopeSeeds {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_points: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directory_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityCandidateView {
+    pub id: String,
+    pub version: String,
+    pub source_kind: String,
+    pub semantic_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_markers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoCapabilityResolution {
+    pub resolution_mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detected: Vec<CapabilityCandidateView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active: Vec<CapabilityCandidateView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed: Vec<CapabilityCandidateView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicted: Vec<CapabilityCandidateView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisory: Vec<CapabilityCandidateView>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectCapabilityIndex {
+    pub schema: String,
+    pub version: u32,
+    pub project_id: String,
+    pub source_kind: String,
+    pub resolution_mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detected: Vec<CapabilityCandidateView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active: Vec<CapabilityCandidateView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed: Vec<CapabilityCandidateView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicted: Vec<CapabilityCandidateView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisory: Vec<CapabilityCandidateView>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrozenCapabilitySpec {
+    pub id: String,
+    pub version: String,
+    pub source_kind: String,
+    pub semantic_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_markers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_rules: Vec<String>,
+    #[serde(default, skip_serializing_if = "CapabilityScopeSeeds::is_empty")]
+    pub scope_seeds: CapabilityScopeSeeds,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_checks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integrity_checks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_scaffold_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrozenCapabilityResolution {
+    pub schema: String,
+    pub version: u32,
+    pub contract_id: String,
+    pub project_capability_index_ref: String,
+    pub project_capability_index_sha256: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_capabilities: Vec<FrozenCapabilitySpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_rules: Vec<String>,
+    #[serde(default, skip_serializing_if = "CapabilityScopeSeeds::is_empty")]
+    pub scope_seeds: CapabilityScopeSeeds,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_checks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integrity_checks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_scaffold_kind: Option<String>,
+    pub generated_at: String,
+}
+
+impl CapabilityScopeSeeds {
+    fn is_empty(&self) -> bool {
+        self.entry_points.is_empty()
+            && self.file_paths.is_empty()
+            && self.directory_paths.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +437,8 @@ pub struct PersistedContract {
     pub architecture_signals_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub architecture_integrity: Option<ContractArchitectureIntegrity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_resolution_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,6 +468,8 @@ pub struct RepoScanSummary {
     pub candidate_target_checks: Vec<String>,
     pub candidate_integrity_checks: Vec<String>,
     pub notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_resolution: Option<RepoCapabilityResolution>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -949,6 +1067,9 @@ mod tests {
                     to_glob: "crates/punk-cli/**".into(),
                 }],
             }),
+            capability_resolution_ref: Some(
+                ".punk/contracts/feat_1/capability-resolution.json".into(),
+            ),
         };
 
         let json = serde_json::to_value(&persisted).unwrap();

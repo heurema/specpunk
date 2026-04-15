@@ -166,6 +166,13 @@ The active repo-local overlay refs should be surfaced through the canonical proj
 ```
 
 That packet is the inspectable source of truth for project skill refs.
+It should also carry a concise capability-resolution summary plus a ref to the detailed repo-kind packet at:
+
+```text
+.punk/project/capabilities.json
+```
+
+The detailed capability packet is where built-in repo-kind candidates (`active`, `suppressed`, `conflicted`, `advisory`) remain inspectable without making the overlay itself too noisy.
 
 ### Global storage
 Shared reusable base/domain layers live in:
@@ -179,6 +186,7 @@ Shared reusable base/domain layers live in:
 
 Global or ambient locations are not the primary source of repo-specific project intelligence.
 If a repo has no repo-local overlays yet, ambient discovery may be used only as explicit fallback/migration behavior and must be exposed by `ProjectOverlay`.
+Ambient/global discovery is advisory only in v0: it must not become execution-time authority for `cut` or `gate`, and it must not override the repo-local built-in capability resolution that was frozen into approved contracts.
 
 ### Hard invariant
 Every task/run must be able to reconstruct:

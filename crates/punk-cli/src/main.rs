@@ -1764,6 +1764,11 @@ fn format_project_overlay_summary(overlay: &punk_orch::ProjectOverlay) -> String
     } else {
         overlay.safe_default_checks.join(", ")
     };
+    let capability_active_ids = if overlay.capability_resolution.active_ids.is_empty() {
+        "none".to_string()
+    } else {
+        overlay.capability_resolution.active_ids.join(", ")
+    };
     let constraints = if overlay.local_constraints.is_empty() {
         "none".to_string()
     } else {
@@ -1776,10 +1781,11 @@ fn format_project_overlay_summary(overlay: &punk_orch::ProjectOverlay) -> String
     };
 
     format!(
-        "Project: {project_id}\nRepo root: {repo_root}\nProject overlay packet: {overlay_ref}\nVCS mode: {vcs_mode}\nStatus scope: {status_scope_mode}\nBootstrap: {bootstrap}\nGuidance: {guidance}\nProject skill resolution: {project_skill_resolution_mode}\nProject skills: {skills}\nAmbient fallback skills: {ambient_skills}\nSafe default checks: {checks}\nCapabilities:\n  bootstrap_ready={bootstrap_ready}\n  project_guidance_ready={guidance_ready}\n  staged_ready={staged_ready}\n  autonomous_ready={autonomous_ready}\n  jj_ready={jj_ready}\n  proof_ready={proof_ready}\nHarness:\n  inspect_ready={inspect_ready}\n  bootable_per_workspace={bootable_per_workspace}\n  ui_legible={ui_legible}\n  logs_legible={logs_legible}\n  metrics_legible={metrics_legible}\n  traces_legible={traces_legible}\nHarness packet: {harness_spec_ref}\n  derivation_source={derivation_source}\n  profiles={profiles}\nLocal constraints:\n{constraints}",
+        "Project: {project_id}\nRepo root: {repo_root}\nProject overlay packet: {overlay_ref}\nCapability index packet: {capability_index_ref}\nVCS mode: {vcs_mode}\nStatus scope: {status_scope_mode}\nBootstrap: {bootstrap}\nGuidance: {guidance}\nProject skill resolution: {project_skill_resolution_mode}\nProject skills: {skills}\nAmbient fallback skills: {ambient_skills}\nSafe default checks: {checks}\nCapabilities:\n  bootstrap_ready={bootstrap_ready}\n  project_guidance_ready={guidance_ready}\n  staged_ready={staged_ready}\n  autonomous_ready={autonomous_ready}\n  jj_ready={jj_ready}\n  proof_ready={proof_ready}\n  active_ids={capability_active_ids}\n  suppressed_count={suppressed_count}\n  conflicted_count={conflicted_count}\n  advisory_count={advisory_count}\nHarness:\n  inspect_ready={inspect_ready}\n  bootable_per_workspace={bootable_per_workspace}\n  ui_legible={ui_legible}\n  logs_legible={logs_legible}\n  metrics_legible={metrics_legible}\n  traces_legible={traces_legible}\nHarness packet: {harness_spec_ref}\n  derivation_source={derivation_source}\n  profiles={profiles}\nLocal constraints:\n{constraints}",
         project_id = overlay.project_id,
         repo_root = overlay.repo_root,
         overlay_ref = overlay_ref,
+        capability_index_ref = overlay.capability_resolution.capability_index_ref,
         vcs_mode = overlay.vcs_mode,
         status_scope_mode = overlay.status_scope_mode,
         bootstrap = bootstrap,
@@ -1794,6 +1800,10 @@ fn format_project_overlay_summary(overlay: &punk_orch::ProjectOverlay) -> String
         autonomous_ready = overlay.capability_summary.autonomous_ready,
         jj_ready = overlay.capability_summary.jj_ready,
         proof_ready = overlay.capability_summary.proof_ready,
+        capability_active_ids = capability_active_ids,
+        suppressed_count = overlay.capability_resolution.suppressed.len(),
+        conflicted_count = overlay.capability_resolution.conflicted.len(),
+        advisory_count = overlay.capability_resolution.advisory.len(),
         inspect_ready = overlay.harness_summary.inspect_ready,
         bootable_per_workspace = overlay.harness_summary.bootable_per_workspace,
         ui_legible = overlay.harness_summary.ui_legible,
@@ -3088,6 +3098,16 @@ mod tests {
                 jj_ready: true,
                 proof_ready: true,
                 project_guidance_ready: true,
+            },
+            capability_resolution: punk_orch::ProjectCapabilityResolutionSummary {
+                capability_index_ref: ".punk/project/capabilities.json".into(),
+                resolution_source: "builtin".into(),
+                resolution_mode: "builtin_only_v1".into(),
+                active_ids: vec!["rust-cargo".into()],
+                active: Vec::new(),
+                suppressed: Vec::new(),
+                conflicted: Vec::new(),
+                advisory: Vec::new(),
             },
             harness_summary: punk_orch::ProjectHarnessSummary {
                 inspect_ready: true,

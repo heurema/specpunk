@@ -87,6 +87,15 @@ impl ProofService {
             let context_path = self.repo_root.join(context_ref);
             if context_path.exists() {
                 hashes.insert(context_ref.clone(), self.events.file_sha256(&context_path)?);
+                if let Ok(context) = read_json::<punk_domain::VerificationContext>(&context_path) {
+                    if let Some(capability_ref) = context.capability_resolution_ref {
+                        let capability_path = self.repo_root.join(&capability_ref);
+                        if capability_path.exists() {
+                            hashes
+                                .insert(capability_ref, self.events.file_sha256(&capability_path)?);
+                        }
+                    }
+                }
             }
         }
         for evidence in &decision.harness_evidence {
@@ -259,6 +268,11 @@ mod tests {
         .unwrap();
         fs::write(root.join(".punk/project/harness.json"), "{ }\n").unwrap();
         fs::write(root.join("tracked.txt"), "ok\n").unwrap();
+        fs::write(
+            root.join(".punk/contracts/feat_1/capability-resolution.json"),
+            "{ \"schema\": \"specpunk/contract-capability-resolution/v1\" }\n",
+        )
+        .unwrap();
         write_json(
             &root.join(".punk/runs/run_1/run.json"),
             &Run {
@@ -314,6 +328,10 @@ mod tests {
                     fingerprint_sha256: "ctx-digest-123".into(),
                 },
                 file_states: vec![],
+                capability_resolution_ref: Some(
+                    ".punk/contracts/feat_1/capability-resolution.json".into(),
+                ),
+                capability_resolution_sha256: Some("cap-digest-123".into()),
                 captured_at: now_rfc3339(),
             },
         )
@@ -419,6 +437,9 @@ mod tests {
         assert!(proofpack
             .hashes
             .contains_key(".punk/runs/run_1/verification-context.json"));
+        assert!(proofpack
+            .hashes
+            .contains_key(".punk/contracts/feat_1/capability-resolution.json"));
         assert!(proofpack.hashes.contains_key(".punk/project/harness.json"));
         assert!(proofpack.hashes.contains_key("tracked.txt"));
 

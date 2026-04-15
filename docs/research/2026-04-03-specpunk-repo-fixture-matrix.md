@@ -21,6 +21,25 @@ Recent critical bugs were discovered only via external dogfood:
 
 That means internal happy paths are not enough.
 
+## 2026-04-15 capability-resolution slice update
+
+The current v0 implementation now has one internal built-in capability registry for:
+
+- `rust-cargo`
+- `node-package-scripts`
+- `go-mod`
+- `python-pyproject-pytest`
+- `swiftpm`
+
+That raises the minimum regression bar:
+
+- SwiftPM repos must exclude `.build/` from scope candidates and scans
+- JS repos must exclude `node_modules/` and `dist/`
+- Python repos must exclude `.venv/`, `.pytest_cache/`, and `dist/`
+- mixed Node+Rust repos must surface both capability candidates in inspectable project intelligence, even if coarse compatibility fields stay simple
+
+Fixture coverage and smoke tests should treat those as required behavior, not optional heuristics.
+
 ## Required repo classes
 
 1. fresh repo with no history
@@ -108,6 +127,10 @@ The current known bug history suggests these should be the first concrete regres
 7. mixed Node+Rust service/session/runtime contract generation for `baseline`
 8. stable bounded `pubpunk` slices for init / cleanup / validate
 
+The capability-resolution slice adds another explicit regression expectation:
+
+9. mixed repo capability detection remains inspectable at the project index layer and is frozen into approved contract context instead of being recomputed from live ambient state
+
 ## Required command matrix
 
 For each relevant repo class, at minimum exercise:
@@ -149,3 +172,9 @@ New external dogfood classes are now concrete enough to treat as required fixtur
     - cleanup of obsolete `style/examples` references
     - `validate --json --project-root`
   - these slices should be tested as deterministic bounded controller paths, not only as general patch/apply flows
+
+The current implemented regression set also now covers:
+
+- built-in capability resolution for all five v0 repo kinds
+- generated-noise exclusion for SwiftPM, JS, and Python repos
+- mixed Node+Rust candidate detection in project intelligence

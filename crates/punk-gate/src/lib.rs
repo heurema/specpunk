@@ -41,6 +41,8 @@ struct VerificationContextOutcome {
     check_root: Option<PathBuf>,
     context_ref: Option<String>,
     identity: Option<VerificationContextIdentity>,
+    capability_resolution_ref: Option<String>,
+    capability_resolution_sha256: Option<String>,
     reasons: Vec<String>,
     valid: bool,
 }
@@ -110,6 +112,19 @@ impl GateService {
             decision_basis.push("scope violation: changed files outside allowed_scope".to_string());
         }
         decision_basis.extend(verification_context.reasons.clone());
+        if let Some(capability_ref) = verification_context.capability_resolution_ref.as_ref() {
+            let capability_hash = verification_context
+                .capability_resolution_sha256
+                .as_deref()
+                .unwrap_or("unknown");
+            decision_basis.push(format!(
+                "capability resolution frozen at {capability_ref} ({capability_hash})"
+            ));
+        } else if let Some(capability_ref) = persisted_contract.capability_resolution_ref.as_ref() {
+            decision_basis.push(format!(
+                "capability resolution expected from approved contract at {capability_ref}"
+            ));
+        }
         let (target, integrity) = if let Some(check_root) = verification_context.check_root.as_ref()
         {
             (
@@ -615,6 +630,8 @@ fn resolve_verification_context(
             check_root: None,
             context_ref: None,
             identity: None,
+            capability_resolution_ref: None,
+            capability_resolution_sha256: None,
             reasons: vec!["frozen verification context missing from run".to_string()],
             valid: false,
         };
@@ -626,6 +643,8 @@ fn resolve_verification_context(
             check_root: None,
             context_ref: Some(context_ref),
             identity: None,
+            capability_resolution_ref: None,
+            capability_resolution_sha256: None,
             reasons: vec![format!(
                 "frozen verification context missing at {}",
                 context_path.display()
@@ -641,6 +660,8 @@ fn resolve_verification_context(
                 check_root: None,
                 context_ref: Some(context_ref),
                 identity: None,
+                capability_resolution_ref: None,
+                capability_resolution_sha256: None,
                 reasons: vec![format!("unable to read frozen verification context: {err}")],
                 valid: false,
             };
@@ -671,6 +692,8 @@ fn resolve_verification_context(
             check_root: None,
             context_ref: Some(context_ref),
             identity: Some(context.identity),
+            capability_resolution_ref: context.capability_resolution_ref,
+            capability_resolution_sha256: context.capability_resolution_sha256,
             reasons,
             valid: false,
         };
@@ -687,6 +710,8 @@ fn resolve_verification_context(
                 check_root: None,
                 context_ref: Some(context_ref),
                 identity: Some(context.identity),
+                capability_resolution_ref: context.capability_resolution_ref,
+                capability_resolution_sha256: context.capability_resolution_sha256,
                 reasons,
                 valid: false,
             };
@@ -765,6 +790,8 @@ fn resolve_verification_context(
         check_root: valid.then_some(check_root),
         context_ref: Some(context_ref),
         identity: Some(context.identity),
+        capability_resolution_ref: context.capability_resolution_ref,
+        capability_resolution_sha256: context.capability_resolution_sha256,
         reasons,
         valid,
     }
@@ -1129,6 +1156,8 @@ mod tests {
                 ..identity
             },
             file_states,
+            capability_resolution_ref: None,
+            capability_resolution_sha256: None,
             captured_at: now_rfc3339(),
         };
         let context_path = root
@@ -1201,6 +1230,7 @@ mod tests {
                 contract,
                 architecture_signals_ref: signals_ref,
                 architecture_integrity: integrity,
+                capability_resolution_ref: None,
             },
         )
         .unwrap();
@@ -2289,6 +2319,130 @@ mod tests {
             .decision_basis
             .iter()
             .all(|reason| !reason.contains("failed")));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gate_uses_frozen_capability_resolution_even_if_project_index_changes() {
+        let (root, global) = architecture_test_root("frozen-capability");
+        fs::create_dir_all(root.join(".punk/project")).unwrap();
+        fs::write(
+            root.join(".punk/project/capabilities.json"),
+            "{ \"active\": [] }\n",
+        )
+        .unwrap();
+        fs::write(root.join("tracked.txt"), "ok\n").unwrap();
+        commit_all(&root, "initial");
+        fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "stabilize tracked file".into(),
+            entry_points: vec!["tracked.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["tracked file stays stable".into()],
+            behavior_requirements: vec!["keep tracked file intact".into()],
+            allowed_scope: vec!["tracked.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        let capability_ref = ".punk/contracts/feat_1/capability-resolution.json".to_string();
+        write_json(
+            &root.join(&capability_ref),
+            &serde_json::json!({
+                "schema": "specpunk/contract-capability-resolution/v1",
+                "version": 1,
+                "contract_id": "ct_1",
+                "project_capability_index_ref": ".punk/project/capabilities.json",
+                "project_capability_index_sha256": "idx-sha",
+                "selected_capabilities": [{"id": "rust-cargo"}],
+                "ignore_rules": ["target"],
+                "scope_seeds": {"entry_points": ["Cargo.toml"]},
+                "target_checks": ["true"],
+                "integrity_checks": ["true"],
+                "generated_at": now_rfc3339()
+            }),
+        )
+        .unwrap();
+        write_json(
+            &root.join(".punk/contracts/feat_1/v1.json"),
+            &PersistedContract {
+                contract,
+                architecture_signals_ref: None,
+                architecture_integrity: None,
+                capability_resolution_ref: Some(capability_ref.clone()),
+            },
+        )
+        .unwrap();
+
+        let mut run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        attach_verification_context(&root, &mut run, &["tracked.txt"]);
+        let context_ref = run.verification_context_ref.clone().unwrap();
+        let context_path = root.join(&context_ref);
+        let mut context: VerificationContext = read_json(&context_path).unwrap();
+        context.capability_resolution_ref = Some(capability_ref.clone());
+        context.capability_resolution_sha256 = Some("cap-sha".into());
+        write_json(&context_path, &context).unwrap();
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        write_json(
+            &root.join(".punk/runs/run_1/receipt.json"),
+            &Receipt {
+                id: "rcpt_1".into(),
+                run_id: "run_1".into(),
+                task_id: "task_1".into(),
+                status: "success".into(),
+                executor_name: "test-executor".into(),
+                changed_files: vec!["tracked.txt".into()],
+                artifacts: ReceiptArtifacts {
+                    stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                    stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+                },
+                checks_run: vec!["true".into()],
+                duration_ms: 1,
+                cost_usd: None,
+                summary: "ok".into(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .unwrap();
+
+        fs::write(
+            root.join(".punk/project/capabilities.json"),
+            "{ \"active\": [{\"id\": \"swiftpm\"}] }\n",
+        )
+        .unwrap();
+
+        let decision = GateService::new(&root, &global).gate_run("run_1").unwrap();
+        assert_eq!(decision.decision, Decision::Accept);
+        assert!(decision.decision_basis.iter().any(|reason| {
+            reason.contains(
+                "capability resolution frozen at .punk/contracts/feat_1/capability-resolution.json",
+            )
+        }));
 
         let _ = fs::remove_dir_all(&root);
     }

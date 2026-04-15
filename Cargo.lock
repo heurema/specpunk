@@ -350,9 +350,11 @@ name = "punk-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "punk-domain",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

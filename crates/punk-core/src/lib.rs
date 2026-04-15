@@ -7,6 +7,7 @@ use punk_domain::{DraftProposal, DraftValidationError, RepoScanSummary};
 
 pub mod architecture;
 pub mod artifacts;
+mod capabilities;
 
 pub use architecture::{
     compute_architecture_signals, line_count_for_path, scan_forbidden_path_dependency, scope_roots,
@@ -14,20 +15,25 @@ pub use architecture::{
     DEFAULT_ARCHITECTURE_THRESHOLDS,
 };
 pub use artifacts::{find_object_path, read_json, relative_ref, write_json};
+pub use capabilities::{
+    build_project_capability_index, capability_generated_noise_path,
+    freeze_contract_capability_resolution, scope_seeds_for_entry_point,
+    scope_seeds_for_entry_point_with_prompt,
+};
 
 struct ScopeCandidates {
     files: Vec<String>,
     directories: Vec<String>,
 }
 
-enum GreenfieldScaffoldKind {
+pub(crate) enum GreenfieldScaffoldKind {
     Rust,
     Go,
     Python,
     Node,
 }
 
-struct GreenfieldScaffoldSeed {
+pub(crate) struct GreenfieldScaffoldSeed {
     entry_points: Vec<String>,
     file_scope_paths: Vec<String>,
     directory_scope_paths: Vec<String>,
@@ -40,54 +46,51 @@ fn is_swiftpm_build_path(path: &Path) -> bool {
 
 pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
     let mut manifests = Vec::new();
-    let mut package_manager = None;
-    let mut available_scripts = BTreeMap::new();
     let mut candidate_integrity_checks = Vec::new();
     let mut candidate_target_checks = Vec::new();
     let mut notes = Vec::new();
     let tokens = prompt_tokens(prompt);
+    let resolved_capabilities = capabilities::resolve_repo_capabilities(repo_root, prompt)?;
+    let package_manager = resolved_capabilities.package_manager.clone();
+    let available_scripts = resolved_capabilities.available_scripts.clone();
     let project_kind = if repo_root.join("Cargo.toml").exists() {
         manifests.push("Cargo.toml".to_string());
-        candidate_integrity_checks.extend(rust_integrity_checks(repo_root)?);
-        candidate_target_checks.extend(rust_target_checks(repo_root, &tokens));
         "rust".to_string()
     } else if repo_root.join("package.json").exists() {
         manifests.push("package.json".to_string());
-        let package_json = repo_root.join("package.json");
-        let value: serde_json::Value = serde_json::from_slice(
-            &fs::read(&package_json).with_context(|| format!("read {}", package_json.display()))?,
-        )
-        .with_context(|| format!("parse {}", package_json.display()))?;
-        if let Some(scripts) = value.get("scripts").and_then(|v| v.as_object()) {
-            available_scripts = scripts
-                .iter()
-                .filter_map(|(key, value)| value.as_str().map(|v| (key.clone(), v.to_string())))
-                .collect();
-        }
-        package_manager = detect_package_manager(repo_root);
-        node_checks(
-            package_manager.as_deref(),
-            &available_scripts,
-            &tokens,
-            &mut candidate_target_checks,
-            &mut candidate_integrity_checks,
-        );
         "node".to_string()
     } else if repo_root.join("go.mod").exists() {
         manifests.push("go.mod".to_string());
-        candidate_integrity_checks.extend(go_integrity_checks());
-        candidate_target_checks.extend(go_target_checks());
         "go".to_string()
     } else if let Some(python_manifest) = python_manifest(repo_root) {
         manifests.push(python_manifest);
-        python_checks(
-            &mut candidate_target_checks,
-            &mut candidate_integrity_checks,
-        );
         "python".to_string()
     } else {
         "generic".to_string()
     };
+
+    for capability in &resolved_capabilities.active {
+        candidate_integrity_checks.extend(capability.integrity_checks.clone());
+        candidate_target_checks.extend(capability.target_checks.clone());
+        if capability
+            .view
+            .matched_markers
+            .iter()
+            .any(|marker| marker.starts_with("prompt:greenfield:"))
+        {
+            let label = match capability.view.id.as_str() {
+                "rust-cargo" => "Rust",
+                "node-package-scripts" => "TypeScript/Node",
+                "go-mod" => "Go",
+                "python-pyproject-pytest" => "Python",
+                "swiftpm" => "SwiftPM",
+                _ => "repo",
+            };
+            notes.push(format!(
+                "inferred initial {label} bootstrap checks from bootstrapped greenfield prompt"
+            ));
+        }
+    }
 
     if repo_root.join("Makefile").exists() {
         manifests.push("Makefile".to_string());
@@ -126,28 +129,36 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
         notes.push("no trustworthy integrity checks inferred".to_string());
     }
 
-    let greenfield_scaffold_seed = greenfield_scaffold_kind
-        .as_ref()
-        .map(|kind| greenfield_scaffold_seed(kind, &tokens));
+    let mut preferred_scope_seeds = resolved_capabilities
+        .active
+        .iter()
+        .filter(|capability| {
+            capability
+                .view
+                .matched_markers
+                .iter()
+                .any(|marker| marker.starts_with("prompt:greenfield:"))
+        })
+        .map(|capability| capability.scope_seeds.clone())
+        .collect::<Vec<_>>();
+    if let Some(scaffold_kind) = greenfield_scaffold_kind.as_ref() {
+        preferred_scope_seeds.push(greenfield_scaffold_seed(scaffold_kind, &tokens).into());
+    }
 
     let mut scope_candidates = collect_scope_candidates(repo_root, prompt)?;
-    if let Some(seed) = &greenfield_scaffold_seed {
-        prepend_preferred_candidates(&mut scope_candidates.files, &seed.file_scope_paths, 20);
-        prepend_preferred_candidates(
-            &mut scope_candidates.directories,
-            &seed.directory_scope_paths,
-            20,
-        );
-        if let Some(scaffold_kind) = &greenfield_scaffold_kind {
-            notes.push(format!(
-                "preferring scaffoldable {} scope candidates from bootstrapped greenfield prompt",
-                greenfield_scaffold_kind_label(scaffold_kind)
-            ));
-        }
+    for seed in &preferred_scope_seeds {
+        prepend_preferred_candidates(&mut scope_candidates.files, &seed.file_paths, 20);
+        prepend_preferred_candidates(&mut scope_candidates.directories, &seed.directory_paths, 20);
+    }
+    if let Some(scaffold_kind) = &greenfield_scaffold_kind {
+        notes.push(format!(
+            "preferring scaffoldable {} scope candidates from bootstrapped greenfield prompt",
+            greenfield_scaffold_kind_label(scaffold_kind)
+        ));
     }
 
     let mut candidate_entry_points = infer_entry_points(repo_root, prompt, &scope_candidates.files);
-    if let Some(seed) = &greenfield_scaffold_seed {
+    for seed in &preferred_scope_seeds {
         prepend_preferred_candidates(&mut candidate_entry_points, &seed.entry_points, 10);
     }
     let candidate_scope_paths = combined_scope_candidates(&scope_candidates);
@@ -164,6 +175,7 @@ pub fn scan_repo(repo_root: &Path, prompt: &str) -> Result<RepoScanSummary> {
         candidate_target_checks,
         candidate_integrity_checks,
         notes,
+        capability_resolution: Some(resolved_capabilities.resolution),
     })
 }
 
@@ -372,7 +384,7 @@ fn error(field: &str, message: &str) -> DraftValidationError {
     }
 }
 
-fn detect_package_manager(repo_root: &Path) -> Option<String> {
+pub(crate) fn detect_package_manager(repo_root: &Path) -> Option<String> {
     for (file, pm) in [
         ("pnpm-lock.yaml", "pnpm"),
         ("yarn.lock", "yarn"),
@@ -396,7 +408,7 @@ fn package_manager_run(pm: Option<&str>, script: &str) -> String {
     }
 }
 
-fn node_checks(
+pub(crate) fn node_checks(
     package_manager: Option<&str>,
     scripts: &BTreeMap<String, String>,
     prompt_tokens: &[String],
@@ -434,7 +446,8 @@ fn collect_scope_candidates(repo_root: &Path, prompt: &str) -> Result<ScopeCandi
         let name = entry.file_name().to_string_lossy().to_string();
         if ignored_name(&name)
             || ignored_relative_path(Path::new(&name))
-            || is_swiftpm_build_path(Path::new(&name))
+            || capabilities::capability_ignore_name(&name)
+            || capabilities::capability_ignored_relative_path(Path::new(&name))
         {
             continue;
         }
@@ -467,10 +480,10 @@ fn collect_scope_candidates(repo_root: &Path, prompt: &str) -> Result<ScopeCandi
     }
 
     let mut files = sort_scored_candidates(file_candidates);
-    files.retain(|candidate| !is_swiftpm_build_path(Path::new(candidate)));
+    files.retain(|candidate| !capabilities::capability_generated_noise_path(candidate));
 
     let mut directories = sort_scored_candidates(directory_candidates);
-    directories.retain(|candidate| !is_swiftpm_build_path(Path::new(candidate)));
+    directories.retain(|candidate| !capabilities::capability_generated_noise_path(candidate));
 
     Ok(ScopeCandidates { files, directories })
 }
@@ -492,7 +505,9 @@ fn walk_repo(
         let relative_path = path
             .strip_prefix(repo_root)
             .map_err(|_| anyhow!("path escaped repo root"))?;
-        if ignored_relative_path(relative_path) {
+        if ignored_relative_path(relative_path)
+            || capabilities::capability_ignored_relative_path(relative_path)
+        {
             continue;
         }
         if path.is_dir() {
@@ -540,20 +555,17 @@ fn combined_scope_candidates(candidates: &ScopeCandidates) -> Vec<String> {
         .files
         .iter()
         .chain(candidates.directories.iter())
-        .filter(|candidate| !is_swiftpm_build_path(Path::new(candidate)))
+        .filter(|candidate| !capabilities::capability_generated_noise_path(candidate))
         .cloned()
         .take(20)
         .collect()
 }
 
-fn ignored_name(name: &str) -> bool {
-    matches!(name, ".git" | ".punk" | "target" | "node_modules")
+pub(crate) fn ignored_name(name: &str) -> bool {
+    matches!(name, ".git" | ".jj" | ".punk")
 }
 
-fn ignored_relative_path(relative: &Path) -> bool {
-    if is_swiftpm_build_path(relative) {
-        return true;
-    }
+pub(crate) fn ignored_relative_path(relative: &Path) -> bool {
     let components = relative
         .components()
         .take(3)
@@ -567,7 +579,7 @@ fn ignored_relative_path(relative: &Path) -> bool {
         ])
 }
 
-fn prompt_tokens(prompt: &str) -> Vec<String> {
+pub(crate) fn prompt_tokens(prompt: &str) -> Vec<String> {
     let mut seen = BTreeSet::new();
     for token in prompt
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -579,7 +591,7 @@ fn prompt_tokens(prompt: &str) -> Vec<String> {
     seen.into_iter().collect()
 }
 
-fn repo_has_bootstrap_markers(repo_root: &Path) -> bool {
+pub(crate) fn repo_has_bootstrap_markers(repo_root: &Path) -> bool {
     let bootstrap_dir = repo_root.join(".punk/bootstrap");
     let has_bootstrap_doc = fs::read_dir(&bootstrap_dir)
         .ok()
@@ -589,7 +601,7 @@ fn repo_has_bootstrap_markers(repo_root: &Path) -> bool {
     repo_root.join(".punk/AGENT_START.md").exists() && has_bootstrap_doc
 }
 
-fn python_manifest(repo_root: &Path) -> Option<String> {
+pub(crate) fn python_manifest(repo_root: &Path) -> Option<String> {
     for candidate in ["pyproject.toml", "pytest.ini", "requirements.txt"] {
         if repo_root.join(candidate).exists() {
             return Some(candidate.to_string());
@@ -598,20 +610,20 @@ fn python_manifest(repo_root: &Path) -> Option<String> {
     None
 }
 
-fn go_target_checks() -> Vec<String> {
+pub(crate) fn go_target_checks() -> Vec<String> {
     vec!["go test ./...".to_string()]
 }
 
-fn go_integrity_checks() -> Vec<String> {
+pub(crate) fn go_integrity_checks() -> Vec<String> {
     vec!["go test ./...".to_string()]
 }
 
-fn python_checks(target: &mut Vec<String>, integrity: &mut Vec<String>) {
+pub(crate) fn python_checks(target: &mut Vec<String>, integrity: &mut Vec<String>) {
     target.push("pytest".to_string());
     integrity.push("pytest".to_string());
 }
 
-fn prompt_explicitly_requests_greenfield_rust_scaffold(tokens: &[String]) -> bool {
+pub(crate) fn prompt_explicitly_requests_greenfield_rust_scaffold(tokens: &[String]) -> bool {
     let requests_rust = tokens.iter().any(|token| {
         matches!(
             token.as_str(),
@@ -622,7 +634,7 @@ fn prompt_explicitly_requests_greenfield_rust_scaffold(tokens: &[String]) -> boo
     requests_rust && requests_scaffold
 }
 
-fn prompt_explicitly_requests_greenfield_go_scaffold(tokens: &[String]) -> bool {
+pub(crate) fn prompt_explicitly_requests_greenfield_go_scaffold(tokens: &[String]) -> bool {
     let requests_go = tokens
         .iter()
         .any(|token| matches!(token.as_str(), "go" | "golang" | "module"));
@@ -630,7 +642,7 @@ fn prompt_explicitly_requests_greenfield_go_scaffold(tokens: &[String]) -> bool 
     requests_go && requests_scaffold
 }
 
-fn prompt_explicitly_requests_greenfield_python_scaffold(tokens: &[String]) -> bool {
+pub(crate) fn prompt_explicitly_requests_greenfield_python_scaffold(tokens: &[String]) -> bool {
     let requests_python = tokens
         .iter()
         .any(|token| matches!(token.as_str(), "python" | "pytest" | "pyproject" | "poetry"));
@@ -638,7 +650,7 @@ fn prompt_explicitly_requests_greenfield_python_scaffold(tokens: &[String]) -> b
     requests_python && requests_scaffold
 }
 
-fn prompt_explicitly_requests_greenfield_node_scaffold(tokens: &[String]) -> bool {
+pub(crate) fn prompt_explicitly_requests_greenfield_node_scaffold(tokens: &[String]) -> bool {
     let requests_node = tokens.iter().any(|token| {
         matches!(
             token.as_str(),
@@ -657,7 +669,7 @@ fn prompt_explicitly_requests_greenfield_node_scaffold(tokens: &[String]) -> boo
     requests_node && requests_scaffold
 }
 
-fn prompt_explicitly_requests_scaffold(tokens: &[String]) -> bool {
+pub(crate) fn prompt_explicitly_requests_scaffold(tokens: &[String]) -> bool {
     tokens
         .iter()
         .any(|token| matches!(token.as_str(), "scaffold" | "bootstrap" | "greenfield"))
@@ -690,7 +702,10 @@ fn greenfield_scaffold_kind(repo_root: &Path, tokens: &[String]) -> Option<Green
     None
 }
 
-fn greenfield_bootstrap_check(kind: &GreenfieldScaffoldKind, tokens: &[String]) -> String {
+pub(crate) fn greenfield_bootstrap_check(
+    kind: &GreenfieldScaffoldKind,
+    tokens: &[String],
+) -> String {
     match kind {
         GreenfieldScaffoldKind::Rust => {
             if tokens.iter().any(|token| token == "workspace") {
@@ -714,7 +729,7 @@ fn greenfield_scaffold_kind_label(kind: &GreenfieldScaffoldKind) -> &'static str
     }
 }
 
-fn greenfield_scaffold_seed(
+pub(crate) fn greenfield_scaffold_seed(
     kind: &GreenfieldScaffoldKind,
     tokens: &[String],
 ) -> GreenfieldScaffoldSeed {
@@ -831,7 +846,7 @@ fn infer_entry_points(repo_root: &Path, prompt: &str, candidates: &[String]) -> 
     results.into_iter().take(10).collect()
 }
 
-fn rust_target_checks(repo_root: &Path, prompt_tokens: &[String]) -> Vec<String> {
+pub(crate) fn rust_target_checks(repo_root: &Path, prompt_tokens: &[String]) -> Vec<String> {
     let mut checks = Vec::new();
     let mut matched_packages = matched_rust_packages(repo_root, prompt_tokens);
     for package in matched_packages.drain(..) {
@@ -850,7 +865,7 @@ fn rust_target_checks(repo_root: &Path, prompt_tokens: &[String]) -> Vec<String>
     checks
 }
 
-fn rust_integrity_checks(repo_root: &Path) -> Result<Vec<String>> {
+pub(crate) fn rust_integrity_checks(repo_root: &Path) -> Result<Vec<String>> {
     let cargo_toml = repo_root.join("Cargo.toml");
     if !cargo_toml.exists() {
         return Ok(Vec::new());
@@ -1112,7 +1127,7 @@ fn package_tokens(package_name: &str) -> Vec<String> {
         .collect()
 }
 
-fn component_to_string(component: Component<'_>) -> String {
+pub(crate) fn component_to_string(component: Component<'_>) -> String {
     component.as_os_str().to_string_lossy().to_string()
 }
 
@@ -2132,7 +2147,9 @@ fn prompt_declares_explicit_touch_set(prompt: &str) -> bool {
         "touch exactly",
         "exact touch set",
         "requested touch set",
-        "scope bounded to",
+        "scope bounded exactly to",
+        "scope bounded to these",
+        "scope bounded only to",
     ]
     .iter()
     .any(|marker| lowered.contains(marker))
@@ -2293,7 +2310,14 @@ fn explicit_scope_override(prompt: &str, repo_root: &Path) -> Option<Vec<String>
         return Some(exact_scope);
     }
     let explicit_scope = explicit_scope_paths(prompt, repo_root);
-    (!explicit_scope.is_empty()).then_some(explicit_scope)
+    if explicit_scope.is_empty() {
+        return None;
+    }
+    if prompt_declares_explicit_touch_set(prompt) || explicit_scope.len() >= 2 {
+        Some(explicit_scope)
+    } else {
+        None
+    }
 }
 
 fn explicit_entry_points_override(explicit_scope: &[String]) -> Option<Vec<String>> {
@@ -2498,7 +2522,7 @@ fn push_unique(items: &mut Vec<String>, value: String) {
     }
 }
 
-fn dedupe(values: &mut Vec<String>) {
+pub(crate) fn dedupe(values: &mut Vec<String>) {
     let mut seen = BTreeSet::new();
     values.retain(|value| seen.insert(value.clone()));
 }
@@ -2797,6 +2821,137 @@ mod tests {
             error.field.starts_with("allowed_scope")
                 && error.message.contains("generated build artifacts")
         }));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn built_in_registry_reports_current_v0_capabilities() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-capability-registry-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("web")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(
+            root.join("web/package.json"),
+            "{\"scripts\":{\"test\":\"vitest\"}}\n",
+        )
+        .unwrap();
+        fs::write(root.join("go.mod"), "module example.com/demo\n\ngo 1.22\n").unwrap();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("Package.swift"), "// swift package\n").unwrap();
+
+        let summary = scan_repo(&root, "stabilize mixed repo capability resolution").unwrap();
+        let resolution = summary.capability_resolution.unwrap();
+        let active_ids = resolution
+            .active
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(active_ids.contains("rust-cargo"));
+        assert!(active_ids.contains("node-package-scripts"));
+        assert!(active_ids.contains("go-mod"));
+        assert!(active_ids.contains("python-pyproject-pytest"));
+        assert!(active_ids.contains("swiftpm"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scope_candidates_ignore_js_and_python_noise_artifacts() {
+        let root =
+            std::env::temp_dir().join(format!("punk-core-js-python-noise-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::create_dir_all(root.join("dist/assets")).unwrap();
+        fs::create_dir_all(root.join("node_modules/react")).unwrap();
+        fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        fs::create_dir_all(root.join(".pytest_cache/v")).unwrap();
+        fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("package.json"),
+            "{\"scripts\":{\"test\":\"vitest\"}}\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/app.py"), "def ready():\n    return True\n").unwrap();
+        fs::write(
+            root.join("tests/test_app.py"),
+            "def test_ready():\n    assert True\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("dist/assets/app.js"),
+            "console.log('generated')\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("node_modules/react/index.js"),
+            "module.exports = {}\n",
+        )
+        .unwrap();
+        fs::write(root.join(".venv/bin/python"), "#!/usr/bin/env python3\n").unwrap();
+        fs::write(root.join(".pytest_cache/v/cache"), "cached\n").unwrap();
+
+        let summary = scan_repo(&root, "tighten app tests").unwrap();
+        for path in summary
+            .candidate_scope_paths
+            .iter()
+            .chain(summary.candidate_file_scope_paths.iter())
+            .chain(summary.candidate_directory_scope_paths.iter())
+        {
+            assert!(!path.contains("dist"));
+            assert!(!path.contains("node_modules"));
+            assert!(!path.contains(".venv"));
+            assert!(!path.contains(".pytest_cache"));
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mixed_repo_capability_resolution_exposes_rust_and_node_candidates() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-mixed-capabilities-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("web/src")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(
+            root.join("web/package.json"),
+            "{\"scripts\":{\"test\":\"vitest\",\"lint\":\"eslint .\"}}\n",
+        )
+        .unwrap();
+        fs::write(root.join("web/src/index.ts"), "export const ok = true;\n").unwrap();
+
+        let summary = scan_repo(&root, "stabilize backend and web checks").unwrap();
+        let resolution = summary.capability_resolution.unwrap();
+        let rust = resolution
+            .active
+            .iter()
+            .find(|candidate| candidate.id == "rust-cargo");
+        let node = resolution
+            .active
+            .iter()
+            .find(|candidate| candidate.id == "node-package-scripts");
+        assert!(rust.is_some());
+        assert!(node.is_some());
+        assert!(node
+            .unwrap()
+            .matched_markers
+            .iter()
+            .any(|marker| marker == "web/package.json"));
 
         let _ = fs::remove_dir_all(&root);
     }

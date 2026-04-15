@@ -129,6 +129,7 @@ Bootstrap is native to `punk`; it does not shell out to `punk-run`.
 Bootstrap writes the current repo-local packet and guidance:
 
 - `.punk/project.json`
+- `.punk/project/capabilities.json`
 - `AGENTS.md`
 - `.punk/AGENT_START.md`
 - `.punk/bootstrap/<project>-core.md`
@@ -149,6 +150,11 @@ Inspect the current derived project-intelligence view with:
 punk inspect project
 punk inspect project --json
 ```
+
+`punk inspect project` stays concise and now points at both:
+
+- `.punk/project/overlay.json`
+- `.punk/project/capabilities.json`
 
 Inspect the current derived work-ledger view with:
 

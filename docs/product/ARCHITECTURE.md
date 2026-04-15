@@ -484,10 +484,13 @@ The storage/layout split must stay explicit:
 | contract document | `.punk/contracts/<feature-id>/vN.json` | canonical | `plot` | approved/draft contract plus persisted `architecture_signals_ref` and optional `architecture_integrity` |
 | architecture signals | `.punk/contracts/<feature-id>/architecture-signals.json` | derived | `plot` | deterministic repo-scan summary for the current contract state |
 | architecture brief | `.punk/contracts/<feature-id>/architecture-brief.md` | derived | `plot` | reviewable deterministic brief for architecture-sensitive slices |
+| project capability index | `.punk/project/capabilities.json` | derived inspect packet | `inspect project` / `plot approve` refresh | built-in repo-kind candidate graph (`active`, `suppressed`, `conflicted`, `advisory`) |
+| frozen contract capability resolution | `.punk/contracts/<feature-id>/capability-resolution.json` | derived frozen packet | `plot approve` | frozen built-in capability semantics that shaped inferred checks, scope seeds, ignore rules, and controller scaffold kind |
 | run receipt | `.punk/runs/<run-id>/receipt.json` | canonical | `cut` | execution truth consumed by `gate` |
+| verification context | `.punk/runs/<run-id>/verification-context.json` | canonical frozen context | `cut` | frozen workspace identity + file states + frozen capability-resolution ref/hash |
 | architecture assessment | `.punk/runs/<run-id>/architecture-assessment.json` | derived | `gate` | deterministic assessment of frozen contract commitments vs receipt/check state |
 | decision object | `.punk/decisions/<decision-id>.json` | canonical | `gate` | final verdict; carries the architecture assessment ref through `check_refs` |
-| proofpack | `.punk/proofs/<decision-id>/proofpack.json` | canonical | `gate` | hash-linked proof chain; hashes the architecture assessment when present |
+| proofpack | `.punk/proofs/<decision-id>/proofpack.json` | canonical | `gate` | hash-linked proof chain; hashes the architecture assessment and frozen capability artifact when present |
 
 That means there is still only one contract truth and one final verdict truth:
 
@@ -912,6 +915,7 @@ ProjectOverlay
   bootstrap_ref
   agent_guidance_ref
   capability_summary
+  capability_resolution
   harness_summary
   harness_spec_ref
   harness_spec
@@ -956,10 +960,30 @@ It must not become:
 The likely correct model is:
 
 - canonical project facts and refs are persisted at `.punk/project/overlay.json`
+- built-in repo-kind candidate resolution is persisted separately at `.punk/project/capabilities.json`
 - shell commands read and display that one project-intelligence packet instead of reconstructing primary truth from ambient directories
 - repo-local `.punk/skills/overlays/**/*.md` refs are the primary project-skill source
 - ambient skill discovery is fallback/migration-only and must stay explicit in the packet when it is used
 - project-specific skill composition remains explicit and inspectable
+
+### Internal capability-resolution rule
+
+`punk-core` owns one built-in capability registry for current v0 repo kinds:
+
+- `rust-cargo`
+- `node-package-scripts`
+- `go-mod`
+- `python-pyproject-pytest`
+- `swiftpm`
+
+This is an internal unification slice, not a public pack system:
+
+- no `punk packs ...`
+- no plugin ABI
+- no ambient execution-time pack loading
+- no same-id shadowing of built-ins
+
+Resolution is frozen at `plot approve` into the contract-scoped capability packet, then copied by ref/hash into the run verification context. `gate` and `proof` must verify against that frozen packet, not against live repo scans or ambient state.
 
 ---
 
