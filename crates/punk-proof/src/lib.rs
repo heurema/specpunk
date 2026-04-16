@@ -290,6 +290,7 @@ mod tests {
                     base_ref: Some("HEAD~1".into()),
                 },
                 verification_context_ref: None,
+                architecture_inputs_ref: None,
                 started_at: now_rfc3339(),
                 ended_at: Some(now_rfc3339()),
             },
@@ -499,6 +500,29 @@ mod tests {
         )
         .unwrap();
         fs::write(
+            root.join(".punk/runs/run_1/architecture-inputs.json"),
+            r#"{
+  "signals_source_ref": ".punk/contracts/feat_1/architecture-signals.json",
+  "signals_ref": ".punk/runs/run_1/architecture-signals.json",
+  "signals_sha256": "signals-sha",
+  "brief_source_ref": ".punk/contracts/feat_1/architecture-brief.md",
+  "brief_ref": ".punk/runs/run_1/architecture-brief.md",
+  "brief_sha256": "brief-sha",
+  "captured_at": "2026-04-16T00:00:00Z"
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join(".punk/runs/run_1/architecture-signals.json"),
+            "{\"contract_id\":\"ct_1\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".punk/runs/run_1/architecture-brief.md"),
+            "# frozen brief\n",
+        )
+        .unwrap();
+        fs::write(
             root.join(".punk/runs/run_1/architecture-assessment.json"),
             "{\"run_id\":\"run_1\"}\n",
         )
@@ -516,7 +540,12 @@ mod tests {
             decision_basis: vec!["checks passed".into()],
             contract_ref: ".punk/contracts/feat_1/v1.json".into(),
             receipt_ref: ".punk/runs/run_1/receipt.json".into(),
-            check_refs: vec![".punk/runs/run_1/architecture-assessment.json".into()],
+            check_refs: vec![
+                ".punk/runs/run_1/architecture-inputs.json".into(),
+                ".punk/runs/run_1/architecture-signals.json".into(),
+                ".punk/runs/run_1/architecture-brief.md".into(),
+                ".punk/runs/run_1/architecture-assessment.json".into(),
+            ],
             verification_context_ref: None,
             verification_context_identity: None,
             command_evidence: Vec::new(),
@@ -534,6 +563,21 @@ mod tests {
             .contains(&".punk/runs/run_1/architecture-assessment.json".to_string()));
         assert!(proof
             .hashes
+            .contains_key(".punk/runs/run_1/architecture-inputs.json"));
+        assert!(proof
+            .hashes
+            .contains_key(".punk/runs/run_1/architecture-signals.json"));
+        assert!(proof
+            .hashes
+            .contains_key(".punk/runs/run_1/architecture-brief.md"));
+        assert!(proof
+            .hashes
             .contains_key(".punk/runs/run_1/architecture-assessment.json"));
+        assert!(!proof
+            .hashes
+            .contains_key(".punk/contracts/feat_1/architecture-signals.json"));
+        assert!(!proof
+            .hashes
+            .contains_key(".punk/contracts/feat_1/architecture-brief.md"));
     }
 }
