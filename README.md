@@ -1,204 +1,75 @@
 <p align="center">
-  <img src="site/assets/punk-mascot.svg" alt="Specpunk mascot" width="240" />
+  <img src="site/assets/punk-mascot.svg" alt="SpecPunk mascot" width="240" />
 </p>
+
+# SpecPunk
 
 Local-first, stewarded multi-agent engineering runtime.
 
-`punk` is the new target shape of this repo: one CLI, one vocabulary, one runtime.
+`punk` is the public surface of this repo: one CLI, one vocabulary, one runtime.
 
-It combines:
-- **orchestration** from specpunk
-- **deliberation** ideas from arbiter
-- **assurance / proof** ideas from signum
-- **modal shell UX** inspired by forgecode
-- **skill/eval ratchet** direction informed by project-skill work such as skillpulse-style tracking
+## What SpecPunk is
 
-## Status
+SpecPunk is a repository-first runtime for AI-driven engineering work across codebases.
 
-This repo is in a **design reset / rebuild** phase.
+It is built around a small set of product laws:
 
-- current code still contains legacy nested workspace pieces under `punk/`
-- those crates are treated as **source material for extraction**
-- docs in `docs/product/` describe the **target architecture**, not a finished released implementation
-- current repo truth uses one explicit status vocabulary:
-  - **active v0 surface**
-  - **in-tree but inactive**
-  - **planned only**
-- the current crate map lives in `docs/product/REPO-STATUS.md`
-
-No backward compatibility is required. The project has not launched, so the repo is being reshaped toward the cleanest final design.
-
-## Read this first
-
-If you are orienting in the repo or choosing the next bounded slice, read in this order:
-
-1. `docs/product/CURRENT-ROADMAP.md`
-2. `docs/product/ADR-provider-alignment.md`
-3. `docs/product/ARCHITECTURE.md`
-4. `docs/product/NORTH-ROADMAP.md`
-
-Short version:
-
-- `specpunk` should stay a **bounded correctness and stewardship layer**
-- provider-native runtimes, tools, tracing, and session primitives should usually be **wrapped**, not rebuilt
-- roadmap work that increases platform complexity without improving boundedness, reliability, inspectability, or operator simplicity should be downgraded or cut
-
-## Product thesis
-
-`punk` is a local-first runtime for AI-driven engineering work across repositories.
-
-It has four pillars:
-- **Kernel** — small, stable Rust core with replaceable edges
-- **Stewardship** — goal, scope, cleanup, docs, and project coherence
-- **Council** — selective multi-model, multi-role deliberation for high-stakes decisions
-- **Skill/Eval ratchet** — project-specific skills improved through evidence and evaluation
-
-It is built around three runtime modes:
-- **`plot`** — shape work, inspect the repo, draft/refine contracts
-- **`cut`** — execute bounded changes in isolated VCS context
-- **`gate`** — verify, decide, and produce proof artifacts
-
-These are not tone presets. They are **permission boundaries**.
-
-## Core model
-
-Canonical object chain:
-
-```text
-Project
-  -> Goal
-    -> Feature
-      -> Contract
-        -> Task
-          -> Run
-            -> Receipt
-            -> DecisionObject
-            -> Proofpack
-```
-
-Key rules:
 - **one CLI**: `punk`
 - **one vocabulary**: `plot / cut / gate`
-- **one state truth**: append-only event log + materialized views
-- **one decision writer**: only `gate` writes final `DecisionObject`
-- **one frozen verification context per run**: `gate` verifies against the persisted run context, not mutable live repo state
-- **VCS-aware, not git-bound**: `jj` preferred, `git` fallback
-- **feature-centric, not PR-centric**
-- **skills improve through curated ratchet, not silent mutation**
+- **contract first**
+- **`gate` writes the final decision**
+- **proof before acceptance**
+- **local-first, VCS-aware operation**
 
-## What makes `punk` different
+The goal is not to be a generic provider-zoo shell or just another chat wrapper around coding models.
+The goal is to make bounded engineering work more reliable, inspectable, and proof-bearing.
 
-`punk` is not just another agent runner.
+## Current status
 
-It is meant to ensure AI agents do not merely write code, but leave the project in a cleaner and more coherent state:
-- bounded scope
-- superseded code removed or explicitly retained
-- docs/config/manifests updated
-- migrations actually finished
-- high-stakes decisions reviewed through structured council protocols when needed
+This repo is in an active rebuild phase.
 
-## Current practical flow
+Use this vocabulary everywhere:
 
-The current usable flow is split into:
+- **active v0 surface**
+- **in-tree but inactive**
+- **planned only**
 
-- **project bootstrap** — explicit admin action
-- **goal-only intake** — user describes the goal, `punk` drafts/contracts internally
-- **mode-level control** — `plot / cut / gate` remain available when you want manual staging
+Current reality:
 
-### Project bootstrap
+- current operator path: `init -> start/go -> plot -> cut -> gate -> proof`
+- `punk-council` is **in-tree but inactive**
+- `punk-shell`, `punk-skills`, `punk-eval`, and `punk-research` are **planned only**
+- legacy code under `punk/` is source material, not the public operator surface
 
-Bootstrap a repo once:
+The exact repo truth lives in [`docs/product/REPO-STATUS.md`](docs/product/REPO-STATUS.md).
+
+## Quickstart
+
+Run the CLI from the source tree:
+
+```bash
+cargo run -p punk-cli -- --help
+```
+
+Initialize a repository:
+
+```bash
+cargo run -p punk-cli -- init --enable-jj --verify
+```
+
+If `punk` is already on your `PATH`, you can use:
 
 ```bash
 punk init --enable-jj --verify
 ```
 
-If the repo basename is not a good project id, use:
-
-```bash
-punk init --project <id> --enable-jj --verify
-```
-
-Goal-intake commands will auto-run `git init` if the directory has no VCS yet, then continue in degraded git-only mode. If that automatic init fails, initialize the repo manually:
-
-```bash
-git init
-punk init --project <id> --enable-jj --verify
-```
-
-Bootstrap is native to `punk`; it does not shell out to `punk-run`.
-
-Bootstrap writes the current repo-local packet and guidance:
-
-- `.punk/project.json`
-- `.punk/project/capabilities.json`
-- `AGENTS.md`
-- `.punk/AGENT_START.md`
-- `.punk/bootstrap/<project>-core.md`
-
-If a repo already has one legacy `.punk/bootstrap/*-core.md` packet, `punk init` and `punk inspect project` reuse it instead of creating a second competing bootstrap packet.
-
-Bootstrap also ensures safe default ignore coverage for:
-
-- `.punk/`
-- `target/`
-- `.playwright-mcp/`
-
-Successful `cut run` receipts also backfill the same safe ignore coverage if a repo was bootstrapped without a `.gitignore`.
-
-Inspect the current derived project-intelligence view with:
-
-```bash
-punk inspect project
-punk inspect project --json
-```
-
-`punk inspect project` stays concise and now points at both:
-
-- `.punk/project/overlay.json`
-- `.punk/project/capabilities.json`
-
-Inspect the current derived work-ledger view with:
-
-```bash
-punk inspect work
-punk inspect work <id>
-punk inspect work <id> --json
-```
-
-Longer-term, project bootstrap should converge on one richer project-intelligence packet instead of a growing set of adjacent bootstrap artifacts.
-
-### Default autonomous path
-
-The default autonomous intake is goal-only:
+Default happy path:
 
 ```bash
 punk go --fallback-staged "<goal>"
 ```
 
-This path runs:
-
-```text
-goal -> draft -> approve -> cut -> gate -> proof
-```
-
-If the first accepted cycle only proves a controller-created bootstrap scaffold and the same goal still clearly asks for implementation work, `punk go` should immediately continue into one bounded follow-up cycle instead of stopping at the bootstrap proof. For greenfield Rust bootstrap+implementation goals, that follow-up should narrow toward the implementation files instead of rerunning the broad bootstrap prompt unchanged.
-
-If autonomy blocks or escalates, `punk` prepares a staged recovery contract and returns a non-zero exit.
-
-The intended operator experience is:
-
-- plain goal in
-- one concise progress or blocker summary out
-- one obvious next step out
-
-Longer-term, blocked or escalated autonomy should also be durable and inspectable through runtime state, not only visible in one shell invocation.
-
-`plot / cut / gate` remain available, but they are expert/control surfaces rather than the default path a normal operator must learn first.
-
-### Staged/manual path
-
-When you want explicit review between stages:
+Staged path:
 
 ```bash
 punk start "<goal>"
@@ -208,115 +79,63 @@ punk gate run <run-id>
 punk gate proof <run-id|decision-id>
 ```
 
-For architecture-sensitive slices, `plot` can also force the deterministic review packet before approval:
+`jj` is preferred when available. `git` is the fallback.
 
-```bash
-punk plot contract --architecture on "<goal>"
-punk plot refine <contract-id> "<guidance>" --architecture on
-```
+## Read this first
 
-Current v0 architecture steering stays inside the same `plot -> cut -> gate` slice:
+If you are orienting in the repo, read in this order:
 
-- `plot contract` / `plot refine` / `plot approve` always refresh the derived `.punk/contracts/<feature-id>/architecture-signals.json` artifact from deterministic repo scan + current contract state
-- `plot` writes the derived `.punk/contracts/<feature-id>/architecture-brief.md` artifact when signals are `critical`, `--architecture on` is used, or the persisted contract already carries architecture integrity constraints
-- the approved contract document remains canonical and may persist:
-  - `architecture_signals_ref`
-  - optional `architecture_integrity { review_required, brief_ref, touched_roots_max?, file_loc_budgets[], forbidden_path_dependencies[] }`
-- `gate` reads only frozen persisted inputs, writes the derived `.punk/runs/<run-id>/architecture-assessment.json` artifact, escalates if critical review was required but missing from the approved contract, blocks on breached enforced constraints, and carries the assessment ref/hash into proof through `check_refs` / `hashes`
-- enforced now: touched-root budgets, file LOC budgets, deterministic Rust crate/module edges, deterministic JS/TS relative-import edges
-- deferred in v0: broader language coverage and whole-repo dependency graph analysis
+1. [`docs/product/REPO-STATUS.md`](docs/product/REPO-STATUS.md)
+2. [`docs/product/CURRENT-ROADMAP.md`](docs/product/CURRENT-ROADMAP.md)
+3. [`docs/product/CLI.md`](docs/product/CLI.md)
+4. [`docs/product/ARCHITECTURE.md`](docs/product/ARCHITECTURE.md)
+5. [`docs/product/ADR-provider-alignment.md`](docs/product/ADR-provider-alignment.md)
+6. [`docs/product/VISION.md`](docs/product/VISION.md)
+7. [`docs/product/ACTION-PLAN.md`](docs/product/ACTION-PLAN.md)
+8. [`docs/product/NORTH-ROADMAP.md`](docs/product/NORTH-ROADMAP.md)
 
-If the workspace cannot auto-initialize Git, `punk start` should stop early and point back to:
+## Canonical docs map
 
-```bash
-git init
-punk init --project <id> --enable-jj --verify
-```
+Core product docs:
 
-Read-only inspection:
+- [Repo status](docs/product/REPO-STATUS.md)
+- [Current roadmap](docs/product/CURRENT-ROADMAP.md)
+- [CLI](docs/product/CLI.md)
+- [Architecture](docs/product/ARCHITECTURE.md)
+- [Vision](docs/product/VISION.md)
+- [Action plan](docs/product/ACTION-PLAN.md)
+- [North roadmap](docs/product/NORTH-ROADMAP.md)
+- [Documentation system](docs/product/DOCS-SYSTEM.md)
 
-```bash
-punk status [id]
-punk inspect work [id]
-punk inspect work [id] --json
-punk inspect <contract-id> --json
-punk inspect <proof-id> --json
-```
+Public docs layer:
 
-- `punk status [id]` is the concise lifecycle pointer: current work id, next action, suggested command, latest contract/run/decision ids
-- `punk inspect work [id]` is the stable human/json view for derived architecture refs: signals summary, brief ref, assessment ref/outcome, and a copied contract-side architecture integrity summary
-- `punk inspect <contract-id> --json` is the source for the full persisted contract shape, including `architecture_signals_ref` and the canonical `architecture_integrity` section when present
-- `punk inspect <proof-id> --json` is the source for the final proof chain, including the hashed architecture assessment ref when present
+- Mintlify config: [`docs.json`](docs.json)
+- Public overview source: [`index.mdx`](index.mdx)
+- Public quickstart source: [`quickstart.mdx`](quickstart.mdx)
+- Public roadmap source: [`roadmap.mdx`](roadmap.mdx)
 
-What is explicitly out of scope for v0:
-- daemon
-- queue
-- goals as user-facing flow
-- council (`panel / quorum / verify`)
-- diverge
-- benchmark subsystem
-- plugin marketplace
-- skill auto-promotion
+The public docs site is a curated layer over the repo.
+Canonical product truth still lives in the repository.
 
-## Docs
+## What is in scope today
 
-- `docs/product/CURRENT-ROADMAP.md` — short active roadmap for current-forward work
-- `docs/product/ACTION-PLAN.md` — current bounded execution plan derived from the 2026-04-11 architecture review
-- `docs/product/ADR-provider-alignment.md` — accepted build/wrap/avoid rule for provider alignment
-- `docs/product/VISION.md` — product boundary and laws
-- `docs/product/ARCHITECTURE.md` — kernel, stewardship, council, skills/eval architecture
-- `docs/product/COUNCIL.md` — advisory multi-model deliberation protocols
-- `docs/product/SKILLS.md` — skill packets, overlays, and candidate skill patches
-- `docs/product/EVAL.md` — task eval, skill eval, and promotion decisions
-- `docs/product/RESEARCH.md` — bounded deep-research protocols
-- `docs/product/DOGFOODING.md` — bounded self-hosting and trust-separation rules
-- `docs/product/CLI.md` — command surface and shell UX
-- `docs/product/NORTH-ROADMAP.md` — durable strategic backlog and linked research tracks
-- `docs/product/MASTER-PLAN.md` — staged build plan
-- `docs/product/CONTINUE-PROMPT.md` — handoff prompt for the next build session
-- `docs/research/2026-04-11-specpunk-architecture-review.md` — review memo that drove the current action plan
+The current public slice is intentionally narrow:
 
-## Target repo shape
+- repository bootstrap
+- goal-first intake through `punk go` and `punk start`
+- contract drafting and approval
+- bounded `cut` execution
+- `gate` decision and proof artifacts
+- repo-local artifacts and inspectable status surfaces
 
-```text
-specpunk/
-├── Cargo.toml
-├── crates/
-│   ├── punk-cli/
-│   ├── punk-shell/
-│   ├── punk-domain/
-│   ├── punk-events/
-│   ├── punk-vcs/
-│   ├── punk-core/
-│   ├── punk-orch/
-│   ├── punk-gate/
-│   ├── punk-proof/
-│   ├── punk-adapters/
-│   ├── punk-council/
-│   ├── punk-skills/
-│   ├── punk-eval/
-│   └── punk-research/
-├── docs/
-└── .punk/
-```
+Not current-forward:
 
-## Current practical note
-
-Today the repo still has a legacy Rust workspace inside `punk/`.
-
-That is **not** the target architecture anymore.
-
-It should be treated as:
-- code to extract
-- code to relocate
-- code to delete when replaced
-
-Also note:
-
-- active v0 surface today: `punk-cli`, `punk-domain`, `punk-events`, `punk-vcs`, `punk-core`, `punk-orch`, `punk-gate`, `punk-proof`, `punk-adapters`
-- `crates/punk-council/` is **in-tree but inactive**: it stays buildable in the workspace, but is **not** part of the active v0 operator surface yet
-- `punk-shell`, `punk-skills`, `punk-eval`, and `punk-research` are **planned only**
-- the exact repo truth is tracked in `docs/product/REPO-STATUS.md`
+- interactive shell as the default surface
+- always-on council
+- broad internal memory platform work
+- provider-zoo UX
+- public research notes
+- examples gallery before real examples exist
 
 ## License
 
