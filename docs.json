@@ -7,6 +7,8 @@
     "light": "#fa83b1",
     "dark": "#e4397f"
   },
+  "logo": "/site/assets/punk-mascot.svg",
+  "favicon": "/site/assets/punk-mascot.svg",
   "navigation": {
     "groups": [
       {
