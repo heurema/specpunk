@@ -1,0 +1,69 @@
+---
+title: Quickstart
+description: Run the current SpecPunk CLI against a local repository.
+---
+
+This quickstart focuses on the current v0 path. It does not cover planned-only surfaces.
+
+## Run the CLI from the repository
+
+SpecPunk currently ships as the `punk` binary in `crates/punk-cli`. From a local clone, you can run it with Cargo:
+
+```bash
+cargo run -p punk-cli -- --help
+```
+
+If you already have `punk` on your PATH, you can use the shorter commands below.
+
+## Initialize a repository
+
+In the repository you want to work on:
+
+```bash
+punk init --enable-jj --verify
+```
+
+If you are running directly from the SpecPunk source tree, prepend `cargo run -p punk-cli --`:
+
+```bash
+cargo run -p punk-cli -- init --enable-jj --verify
+```
+
+`jj` is preferred when available. `git` is the fallback.
+
+## Default autonomous path
+
+Give SpecPunk a plain goal:
+
+```bash
+punk go --fallback-staged "add a bounded CLI feature with tests"
+```
+
+This is the default happy path:
+
+```text
+goal -> draft -> approve -> cut -> gate -> proof
+```
+
+If autonomy blocks, SpecPunk prepares a staged recovery path instead of hiding the failure.
+
+## Staged or manual path
+
+Use the staged path when you want review between phases:
+
+```bash
+punk start "add a bounded CLI feature with tests"
+punk plot approve <contract-id>
+punk cut run <contract-id>
+punk gate run <run-id>
+punk gate proof <run-id|decision-id>
+```
+
+## What is not in this quickstart
+
+- interactive shell
+- council-driven flows
+- examples gallery
+- research workflows
+
+For the current command surface, see [CLI reference](/reference/cli).
