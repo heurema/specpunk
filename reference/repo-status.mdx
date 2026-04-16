@@ -1,0 +1,59 @@
+---
+title: Repo status
+description: What is real today in SpecPunk versus what is inactive or planned.
+---
+
+SpecPunk uses one explicit status vocabulary across the repo.
+
+## Status vocabulary
+
+### Active v0 surface
+
+Exists in the current workspace and is part of today's operator and runtime surface.
+
+### In-tree but inactive
+
+Exists in the current workspace and stays buildable, but is not part of the normal current operator path.
+
+### Planned only
+
+Part of the target product shape, but not a current workspace member or current public path.
+
+## Current workspace truth
+
+### Active v0 surface
+
+- `punk-cli`
+- `punk-domain`
+- `punk-events`
+- `punk-vcs`
+- `punk-core`
+- `punk-orch`
+- `punk-gate`
+- `punk-proof`
+- `punk-adapters`
+
+These crates define the current working loop:
+
+```text
+init -> start/go -> plot -> cut -> gate -> proof
+```
+
+### In-tree but inactive
+
+- `punk-council`
+
+`punk-council` is intentionally present and buildable, but it is not part of the active v0 operator surface.
+
+### Planned only
+
+- `punk-shell`
+- `punk-skills`
+- `punk-eval`
+- `punk-research`
+
+These belong to the target shape, not today's default workflow.
+
+## Why this page exists
+
+The public docs should not describe planned-only or inactive surfaces as if they are part of today's operator path. This page is the short public version of that boundary.
