@@ -15,6 +15,7 @@
         "group": "Overview",
         "pages": [
           "index",
+          "install",
           "quickstart",
           "roadmap"
         ]
