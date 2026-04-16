@@ -1,0 +1,37 @@
+{
+  "theme": "mint",
+  "name": "SpecPunk",
+  "description": "Local-first, stewarded multi-agent engineering runtime.",
+  "colors": {
+    "primary": "#f33385",
+    "light": "#fa83b1",
+    "dark": "#e4397f"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Overview",
+        "pages": [
+          "index",
+          "quickstart",
+          "roadmap"
+        ]
+      },
+      {
+        "group": "Core concepts",
+        "pages": [
+          "concepts/plot-cut-gate",
+          "concepts/contracts-runs-proofs"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "reference/cli",
+          "reference/repo-status",
+          "reference/architecture"
+        ]
+      }
+    ]
+  }
+}
