@@ -278,6 +278,23 @@ pub struct VerificationContext {
     pub captured_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrozenArchitectureInputs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals_source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_sha256: Option<String>,
+    pub captured_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CapabilityScopeSeeds {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -526,6 +543,8 @@ pub struct Run {
     pub vcs: RunVcs,
     #[serde(default)]
     pub verification_context_ref: Option<String>,
+    #[serde(default)]
+    pub architecture_inputs_ref: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,
 }
@@ -1083,5 +1102,28 @@ mod tests {
         assert_eq!(integrity.touched_roots_max, Some(1));
         assert_eq!(integrity.file_loc_budgets[0].max_after_loc, 900);
         assert_eq!(integrity.forbidden_path_dependencies.len(), 1);
+    }
+
+    #[test]
+    fn frozen_architecture_inputs_round_trip() {
+        let frozen = FrozenArchitectureInputs {
+            signals_source_ref: Some(".punk/contracts/feat_1/architecture-signals.json".into()),
+            signals_ref: Some(".punk/runs/run_1/architecture-signals.json".into()),
+            signals_sha256: Some("signals-sha".into()),
+            brief_source_ref: Some(".punk/contracts/feat_1/architecture-brief.md".into()),
+            brief_ref: Some(".punk/runs/run_1/architecture-brief.md".into()),
+            brief_sha256: Some("brief-sha".into()),
+            captured_at: "2026-04-16T00:00:00Z".into(),
+        };
+
+        let json = serde_json::to_value(&frozen).unwrap();
+        assert_eq!(
+            json["signals_ref"],
+            ".punk/runs/run_1/architecture-signals.json"
+        );
+        assert_eq!(json["brief_sha256"], "brief-sha");
+
+        let decoded: FrozenArchitectureInputs = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, frozen);
     }
 }

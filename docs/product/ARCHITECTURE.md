@@ -488,6 +488,7 @@ The storage/layout split must stay explicit:
 | frozen contract capability resolution | `.punk/contracts/<feature-id>/capability-resolution.json` | derived frozen packet | `plot approve` | frozen built-in capability semantics that shaped inferred checks, scope seeds, ignore rules, and controller scaffold kind |
 | run receipt | `.punk/runs/<run-id>/receipt.json` | canonical | `cut` | execution truth consumed by `gate` |
 | verification context | `.punk/runs/<run-id>/verification-context.json` | canonical frozen context | `cut` | frozen workspace identity + file states + frozen capability-resolution ref/hash |
+| frozen architecture inputs | `.punk/runs/<run-id>/architecture-inputs.json` | derived frozen packet | `cut` | frozen contract-side architecture evidence refs plus copied run-scoped signals/brief hashes for `gate` / `proof` |
 | architecture assessment | `.punk/runs/<run-id>/architecture-assessment.json` | derived | `gate` | deterministic assessment of frozen contract commitments vs receipt/check state |
 | decision object | `.punk/decisions/<decision-id>.json` | canonical | `gate` | final verdict; carries the architecture assessment ref through `check_refs` |
 | proofpack | `.punk/proofs/<decision-id>/proofpack.json` | canonical | `gate` | hash-linked proof chain; hashes the architecture assessment and frozen capability artifact when present |
@@ -597,7 +598,8 @@ not through a separate verdict kind.
 That means:
 
 - `gate` reads the persisted approved `Contract`
-- `gate` may read the persisted contract-side `architecture-signals.json` artifact referenced by that contract document
+- `cut` freezes any contract-side architecture evidence expected for the run into `.punk/runs/<run-id>/architecture-inputs.json` plus run-scoped copies of `architecture-signals.json` and optional `architecture-brief.md`
+- `gate` reads only those frozen run-scoped architecture refs when architecture evidence is present for the run
 - `gate` reads the persisted `Receipt`
 - `gate` reads the persisted verification context referenced by `Run`
 - `gate` may read persisted check outputs
@@ -1243,6 +1245,7 @@ These rules must hold in the first working version:
    - VCS backend
    - `change_ref`
    - `verification_context_ref` once `cut run` persists the frozen check context
+   - `architecture_inputs_ref` when the approved contract carries contract-side architecture evidence that must stay frozen for `gate` / `proof`
 3. Every approved `Contract` must have non-empty:
    - `allowed_scope`
    - `target_checks`
