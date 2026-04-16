@@ -435,6 +435,16 @@ pub fn apply_explicit_prompt_overrides(
         if let Some(explicit_entry_points) = explicit_entry_points_override(&explicit_scope) {
             proposal.entry_points = explicit_entry_points;
         }
+    } else {
+        for hinted_path in explicit_scope_hints(prompt, repo_root) {
+            if !proposal
+                .allowed_scope
+                .iter()
+                .any(|existing| existing == &hinted_path)
+            {
+                proposal.allowed_scope.push(hinted_path);
+            }
+        }
     }
 
     if let Some(explicit_target_checks) = explicit_target_checks_override(repo_root, prompt) {
@@ -2210,6 +2220,10 @@ fn prompt_declares_explicit_touch_set(prompt: &str) -> bool {
         "scope bounded exactly to",
         "scope bounded to these",
         "scope bounded only to",
+        "restrict allowed_scope exactly to",
+        "restrict allowed scope exactly to",
+        "allowed_scope exactly to",
+        "allowed scope exactly to",
     ]
     .iter()
     .any(|marker| lowered.contains(marker))
@@ -2366,15 +2380,53 @@ fn explicit_scope_override(prompt: &str, repo_root: &Path) -> Option<Vec<String>
     if !exact_scope.is_empty() {
         return Some(exact_scope);
     }
-    let explicit_scope = explicit_scope_paths(prompt, repo_root);
-    if explicit_scope.is_empty() {
-        return None;
+    let code_span_scope = explicit_code_span_scope_paths(prompt, repo_root);
+    if code_span_scope.len() >= 2 {
+        return Some(code_span_scope);
     }
-    if prompt_declares_explicit_touch_set(prompt) || explicit_scope.len() >= 2 {
-        Some(explicit_scope)
-    } else {
-        None
+    prompt_declares_explicit_touch_set(prompt)
+        .then(|| explicit_scope_paths(prompt, repo_root))
+        .filter(|explicit_scope| !explicit_scope.is_empty())
+}
+
+fn explicit_scope_hints(prompt: &str, repo_root: &Path) -> Vec<String> {
+    if prompt_declares_explicit_touch_set(prompt) {
+        return Vec::new();
     }
+    if !authoritative_exact_scope_paths(prompt, repo_root).is_empty() {
+        return Vec::new();
+    }
+    if explicit_code_span_scope_paths(prompt, repo_root).len() >= 2 {
+        return Vec::new();
+    }
+    if prompt_has_scaffold_or_init_intent(prompt) {
+        return Vec::new();
+    }
+    explicit_scope_paths(prompt, repo_root)
+}
+
+fn explicit_code_span_scope_paths(prompt: &str, repo_root: &Path) -> Vec<String> {
+    let mut paths = Vec::new();
+    for candidate in code_spans(prompt) {
+        if !looks_like_repo_path(&candidate) {
+            continue;
+        }
+        if validate_scope_path(repo_root, &candidate).is_ok() {
+            push_unique(&mut paths, candidate);
+        }
+    }
+    paths
+}
+
+fn prompt_has_scaffold_or_init_intent(prompt: &str) -> bool {
+    let lowered = prompt.to_ascii_lowercase();
+    lowered.contains(" init ")
+        || lowered.starts_with("init ")
+        || lowered.contains("init command")
+        || lowered.contains(" scaffold")
+        || lowered.starts_with("scaffold ")
+        || lowered.contains(" bootstrap")
+        || lowered.starts_with("bootstrap ")
 }
 
 fn explicit_entry_points_override(explicit_scope: &[String]) -> Option<Vec<String>> {
@@ -2413,6 +2465,7 @@ fn target_check_markers() -> &'static [&'static str] {
         "target checks to satisfy",
         "target checks:",
         "target_checks:",
+        "verify with",
     ]
 }
 
@@ -2431,6 +2484,7 @@ fn integrity_check_markers() -> &'static [&'static str] {
         "integrity checks to keep passing",
         "integrity checks:",
         "integrity_checks:",
+        "verify with",
     ]
 }
 
@@ -3801,6 +3855,89 @@ mod tests {
                 "crates/punk-cli/src/main.rs".to_string(),
             ]
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_explicit_prompt_overrides_merges_incidental_scope_hints_without_replacing_scope() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-merge-incidental-scope-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("src/runtime.rs"), "pub fn runtime() {}\n").unwrap();
+        fs::write(root.join("src/service.rs"), "pub fn service() {}\n").unwrap();
+        fs::write(root.join("README.md"), "# demo\n").unwrap();
+        fs::write(root.join("docs/spec.md"), "# spec\n").unwrap();
+
+        let guidance =
+            "Update README.md and docs/spec.md so they match src/runtime.rs and src/service.rs.";
+        let mut proposal = DraftProposal {
+            title: "runtime docs".into(),
+            summary: "runtime docs".into(),
+            entry_points: vec!["src/runtime.rs".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["src/runtime.rs".into(), "src/service.rs".into()],
+            target_checks: vec!["cargo test".into()],
+            integrity_checks: vec!["cargo test".into()],
+            risk_level: "low".into(),
+        };
+
+        apply_explicit_prompt_overrides(&root, guidance, &mut proposal);
+
+        assert_eq!(proposal.entry_points, vec!["src/runtime.rs".to_string()]);
+        assert_eq!(
+            proposal.allowed_scope,
+            vec![
+                "src/runtime.rs".to_string(),
+                "src/service.rs".to_string(),
+                "README.md".to_string(),
+                "docs/spec.md".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_explicit_prompt_overrides_uses_verify_with_commands_for_checks() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-core-verify-with-checks-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let guidance =
+            "Update the live track docs and verify with npm --prefix baseline-site run check and npm --prefix baseline-site run test:integration.";
+        let mut proposal = DraftProposal {
+            title: "live track docs".into(),
+            summary: "live track docs".into(),
+            entry_points: vec!["README.md".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["README.md".into()],
+            target_checks: vec!["npm run build:web".into()],
+            integrity_checks: vec!["npm run check".into()],
+            risk_level: "low".into(),
+        };
+
+        apply_explicit_prompt_overrides(&root, guidance, &mut proposal);
+
+        assert_eq!(
+            proposal.target_checks,
+            vec![
+                "npm --prefix baseline-site run check".to_string(),
+                "npm --prefix baseline-site run test:integration".to_string(),
+            ]
+        );
+        assert_eq!(proposal.integrity_checks, proposal.target_checks);
 
         let _ = fs::remove_dir_all(&root);
     }

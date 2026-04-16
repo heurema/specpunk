@@ -29,8 +29,8 @@ use punk_domain::{
     FrozenCapabilityResolution, ModeId, PersistedContract, Project, ProjectCapabilityIndex,
     Receipt, ReceiptArtifacts, RefineInput, ResearchArtifact, ResearchArtifactInput,
     ResearchInvalidationEntry, ResearchPacket, ResearchQuestion, ResearchRecord,
-    ResearchStartInput, ResearchSynthesis, ResearchSynthesisInput, Run, RunStatus, Task, TaskKind,
-    TaskStatus, VcsKind, VerificationContext, VerificationContextFileState,
+    ResearchStartInput, ResearchSynthesis, ResearchSynthesisInput, Run, RunStatus, Task,
+    TaskKind, TaskStatus, VcsKind, VerificationContext, VerificationContextFileState,
     VerificationContextIdentity,
 };
 use punk_events::EventStore;
@@ -398,6 +398,89 @@ fn build_verification_context(
     })
 }
 
+fn frozen_run_harness_spec_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("harness-spec.json")
+}
+
+fn frozen_run_harness_artifacts_dir(run_dir: &Path) -> PathBuf {
+    run_dir.join("harness-artifacts")
+}
+
+fn empty_frozen_harness_spec(project_id: &str) -> PersistedHarnessSpec {
+    PersistedHarnessSpec {
+        project_id: project_id.to_string(),
+        inspect_ready: false,
+        bootable_per_workspace: false,
+        capabilities: PersistedHarnessCapabilities {
+            ui_legible: false,
+            logs_legible: false,
+            metrics_legible: false,
+            traces_legible: false,
+        },
+        profiles: Vec::new(),
+        derivation_source: "run_frozen_empty_v1".to_string(),
+        updated_at: now_rfc3339(),
+    }
+}
+
+fn freeze_run_harness_snapshot(repo_root: &Path, run_dir: &Path) -> Result<()> {
+    let live_harness_path = repo_root.join(".punk/project/harness.json");
+    let frozen_harness_path = frozen_run_harness_spec_path(run_dir);
+
+    if let Some(parent) = frozen_harness_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    if live_harness_path.exists() {
+        fs::copy(&live_harness_path, &frozen_harness_path)?;
+    } else {
+        let project = project_id(repo_root)?;
+        write_json(&frozen_harness_path, &empty_frozen_harness_spec(&project))?;
+        return Ok(());
+    }
+
+    let snapshot: serde_json::Value = match read_json(&frozen_harness_path) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return Ok(()),
+    };
+    let Some(profiles) = snapshot.get("profiles").and_then(|value| value.as_array()) else {
+        return Ok(());
+    };
+
+    for profile in profiles {
+        let Some(validation_recipes) = profile
+            .get("validation_recipes")
+            .and_then(|value| value.as_array())
+        else {
+            continue;
+        };
+        for recipe in validation_recipes {
+            let Some(kind) = recipe.get("kind").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if kind != "artifact_assertion" {
+                continue;
+            }
+            let Some(path) = recipe.get("path").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if !is_safe_repo_relative_path(path) {
+                continue;
+            }
+            let source = repo_root.join(path);
+            if !source.is_file() {
+                continue;
+            }
+            let destination = frozen_run_harness_artifacts_dir(run_dir).join(path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(source, destination)?;
+        }
+    }
+
+    Ok(())
+}
 fn freeze_run_architecture_artifact(
     repo_root: &Path,
     source_ref: Option<&str>,
@@ -429,16 +512,13 @@ fn freeze_run_architecture_inputs(
     contract_path: &Path,
     persisted_contract: &PersistedContract,
 ) -> Result<Option<String>> {
-    let signals_source_ref = persisted_contract
-        .architecture_signals_ref
-        .clone()
-        .or_else(|| {
-            let fallback = architecture_signals_artifact_path(contract_path);
-            fallback
-                .exists()
-                .then(|| relative_ref(repo_root, &fallback).ok())
-                .flatten()
-        });
+    let signals_source_ref = persisted_contract.architecture_signals_ref.clone().or_else(|| {
+        let fallback = architecture_signals_artifact_path(contract_path);
+        fallback
+            .exists()
+            .then(|| relative_ref(repo_root, &fallback).ok())
+            .flatten()
+    });
     let brief_source_ref = persisted_contract
         .architecture_integrity
         .as_ref()
@@ -1808,6 +1888,7 @@ impl OrchService {
             .as_ref()
             .map(|reference| sha256_file(&self.paths.repo_root.join(reference)))
             .transpose()?;
+        freeze_run_harness_snapshot(&self.paths.repo_root, &run_dir)?;
         run.architecture_inputs_ref = freeze_run_architecture_inputs(
             &self.paths.repo_root,
             &run_dir,
@@ -6100,6 +6181,7 @@ fn prompt_declares_explicit_check_set(prompt: &str) -> bool {
         || lowered.contains("target checks")
         || lowered.contains("integrity checks")
         || lowered.contains("exactly one command")
+        || lowered.contains("verify with")
 }
 
 fn candidate_checks_look_backend_service(scan: &punk_domain::RepoScanSummary) -> bool {
@@ -6416,6 +6498,10 @@ fn prompt_declares_explicit_touch_set(prompt: &str) -> bool {
         "scope bounded exactly to",
         "scope bounded to these",
         "scope bounded only to",
+        "restrict allowed_scope exactly to",
+        "restrict allowed scope exactly to",
+        "allowed_scope exactly to",
+        "allowed scope exactly to",
     ]
     .iter()
     .any(|marker| lowered.contains(marker))
@@ -6661,6 +6747,12 @@ fn timeout_seed_semantics(prompt: &str, entry_points: &[String]) -> (Vec<String>
     let mentions_init_surface = lowered.contains(" init ")
         || lowered.starts_with("init ")
         || lowered.contains("init command");
+    let scaffold_or_init_intent = greenfield_scaffold_seed
+        || mentions_init_surface
+        || lowered.contains(" scaffold")
+        || lowered.starts_with("scaffold ")
+        || lowered.contains(" bootstrap")
+        || lowered.starts_with("bootstrap ");
     if !greenfield_scaffold_seed && mentions_init_surface {
         push_unique_string(
             &mut expected_interfaces,
@@ -6676,7 +6768,11 @@ fn timeout_seed_semantics(prompt: &str, entry_points: &[String]) -> (Vec<String>
             );
         }
     }
-    let starter_files = timeout_prompt_starter_files(prompt);
+    let starter_files = if scaffold_or_init_intent {
+        timeout_prompt_starter_files(prompt)
+    } else {
+        Vec::new()
+    };
     if !starter_files.is_empty() {
         push_unique_string(
             &mut expected_interfaces,
@@ -6693,7 +6789,7 @@ fn timeout_seed_semantics(prompt: &str, entry_points: &[String]) -> (Vec<String>
             ),
         );
     }
-    if lowered.contains("test") {
+    if lowered.contains("test") && scaffold_or_init_intent {
         push_unique_string(
             &mut expected_interfaces,
             "Tests cover the init command behavior.".to_string(),
@@ -9812,6 +9908,147 @@ mod tests {
     }
 
     #[test]
+    fn timeout_fallback_keeps_baseline_runtime_scope_and_verify_commands_for_live_track_prompt() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-timeout-live-track-baseline-{suffix}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("baseline-site/src/pages/api/cli")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/services")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/lib/session")).unwrap();
+        fs::create_dir_all(root.join("baseline-site/src/pages")).unwrap();
+        fs::create_dir_all(root.join("crates/baseline-cli/src")).unwrap();
+        fs::create_dir_all(root.join("docs/ops")).unwrap();
+        fs::create_dir_all(root.join("docs/specs")).unwrap();
+        fs::write(
+            root.join("baseline-site/package.json"),
+            r#"{"name":"baseline-site","scripts":{"check":"echo nested-check","build:web":"echo nested-build","test:integration":"echo nested-test"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"baseline","scripts":{"check":"npm --prefix baseline-site run check","build:web":"npm --prefix baseline-site run build:web"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/Cargo.toml"),
+            "[package]\nname = \"baseline-cli\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("crates/baseline-cli/src/main.rs"),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/api/cli/enroll.ts"),
+            "export async function post() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/enrollments.ts"),
+            "export async function enroll() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/services/dispatch.ts"),
+            "export async function dispatch() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/operator.ts"),
+            "export function operatorSession() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/lib/session/cookies.ts"),
+            "export function readCookies() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("baseline-site/src/pages/report.astro"),
+            "---\\n---\\n<section />\\n",
+        )
+        .unwrap();
+        fs::write(root.join("README.md"), "# baseline\n").unwrap();
+        fs::write(root.join("docs/ops/STATUS.md"), "status\n").unwrap();
+        fs::write(
+            root.join("docs/specs/dispatch-track-runtime-spec-v1.md"),
+            "spec\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let prompt = "Harden reliable-agent-building as the first honest live track: tighten copy across /report, /success, /dispatch, /tracks/[slug], /enrollments/[id], /support and supporting content so it matches the current implemented runtime; preserve Dispatch as a thin control plane and keep the CLI HTTP contract unchanged; keep reliable-agent-building live and all other current tracks waitlisted; add/extend integration coverage for the full happy path (baseline handoff, profile creation, live track enrollment, one-time token reveal, CLI enroll/status/complete, dispatch summary completed state); update README.md, docs/ops/STATUS.md, and docs/specs/dispatch-track-runtime-spec-v1.md to describe one live track, waitlisted others, thin control plane, and no real auth yet; verify with npm --prefix baseline-site run check and npm --prefix baseline-site run test:integration";
+        let mut scan = scan_repo(&root, prompt).unwrap();
+        enrich_scan_with_nested_integrity_fallback(&root, &mut scan).unwrap();
+        apply_prompt_targeting_bias(&root, prompt, &mut scan);
+        let fallback = recover_timeout_draft_proposal(&root, prompt, &scan).unwrap();
+
+        assert!(fallback
+            .entry_points
+            .iter()
+            .any(|path| path == "crates/baseline-cli/src/main.rs"));
+        assert!(fallback.entry_points.iter().any(|path| {
+            path == "baseline-site/src/pages/api/cli/enroll.ts"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+                || path == "baseline-site/src/lib/session/operator.ts"
+        }));
+        assert!(fallback
+            .allowed_scope
+            .iter()
+            .any(|path| path == "README.md"));
+        assert!(fallback
+            .allowed_scope
+            .iter()
+            .any(|path| path == "docs/ops/STATUS.md"));
+        assert!(fallback
+            .allowed_scope
+            .iter()
+            .any(|path| path == "docs/specs/dispatch-track-runtime-spec-v1.md"));
+        assert!(fallback.allowed_scope.iter().any(|path| {
+            path == "baseline-site/src/lib/services"
+                || path == "baseline-site/src/lib/services/enrollments.ts"
+        }));
+        assert!(fallback
+            .allowed_scope
+            .iter()
+            .any(|path| path == "crates/baseline-cli"));
+        assert!(!fallback
+            .expected_interfaces
+            .iter()
+            .any(|item| item.contains("Init creates canonical starter files")));
+        assert!(!fallback
+            .expected_interfaces
+            .iter()
+            .any(|item| item.contains("Tests cover the init command behavior")));
+        assert_eq!(
+            fallback.target_checks,
+            vec![
+                "npm --prefix baseline-site run check".to_string(),
+                "npm --prefix baseline-site run test:integration".to_string(),
+            ]
+        );
+        assert_eq!(fallback.integrity_checks, fallback.target_checks);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn draft_contract_prunes_prompt_excluded_generated_scope_paths() {
         struct PollutedScopeDrafter;
 
@@ -10869,6 +11106,278 @@ fn ok() {}
 fn ok() {}
 "
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn freeze_run_harness_snapshot_copies_packet_and_mirrors_artifacts() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-freeze-harness-{}-{suffix}",
+            std::process::id()
+        ));
+        let run_dir = root.join(".punk/runs/run_1");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/project")).unwrap();
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(root.join("artifacts")).unwrap();
+        fs::write(root.join("artifacts/result.txt"), "ok\n").unwrap();
+        let harness_bytes = br#"{
+  "project_id": "demo",
+  "inspect_ready": true,
+  "bootable_per_workspace": true,
+  "capabilities": {
+    "ui_legible": false,
+    "logs_legible": false,
+    "metrics_legible": false,
+    "traces_legible": false
+  },
+  "profiles": [
+    {
+      "name": "default",
+      "validation_surfaces": ["command", "log_query"],
+      "validation_recipes": [
+        { "kind": "artifact_assertion", "path": "artifacts/result.txt" },
+        { "kind": "artifact_assertion", "path": "artifacts/missing.txt" },
+        { "kind": "artifact_assertion", "path": "../escape.txt" }
+      ]
+    }
+  ],
+  "derivation_source": "repo_markers_v1",
+  "updated_at": "2026-04-15T00:00:00Z"
+}
+"#;
+        fs::write(root.join(".punk/project/harness.json"), harness_bytes).unwrap();
+
+        freeze_run_harness_snapshot(&root, &run_dir).unwrap();
+
+        assert_eq!(
+            fs::read(run_dir.join("harness-spec.json")).unwrap(),
+            harness_bytes
+        );
+        assert_eq!(
+            fs::read_to_string(run_dir.join("harness-artifacts/artifacts/result.txt")).unwrap(),
+            "ok\n"
+        );
+        assert!(!run_dir
+            .join("harness-artifacts/artifacts/missing.txt")
+            .exists());
+        assert!(!run_dir.join("harness-artifacts/../escape.txt").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn freeze_run_harness_snapshot_writes_empty_snapshot_when_project_packet_is_missing() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-freeze-harness-empty-{}-{suffix}",
+            std::process::id()
+        ));
+        let run_dir = root.join(".punk/runs/run_1");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&run_dir).unwrap();
+
+        freeze_run_harness_snapshot(&root, &run_dir).unwrap();
+
+        let frozen: PersistedHarnessSpec = read_json(&run_dir.join("harness-spec.json")).unwrap();
+        assert!(frozen.profiles.is_empty());
+        assert!(!frozen.inspect_ready);
+        assert_eq!(frozen.derivation_source, "run_frozen_empty_v1");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn freeze_run_architecture_inputs_copies_signals_and_optional_brief() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-freeze-architecture-{}-{suffix}",
+            std::process::id()
+        ));
+        let run_dir = root.join(".punk/runs/run_1");
+        let contract_dir = root.join(".punk/contracts/feat_1");
+        let contract_path = contract_dir.join("v1.json");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&contract_dir).unwrap();
+
+        let signals = ArchitectureSignals {
+            contract_id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            scope_roots: vec!["tracked.txt".into()],
+            oversized_files: Vec::new(),
+            distinct_scope_roots: 1,
+            entry_point_count: 1,
+            expected_interface_count: 1,
+            import_path_count: 0,
+            has_cleanup_obligations: false,
+            has_docs_obligations: false,
+            has_migration_sensitive_surfaces: false,
+            severity: ArchitectureSeverity::Warn,
+            trigger_reasons: vec!["review required".into()],
+            thresholds: punk_domain::ArchitectureThresholds {
+                warn_file_loc: 600,
+                critical_file_loc: 1200,
+                critical_scope_roots: 1,
+                warn_expected_interfaces: 2,
+                warn_import_paths: 5,
+            },
+            computed_at: now_rfc3339(),
+        };
+        write_json(&contract_dir.join("architecture-signals.json"), &signals).unwrap();
+        fs::write(contract_dir.join("architecture-brief.md"), "# brief\n").unwrap();
+
+        let persisted_contract = PersistedContract {
+            contract: Contract {
+                id: "ct_1".into(),
+                feature_id: "feat_1".into(),
+                version: 1,
+                status: ContractStatus::Approved,
+                prompt_source: "freeze architecture".into(),
+                entry_points: vec!["tracked.txt".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["tracked".into()],
+                behavior_requirements: vec!["keep tracked stable".into()],
+                allowed_scope: vec!["tracked.txt".into()],
+                target_checks: vec!["true".into()],
+                integrity_checks: vec!["true".into()],
+                risk_level: "medium".into(),
+                created_at: now_rfc3339(),
+                approved_at: Some(now_rfc3339()),
+            },
+            architecture_signals_ref: Some(".punk/contracts/feat_1/architecture-signals.json".into()),
+            architecture_integrity: Some(ContractArchitectureIntegrity {
+                review_required: true,
+                brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
+                touched_roots_max: Some(1),
+                file_loc_budgets: Vec::new(),
+                forbidden_path_dependencies: Vec::new(),
+            }),
+            capability_resolution_ref: None,
+        };
+        write_json(&contract_path, &persisted_contract).unwrap();
+
+        let frozen_ref = freeze_run_architecture_inputs(
+            &root,
+            &run_dir,
+            &contract_path,
+            &persisted_contract,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(frozen_ref, ".punk/runs/run_1/architecture-inputs.json");
+
+        let frozen: FrozenArchitectureInputs =
+            read_json(&run_dir.join("architecture-inputs.json")).unwrap();
+        assert_eq!(
+            frozen.signals_source_ref.as_deref(),
+            Some(".punk/contracts/feat_1/architecture-signals.json")
+        );
+        assert_eq!(
+            frozen.signals_ref.as_deref(),
+            Some(".punk/runs/run_1/architecture-signals.json")
+        );
+        assert!(frozen.signals_sha256.is_some());
+        assert_eq!(
+            frozen.brief_ref.as_deref(),
+            Some(".punk/runs/run_1/architecture-brief.md")
+        );
+        assert!(frozen.brief_sha256.is_some());
+        let copied_signals: ArchitectureSignals =
+            read_json(&run_dir.join("architecture-signals.json")).unwrap();
+        assert_eq!(copied_signals, signals);
+        assert_eq!(
+            fs::read_to_string(run_dir.join("architecture-brief.md")).unwrap(),
+            "# brief\n"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn freeze_run_architecture_inputs_records_missing_declared_sources_without_copying() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-freeze-architecture-missing-{}-{suffix}",
+            std::process::id()
+        ));
+        let run_dir = root.join(".punk/runs/run_1");
+        let contract_dir = root.join(".punk/contracts/feat_1");
+        let contract_path = contract_dir.join("v1.json");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&run_dir).unwrap();
+        fs::create_dir_all(&contract_dir).unwrap();
+
+        let persisted_contract = PersistedContract {
+            contract: Contract {
+                id: "ct_1".into(),
+                feature_id: "feat_1".into(),
+                version: 1,
+                status: ContractStatus::Approved,
+                prompt_source: "freeze architecture".into(),
+                entry_points: vec!["tracked.txt".into()],
+                import_paths: vec![],
+                expected_interfaces: vec!["tracked".into()],
+                behavior_requirements: vec!["keep tracked stable".into()],
+                allowed_scope: vec!["tracked.txt".into()],
+                target_checks: vec!["true".into()],
+                integrity_checks: vec!["true".into()],
+                risk_level: "medium".into(),
+                created_at: now_rfc3339(),
+                approved_at: Some(now_rfc3339()),
+            },
+            architecture_signals_ref: Some(".punk/contracts/feat_1/architecture-signals.json".into()),
+            architecture_integrity: Some(ContractArchitectureIntegrity {
+                review_required: true,
+                brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
+                touched_roots_max: Some(1),
+                file_loc_budgets: Vec::new(),
+                forbidden_path_dependencies: Vec::new(),
+            }),
+            capability_resolution_ref: None,
+        };
+        write_json(&contract_path, &persisted_contract).unwrap();
+
+        let frozen_ref = freeze_run_architecture_inputs(
+            &root,
+            &run_dir,
+            &contract_path,
+            &persisted_contract,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(frozen_ref, ".punk/runs/run_1/architecture-inputs.json");
+
+        let frozen: FrozenArchitectureInputs =
+            read_json(&run_dir.join("architecture-inputs.json")).unwrap();
+        assert_eq!(
+            frozen.signals_source_ref.as_deref(),
+            Some(".punk/contracts/feat_1/architecture-signals.json")
+        );
+        assert!(frozen.signals_ref.is_none());
+        assert!(frozen.signals_sha256.is_none());
+        assert_eq!(
+            frozen.brief_source_ref.as_deref(),
+            Some(".punk/contracts/feat_1/architecture-brief.md")
+        );
+        assert!(frozen.brief_ref.is_none());
+        assert!(frozen.brief_sha256.is_none());
+        assert!(!run_dir.join("architecture-signals.json").exists());
+        assert!(!run_dir.join("architecture-brief.md").exists());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -15613,186 +16122,4 @@ fn ok() {}
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn freeze_run_architecture_inputs_copies_signals_and_optional_brief() {
-        let suffix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "punk-orch-freeze-architecture-{}-{suffix}",
-            std::process::id()
-        ));
-        let run_dir = root.join(".punk/runs/run_1");
-        let contract_dir = root.join(".punk/contracts/feat_1");
-        let contract_path = contract_dir.join("v1.json");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&run_dir).unwrap();
-        fs::create_dir_all(&contract_dir).unwrap();
-
-        let signals = ArchitectureSignals {
-            contract_id: "ct_1".into(),
-            feature_id: "feat_1".into(),
-            scope_roots: vec!["tracked.txt".into()],
-            oversized_files: Vec::new(),
-            distinct_scope_roots: 1,
-            entry_point_count: 1,
-            expected_interface_count: 1,
-            import_path_count: 0,
-            has_cleanup_obligations: false,
-            has_docs_obligations: false,
-            has_migration_sensitive_surfaces: false,
-            severity: ArchitectureSeverity::Warn,
-            trigger_reasons: vec!["review required".into()],
-            thresholds: punk_domain::ArchitectureThresholds {
-                warn_file_loc: 600,
-                critical_file_loc: 1200,
-                critical_scope_roots: 1,
-                warn_expected_interfaces: 2,
-                warn_import_paths: 5,
-            },
-            computed_at: now_rfc3339(),
-        };
-        write_json(&contract_dir.join("architecture-signals.json"), &signals).unwrap();
-        fs::write(contract_dir.join("architecture-brief.md"), "# brief\n").unwrap();
-
-        let persisted_contract = PersistedContract {
-            contract: Contract {
-                id: "ct_1".into(),
-                feature_id: "feat_1".into(),
-                version: 1,
-                status: ContractStatus::Approved,
-                prompt_source: "freeze architecture".into(),
-                entry_points: vec!["tracked.txt".into()],
-                import_paths: vec![],
-                expected_interfaces: vec!["tracked".into()],
-                behavior_requirements: vec!["keep tracked stable".into()],
-                allowed_scope: vec!["tracked.txt".into()],
-                target_checks: vec!["true".into()],
-                integrity_checks: vec!["true".into()],
-                risk_level: "medium".into(),
-                created_at: now_rfc3339(),
-                approved_at: Some(now_rfc3339()),
-            },
-            architecture_signals_ref: Some(
-                ".punk/contracts/feat_1/architecture-signals.json".into(),
-            ),
-            architecture_integrity: Some(ContractArchitectureIntegrity {
-                review_required: true,
-                brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
-                touched_roots_max: Some(1),
-                file_loc_budgets: Vec::new(),
-                forbidden_path_dependencies: Vec::new(),
-            }),
-            capability_resolution_ref: None,
-        };
-        write_json(&contract_path, &persisted_contract).unwrap();
-
-        let frozen_ref =
-            freeze_run_architecture_inputs(&root, &run_dir, &contract_path, &persisted_contract)
-                .unwrap()
-                .unwrap();
-        assert_eq!(frozen_ref, ".punk/runs/run_1/architecture-inputs.json");
-
-        let frozen: FrozenArchitectureInputs =
-            read_json(&run_dir.join("architecture-inputs.json")).unwrap();
-        assert_eq!(
-            frozen.signals_source_ref.as_deref(),
-            Some(".punk/contracts/feat_1/architecture-signals.json")
-        );
-        assert_eq!(
-            frozen.signals_ref.as_deref(),
-            Some(".punk/runs/run_1/architecture-signals.json")
-        );
-        assert!(frozen.signals_sha256.is_some());
-        assert_eq!(
-            frozen.brief_ref.as_deref(),
-            Some(".punk/runs/run_1/architecture-brief.md")
-        );
-        assert!(frozen.brief_sha256.is_some());
-        let copied_signals: ArchitectureSignals =
-            read_json(&run_dir.join("architecture-signals.json")).unwrap();
-        assert_eq!(copied_signals, signals);
-        assert_eq!(
-            fs::read_to_string(run_dir.join("architecture-brief.md")).unwrap(),
-            "# brief\n"
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn freeze_run_architecture_inputs_records_missing_declared_sources_without_copying() {
-        let suffix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "punk-orch-freeze-architecture-missing-{}-{suffix}",
-            std::process::id()
-        ));
-        let run_dir = root.join(".punk/runs/run_1");
-        let contract_dir = root.join(".punk/contracts/feat_1");
-        let contract_path = contract_dir.join("v1.json");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&run_dir).unwrap();
-        fs::create_dir_all(&contract_dir).unwrap();
-
-        let persisted_contract = PersistedContract {
-            contract: Contract {
-                id: "ct_1".into(),
-                feature_id: "feat_1".into(),
-                version: 1,
-                status: ContractStatus::Approved,
-                prompt_source: "freeze architecture".into(),
-                entry_points: vec!["tracked.txt".into()],
-                import_paths: vec![],
-                expected_interfaces: vec!["tracked".into()],
-                behavior_requirements: vec!["keep tracked stable".into()],
-                allowed_scope: vec!["tracked.txt".into()],
-                target_checks: vec!["true".into()],
-                integrity_checks: vec!["true".into()],
-                risk_level: "medium".into(),
-                created_at: now_rfc3339(),
-                approved_at: Some(now_rfc3339()),
-            },
-            architecture_signals_ref: Some(
-                ".punk/contracts/feat_1/architecture-signals.json".into(),
-            ),
-            architecture_integrity: Some(ContractArchitectureIntegrity {
-                review_required: true,
-                brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
-                touched_roots_max: Some(1),
-                file_loc_budgets: Vec::new(),
-                forbidden_path_dependencies: Vec::new(),
-            }),
-            capability_resolution_ref: None,
-        };
-        write_json(&contract_path, &persisted_contract).unwrap();
-
-        let frozen_ref =
-            freeze_run_architecture_inputs(&root, &run_dir, &contract_path, &persisted_contract)
-                .unwrap()
-                .unwrap();
-        assert_eq!(frozen_ref, ".punk/runs/run_1/architecture-inputs.json");
-
-        let frozen: FrozenArchitectureInputs =
-            read_json(&run_dir.join("architecture-inputs.json")).unwrap();
-        assert_eq!(
-            frozen.signals_source_ref.as_deref(),
-            Some(".punk/contracts/feat_1/architecture-signals.json")
-        );
-        assert!(frozen.signals_ref.is_none());
-        assert!(frozen.signals_sha256.is_none());
-        assert_eq!(
-            frozen.brief_source_ref.as_deref(),
-            Some(".punk/contracts/feat_1/architecture-brief.md")
-        );
-        assert!(frozen.brief_ref.is_none());
-        assert!(frozen.brief_sha256.is_none());
-        assert!(!run_dir.join("architecture-signals.json").exists());
-        assert!(!run_dir.join("architecture-brief.md").exists());
-
-        let _ = fs::remove_dir_all(&root);
-    }
 }
