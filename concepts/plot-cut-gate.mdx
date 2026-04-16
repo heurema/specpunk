@@ -1,0 +1,69 @@
+---
+title: Plot, Cut, Gate
+description: The three canonical runtime modes in SpecPunk.
+---
+
+SpecPunk uses three canonical runtime modes:
+
+- `plot`
+- `cut`
+- `gate`
+
+These are not tone presets. They are permission boundaries.
+
+## Plot
+
+`plot` is the planning and inspection mode.
+
+Use it to:
+
+- inspect the repository
+- draft or refine a contract
+- shape scope before execution
+- prepare a bounded slice of work
+
+What `plot` does not do:
+
+- change repository files as part of implementation
+- run the final acceptance decision
+
+## Cut
+
+`cut` is the execution mode.
+
+Use it to:
+
+- carry out bounded implementation work
+- change repository files inside approved scope
+- run checks and produce a receipt
+
+What `cut` does not do:
+
+- write the final decision
+- write proof artifacts
+
+## Gate
+
+`gate` is the verification and decision mode.
+
+Use it to:
+
+- evaluate the run against frozen inputs
+- run target and integrity checks
+- write the final `DecisionObject`
+- write proof artifacts
+
+What `gate` does not do:
+
+- act like a second implementation pass
+- replace the bounded execution flow
+
+## Why this matters
+
+The current public surface is intentionally built around one vocabulary:
+
+- one CLI: `punk`
+- one runtime shape: `plot / cut / gate`
+- one final decision writer: `gate`
+
+That keeps the operator path small and makes it easier to tell what is current, what is advisory, and what is only planned.
