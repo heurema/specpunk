@@ -1,4 +1,6 @@
-# punk
+<p align="center">
+  <img src="site/assets/punk-mascot-render.png" alt="Specpunk mascot" width="240" />
+</p>
 
 Local-first, stewarded multi-agent engineering runtime.
 
