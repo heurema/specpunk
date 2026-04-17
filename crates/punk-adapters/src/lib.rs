@@ -8720,6 +8720,7 @@ mod tests {
             .execute_contract(ExecuteInput {
                 repo_root: root.clone(),
                 contract,
+                capability_resolution: None,
                 stdout_path,
                 stderr_path,
                 executor_pid_path: pid_path,
@@ -8829,6 +8830,7 @@ mod tests {
             .execute_contract(ExecuteInput {
                 repo_root: root.clone(),
                 contract,
+                capability_resolution: None,
                 stdout_path,
                 stderr_path,
                 executor_pid_path: pid_path,

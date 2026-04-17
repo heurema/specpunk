@@ -691,35 +691,8 @@ fn architecture_brief_artifact_path(contract_path: &Path) -> PathBuf {
     contract_path.with_file_name("architecture-brief.md")
 }
 
-fn frozen_run_architecture_inputs_path(run_dir: &Path) -> PathBuf {
-    run_dir.join("architecture-inputs.json")
-}
-
-fn frozen_run_architecture_signals_path(run_dir: &Path) -> PathBuf {
-    run_dir.join("architecture-signals.json")
-}
-
-fn frozen_run_architecture_brief_path(run_dir: &Path) -> PathBuf {
-    run_dir.join("architecture-brief.md")
-}
-
 fn capability_resolution_artifact_path(contract_path: &Path) -> PathBuf {
     contract_path.with_file_name("capability-resolution.json")
-}
-
-fn is_safe_repo_relative_path(path: &str) -> bool {
-    let candidate = Path::new(path);
-    if candidate.is_absolute() {
-        return false;
-    }
-    candidate.components().all(|component| {
-        !matches!(
-            component,
-            std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_)
-        )
-    })
 }
 
 fn read_persisted_contract_doc(path: &Path) -> Result<PersistedContract> {
@@ -8448,7 +8421,6 @@ exit {}
             .unwrap();
         service.approve_contract(&contract.id).unwrap()
     }
-    }
 
     struct FakeExecutor;
 
@@ -14028,7 +14000,8 @@ fn ok() {}
             contract.allowed_scope,
             vec![
                 "crates/pubpunk-core/src/lib.rs".to_string(),
-                "tests/validate_json.rs".to_string()
+                "tests/validate_json.rs".to_string(),
+                "tests".to_string()
             ]
         );
         assert_eq!(
