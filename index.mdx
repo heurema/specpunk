@@ -3,11 +3,36 @@ title: SpecPunk
 description: Local-first, stewarded multi-agent engineering runtime.
 ---
 
-SpecPunk is a local-first runtime for AI-driven engineering work across repositories. It focuses on bounded execution, deterministic gate semantics, proof-bearing decisions, and a simple operator shell.
+SpecPunk is a repository-first runtime for AI-driven engineering work across codebases. It is built around bounded execution, deterministic gate semantics, proof-bearing decisions, and a small operator-facing surface.
+
+## What SpecPunk is
+
+SpecPunk is designed for engineering work that needs to be:
+
+- bounded
+- inspectable
+- contract-first
+- proof-bearing
+- local-first
+
+The public surface is intentionally small:
+
+- one CLI: `punk`
+- one vocabulary: `plot / cut / gate`
+- one final decision writer: `gate`
+
+## What SpecPunk is not
+
+SpecPunk is not trying to be:
+
+- a provider-zoo shell
+- a broad hosted control plane
+- an always-on swarm interface
+- a second product surface next to the repository
 
 ## Current status
 
-SpecPunk is in an active rebuild phase. These public docs describe the current operator path and keep it separate from future or inactive surfaces.
+SpecPunk is in an active rebuild phase. These docs describe the current operator path and keep it separate from inactive or future surfaces.
 
 Today:
 
@@ -18,13 +43,15 @@ Today:
 
 ## Start here
 
-- [Install](/install)
-- [Quickstart](/quickstart)
-- [Roadmap](/roadmap)
-- [CLI reference](/reference/cli)
-- [Repo status](/reference/repo-status)
+Use this order if you are new to the project:
 
-## Principles
+1. [Install](/install)
+2. [Quickstart](/quickstart)
+3. [Roadmap](/roadmap)
+4. [CLI reference](/reference/cli)
+5. [Repo status](/reference/repo-status)
+
+## Core principles
 
 - one CLI
 - one vocabulary: `plot / cut / gate`
@@ -35,4 +62,11 @@ Today:
 
 ## Scope of this site
 
-This site is a public, curated layer over the repository. It focuses on what the project is, how to use the current CLI, and what is on the roadmap. Internal research notes are intentionally not part of the public docs.
+This site is a public, curated layer over the repository. It focuses on:
+
+- what SpecPunk is
+- how to run the current CLI
+- what is real today
+- what is on the current roadmap
+
+Internal research notes are intentionally not part of the public docs.
