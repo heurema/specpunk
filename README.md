@@ -211,17 +211,23 @@ punk incident defaults --global --repo /path/to/specpunk --github owner/repo
 punk incident promote <incident-id>         # uses default --repo when configured
 punk incident submit <incident-id>          # uses default --github when configured
 punk incident submit <incident-id> --publish
+punk issue admit <issue-number>             # uses default --github when configured
+punk issue admit <issue-number> --publish
+punk incident admit <issue-number>          # compatibility path
 punk incident rerun <promotion-id> --auto-run
 punk incident resubmit <submission-id> --publish
 punk inspect sub_<id>
 punk inspect sub_<id> --json
+punk inspect adm_<id>
+punk inspect adm_<id> --json
 ```
 
-The current incident lane has three bounded slices:
+The current incident lane has four bounded slices:
 
 - repo-local capture freezes an inspectable bundle under `.punk/incidents/`
 - internal promote copies that bundle into another `punk` repo, drafts an inspectable upstream contract there, records the handoff under `.punk/promotions/`, and can explicitly continue with `--auto-run`
 - external submit prepares a sanitized GitHub issue bundle under `.punk/submissions/` and only publishes when `--publish` is passed explicitly
+- inbound admit fetches a published GitHub issue, records an inspectable admission decision under `.punk/admissions/`, and only applies labels/comments/close state when `--publish` is passed explicitly
 
 Current GitHub publish uses `gh`, so missing auth should still leave an inspectable `sub_<id>` bundle even when publication fails.
 If publish fails after prepare, retry the same submission bundle with `punk incident resubmit <submission-id> --publish` instead of generating a new issue body snapshot.
@@ -231,6 +237,8 @@ Resolution precedence is: explicit flag > repo-local default > global default.
 `punk incident promote --auto-run` is still explicit opt-in; when used it auto-approves the drafted upstream contract, runs it, gates it, writes a proof, and stores that execution snapshot back onto the promotion record.
 Auto-run is only suggested and permitted when the effective promote target has a matching `.punk/project.json` identity packet, an `AGENTS.md` guide that identifies `specpunk`, and the expected local `specpunk` markers (`Cargo.toml`, `crates/specpunk/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`). Otherwise the lane stays draft-only.
 If that internal auto-run fails before it reaches a proof, the promotion record now keeps the last failed phase plus any partial run/receipt/decision refs; retry the same promotion with `punk incident rerun <promotion-id> --auto-run` instead of creating a new promotion bundle.
+`punk incident submit` now embeds a hidden machine-readable runtime packet in the published GitHub issue body, and `punk issue admit` is the general repo intake gate for both those runtime reports and manual backlog issues. It classifies each published GitHub issue as `admission:close-now`, `admission:defer-after-core`, or `admission:core-now`.
+Only `core_now` admissions are eligible for immediate core-stabilization work intake; `defer_after_core` stays open but out of the active loop, and `close_now` is the close-now path for invalid, duplicate, obsolete, legacy-surface, or otherwise non-admissible issues.
 
 The intended operator experience is:
 

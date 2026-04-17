@@ -505,6 +505,7 @@ The storage/layout split must stay explicit:
 | imported incident bundle | `.punk/imported-incidents/<source-project>/<incident-id>/<promotion-id>/incident.json` | derived transfer artifact | `incident promote` | copied upstream evidence bundle inside the target repo before any fix contract runs |
 | incident promotion record | `.punk/promotions/<incident-id>/<promotion-id>.json` | derived transfer ledger | `incident promote` | durable link between source incident, imported target bundle, drafted upstream contract, plus auto-run attempt/failure/completion metadata |
 | incident submission record | `.punk/submissions/<incident-id>/<submission-id>/submission.json` | derived outbound ledger | `incident submit` | sanitized GitHub issue packet plus publish outcome/error state for external reporting |
+| incident admission record | `.punk/admissions/<github-repo>/<issue-number>/<admission-id>/admission.json` | derived inbound ledger | `issue admit` | inspectable GitHub issue intake verdict (`close_now`, `defer_after_core`, `core_now`) plus publish outcome/error state for repo triage |
 
 That means there is still only one contract truth and one final verdict truth:
 
@@ -909,6 +910,8 @@ Rules:
 - `--auto-run` must stay deterministic and policy-gated: only suggest or permit it when the effective promote target has a matching `.punk/project.json` identity packet, an `AGENTS.md` guide that identifies `specpunk`, and the expected local `specpunk` markers (`Cargo.toml`, `crates/specpunk/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`); otherwise keep the lane draft-only
 - failed internal auto-run attempts should still update the promotion record with attempt count and the last failed phase/error/partial refs, so retry does not depend on shell history
 - external submission writes a sanitized `.punk/submissions/...` bundle first and only publishes to GitHub with explicit operator opt-in
+- external submission should also carry a hidden machine-readable runtime packet so later repo intake can classify the issue without depending on old terminal output or copy-pasted context
+- inbound issue admission is a separate derived step over the published GitHub issue, not an automatic transition into work
 - repo-local incident defaults remain project-scoped under `.punk/project/incident-defaults.json`, while operator-wide defaults live under `~/.punk/config/incident-defaults.json`; target resolution precedence is explicit flag > repo-local default > global default
 - this lane exists to make foreign-repo `punk` failures inspectable and transferable without trying to fix `punk` inside the foreign repo itself
 
@@ -968,6 +971,60 @@ IncidentSubmissionRecord
   created_at
   updated_at
 ```
+
+The inbound triage record is:
+
+```text
+IncidentAdmissionRecord
+  github_repo
+  issue_number
+  issue_url
+  issue_title
+  issue_state
+  issue_labels[]
+  source_kind
+  report_format?
+  incident_id?
+  project_id?
+  work_id?
+  decision_outcome?
+  failure_signature?
+  blocked_reason?
+  summary?
+  goal?
+  capture_basis[]
+  matched_runtime_markers[]
+  policy_version
+  assessment
+    has_runtime_report
+    has_deterministic_evidence
+    has_runtime_marker
+    duplicate_or_resolved
+    high_severity_marker
+    targets_legacy_surface
+    targets_active_core_surface
+    targets_later_track
+    indicates_core_blocker
+    targets_cut_surface
+  decision
+    close_now | defer_after_core | core_now
+  reasons[]
+  publish_state
+  applied_labels[]
+  closed_issue
+  published_comment_url?
+  publish_error?
+  created_at
+  updated_at
+```
+
+Rules:
+
+- this is a **derived inbound ledger**, not a new kernel truth object
+- published GitHub issues from foreign repos are **signals only**, not work items
+- only `core_now` admissions are allowed to enter immediate core-stabilization work intake
+- `defer_after_core` keeps a valid runtime report or backlog item open but outside the active intake loop
+- `close_now` is the close-now path for duplicates, obsolete issues, decommissioned/cut surfaces, and other non-admissible work
 
 ---
 

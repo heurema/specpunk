@@ -39,6 +39,7 @@ enum Command {
     Start(StartCommand),
     Research(ResearchCommand),
     Incident(IncidentCommand),
+    Issue(IssueCommand),
     Plot(PlotCommand),
     Cut(CutCommand),
     Gate(GateCommand),
@@ -84,6 +85,12 @@ struct ResearchCommand {
 struct IncidentCommand {
     #[command(subcommand)]
     action: IncidentAction,
+}
+
+#[derive(Args)]
+struct IssueCommand {
+    #[command(subcommand)]
+    action: IssueAction,
 }
 
 #[derive(Subcommand)]
@@ -193,6 +200,15 @@ enum IncidentAction {
         #[arg(long)]
         json: bool,
     },
+    Admit {
+        issue_number: u64,
+        #[arg(long = "github")]
+        github_repo: Option<String>,
+        #[arg(long)]
+        publish: bool,
+        #[arg(long)]
+        json: bool,
+    },
     Resubmit {
         submission_id: String,
         #[arg(long)]
@@ -207,6 +223,19 @@ enum IncidentAction {
         github_repo: Option<String>,
         #[arg(long)]
         global: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum IssueAction {
+    Admit {
+        issue_number: u64,
+        #[arg(long = "github")]
+        github_repo: Option<String>,
+        #[arg(long)]
+        publish: bool,
         #[arg(long)]
         json: bool,
     },
@@ -462,6 +491,23 @@ fn run() -> Result<()> {
                 render(json, &view, &format_research_summary(&view))
             }
         },
+        Command::Issue(issue) => match issue.action {
+            IssueAction::Admit {
+                issue_number,
+                github_repo,
+                publish,
+                json,
+            } => {
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let github_repo = resolve_issue_github_repo(&orch, github_repo.as_deref())?;
+                let admission = orch.admit_incident_issue(issue_number, &github_repo, publish)?;
+                render(
+                    json,
+                    &admission,
+                    &format_issue_admission_summary(&admission),
+                )
+            }
+        },
         Command::Incident(incident) => match incident.action {
             IncidentAction::Capture { proof_id, json } => {
                 let orch = OrchService::new(&repo_root, &global_root)?;
@@ -576,12 +622,27 @@ fn run() -> Result<()> {
                 json,
             } => {
                 let orch = OrchService::new(&repo_root, &global_root)?;
-                let github_repo = resolve_incident_submit_repo(&orch, github_repo.as_deref())?;
+                let github_repo = resolve_issue_github_repo(&orch, github_repo.as_deref())?;
                 let submission = orch.submit_incident(&incident_id, &github_repo, publish)?;
                 render(
                     json,
                     &submission,
                     &format_incident_submission_summary(&submission),
+                )
+            }
+            IncidentAction::Admit {
+                issue_number,
+                github_repo,
+                publish,
+                json,
+            } => {
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let github_repo = resolve_issue_github_repo(&orch, github_repo.as_deref())?;
+                let admission = orch.admit_incident_issue(issue_number, &github_repo, publish)?;
+                render(
+                    json,
+                    &admission,
+                    &format_issue_admission_summary(&admission),
                 )
             }
             IncidentAction::Resubmit {
@@ -806,13 +867,21 @@ fn run() -> Result<()> {
                     &format_incident_submission_summary(&submission),
                 );
             }
+            if !inspect.json && inspect.id.is_none() && inspect.target.starts_with("adm_") {
+                let admission = orch.inspect_incident_admission(&inspect.target)?;
+                return render(
+                    false,
+                    &admission,
+                    &format_issue_admission_summary(&admission),
+                );
+            }
             if inspect.id.is_none() && inspect.target.starts_with("research_") {
                 let research = orch.inspect_research(&inspect.target)?;
                 return render(inspect.json, &research, &format_research_summary(&research));
             }
             if !inspect.json || inspect.id.is_some() {
                 return Err(anyhow!(
-                    "inspect for object ids currently requires `punk inspect <id> --json`; only `proof_<id>`, `inc_<id>`, `prom_<id>`, `sub_<id>`, and `research_<id>` currently support human inspect output. Use `punk inspect project` or `punk inspect work [id]` for human inspect views"
+                    "inspect for object ids currently requires `punk inspect <id> --json`; only `proof_<id>`, `inc_<id>`, `prom_<id>`, `sub_<id>`, `adm_<id>`, and `research_<id>` currently support human inspect output. Use `punk inspect project` or `punk inspect work [id]` for human inspect views"
                 ));
             }
             let value = orch.inspect(&inspect.target)?;
@@ -3219,6 +3288,89 @@ fn format_incident_submission_summary(
     )
 }
 
+fn format_issue_admission_summary(admission: &punk_domain::IncidentAdmissionRecord) -> String {
+    let incident_id = admission.incident_id.as_deref().unwrap_or("none");
+    let project_id = admission.project_id.as_deref().unwrap_or("none");
+    let work_id = admission.work_id.as_deref().unwrap_or("none");
+    let report_format = admission.report_format.as_deref().unwrap_or("unknown");
+    let blocked_reason = admission.blocked_reason.as_deref().unwrap_or("none");
+    let summary = admission.summary.as_deref().unwrap_or("none");
+    let comment_url = admission
+        .published_comment_url
+        .as_deref()
+        .unwrap_or("not published");
+    let publish_error = admission.publish_error.as_deref().unwrap_or("none");
+    let matched_runtime_markers = if admission.matched_runtime_markers.is_empty() {
+        "none".to_string()
+    } else {
+        admission.matched_runtime_markers.join(", ")
+    };
+    let reasons = if admission.reasons.is_empty() {
+        "none".to_string()
+    } else {
+        admission.reasons.join("; ")
+    };
+    let applied_labels = if admission.applied_labels.is_empty() {
+        "none".to_string()
+    } else {
+        admission.applied_labels.join(", ")
+    };
+    format!(
+        "Admission: {admission_id}\nGitHub issue: {github_repo}#{issue_number}\nIssue URL: {issue_url}\nIssue title: {issue_title}\nIssue state: {issue_state}\nSource kind: {source_kind}\nReport format: {report_format}\nIncident: {incident_id}\nProject: {project_id}\nWork: {work_id}\nSummary: {summary}\nBlocked reason: {blocked_reason}\nMatched runtime markers: {matched_runtime_markers}\nDecision: {decision}\nAssessment: runtime_report={has_runtime_report} deterministic_evidence={has_deterministic_evidence} runtime_marker={has_runtime_marker} duplicate_or_resolved={duplicate_or_resolved} high_severity={high_severity_marker} legacy_surface={targets_legacy_surface} active_core_surface={targets_active_core_surface} later_track={targets_later_track} core_blocker={indicates_core_blocker} cut_surface={targets_cut_surface}\nReasons: {reasons}\nPublish state: {publish_state}\nApplied labels: {applied_labels}\nClosed issue: {closed_issue}\nPublished comment: {comment_url}\nPublish error: {publish_error}",
+        admission_id = admission.id,
+        github_repo = admission.github_repo,
+        issue_number = admission.issue_number,
+        issue_url = admission.issue_url,
+        issue_title = admission.issue_title,
+        issue_state = admission.issue_state,
+        source_kind = admission.source_kind,
+        report_format = report_format,
+        incident_id = incident_id,
+        project_id = project_id,
+        work_id = work_id,
+        summary = summary,
+        blocked_reason = blocked_reason,
+        matched_runtime_markers = matched_runtime_markers,
+        decision = issue_admission_decision_label(&admission.decision),
+        has_runtime_report = admission.assessment.has_runtime_report,
+        has_deterministic_evidence = admission.assessment.has_deterministic_evidence,
+        has_runtime_marker = admission.assessment.has_runtime_marker,
+        duplicate_or_resolved = admission.assessment.duplicate_or_resolved,
+        high_severity_marker = admission.assessment.high_severity_marker,
+        targets_legacy_surface = admission.assessment.targets_legacy_surface,
+        targets_active_core_surface = admission.assessment.targets_active_core_surface,
+        targets_later_track = admission.assessment.targets_later_track,
+        indicates_core_blocker = admission.assessment.indicates_core_blocker,
+        targets_cut_surface = admission.assessment.targets_cut_surface,
+        reasons = reasons,
+        publish_state = issue_admission_publish_state_label(&admission.publish_state),
+        applied_labels = applied_labels,
+        closed_issue = admission.closed_issue,
+        comment_url = comment_url,
+        publish_error = publish_error,
+    )
+}
+
+fn issue_admission_decision_label(
+    decision: &punk_domain::IncidentAdmissionDecision,
+) -> &'static str {
+    match decision {
+        punk_domain::IncidentAdmissionDecision::CloseNow => "close_now",
+        punk_domain::IncidentAdmissionDecision::DeferAfterCore => "defer_after_core",
+        punk_domain::IncidentAdmissionDecision::CoreNow => "core_now",
+    }
+}
+
+fn issue_admission_publish_state_label(
+    state: &punk_domain::IncidentAdmissionPublishState,
+) -> &'static str {
+    match state {
+        punk_domain::IncidentAdmissionPublishState::Preview => "preview",
+        punk_domain::IncidentAdmissionPublishState::Applied => "applied",
+        punk_domain::IncidentAdmissionPublishState::PublishFailed => "publish_failed",
+    }
+}
+
 fn format_incident_defaults_summary(label: &str, defaults: &punk_orch::IncidentDefaults) -> String {
     let promote_repo_root = defaults
         .promote_repo_root
@@ -3248,7 +3400,7 @@ fn resolve_incident_promote_repo(orch: &OrchService, repo: Option<&Path>) -> Res
     Ok(PathBuf::from(configured))
 }
 
-fn resolve_incident_submit_repo(orch: &OrchService, github_repo: Option<&str>) -> Result<String> {
+fn resolve_issue_github_repo(orch: &OrchService, github_repo: Option<&str>) -> Result<String> {
     if let Some(github_repo) = github_repo {
         return Ok(github_repo.to_string());
     }
@@ -4602,6 +4754,70 @@ mod tests {
     }
 
     #[test]
+    fn incident_admit_command_parses_with_issue_number_and_github_repo() {
+        let cli = Cli::try_parse_from([
+            "punk",
+            "incident",
+            "admit",
+            "123",
+            "--github",
+            "heurema/specpunk",
+            "--publish",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Incident(IncidentCommand {
+                action:
+                    IncidentAction::Admit {
+                        issue_number,
+                        github_repo,
+                        publish,
+                        json,
+                    },
+            }) => {
+                assert_eq!(issue_number, 123);
+                assert_eq!(github_repo.as_deref(), Some("heurema/specpunk"));
+                assert!(publish);
+                assert!(json);
+            }
+            _ => panic!("expected incident admit command"),
+        }
+    }
+
+    #[test]
+    fn issue_admit_command_parses_with_issue_number_and_github_repo() {
+        let cli = Cli::try_parse_from([
+            "punk",
+            "issue",
+            "admit",
+            "123",
+            "--github",
+            "heurema/specpunk",
+            "--publish",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Issue(IssueCommand {
+                action:
+                    IssueAction::Admit {
+                        issue_number,
+                        github_repo,
+                        publish,
+                        json,
+                    },
+            }) => {
+                assert_eq!(issue_number, 123);
+                assert_eq!(github_repo.as_deref(), Some("heurema/specpunk"));
+                assert!(publish);
+                assert!(json);
+            }
+            _ => panic!("expected issue admit command"),
+        }
+    }
+
+    #[test]
     fn incident_resubmit_command_parses_with_publish_flag() {
         let cli = Cli::try_parse_from([
             "punk",
@@ -5376,7 +5592,7 @@ mod tests {
             .unwrap();
 
         let promote_repo = resolve_incident_promote_repo(&orch, None).unwrap();
-        let github_repo = resolve_incident_submit_repo(&orch, None).unwrap();
+        let github_repo = resolve_issue_github_repo(&orch, None).unwrap();
 
         assert_eq!(promote_repo, target.canonicalize().unwrap());
         assert_eq!(github_repo, "heurema/specpunk");
@@ -5409,7 +5625,7 @@ mod tests {
             .unwrap();
 
         let promote_repo = resolve_incident_promote_repo(&orch, None).unwrap();
-        let github_repo = resolve_incident_submit_repo(&orch, None).unwrap();
+        let github_repo = resolve_issue_github_repo(&orch, None).unwrap();
 
         assert_eq!(promote_repo, target.canonicalize().unwrap());
         assert_eq!(github_repo, "heurema/specpunk");

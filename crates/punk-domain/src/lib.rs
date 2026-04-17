@@ -764,6 +764,99 @@ pub struct IncidentSubmissionRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IncidentAdmissionDecision {
+    #[serde(alias = "close_reject")]
+    CloseNow,
+    #[serde(alias = "defer")]
+    DeferAfterCore,
+    CoreNow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IncidentAdmissionPublishState {
+    Preview,
+    Applied,
+    PublishFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentAdmissionAssessment {
+    #[serde(default)]
+    pub has_runtime_report: bool,
+    #[serde(default)]
+    pub has_deterministic_evidence: bool,
+    #[serde(default)]
+    pub has_runtime_marker: bool,
+    #[serde(default)]
+    pub duplicate_or_resolved: bool,
+    #[serde(default)]
+    pub high_severity_marker: bool,
+    #[serde(default)]
+    pub targets_legacy_surface: bool,
+    #[serde(default)]
+    pub targets_active_core_surface: bool,
+    #[serde(default)]
+    pub targets_later_track: bool,
+    #[serde(default)]
+    pub indicates_core_blocker: bool,
+    #[serde(default)]
+    pub targets_cut_surface: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentAdmissionRecord {
+    pub id: String,
+    pub github_repo: String,
+    pub issue_number: u64,
+    pub issue_url: String,
+    pub issue_title: String,
+    pub issue_state: String,
+    #[serde(default)]
+    pub issue_labels: Vec<String>,
+    pub source_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incident_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub capture_basis: Vec<String>,
+    #[serde(default)]
+    pub matched_runtime_markers: Vec<String>,
+    pub policy_version: String,
+    pub assessment: IncidentAdmissionAssessment,
+    pub decision: IncidentAdmissionDecision,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    pub publish_state: IncidentAdmissionPublishState,
+    #[serde(default)]
+    pub applied_labels: Vec<String>,
+    #[serde(default)]
+    pub closed_issue: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_comment_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResearchBudget {
     pub max_rounds: u32,
@@ -1306,6 +1399,62 @@ mod tests {
         let json = serde_json::to_value(&submission).unwrap();
         let decoded: IncidentSubmissionRecord = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, submission);
+    }
+
+    #[test]
+    fn incident_admission_record_round_trips_through_json() {
+        let admission = IncidentAdmissionRecord {
+            id: "adm_123".into(),
+            github_repo: "heurema/specpunk".into(),
+            issue_number: 123,
+            issue_url: "https://github.com/heurema/specpunk/issues/123".into(),
+            issue_title: "punk runtime bug [inc_123]: blocked:no-progress".into(),
+            issue_state: "open".into(),
+            issue_labels: vec!["bug".into()],
+            source_kind: "punk_runtime_incident".into(),
+            report_format: Some("punk_runtime_incident_v1".into()),
+            incident_id: Some("inc_123".into()),
+            project_id: Some("pubpunk".into()),
+            work_id: Some("feat_123".into()),
+            decision_outcome: Some("blocked".into()),
+            failure_signature: Some("blocked:no-progress".into()),
+            blocked_reason: Some("controller stalled with no progress".into()),
+            summary: Some("controller stalled with no-progress and left no product changes".into()),
+            goal: Some("stabilize project goal".into()),
+            capture_basis: vec![
+                "decision outcome: blocked".into(),
+                "matched runtime marker: no-progress".into(),
+            ],
+            matched_runtime_markers: vec!["no-progress".into()],
+            policy_version: "incident_admission_v1".into(),
+            assessment: IncidentAdmissionAssessment {
+                has_runtime_report: true,
+                has_deterministic_evidence: true,
+                has_runtime_marker: true,
+                duplicate_or_resolved: false,
+                high_severity_marker: true,
+                targets_legacy_surface: false,
+                targets_active_core_surface: true,
+                targets_later_track: false,
+                indicates_core_blocker: true,
+                targets_cut_surface: false,
+            },
+            decision: IncidentAdmissionDecision::CoreNow,
+            reasons: vec!["matched high-severity runtime markers: no-progress".into()],
+            publish_state: IncidentAdmissionPublishState::Applied,
+            applied_labels: vec!["admission:core-now".into()],
+            closed_issue: false,
+            published_comment_url: Some(
+                "https://github.com/heurema/specpunk/issues/123#issuecomment-1".into(),
+            ),
+            publish_error: None,
+            created_at: "2026-04-17T10:00:00Z".into(),
+            updated_at: "2026-04-17T10:01:00Z".into(),
+        };
+
+        let json = serde_json::to_value(&admission).unwrap();
+        let decoded: IncidentAdmissionRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, admission);
     }
 
     #[test]

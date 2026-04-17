@@ -210,6 +210,9 @@ Current incident inspect surface:
 - `punk incident rerun <promotion-id> --auto-run`
 - `punk incident submit <incident-id> --github owner/repo`
 - `punk incident submit <incident-id> --github owner/repo --publish`
+- `punk issue admit <issue-number> --github owner/repo`
+- `punk issue admit <issue-number> --github owner/repo --publish`
+- `punk incident admit <issue-number> --github owner/repo` (compatibility path)
 - `punk incident resubmit <submission-id> --publish`
 - `punk inspect inc_<id> --json`
 - `punk inspect inc_<id>`
@@ -217,6 +220,8 @@ Current incident inspect surface:
 - `punk inspect prom_<id>`
 - `punk inspect sub_<id> --json`
 - `punk inspect sub_<id>`
+- `punk inspect adm_<id> --json`
+- `punk inspect adm_<id>`
 
 Current promote semantics:
 
@@ -238,6 +243,21 @@ Current promote semantics:
 - if internal auto-run fails before proof creation, `incident rerun <promotion-id> --auto-run` reuses the same promotion record and target contract instead of creating a second promotion bundle
 - `incident submit` writes a sanitized GitHub issue bundle under `.punk/submissions/...`
 - `incident submit` prepares only by default; `--publish` is the explicit networked step
+- `incident submit` now also embeds a hidden machine-readable runtime packet in the GitHub issue body so later admission can classify the report without depending on shell scrollback
+- `issue admit` fetches a published GitHub issue, evaluates it against the current issue-admission policy, and records an inspectable decision under `.punk/admissions/...`
+- `issue admit` prepares only by default; `--publish` is the explicit networked step that applies the `admission:*` label, posts the admission comment, and closes the issue when the decision is `close_now`
+- the admission policy is intentionally conservative:
+  - `close_now` when the issue is closed/duplicate/obsolete, targets a decommissioned or cut surface, or otherwise should never enter the active core intake lane
+  - `core_now` when the issue is either a valid high-severity runtime report or a manual repo issue that clearly targets an active core surface and carries blocker/bug signals
+  - `defer_after_core` when the issue is real enough to keep, but should remain outside immediate core stabilization
+- runtime reports use the embedded machine packet plus runtime marker vocabulary:
+  - high-severity markers such as `no-progress`, `timeout`, `panic`, `controller`, `executor`, `zero-byte-file`, or `patch-apply` go to `core_now`
+  - valid runtime reports without those markers go to `defer_after_core`
+- manual/backlog issues use strategic surface checks:
+  - legacy `punk-supervisor` / decommissioned / cut surfaces go to `close_now`
+  - active core blockers may go to `core_now`
+  - later-track or non-blocking backlog items go to `defer_after_core`
+- only `core_now` admissions are eligible for immediate core-stabilization work intake; `defer_after_core` issues remain open but outside the active intake lane
 - publish currently uses `gh api`, so missing `gh` auth should fail after writing an inspectable `sub_<id>` bundle
 - `incident resubmit` reuses an existing `.punk/submissions/...` bundle and requires `--publish`
 - `incident resubmit` rejects already-published `sub_<id>` records to avoid accidental duplicate issues
@@ -457,6 +477,8 @@ punk incident capture <proof-id>
 punk incident promote <incident-id> [--repo </absolute/or/relative/path>] [--auto-run]
 punk incident rerun <promotion-id> --auto-run
 punk incident submit <incident-id> [--github owner/repo] [--publish]
+punk issue admit <issue-number> [--github owner/repo] [--publish]
+punk incident admit <issue-number> [--github owner/repo] [--publish]   # compatibility path
 punk incident resubmit <submission-id> --publish
 ```
 
@@ -555,6 +577,10 @@ When `--fallback-staged` is set and autonomy blocks:
 - actual GitHub publication requires explicit `--publish`
 - plain promote copies the incident bundle into the target repo, drafts an inspectable contract there, and does not auto-approve or auto-run anything
 - submit writes a sanitized `.punk/submissions/...` bundle first so failed publication still leaves something inspectable
+- submit also embeds a hidden machine-readable runtime packet in the GitHub issue body for later intake
+- admit reads a published GitHub issue back through `gh api`, records the admission verdict under `.punk/admissions/...`, and only mutates GitHub state when `--publish` is passed
+- admit applies exactly one `admission:*` label and closes the issue only when the verdict is `close_now`
+- only `core_now` admissions should be allowed into immediate core-stabilization work intake; `defer_after_core` stays in backlog, `close_now` is the close-now path
 - resubmit lets the operator retry the exact same prepared submission bundle after fixing `gh` auth or network issues
 
 The intended durable behavior is stronger than shell text:

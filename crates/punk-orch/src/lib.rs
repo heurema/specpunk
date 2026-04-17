@@ -26,13 +26,14 @@ use punk_domain::{
     ArchitectureSeverity, ArchitectureSignals, AutonomyOutcome, AutonomyRecord,
     CapabilityCandidateView, Contract, ContractArchitectureIntegrity, ContractStatus, DraftInput,
     DraftProposal, EventEnvelope, Feature, FeatureStatus, FrozenArchitectureInputs,
-    FrozenCapabilityResolution, IncidentPromotionExecution, IncidentPromotionFailure,
-    IncidentPromotionRecord, IncidentRecord, IncidentSubmissionRecord, ModeId, PersistedContract,
-    Project, ProjectCapabilityIndex, Receipt, ReceiptArtifacts, RefineInput, ResearchArtifact,
-    ResearchArtifactInput, ResearchInvalidationEntry, ResearchPacket, ResearchQuestion,
-    ResearchRecord, ResearchStartInput, ResearchSynthesis, ResearchSynthesisInput, Run, RunStatus,
-    Task, TaskKind, TaskStatus, VcsKind, VerificationContext, VerificationContextFileState,
-    VerificationContextIdentity,
+    FrozenCapabilityResolution, IncidentAdmissionAssessment, IncidentAdmissionDecision,
+    IncidentAdmissionPublishState, IncidentAdmissionRecord, IncidentPromotionExecution,
+    IncidentPromotionFailure, IncidentPromotionRecord, IncidentRecord, IncidentSubmissionRecord,
+    ModeId, PersistedContract, Project, ProjectCapabilityIndex, Receipt, ReceiptArtifacts,
+    RefineInput, ResearchArtifact, ResearchArtifactInput, ResearchInvalidationEntry,
+    ResearchPacket, ResearchQuestion, ResearchRecord, ResearchStartInput, ResearchSynthesis,
+    ResearchSynthesisInput, Run, RunStatus, Task, TaskKind, TaskStatus, VcsKind,
+    VerificationContext, VerificationContextFileState, VerificationContextIdentity,
 };
 use punk_events::EventStore;
 use punk_vcs::{current_snapshot_ref, detect_backend};
@@ -56,6 +57,7 @@ pub struct RepoPaths {
     pub incidents_dir: PathBuf,
     pub promotions_dir: PathBuf,
     pub submissions_dir: PathBuf,
+    pub admissions_dir: PathBuf,
     pub imported_incidents_dir: PathBuf,
     pub project_dir: PathBuf,
     pub harness_spec_path: PathBuf,
@@ -237,6 +239,56 @@ pub struct IncidentDefaults {
     pub github_repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubIssueLabel {
+    name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubIssueSnapshot {
+    number: u64,
+    title: String,
+    #[serde(default)]
+    body: String,
+    state: String,
+    html_url: String,
+    #[serde(default)]
+    labels: Vec<GitHubIssueLabel>,
+    #[serde(default)]
+    pull_request: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct MachineIncidentReportPacket {
+    format: String,
+    incident_id: String,
+    project_id: String,
+    work_id: String,
+    decision_outcome: String,
+    summary: String,
+    goal: String,
+    failure_signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocked_reason: Option<String>,
+    #[serde(default)]
+    capture_basis: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ParsedIncidentIssueReport {
+    source_kind: String,
+    report_format: Option<String>,
+    incident_id: Option<String>,
+    project_id: Option<String>,
+    work_id: Option<String>,
+    decision_outcome: Option<String>,
+    failure_signature: Option<String>,
+    blocked_reason: Option<String>,
+    summary: Option<String>,
+    goal: Option<String>,
+    capture_basis: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -557,13 +609,16 @@ fn freeze_run_architecture_inputs(
     contract_path: &Path,
     persisted_contract: &PersistedContract,
 ) -> Result<Option<String>> {
-    let signals_source_ref = persisted_contract.architecture_signals_ref.clone().or_else(|| {
-        let fallback = architecture_signals_artifact_path(contract_path);
-        fallback
-            .exists()
-            .then(|| relative_ref(repo_root, &fallback).ok())
-            .flatten()
-    });
+    let signals_source_ref = persisted_contract
+        .architecture_signals_ref
+        .clone()
+        .or_else(|| {
+            let fallback = architecture_signals_artifact_path(contract_path);
+            fallback
+                .exists()
+                .then(|| relative_ref(repo_root, &fallback).ok())
+                .flatten()
+        });
     let brief_source_ref = persisted_contract
         .architecture_integrity
         .as_ref()
@@ -1042,6 +1097,7 @@ impl OrchService {
             incidents_dir: dot_punk.join("incidents"),
             promotions_dir: dot_punk.join("promotions"),
             submissions_dir: dot_punk.join("submissions"),
+            admissions_dir: dot_punk.join("admissions"),
             imported_incidents_dir: dot_punk.join("imported-incidents"),
             project_dir: project_dir.clone(),
             harness_spec_path: project_dir.join("harness.json"),
@@ -1168,6 +1224,7 @@ impl OrchService {
         fs::create_dir_all(&self.paths.incidents_dir)?;
         fs::create_dir_all(&self.paths.promotions_dir)?;
         fs::create_dir_all(&self.paths.submissions_dir)?;
+        fs::create_dir_all(&self.paths.admissions_dir)?;
         fs::create_dir_all(&self.paths.imported_incidents_dir)?;
         fs::create_dir_all(&self.paths.project_dir)?;
         self.events.ensure_dirs()?;
@@ -2395,6 +2452,7 @@ impl OrchService {
             &self.paths.incidents_dir,
             &self.paths.promotions_dir,
             &self.paths.submissions_dir,
+            &self.paths.admissions_dir,
         ] {
             if let Ok(path) = self.find_object_path(dir, id) {
                 let mut value = read_json(&path)?;
@@ -2437,6 +2495,14 @@ impl OrchService {
     ) -> Result<IncidentSubmissionRecord> {
         let submission_path = self.find_object_path(&self.paths.submissions_dir, submission_id)?;
         read_json(&submission_path)
+    }
+
+    pub fn inspect_incident_admission(
+        &self,
+        admission_id: &str,
+    ) -> Result<IncidentAdmissionRecord> {
+        let admission_path = self.find_object_path(&self.paths.admissions_dir, admission_id)?;
+        read_json(&admission_path)
     }
 
     pub fn inspect_research(&self, research_id: &str) -> Result<ResearchInspectView> {
@@ -3461,6 +3527,150 @@ impl OrchService {
                 Err(anyhow!(
                     "GitHub issue republish failed; inspect {} for the prepared submission bundle: {}",
                     submission.id,
+                    error
+                ))
+            }
+        }
+    }
+
+    pub fn admit_incident_issue(
+        &self,
+        issue_number: u64,
+        github_repo: &str,
+        publish: bool,
+    ) -> Result<IncidentAdmissionRecord> {
+        self.admit_incident_issue_with_gh(issue_number, github_repo, publish, Path::new("gh"))
+    }
+
+    fn admit_incident_issue_with_gh(
+        &self,
+        issue_number: u64,
+        github_repo: &str,
+        publish: bool,
+        gh_bin: &Path,
+    ) -> Result<IncidentAdmissionRecord> {
+        let project = self.bootstrap_project()?;
+        let github_repo = normalize_github_repo(github_repo)?;
+        let issue =
+            fetch_github_issue_snapshot(gh_bin, &self.paths.repo_root, &github_repo, issue_number)?;
+        let parsed = parse_incident_issue_report(&issue.title, &issue.body);
+        let repo_issues = if parsed.incident_id.is_some() {
+            list_github_repo_issues(gh_bin, &self.paths.repo_root, &github_repo)?
+        } else {
+            Vec::new()
+        };
+        let admission_id = new_id("adm");
+        let admission_dir = self
+            .paths
+            .admissions_dir
+            .join(sanitize_repo_slug(&github_repo))
+            .join(issue.number.to_string())
+            .join(&admission_id);
+        let admission_path = admission_dir.join("admission.json");
+        fs::create_dir_all(&admission_dir)?;
+
+        let issue_labels = issue
+            .labels
+            .iter()
+            .map(|label| label.name.clone())
+            .collect::<Vec<_>>();
+        let (assessment, decision, reasons, matched_runtime_markers) =
+            evaluate_incident_issue_admission(&issue, &parsed, &repo_issues);
+        let now = now_rfc3339();
+        let mut admission = IncidentAdmissionRecord {
+            id: admission_id,
+            github_repo: github_repo.clone(),
+            issue_number: issue.number,
+            issue_url: issue.html_url.clone(),
+            issue_title: issue.title.clone(),
+            issue_state: issue.state.clone(),
+            issue_labels,
+            source_kind: if parsed.source_kind.trim().is_empty() {
+                "unknown".to_string()
+            } else {
+                parsed.source_kind.clone()
+            },
+            report_format: parsed.report_format.clone(),
+            incident_id: parsed.incident_id.clone(),
+            project_id: parsed.project_id.clone(),
+            work_id: parsed.work_id.clone(),
+            decision_outcome: parsed.decision_outcome.clone(),
+            failure_signature: parsed.failure_signature.clone(),
+            blocked_reason: parsed.blocked_reason.clone(),
+            summary: parsed.summary.clone(),
+            goal: parsed.goal.clone(),
+            capture_basis: parsed.capture_basis.clone(),
+            matched_runtime_markers,
+            policy_version: "incident_admission_v1".to_string(),
+            assessment,
+            decision,
+            reasons,
+            publish_state: IncidentAdmissionPublishState::Preview,
+            applied_labels: Vec::new(),
+            closed_issue: false,
+            published_comment_url: None,
+            publish_error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        write_json(&admission_path, &admission)?;
+        self.append_event(
+            &project.id,
+            None,
+            None,
+            None,
+            ModeId::Gate,
+            "incident.admission_recorded",
+            Some(&admission_path),
+        )?;
+
+        if !publish {
+            return Ok(admission);
+        }
+
+        match publish_incident_admission_to_github(
+            gh_bin,
+            &self.paths.repo_root,
+            &github_repo,
+            &issue,
+            &admission,
+        ) {
+            Ok(published) => {
+                admission.publish_state = IncidentAdmissionPublishState::Applied;
+                admission.applied_labels = published.applied_labels;
+                admission.closed_issue = published.closed_issue;
+                admission.published_comment_url = published.comment_url;
+                admission.publish_error = None;
+                admission.updated_at = now_rfc3339();
+                write_json(&admission_path, &admission)?;
+                self.append_event(
+                    &project.id,
+                    None,
+                    None,
+                    None,
+                    ModeId::Gate,
+                    "incident.admission_published",
+                    Some(&admission_path),
+                )?;
+                Ok(admission)
+            }
+            Err(error) => {
+                admission.publish_state = IncidentAdmissionPublishState::PublishFailed;
+                admission.publish_error = Some(error.to_string());
+                admission.updated_at = now_rfc3339();
+                write_json(&admission_path, &admission)?;
+                self.append_event(
+                    &project.id,
+                    None,
+                    None,
+                    None,
+                    ModeId::Gate,
+                    "incident.admission_publish_failed",
+                    Some(&admission_path),
+                )?;
+                Err(anyhow!(
+                    "GitHub issue admission publish failed; inspect {} for the recorded decision: {}",
+                    admission.id,
                     error
                 ))
             }
@@ -4920,6 +5130,24 @@ fn render_incident_submission_title(incident: &IncidentRecord) -> String {
     )
 }
 
+fn render_incident_submission_machine_packet(incident: &IncidentRecord) -> String {
+    let packet = MachineIncidentReportPacket {
+        format: "punk_runtime_incident_v1".to_string(),
+        incident_id: incident.id.clone(),
+        project_id: incident.project_id.clone(),
+        work_id: incident.work_id.clone(),
+        decision_outcome: incident.decision_outcome.clone(),
+        summary: incident.summary.clone(),
+        goal: incident.goal.clone(),
+        failure_signature: incident.failure_signature.clone(),
+        blocked_reason: incident.blocked_reason.clone(),
+        capture_basis: incident.capture_basis.clone(),
+    };
+    let json =
+        serde_json::to_string_pretty(&packet).expect("machine incident packet should serialize");
+    format!("<!-- punk-machine-report:start -->\n{json}\n<!-- punk-machine-report:end -->")
+}
+
 fn render_public_incident_submission_body(incident: &IncidentRecord) -> String {
     let blocked_reason = incident.blocked_reason.as_deref().unwrap_or("none");
     let capture_basis = if incident.capture_basis.is_empty() {
@@ -4932,8 +5160,9 @@ fn render_public_incident_submission_body(incident: &IncidentRecord) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let machine_packet = render_incident_submission_machine_packet(incident);
     format!(
-        "# Suspected punk runtime bug: {signature}\n\n## Summary\n{summary}\n\n## Report context\n- incident_id: {incident_id}\n- project_id: {project_id}\n- work_id: {work_id}\n- decision_outcome: {decision_outcome}\n\n## Goal\n{goal}\n\n## Blocked reason\n{blocked_reason}\n\n## Why this looks runtime-related\n{capture_basis}\n\n## Local operator note\nThe reporter can inspect the local bundle with `punk inspect {incident_id} --json`.\n",
+        "# Suspected punk runtime bug: {signature}\n\n## Summary\n{summary}\n\n## Report context\n- incident_id: {incident_id}\n- project_id: {project_id}\n- work_id: {work_id}\n- decision_outcome: {decision_outcome}\n\n## Goal\n{goal}\n\n## Blocked reason\n{blocked_reason}\n\n## Why this looks runtime-related\n{capture_basis}\n\n## Local operator note\nThe reporter can inspect the local bundle with `punk inspect {incident_id} --json`.\n\n{machine_packet}\n",
         signature = incident.failure_signature,
         summary = incident.summary,
         incident_id = incident.id,
@@ -4943,6 +5172,7 @@ fn render_public_incident_submission_body(incident: &IncidentRecord) -> String {
         goal = incident.goal,
         blocked_reason = blocked_reason,
         capture_basis = capture_basis,
+        machine_packet = machine_packet,
     )
 }
 
@@ -5042,6 +5272,690 @@ fn publish_incident_submission_to_github(
         .and_then(|value| value.as_u64())
         .ok_or_else(|| anyhow!("GitHub response missing number"))?;
     Ok((issue_url.to_string(), issue_number))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdmissionPublishResult {
+    applied_labels: Vec<String>,
+    closed_issue: bool,
+    comment_url: Option<String>,
+}
+
+fn sanitize_repo_slug(github_repo: &str) -> String {
+    github_repo.replace('/', "__")
+}
+
+fn incident_id_from_issue_title(title: &str) -> Option<String> {
+    let start = title.find('[')?;
+    let end = title[start + 1..].find(']')?;
+    let value = title[start + 1..start + 1 + end].trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn parse_incident_issue_report(title: &str, body: &str) -> ParsedIncidentIssueReport {
+    parse_machine_incident_issue_report(body)
+        .or_else(|| parse_legacy_incident_issue_report(title, body))
+        .unwrap_or_default()
+}
+
+fn parse_machine_incident_issue_report(body: &str) -> Option<ParsedIncidentIssueReport> {
+    let start_marker = "<!-- punk-machine-report:start -->";
+    let end_marker = "<!-- punk-machine-report:end -->";
+    let start = body.find(start_marker)? + start_marker.len();
+    let end = body[start..].find(end_marker)? + start;
+    let packet: MachineIncidentReportPacket = serde_json::from_str(body[start..end].trim()).ok()?;
+    Some(ParsedIncidentIssueReport {
+        source_kind: "punk_runtime_incident".to_string(),
+        report_format: Some(packet.format),
+        incident_id: Some(packet.incident_id),
+        project_id: Some(packet.project_id),
+        work_id: Some(packet.work_id),
+        decision_outcome: Some(packet.decision_outcome),
+        failure_signature: Some(packet.failure_signature),
+        blocked_reason: packet.blocked_reason,
+        summary: Some(packet.summary),
+        goal: Some(packet.goal),
+        capture_basis: packet.capture_basis,
+    })
+}
+
+fn parse_legacy_incident_issue_report(
+    title: &str,
+    body: &str,
+) -> Option<ParsedIncidentIssueReport> {
+    if !body.contains("# Suspected punk runtime bug:") {
+        return None;
+    }
+    let context = extract_markdown_bullet_map(body, "Report context");
+    let capture_basis = extract_markdown_list_section(body, "Why this looks runtime-related");
+    Some(ParsedIncidentIssueReport {
+        source_kind: "punk_runtime_incident".to_string(),
+        report_format: Some("legacy_markdown_v0".to_string()),
+        incident_id: context.get("incident_id").cloned(),
+        project_id: context.get("project_id").cloned(),
+        work_id: context.get("work_id").cloned(),
+        decision_outcome: context.get("decision_outcome").cloned(),
+        failure_signature: title
+            .split("]: ")
+            .nth(1)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| incident_id_from_issue_title(title)),
+        blocked_reason: extract_markdown_section(body, "Blocked reason")
+            .filter(|value| !value.eq_ignore_ascii_case("none")),
+        summary: extract_markdown_section(body, "Summary"),
+        goal: extract_markdown_section(body, "Goal"),
+        capture_basis,
+    })
+}
+
+fn extract_markdown_section(body: &str, heading: &str) -> Option<String> {
+    let header = format!("## {heading}");
+    let start = body.find(&header)? + header.len();
+    let remainder = body[start..].trim_start_matches('\n');
+    let end = remainder.find("\n## ").unwrap_or(remainder.len());
+    let value = remainder[..end].trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn extract_markdown_bullet_map(body: &str, heading: &str) -> BTreeMap<String, String> {
+    extract_markdown_section(body, heading)
+        .map(|section| {
+            section
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    let payload = line.strip_prefix("- ")?;
+                    let (key, value) = payload.split_once(':')?;
+                    let value = value.trim();
+                    (!value.is_empty()).then(|| (key.trim().to_string(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn extract_markdown_list_section(body: &str, heading: &str) -> Vec<String> {
+    extract_markdown_section(body, heading)
+        .map(|section| {
+            section
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("- ").map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn extract_runtime_markers(capture_basis: &[String]) -> Vec<String> {
+    let mut markers = capture_basis
+        .iter()
+        .filter_map(|item| item.strip_prefix("matched runtime marker: "))
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>();
+    markers.sort();
+    markers.dedup();
+    markers
+}
+
+fn is_high_severity_runtime_marker(marker: &str) -> bool {
+    matches!(
+        marker,
+        "no-progress"
+            | "corruption"
+            | "damaged-file"
+            | "zero-byte-file"
+            | "orphaned-run"
+            | "timeout"
+            | "stall"
+            | "executor"
+            | "controller"
+            | "panic"
+            | "patch-apply"
+            | "apply-patch"
+    )
+}
+
+fn combined_issue_text(issue: &GitHubIssueSnapshot) -> String {
+    format!("{} {}", issue.title, issue.body).to_ascii_lowercase()
+}
+
+fn collect_named_markers(text: &str, markers: &[(&str, &str)]) -> Vec<String> {
+    let mut found = BTreeSet::new();
+    for (needle, label) in markers {
+        if text.contains(needle) {
+            found.insert((*label).to_string());
+        }
+    }
+    found.into_iter().collect()
+}
+
+fn evaluate_incident_issue_admission(
+    issue: &GitHubIssueSnapshot,
+    parsed: &ParsedIncidentIssueReport,
+    repo_issues: &[GitHubIssueSnapshot],
+) -> (
+    IncidentAdmissionAssessment,
+    IncidentAdmissionDecision,
+    Vec<String>,
+    Vec<String>,
+) {
+    let issue_labels = issue
+        .labels
+        .iter()
+        .map(|label| label.name.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let combined_text = combined_issue_text(issue);
+    let legacy_surface_markers = collect_named_markers(
+        &combined_text,
+        &[
+            (
+                "punk-supervisor",
+                "references decommissioned punk-supervisor surface",
+            ),
+            (
+                "bash supervisor",
+                "references legacy bash supervisor surface",
+            ),
+            (
+                "dev.punk.supervisor",
+                "references decommissioned dev.punk.supervisor service",
+            ),
+            (
+                "audit.jsonl",
+                "references legacy supervisor audit.jsonl surface",
+            ),
+            ("task.json", "references legacy supervisor task.json bus"),
+            ("dispatch wrapper", "references legacy dispatch wrapper"),
+            (
+                "depends_on",
+                "references legacy supervisor depends_on field",
+            ),
+            ("max_slots", "references legacy supervisor slot scheduler"),
+        ],
+    );
+    let active_core_markers = collect_named_markers(
+        &combined_text,
+        &[
+            ("punk init", "punk init"),
+            ("punk start", "punk start"),
+            ("punk go", "punk go"),
+            ("go --fallback-staged", "go --fallback-staged"),
+            ("punk plot", "punk plot"),
+            ("punk cut", "punk cut"),
+            ("punk gate", "punk gate"),
+            ("punk status", "punk status"),
+            ("punk inspect", "punk inspect"),
+            ("proofpack", "proofpack"),
+            ("work ledger", "work ledger"),
+            ("receipt", "receipt"),
+            ("decision", "decision object"),
+            ("verification context", "verification context"),
+            ("allowed_scope", "allowed_scope"),
+            ("worktree", "worktree"),
+            ("isolated workspace", "isolated workspace"),
+            ("incident promote", "incident promote"),
+            ("incident submit", "incident submit"),
+            ("issue admit", "issue admit"),
+            ("workspace", "workspace"),
+        ],
+    );
+    let later_track_markers = collect_named_markers(
+        &combined_text,
+        &[
+            ("parallel agents", "parallel agents"),
+            ("parallel tasks", "parallel tasks"),
+            ("dependency ordering", "dependency ordering"),
+            ("depends_on", "dependency ordering"),
+            ("heartbeat", "heartbeat/progress telemetry"),
+            ("progress events", "progress telemetry"),
+            ("cancel", "task cancellation"),
+            ("project intelligence", "project intelligence"),
+            ("council", "council"),
+            ("research", "research"),
+            ("skill", "skills/project intelligence"),
+        ],
+    );
+    let cut_surface_markers = collect_named_markers(
+        &combined_text,
+        &[
+            ("role-heavy", "role-heavy surface is cut/avoid"),
+            ("roleplay", "roleplay surface is cut/avoid"),
+            ("provider dashboard", "provider-zoo UX is cut/avoid"),
+            ("provider zoo", "provider-zoo UX is cut/avoid"),
+            (
+                "universal agent runtime",
+                "universal agent runtime is cut/avoid",
+            ),
+            (
+                "internal memory platform",
+                "large internal memory platform is cut/avoid",
+            ),
+            (
+                "free-text-heavy orchestration",
+                "free-text-heavy orchestration is cut/avoid",
+            ),
+        ],
+    );
+    let blocker_markers = collect_named_markers(
+        &combined_text,
+        &[
+            ("overwrite", "overwrite risk"),
+            ("data loss", "data-loss risk"),
+            ("corruption", "corruption risk"),
+            ("panic", "panic risk"),
+            ("unsafe", "unsafe behavior"),
+            ("blocked", "blocked behavior"),
+            ("cannot", "cannot complete"),
+            ("can't", "cannot complete"),
+            ("fails", "explicit failure"),
+            ("failure", "explicit failure"),
+            ("stuck", "stuck behavior"),
+            ("stopper", "stopper wording"),
+            ("no worktree isolation", "missing worktree isolation"),
+            ("overwrite each other", "concurrent overwrite risk"),
+        ],
+    );
+    let has_bug_label = issue_labels.iter().any(|label| label == "bug");
+    let has_enhancement_label = issue_labels.iter().any(|label| label == "enhancement");
+    let has_runtime_report =
+        issue.pull_request.is_none() && parsed.source_kind == "punk_runtime_incident";
+    let has_deterministic_evidence = parsed
+        .incident_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .is_some()
+        && parsed
+            .project_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
+        && parsed
+            .work_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
+        && parsed
+            .decision_outcome
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .is_some()
+        && parsed
+            .failure_signature
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .is_some();
+    let matched_runtime_markers = extract_runtime_markers(&parsed.capture_basis);
+    let has_runtime_marker = !matched_runtime_markers.is_empty();
+    let high_severity_marker = matched_runtime_markers
+        .iter()
+        .any(|marker| is_high_severity_runtime_marker(marker));
+    let duplicate_issue = parsed.incident_id.as_deref().is_some_and(|incident_id| {
+        repo_issues.iter().any(|candidate| {
+            candidate.pull_request.is_none()
+                && candidate.number != issue.number
+                && candidate.number < issue.number
+                && incident_id_from_issue_title(&candidate.title).as_deref() == Some(incident_id)
+        })
+    });
+    let resolved_by_state = issue.state.eq_ignore_ascii_case("closed");
+    let resolved_by_label = issue_labels.iter().any(|label| {
+        matches!(
+            label.as_str(),
+            "duplicate" | "invalid" | "wontfix" | "already-fixed" | "obsolete" | "not-specpunk"
+        )
+    });
+    let duplicate_or_resolved = duplicate_issue || resolved_by_state || resolved_by_label;
+
+    let assessment = IncidentAdmissionAssessment {
+        has_runtime_report,
+        has_deterministic_evidence,
+        has_runtime_marker,
+        duplicate_or_resolved,
+        high_severity_marker,
+        targets_legacy_surface: !legacy_surface_markers.is_empty(),
+        targets_active_core_surface: !active_core_markers.is_empty()
+            && legacy_surface_markers.is_empty(),
+        targets_later_track: !later_track_markers.is_empty(),
+        indicates_core_blocker: has_bug_label || !blocker_markers.is_empty(),
+        targets_cut_surface: !cut_surface_markers.is_empty(),
+    };
+
+    let mut reasons = Vec::new();
+    let decision = if duplicate_or_resolved {
+        if duplicate_issue {
+            reasons.push("duplicate incident id already exists on an older issue".to_string());
+        }
+        if resolved_by_state {
+            reasons.push("issue is already closed".to_string());
+        }
+        if resolved_by_label {
+            reasons.push("issue already carries duplicate/invalid/obsolete labels".to_string());
+        }
+        IncidentAdmissionDecision::CloseNow
+    } else if !cut_surface_markers.is_empty() {
+        reasons.push(format!(
+            "issue targets cut/avoid surfaces: {}",
+            cut_surface_markers.join(", ")
+        ));
+        IncidentAdmissionDecision::CloseNow
+    } else if !legacy_surface_markers.is_empty() {
+        reasons.push(format!(
+            "issue targets legacy/decommissioned surfaces: {}",
+            legacy_surface_markers.join(", ")
+        ));
+        IncidentAdmissionDecision::CloseNow
+    } else if has_runtime_report && !has_deterministic_evidence {
+        reasons.push(
+            "runtime report is missing deterministic evidence fields (incident/project/work/outcome/signature)"
+                .to_string(),
+        );
+        IncidentAdmissionDecision::CloseNow
+    } else if has_runtime_report && high_severity_marker {
+        reasons.push(format!(
+            "valid runtime report matched high-severity runtime markers: {}",
+            matched_runtime_markers.join(", ")
+        ));
+        IncidentAdmissionDecision::CoreNow
+    } else if has_runtime_report {
+        if has_runtime_marker {
+            reasons.push(format!(
+                "valid runtime report matched only post-core runtime markers: {}",
+                matched_runtime_markers.join(", ")
+            ));
+        } else {
+            reasons.push(
+                "valid runtime report lacks a high-severity runtime marker; keep it for post-core stabilization review"
+                    .to_string(),
+            );
+        }
+        IncidentAdmissionDecision::DeferAfterCore
+    } else if !active_core_markers.is_empty() && (has_bug_label || !blocker_markers.is_empty()) {
+        reasons.push(format!(
+            "manual repo issue targets current core surfaces: {}",
+            active_core_markers.join(", ")
+        ));
+        if has_bug_label {
+            reasons.push("issue carries the bug label".to_string());
+        }
+        if !blocker_markers.is_empty() {
+            reasons.push(format!(
+                "issue carries blocker signals: {}",
+                blocker_markers.join(", ")
+            ));
+        }
+        IncidentAdmissionDecision::CoreNow
+    } else if !active_core_markers.is_empty() {
+        reasons.push(format!(
+            "manual repo issue targets current core surfaces but does not justify immediate intake: {}",
+            active_core_markers.join(", ")
+        ));
+        IncidentAdmissionDecision::DeferAfterCore
+    } else if !later_track_markers.is_empty() || has_enhancement_label {
+        if !later_track_markers.is_empty() {
+            reasons.push(format!(
+                "manual repo issue fits post-core backlog tracks: {}",
+                later_track_markers.join(", ")
+            ));
+        }
+        if has_enhancement_label {
+            reasons.push("issue carries the enhancement label".to_string());
+        }
+        IncidentAdmissionDecision::DeferAfterCore
+    } else if !has_deterministic_evidence {
+        reasons.push(
+            "manual repo issue is not obsolete, but it lacks deterministic runtime evidence and does not map to an immediate core blocker"
+                .to_string(),
+        );
+        IncidentAdmissionDecision::DeferAfterCore
+    } else {
+        reasons.push(
+            "manual repo issue remains a post-core backlog item until it is reframed against a current core surface or elevated by stronger evidence"
+                .to_string(),
+        );
+        IncidentAdmissionDecision::DeferAfterCore
+    };
+
+    (assessment, decision, reasons, matched_runtime_markers)
+}
+
+fn fetch_github_issue_snapshot(
+    gh_bin: &Path,
+    repo_root: &Path,
+    github_repo: &str,
+    issue_number: u64,
+) -> Result<GitHubIssueSnapshot> {
+    let endpoint = format!("repos/{github_repo}/issues/{issue_number}");
+    let issue: GitHubIssueSnapshot = serde_json::from_value(run_gh_api_json(
+        gh_bin,
+        repo_root,
+        "GET",
+        &endpoint,
+        &[],
+        &[],
+    )?)?;
+    Ok(issue)
+}
+
+fn list_github_repo_issues(
+    gh_bin: &Path,
+    repo_root: &Path,
+    github_repo: &str,
+) -> Result<Vec<GitHubIssueSnapshot>> {
+    let endpoint = format!("repos/{github_repo}/issues?state=all&per_page=100");
+    let issues: Vec<GitHubIssueSnapshot> = serde_json::from_value(run_gh_api_json(
+        gh_bin,
+        repo_root,
+        "GET",
+        &endpoint,
+        &[],
+        &[],
+    )?)?;
+    Ok(issues)
+}
+
+fn run_gh_api_json(
+    gh_bin: &Path,
+    repo_root: &Path,
+    method: &str,
+    endpoint: &str,
+    form_fields: &[(&str, String)],
+    file_fields: &[(&str, String)],
+) -> Result<serde_json::Value> {
+    let mut args = vec![
+        "api".to_string(),
+        "--method".to_string(),
+        method.to_string(),
+        endpoint.to_string(),
+    ];
+    for (key, value) in form_fields {
+        args.push("-f".to_string());
+        args.push(format!("{key}={value}"));
+    }
+    for (key, value) in file_fields {
+        args.push("-F".to_string());
+        args.push(format!("{key}={value}"));
+    }
+    let output = std::process::Command::new(gh_bin)
+        .current_dir(repo_root)
+        .args(&args)
+        .output()
+        .map_err(|error| anyhow!("failed to execute {}: {error}", gh_bin.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(anyhow!(
+            "{}",
+            if detail.is_empty() {
+                format!("gh api exited with {}", output.status)
+            } else {
+                detail
+            }
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    Ok(serde_json::from_str(&stdout)?)
+}
+
+fn publish_incident_admission_to_github(
+    gh_bin: &Path,
+    repo_root: &Path,
+    github_repo: &str,
+    issue: &GitHubIssueSnapshot,
+    admission: &IncidentAdmissionRecord,
+) -> Result<AdmissionPublishResult> {
+    let decision_label = admission_decision_label(&admission.decision);
+    ensure_github_label(gh_bin, repo_root, github_repo, decision_label)?;
+    let mut labels = issue
+        .labels
+        .iter()
+        .map(|label| label.name.clone())
+        .filter(|label| !label.starts_with("admission:"))
+        .collect::<Vec<_>>();
+    labels.push(decision_label.to_string());
+    labels.sort();
+    labels.dedup();
+
+    let endpoint = format!("repos/{github_repo}/issues/{}", issue.number);
+    let label_fields = labels
+        .iter()
+        .map(|label| ("labels[]", label.clone()))
+        .collect::<Vec<_>>();
+    let _ = run_gh_api_json(gh_bin, repo_root, "PATCH", &endpoint, &label_fields, &[])?;
+
+    let comment_endpoint = format!("repos/{github_repo}/issues/{}/comments", issue.number);
+    let comment = run_gh_api_json(
+        gh_bin,
+        repo_root,
+        "POST",
+        &comment_endpoint,
+        &[("body", render_incident_admission_comment(admission))],
+        &[],
+    )?;
+    let comment_url = comment
+        .get("html_url")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+
+    let closed_issue = matches!(admission.decision, IncidentAdmissionDecision::CloseNow);
+    if closed_issue {
+        let _ = run_gh_api_json(
+            gh_bin,
+            repo_root,
+            "PATCH",
+            &endpoint,
+            &[("state", "closed".to_string())],
+            &[],
+        )?;
+    }
+
+    Ok(AdmissionPublishResult {
+        applied_labels: labels,
+        closed_issue,
+        comment_url,
+    })
+}
+
+fn admission_decision_label(decision: &IncidentAdmissionDecision) -> &'static str {
+    match decision {
+        IncidentAdmissionDecision::CloseNow => "admission:close-now",
+        IncidentAdmissionDecision::DeferAfterCore => "admission:defer-after-core",
+        IncidentAdmissionDecision::CoreNow => "admission:core-now",
+    }
+}
+
+fn render_incident_admission_comment(admission: &IncidentAdmissionRecord) -> String {
+    let mut reasons = admission.reasons.clone();
+    if reasons.is_empty() {
+        reasons.push("no additional admission reason recorded".to_string());
+    }
+    let reasons = reasons
+        .into_iter()
+        .map(|reason| format!("- {reason}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let markers = if admission.matched_runtime_markers.is_empty() {
+        "- none".to_string()
+    } else {
+        admission
+            .matched_runtime_markers
+            .iter()
+            .map(|marker| format!("- {marker}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "## Specpunk issue admission\n- policy: {policy}\n- decision: {decision}\n- source_kind: {source_kind}\n- has_runtime_report: {has_runtime_report}\n- has_deterministic_evidence: {has_deterministic_evidence}\n- has_runtime_marker: {has_runtime_marker}\n- duplicate_or_resolved: {duplicate_or_resolved}\n- high_severity_marker: {high_severity_marker}\n- targets_legacy_surface: {targets_legacy_surface}\n- targets_active_core_surface: {targets_active_core_surface}\n- targets_later_track: {targets_later_track}\n- indicates_core_blocker: {indicates_core_blocker}\n- targets_cut_surface: {targets_cut_surface}\n\n### Matched runtime markers\n{markers}\n\n### Reasons\n{reasons}\n\nOnly `core_now` issues are eligible for immediate core-stabilization work intake. `defer_after_core` stays open but outside the active loop. `close_now` is the close-now path.",
+        policy = admission.policy_version,
+        decision = serde_json::to_string(&admission.decision)
+            .unwrap_or_else(|_| "\"unknown\"".to_string())
+            .trim_matches('"')
+            .to_string(),
+        source_kind = admission.source_kind,
+        has_runtime_report = admission.assessment.has_runtime_report,
+        has_deterministic_evidence = admission.assessment.has_deterministic_evidence,
+        has_runtime_marker = admission.assessment.has_runtime_marker,
+        duplicate_or_resolved = admission.assessment.duplicate_or_resolved,
+        high_severity_marker = admission.assessment.high_severity_marker,
+        targets_legacy_surface = admission.assessment.targets_legacy_surface,
+        targets_active_core_surface = admission.assessment.targets_active_core_surface,
+        targets_later_track = admission.assessment.targets_later_track,
+        indicates_core_blocker = admission.assessment.indicates_core_blocker,
+        targets_cut_surface = admission.assessment.targets_cut_surface,
+        markers = markers,
+        reasons = reasons,
+    )
+}
+
+fn ensure_github_label(
+    gh_bin: &Path,
+    repo_root: &Path,
+    github_repo: &str,
+    label: &str,
+) -> Result<()> {
+    let (color, description) = match label {
+        "admission:close-now" => ("6A737D", "Close now: not for the active core intake lane"),
+        "admission:defer-after-core" => (
+            "FBCA04",
+            "Valid issue, but deferred until after core stabilization",
+        ),
+        "admission:core-now" => (
+            "B60205",
+            "Admitted as an immediate core-stabilization blocker",
+        ),
+        _ => ("6A737D", "Specpunk issue admission label"),
+    };
+    let endpoint = format!("repos/{github_repo}/labels");
+    match run_gh_api_json(
+        gh_bin,
+        repo_root,
+        "POST",
+        &endpoint,
+        &[
+            ("name", label.to_string()),
+            ("color", color.to_string()),
+            ("description", description.to_string()),
+        ],
+        &[],
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let message = error.to_string().to_ascii_lowercase();
+            if message.contains("already_exists")
+                || message.contains("already exists")
+                || message.contains("validation failed")
+            {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 fn autonomy_next_action(
@@ -8287,10 +9201,66 @@ mod tests {
 
     #[cfg(unix)]
     fn write_fake_gh_script(path: &Path, stdout: &str, exit_code: i32) {
-        let script = format!("#!/bin/sh
+        let script = format!(
+            "#!/bin/sh
 printf '%s' '{}'
 exit {}
-", stdout, exit_code);
+",
+            stdout, exit_code
+        );
+        fs::write(path, script).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_fake_gh_router_script(
+        path: &Path,
+        log_path: &Path,
+        issue_json: &str,
+        issues_json: &str,
+    ) {
+        let script = format!(
+            "#!/bin/sh
+set -eu
+printf '%s\n' \"$*\" >> \"{log}\"
+args=\"$*\"
+case \"$args\" in
+  *\"repos/heurema/specpunk/issues?state=all&per_page=100\"*)
+    printf '%s' '{issues_json}'
+    ;;
+  *\"repos/heurema/specpunk/issues/123/comments\"*)
+    printf '%s' '{{\"html_url\":\"https://github.com/heurema/specpunk/issues/123#issuecomment-1\"}}'
+    ;;
+  *\"repos/heurema/specpunk/issues/123\"*\"-f state=closed\"*)
+    printf '%s' '{{\"number\":123,\"state\":\"closed\"}}'
+    ;;
+  *\"repos/heurema/specpunk/issues/123\"*\"-f labels[]=admission:core-now\"*)
+    printf '%s' '{{\"number\":123}}'
+    ;;
+  *\"repos/heurema/specpunk/issues/123\"*\"-f labels[]=admission:close-now\"*)
+    printf '%s' '{{\"number\":123}}'
+    ;;
+  *\"repos/heurema/specpunk/issues/123\"*\"-f labels[]=admission:defer-after-core\"*)
+    printf '%s' '{{\"number\":123}}'
+    ;;
+  *\"repos/heurema/specpunk/labels\"*)
+    printf '%s' '{{\"name\":\"ok\"}}'
+    ;;
+  *\"repos/heurema/specpunk/issues/123\"*)
+    printf '%s' '{issue_json}'
+    ;;
+  *)
+    printf '%s' '{{\"message\":\"unexpected gh call\"}}' >&2
+    exit 1
+    ;;
+esac
+",
+            log = log_path.display(),
+            issue_json = issue_json.replace('\'', "'\\''"),
+            issues_json = issues_json.replace('\'', "'\\''"),
+        );
         fs::write(path, script).unwrap();
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
@@ -12551,7 +13521,9 @@ fn ok() {}
                 created_at: now_rfc3339(),
                 approved_at: Some(now_rfc3339()),
             },
-            architecture_signals_ref: Some(".punk/contracts/feat_1/architecture-signals.json".into()),
+            architecture_signals_ref: Some(
+                ".punk/contracts/feat_1/architecture-signals.json".into(),
+            ),
             architecture_integrity: Some(ContractArchitectureIntegrity {
                 review_required: true,
                 brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
@@ -12563,14 +13535,10 @@ fn ok() {}
         };
         write_json(&contract_path, &persisted_contract).unwrap();
 
-        let frozen_ref = freeze_run_architecture_inputs(
-            &root,
-            &run_dir,
-            &contract_path,
-            &persisted_contract,
-        )
-        .unwrap()
-        .unwrap();
+        let frozen_ref =
+            freeze_run_architecture_inputs(&root, &run_dir, &contract_path, &persisted_contract)
+                .unwrap()
+                .unwrap();
         assert_eq!(frozen_ref, ".punk/runs/run_1/architecture-inputs.json");
 
         let frozen: FrozenArchitectureInputs =
@@ -12635,7 +13603,9 @@ fn ok() {}
                 created_at: now_rfc3339(),
                 approved_at: Some(now_rfc3339()),
             },
-            architecture_signals_ref: Some(".punk/contracts/feat_1/architecture-signals.json".into()),
+            architecture_signals_ref: Some(
+                ".punk/contracts/feat_1/architecture-signals.json".into(),
+            ),
             architecture_integrity: Some(ContractArchitectureIntegrity {
                 review_required: true,
                 brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
@@ -12647,14 +13617,10 @@ fn ok() {}
         };
         write_json(&contract_path, &persisted_contract).unwrap();
 
-        let frozen_ref = freeze_run_architecture_inputs(
-            &root,
-            &run_dir,
-            &contract_path,
-            &persisted_contract,
-        )
-        .unwrap()
-        .unwrap();
+        let frozen_ref =
+            freeze_run_architecture_inputs(&root, &run_dir, &contract_path, &persisted_contract)
+                .unwrap()
+                .unwrap();
         assert_eq!(frozen_ref, ".punk/runs/run_1/architecture-inputs.json");
 
         let frozen: FrozenArchitectureInputs =
@@ -17116,6 +18082,8 @@ fn ok() {}
 
         let body = fs::read_to_string(root.join(&submission.body_ref)).unwrap();
         assert!(body.contains("Suspected punk runtime bug"));
+        assert!(body.contains("punk-machine-report:start"));
+        assert!(body.contains("\"format\": \"punk_runtime_incident_v1\""));
         assert!(!body.contains(&root.display().to_string()));
 
         let inspected = service.inspect_incident_submission(&submission.id).unwrap();
@@ -17338,6 +18306,296 @@ fn ok() {}
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);
         let _ = fs::remove_file(&fake_gh);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admit_incident_issue_classifies_high_severity_runtime_report_as_core_now() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-incident-admit-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-incident-admit-preview-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fake_gh = std::env::temp_dir().join(format!(
+            "punk-orch-fake-gh-admit-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log_path = std::env::temp_dir().join(format!(
+            "punk-orch-fake-gh-admit-preview-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let (service, incident) = prepare_captured_incident_fixture(&root, &global);
+        let submission = service
+            .submit_incident(&incident.id, "heurema/specpunk", false)
+            .unwrap();
+        let body = fs::read_to_string(root.join(&submission.body_ref)).unwrap();
+        let issue_json = serde_json::json!({
+            "number": 123,
+            "title": submission.issue_title,
+            "body": body,
+            "state": "open",
+            "html_url": "https://github.com/heurema/specpunk/issues/123",
+            "labels": [{"name": "bug"}]
+        })
+        .to_string();
+        let issues_json = serde_json::json!([{
+            "number": 123,
+            "title": submission.issue_title,
+            "body": body,
+            "state": "open",
+            "html_url": "https://github.com/heurema/specpunk/issues/123",
+            "labels": [{"name": "bug"}]
+        }])
+        .to_string();
+        write_fake_gh_router_script(&fake_gh, &log_path, &issue_json, &issues_json);
+
+        let admission = service
+            .admit_incident_issue_with_gh(123, "heurema/specpunk", false, &fake_gh)
+            .unwrap();
+
+        assert_eq!(admission.decision, IncidentAdmissionDecision::CoreNow);
+        assert_eq!(
+            admission.publish_state,
+            IncidentAdmissionPublishState::Preview
+        );
+        assert!(admission
+            .matched_runtime_markers
+            .iter()
+            .any(|marker| marker == "no-progress"));
+        assert!(admission.assessment.high_severity_marker);
+        assert!(admission
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("high-severity runtime markers")));
+
+        let inspected = service.inspect_incident_admission(&admission.id).unwrap();
+        assert_eq!(inspected.id, admission.id);
+
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("repos/heurema/specpunk/issues/123"));
+        assert!(log.contains("repos/heurema/specpunk/issues?state=all&per_page=100"));
+        assert!(!log.contains("comments"));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        let _ = fs::remove_file(&fake_gh);
+        let _ = fs::remove_file(&log_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admit_incident_issue_classifies_legacy_runtime_report_without_high_severity_as_defer_after_core(
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-incident-admit-legacy-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-incident-admit-legacy-preview-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fake_gh = std::env::temp_dir().join(format!(
+            "punk-orch-fake-gh-admit-legacy-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log_path = std::env::temp_dir().join(format!(
+            "punk-orch-fake-gh-admit-legacy-preview-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let (service, _incident) = prepare_captured_incident_fixture(&root, &global);
+        let issue_title =
+            "punk runtime bug [inc_20260417072944692]: blocked by missing bounded context";
+        let issue_body = r#"# Suspected punk runtime bug: blocked by missing bounded context
+
+## Summary
+Specpunk promotion could not assemble a safe bounded patch.
+
+## Report context
+- incident_id: inc_20260417072944692
+- project_id: pubpunk-97a6e32805
+- work_id: feat_20260417072928387
+- decision_outcome: blocked
+
+## Goal
+Fix the promoted runtime issue.
+
+## Blocked reason
+Not enough in-lane context to build a bounded patch.
+
+## Why this looks runtime-related
+- escalation came from the runtime incident lane
+- promoted evidence bundle was incomplete for bounded execution
+"#;
+        let issue_json = serde_json::json!({
+            "number": 123,
+            "title": issue_title,
+            "body": issue_body,
+            "state": "open",
+            "html_url": "https://github.com/heurema/specpunk/issues/123",
+            "labels": []
+        })
+        .to_string();
+        let issues_json = serde_json::json!([{
+            "number": 123,
+            "title": issue_title,
+            "body": issue_body,
+            "state": "open",
+            "html_url": "https://github.com/heurema/specpunk/issues/123",
+            "labels": []
+        }])
+        .to_string();
+        write_fake_gh_router_script(&fake_gh, &log_path, &issue_json, &issues_json);
+
+        let admission = service
+            .admit_incident_issue_with_gh(123, "heurema/specpunk", false, &fake_gh)
+            .unwrap();
+
+        assert_eq!(
+            admission.decision,
+            IncidentAdmissionDecision::DeferAfterCore
+        );
+        assert_eq!(
+            admission.publish_state,
+            IncidentAdmissionPublishState::Preview
+        );
+        assert!(admission.assessment.has_runtime_report);
+        assert!(admission.assessment.has_deterministic_evidence);
+        assert!(!admission.assessment.high_severity_marker);
+        assert!(admission.matched_runtime_markers.is_empty());
+        assert!(admission
+            .reasons
+            .iter()
+            .any(|reason| { reason.contains("lacks a high-severity runtime marker") }));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        let _ = fs::remove_file(&fake_gh);
+        let _ = fs::remove_file(&log_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admit_incident_issue_publish_closes_close_now_issue() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-incident-admit-publish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-incident-admit-publish-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fake_gh = std::env::temp_dir().join(format!(
+            "punk-orch-fake-gh-admit-publish-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log_path = std::env::temp_dir().join(format!(
+            "punk-orch-fake-gh-admit-publish-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let (service, _incident) = prepare_captured_incident_fixture(&root, &global);
+        let issue_json = serde_json::json!({
+            "number": 123,
+            "title": "punk-supervisor: no heartbeat/progress events in audit.jsonl",
+            "body": "Legacy punk-supervisor backlog item about audit.jsonl heartbeat telemetry.",
+            "state": "open",
+            "html_url": "https://github.com/heurema/specpunk/issues/123",
+            "labels": []
+        })
+        .to_string();
+        let issues_json = serde_json::json!([{
+            "number": 123,
+            "title": "punk-supervisor: no heartbeat/progress events in audit.jsonl",
+            "body": "Legacy punk-supervisor backlog item about audit.jsonl heartbeat telemetry.",
+            "state": "open",
+            "html_url": "https://github.com/heurema/specpunk/issues/123",
+            "labels": []
+        }])
+        .to_string();
+        write_fake_gh_router_script(&fake_gh, &log_path, &issue_json, &issues_json);
+
+        let admission = service
+            .admit_incident_issue_with_gh(123, "heurema/specpunk", true, &fake_gh)
+            .unwrap();
+
+        assert_eq!(admission.decision, IncidentAdmissionDecision::CloseNow);
+        assert_eq!(
+            admission.publish_state,
+            IncidentAdmissionPublishState::Applied
+        );
+        assert!(admission.closed_issue);
+        assert_eq!(
+            admission.applied_labels,
+            vec!["admission:close-now".to_string()]
+        );
+        assert_eq!(
+            admission.published_comment_url.as_deref(),
+            Some("https://github.com/heurema/specpunk/issues/123#issuecomment-1")
+        );
+
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("repos/heurema/specpunk/labels"));
+        assert!(log.contains("repos/heurema/specpunk/issues/123/comments"));
+        assert!(log.contains("labels[]=admission:close-now"));
+        assert!(log.contains("state=closed"));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        let _ = fs::remove_file(&fake_gh);
+        let _ = fs::remove_file(&log_path);
     }
 
     #[test]
