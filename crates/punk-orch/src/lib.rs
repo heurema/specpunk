@@ -424,6 +424,33 @@ fn frozen_run_harness_artifacts_dir(run_dir: &Path) -> PathBuf {
     run_dir.join("harness-artifacts")
 }
 
+fn frozen_run_architecture_inputs_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("architecture-inputs.json")
+}
+
+fn frozen_run_architecture_signals_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("architecture-signals.json")
+}
+
+fn frozen_run_architecture_brief_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("architecture-brief.md")
+}
+
+fn is_safe_repo_relative_path(path: &str) -> bool {
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        return false;
+    }
+    candidate.components().all(|component| {
+        !matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    })
+}
+
 fn empty_frozen_harness_spec(project_id: &str) -> PersistedHarnessSpec {
     PersistedHarnessSpec {
         project_id: project_id.to_string(),
@@ -530,16 +557,13 @@ fn freeze_run_architecture_inputs(
     contract_path: &Path,
     persisted_contract: &PersistedContract,
 ) -> Result<Option<String>> {
-    let signals_source_ref = persisted_contract
-        .architecture_signals_ref
-        .clone()
-        .or_else(|| {
-            let fallback = architecture_signals_artifact_path(contract_path);
-            fallback
-                .exists()
-                .then(|| relative_ref(repo_root, &fallback).ok())
-                .flatten()
-        });
+    let signals_source_ref = persisted_contract.architecture_signals_ref.clone().or_else(|| {
+        let fallback = architecture_signals_artifact_path(contract_path);
+        fallback
+            .exists()
+            .then(|| relative_ref(repo_root, &fallback).ok())
+            .flatten()
+    });
     let brief_source_ref = persisted_contract
         .architecture_integrity
         .as_ref()
@@ -12555,9 +12579,7 @@ fn ok() {}
                 created_at: now_rfc3339(),
                 approved_at: Some(now_rfc3339()),
             },
-            architecture_signals_ref: Some(
-                ".punk/contracts/feat_1/architecture-signals.json".into(),
-            ),
+            architecture_signals_ref: Some(".punk/contracts/feat_1/architecture-signals.json".into()),
             architecture_integrity: Some(ContractArchitectureIntegrity {
                 review_required: true,
                 brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
@@ -12569,10 +12591,14 @@ fn ok() {}
         };
         write_json(&contract_path, &persisted_contract).unwrap();
 
-        let frozen_ref =
-            freeze_run_architecture_inputs(&root, &run_dir, &contract_path, &persisted_contract)
-                .unwrap()
-                .unwrap();
+        let frozen_ref = freeze_run_architecture_inputs(
+            &root,
+            &run_dir,
+            &contract_path,
+            &persisted_contract,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(frozen_ref, ".punk/runs/run_1/architecture-inputs.json");
 
         let frozen: FrozenArchitectureInputs =
@@ -12637,9 +12663,7 @@ fn ok() {}
                 created_at: now_rfc3339(),
                 approved_at: Some(now_rfc3339()),
             },
-            architecture_signals_ref: Some(
-                ".punk/contracts/feat_1/architecture-signals.json".into(),
-            ),
+            architecture_signals_ref: Some(".punk/contracts/feat_1/architecture-signals.json".into()),
             architecture_integrity: Some(ContractArchitectureIntegrity {
                 review_required: true,
                 brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
@@ -12651,10 +12675,14 @@ fn ok() {}
         };
         write_json(&contract_path, &persisted_contract).unwrap();
 
-        let frozen_ref =
-            freeze_run_architecture_inputs(&root, &run_dir, &contract_path, &persisted_contract)
-                .unwrap()
-                .unwrap();
+        let frozen_ref = freeze_run_architecture_inputs(
+            &root,
+            &run_dir,
+            &contract_path,
+            &persisted_contract,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(frozen_ref, ".punk/runs/run_1/architecture-inputs.json");
 
         let frozen: FrozenArchitectureInputs =

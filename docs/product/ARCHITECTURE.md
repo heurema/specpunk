@@ -234,9 +234,11 @@ That means:
 Current bounded progress:
 
 - `ProjectOverlay` now exposes derived `harness_summary`
+- `cut` now freezes the current harness packet plus file-based `artifact_assertion` inputs into run-scoped artifacts under `.punk/runs/<run-id>/...`
+- `gate` and `proof` now read harness evidence from those frozen run-scoped refs instead of the mutable live repo
 - the current proof step persists typed `command` evidence for existing `target` / `integrity` checks in `DecisionObject` and `Proofpack`
 - `Proofpack` now also persists `run_ref`, `workspace_lineage`, `executor_identity`, and an explicit `reproducibility_claim`
-- this still does **not** introduce a repo-local harness packet or non-command evidence execution
+- this still does **not** add a new public harness surface or expand beyond bounded file-based `artifact_assertion` execution
 
 See also:
 

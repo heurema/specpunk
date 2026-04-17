@@ -89,8 +89,8 @@ impl GateService {
         }
         let verification_context =
             resolve_verification_context(&self.repo_root, &run, &persisted_contract);
-        let declared_harness_evidence = load_declared_harness_evidence(&self.repo_root);
-        let harness = run_harness_recipes(&self.repo_root)?;
+        let declared_harness_evidence = load_declared_harness_evidence(&self.repo_root, &run.id);
+        let harness = run_harness_recipes(&self.repo_root, &run.id)?;
         let architecture = assess_architecture(
             &self.repo_root,
             &run,
@@ -561,6 +561,7 @@ fn load_frozen_architecture_inputs(
         }
     };
 
+    let event_store = EventStore::new(repo_root);
     let mut reasons = Vec::new();
     let mut reason_codes = Vec::new();
 
@@ -579,7 +580,6 @@ fn load_frozen_architecture_inputs(
         reason_codes.push("frozen_architecture_inputs_unavailable".to_string());
     }
 
-    let event_store = EventStore::new(repo_root);
     let mut signals = None;
     if let Some(source_ref) = manifest.signals_source_ref.as_ref() {
         let (Some(signals_ref), Some(signals_sha256)) = (
@@ -1189,8 +1189,23 @@ fn run_checks(
     })
 }
 
-fn load_declared_harness_evidence(repo_root: &Path) -> Vec<DeclaredHarnessEvidence> {
-    let harness_spec_path = repo_root.join(".punk/project/harness.json");
+fn frozen_harness_spec_path(repo_root: &Path, run_id: &str) -> PathBuf {
+    repo_root
+        .join(".punk/runs")
+        .join(run_id)
+        .join("harness-spec.json")
+}
+
+fn frozen_harness_artifact_path(repo_root: &Path, run_id: &str, path: &str) -> PathBuf {
+    repo_root
+        .join(".punk/runs")
+        .join(run_id)
+        .join("harness-artifacts")
+        .join(path)
+}
+
+fn load_declared_harness_evidence(repo_root: &Path, run_id: &str) -> Vec<DeclaredHarnessEvidence> {
+    let harness_spec_path = frozen_harness_spec_path(repo_root, run_id);
     if !harness_spec_path.exists() {
         return Vec::new();
     }
@@ -1235,18 +1250,30 @@ fn load_declared_harness_evidence(repo_root: &Path) -> Vec<DeclaredHarnessEviden
         .collect()
 }
 
-fn run_harness_recipes(repo_root: &Path) -> Result<HarnessRunSummary> {
-    let harness_spec_path = repo_root.join(".punk/project/harness.json");
+fn run_harness_recipes(repo_root: &Path, run_id: &str) -> Result<HarnessRunSummary> {
+    let harness_spec_path = frozen_harness_spec_path(repo_root, run_id);
     if !harness_spec_path.exists() {
         return Ok(HarnessRunSummary {
-            status: CheckStatus::Unverified,
-            reasons: Vec::new(),
+            status: CheckStatus::Fail,
+            reasons: vec![format!(
+                "frozen harness snapshot missing at {}",
+                harness_spec_path.display()
+            )],
             harness_evidence: Vec::new(),
         });
     }
-    let spec: serde_json::Value = read_json(&harness_spec_path)?;
+    let spec: serde_json::Value = match read_json(&harness_spec_path) {
+        Ok(spec) => spec,
+        Err(err) => {
+            return Ok(HarnessRunSummary {
+                status: CheckStatus::Fail,
+                reasons: vec![format!("unable to read frozen harness snapshot: {err}")],
+                harness_evidence: Vec::new(),
+            });
+        }
+    };
     let harness_ref = relative_ref(repo_root, &harness_spec_path)
-        .unwrap_or_else(|_| ".punk/project/harness.json".to_string());
+        .unwrap_or_else(|_| format!(".punk/runs/{run_id}/harness-spec.json"));
     let Some(profiles) = spec.get("profiles").and_then(|value| value.as_array()) else {
         return Ok(HarnessRunSummary {
             status: CheckStatus::Unverified,
@@ -1282,7 +1309,7 @@ fn run_harness_recipes(repo_root: &Path) -> Result<HarnessRunSummary> {
             };
             executed = true;
             let (status, summary, artifact_ref) =
-                run_artifact_assertion(repo_root, profile_name, path)?;
+                run_artifact_assertion(repo_root, run_id, profile_name, path)?;
             if status == CheckStatus::Fail {
                 failed = true;
             }
@@ -1313,6 +1340,7 @@ fn run_harness_recipes(repo_root: &Path) -> Result<HarnessRunSummary> {
 
 fn run_artifact_assertion(
     repo_root: &Path,
+    run_id: &str,
     profile_name: &str,
     path: &str,
 ) -> Result<(CheckStatus, String, Option<String>)> {
@@ -1325,18 +1353,22 @@ fn run_artifact_assertion(
             None,
         ));
     }
-    let artifact_path = repo_root.join(path);
+    let artifact_path = frozen_harness_artifact_path(repo_root, run_id, path);
     if artifact_path.exists() {
         let artifact_ref = relative_ref(repo_root, &artifact_path).ok();
         Ok((
             CheckStatus::Pass,
-            format!("artifact_assertion passed for profile {profile_name}: {path} exists"),
+            format!(
+                "artifact_assertion passed for profile {profile_name}: frozen snapshot captured {path}"
+            ),
             artifact_ref,
         ))
     } else {
         Ok((
             CheckStatus::Fail,
-            format!("artifact_assertion failed for profile {profile_name}: {path} is missing"),
+            format!(
+                "artifact_assertion failed for profile {profile_name}: frozen snapshot is missing {path}"
+            ),
             None,
         ))
     }
@@ -1410,6 +1442,16 @@ mod tests {
         capability_resolution_ref: Option<String>,
         capability_resolution_sha256: Option<String>,
     ) {
+        if !frozen_harness_spec_path(root, &run.id).exists() {
+            write_frozen_harness_snapshot(
+                root,
+                &run.id,
+                r#"{
+  "project_id": "test",
+  "profiles": []
+}"#,
+            );
+        }
         let workspace_root = PathBuf::from(&run.vcs.workspace_ref);
         if let Ok(backend) = detect_backend(&workspace_root) {
             run.vcs.backend = backend.kind();
@@ -1462,6 +1504,36 @@ mod tests {
             .join("verification-context.json");
         write_json(&context_path, &context).unwrap();
         run.verification_context_ref = Some(relative_ref(root, &context_path).unwrap());
+    }
+
+    fn write_frozen_harness_snapshot(root: &Path, run_id: &str, contents: &str) -> String {
+        let path = root
+            .join(".punk/runs")
+            .join(run_id)
+            .join("harness-spec.json");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, contents).unwrap();
+        relative_ref(root, &path).unwrap()
+    }
+
+    fn write_frozen_harness_artifact(
+        root: &Path,
+        run_id: &str,
+        path: &str,
+        contents: &str,
+    ) -> String {
+        let artifact_path = root
+            .join(".punk/runs")
+            .join(run_id)
+            .join("harness-artifacts")
+            .join(path);
+        if let Some(parent) = artifact_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&artifact_path, contents).unwrap();
+        relative_ref(root, &artifact_path).unwrap()
     }
 
     fn architecture_test_root(label: &str) -> (PathBuf, PathBuf) {
@@ -1662,7 +1734,12 @@ mod tests {
         write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
         let gate = GateService::new(&root, &global);
         let decision = gate.gate_run("run_1").unwrap();
-        assert_eq!(decision.decision, Decision::Block);
+        assert_eq!(
+            decision.decision,
+            Decision::Block,
+            "{:?}",
+            decision.decision_basis
+        );
         assert_eq!(decision.command_evidence.len(), 2);
         assert!(decision
             .command_evidence
@@ -1897,6 +1974,7 @@ mod tests {
         attach_verification_context(&root, &mut run, &["tracked.txt"]);
         run.architecture_inputs_ref = Some(freeze_architecture_inputs_for_run(&root, "run_1"));
         write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        fs::remove_file(root.join(".punk/runs/run_1/harness-spec.json")).unwrap();
 
         let gate = GateService::new(&root, &global);
         let decision = gate.gate_run("run_1").unwrap();
@@ -2199,12 +2277,7 @@ mod tests {
         fs::remove_file(root.join(".punk/contracts/feat_1/architecture-brief.md")).unwrap();
 
         let decision = GateService::new(&root, &global).gate_run("run_1").unwrap();
-        assert_eq!(
-            decision.decision,
-            Decision::Accept,
-            "{:?}",
-            decision.decision_basis
-        );
+        assert_eq!(decision.decision, Decision::Accept, "{:?}", decision.decision_basis);
         assert!(decision
             .check_refs
             .contains(&".punk/runs/run_1/architecture-inputs.json".to_string()));
@@ -2340,12 +2413,7 @@ mod tests {
         write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
 
         let decision = GateService::new(&root, &global).gate_run("run_1").unwrap();
-        assert_eq!(
-            decision.decision,
-            Decision::Block,
-            "{:?}",
-            decision.decision_basis
-        );
+        assert_eq!(decision.decision, Decision::Block, "{:?}", decision.decision_basis);
 
         let assessment: ArchitectureAssessment =
             read_json(&root.join(".punk/runs/run_1/architecture-assessment.json")).unwrap();
@@ -2353,10 +2421,9 @@ mod tests {
         assert!(assessment
             .reason_codes
             .contains(&"frozen_architecture_inputs_unavailable".to_string()));
-        assert!(assessment
-            .reasons
-            .iter()
-            .any(|reason| { reason.contains("frozen architecture signals snapshot missing") }));
+        assert!(assessment.reasons.iter().any(|reason| {
+            reason.contains("frozen architecture signals snapshot missing")
+        }));
         assert_eq!(
             assessment.brief_ref.as_deref(),
             Some(".punk/runs/run_1/architecture-brief.md")
@@ -2464,15 +2531,8 @@ mod tests {
         fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
         fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
         fs::create_dir_all(root.join(".punk/project")).unwrap();
-        fs::create_dir_all(root.join("artifacts")).unwrap();
         std::process::Command::new("git")
             .args(["init"])
-            .current_dir(&root)
-            .output()
-            .unwrap();
-        fs::write(root.join("artifacts/result.txt"), "ok\n").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "artifacts/result.txt"])
             .current_dir(&root)
             .output()
             .unwrap();
@@ -2489,8 +2549,9 @@ mod tests {
             .current_dir(&root)
             .output()
             .unwrap();
-        fs::write(
-            root.join(".punk/project/harness.json"),
+        let harness_ref = write_frozen_harness_snapshot(
+            &root,
+            "run_1",
             r#"{
   "project_id": "demo",
   "inspect_ready": true,
@@ -2516,8 +2577,9 @@ mod tests {
   "derivation_source": "repo_markers_v1",
   "updated_at": "2026-04-08T00:00:00Z"
 }"#,
-        )
-        .unwrap();
+        );
+        let artifact_ref =
+            write_frozen_harness_artifact(&root, "run_1", "artifacts/result.txt", "ok\n");
         let contract = Contract {
             id: "ct_1".into(),
             feature_id: "feat_1".into(),
@@ -2583,20 +2645,25 @@ mod tests {
         write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
         let gate = GateService::new(&root, &global);
         let decision = gate.gate_run("run_1").unwrap();
-        assert_eq!(decision.decision, Decision::Accept);
+        assert_eq!(
+            decision.decision,
+            Decision::Accept,
+            "{:?}",
+            decision.decision_basis
+        );
         assert_eq!(
             decision.declared_harness_evidence,
             vec![
                 DeclaredHarnessEvidence {
                     evidence_type: "log_query".into(),
                     profile: "default".into(),
-                    source_ref: Some(".punk/project/harness.json".into()),
+                    source_ref: Some(harness_ref.clone()),
                     summary: "declared harness surface log_query from profile default".into(),
                 },
                 DeclaredHarnessEvidence {
                     evidence_type: "ui_snapshot".into(),
                     profile: "default".into(),
-                    source_ref: Some(".punk/project/harness.json".into()),
+                    source_ref: Some(harness_ref.clone()),
                     summary: "declared harness surface ui_snapshot from profile default".into(),
                 },
             ]
@@ -2607,11 +2674,9 @@ mod tests {
                 evidence_type: "artifact_assertion".into(),
                 profile: "default".into(),
                 status: CheckStatus::Pass,
-                summary:
-                    "artifact_assertion passed for profile default: artifacts/result.txt exists"
-                        .into(),
-                source_ref: Some(".punk/project/harness.json".into()),
-                artifact_ref: Some("artifacts/result.txt".into()),
+                summary: "artifact_assertion passed for profile default: frozen snapshot captured artifacts/result.txt".into(),
+                source_ref: Some(harness_ref),
+                artifact_ref: Some(artifact_ref),
             }]
         );
         let _ = fs::remove_dir_all(&root);
@@ -2637,8 +2702,9 @@ mod tests {
             .current_dir(&root)
             .output()
             .unwrap();
-        fs::write(
-            root.join(".punk/project/harness.json"),
+        write_frozen_harness_snapshot(
+            &root,
+            "run_1",
             r#"{
   "project_id": "demo",
   "profiles": [
@@ -2654,8 +2720,7 @@ mod tests {
     }
   ]
 }"#,
-        )
-        .unwrap();
+        );
         let contract = Contract {
             id: "ct_1".into(),
             feature_id: "feat_1".into(),
@@ -2726,9 +2791,358 @@ mod tests {
         assert_eq!(decision.harness_evidence[0].status, CheckStatus::Fail);
         assert!(decision.decision_basis.iter().any(|reason| {
             reason.contains(
-                "artifact_assertion failed for profile default: artifacts/missing.txt is missing",
+                "artifact_assertion failed for profile default: frozen snapshot is missing artifacts/missing.txt",
             )
         }));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gate_uses_frozen_harness_snapshot_even_if_live_repo_changes_after_cut() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-harness-frozen-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let workspace = root.join("isolated-workspace");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/project")).unwrap();
+        fs::create_dir_all(root.join("artifacts")).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        fs::write(workspace.join("tracked.txt"), "before\n").unwrap();
+        fs::write(root.join("artifacts/result.txt"), "live-before\n").unwrap();
+        fs::write(
+            root.join(".punk/project/harness.json"),
+            r#"{
+  "project_id": "demo",
+  "profiles": [
+    {
+      "name": "live",
+      "validation_surfaces": ["command"],
+      "validation_recipes": [
+        {
+          "kind": "artifact_assertion",
+          "path": "artifacts/live-only.txt"
+        }
+      ]
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "baseline",
+            ])
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        fs::write(workspace.join("tracked.txt"), "after\n").unwrap();
+        let harness_ref = write_frozen_harness_snapshot(
+            &root,
+            "run_1",
+            r#"{
+  "project_id": "demo",
+  "profiles": [
+    {
+      "name": "default",
+      "validation_surfaces": ["command", "log_query"],
+      "validation_recipes": [
+        {
+          "kind": "artifact_assertion",
+          "path": "artifacts/result.txt"
+        }
+      ]
+    }
+  ]
+}"#,
+        );
+        let artifact_ref =
+            write_frozen_harness_artifact(&root, "run_1", "artifacts/result.txt", "frozen\n");
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "x".into(),
+            entry_points: vec!["tracked.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["tracked.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
+        let mut run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: workspace.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            architecture_inputs_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "success".into(),
+            executor_name: "fake".into(),
+            changed_files: vec!["tracked.txt".into()],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec![],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "done".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        attach_verification_context(&root, &mut run, &["tracked.txt"]);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+
+        fs::write(
+            root.join(".punk/project/harness.json"),
+            r#"{
+  "project_id": "demo",
+  "profiles": [
+    {
+      "name": "mutated",
+      "validation_surfaces": ["command", "ui_snapshot"],
+      "validation_recipes": [
+        {
+          "kind": "artifact_assertion",
+          "path": "artifacts/mutated.txt"
+        }
+      ]
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        fs::remove_file(root.join("artifacts/result.txt")).unwrap();
+        fs::write(root.join("artifacts/mutated.txt"), "live-after\n").unwrap();
+
+        let gate = GateService::new(&root, &global);
+        let decision = gate.gate_run("run_1").unwrap();
+
+        assert_eq!(
+            decision.decision,
+            Decision::Accept,
+            "{:?}",
+            decision.decision_basis
+        );
+        assert_eq!(
+            decision.declared_harness_evidence,
+            vec![DeclaredHarnessEvidence {
+                evidence_type: "log_query".into(),
+                profile: "default".into(),
+                source_ref: Some(harness_ref.clone()),
+                summary: "declared harness surface log_query from profile default".into(),
+            }]
+        );
+        assert_eq!(
+            decision.harness_evidence,
+            vec![HarnessEvidence {
+                evidence_type: "artifact_assertion".into(),
+                profile: "default".into(),
+                status: CheckStatus::Pass,
+                summary: "artifact_assertion passed for profile default: frozen snapshot captured artifacts/result.txt".into(),
+                source_ref: Some(harness_ref),
+                artifact_ref: Some(artifact_ref),
+            }]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gate_blocks_when_frozen_harness_snapshot_is_missing_even_if_live_repo_packet_exists() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-gate-harness-missing-snapshot-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/project")).unwrap();
+        fs::create_dir_all(root.join("artifacts")).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join("tracked.txt"), "before\n").unwrap();
+        fs::write(root.join("artifacts/result.txt"), "live\n").unwrap();
+        fs::write(
+            root.join(".punk/project/harness.json"),
+            r#"{
+  "project_id": "demo",
+  "profiles": [
+    {
+      "name": "live",
+      "validation_surfaces": ["command"],
+      "validation_recipes": [
+        {
+          "kind": "artifact_assertion",
+          "path": "artifacts/result.txt"
+        }
+      ]
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "add",
+                "tracked.txt",
+                "artifacts/result.txt",
+                ".punk/project/harness.json",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=Punk Test",
+                "-c",
+                "user.email=punk@example.com",
+                "commit",
+                "-m",
+                "baseline",
+            ])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        fs::write(root.join("tracked.txt"), "after\n").unwrap();
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "x".into(),
+            entry_points: vec!["tracked.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["tracked.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "low".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/contracts/feat_1/v1.json"), &contract).unwrap();
+        let mut run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            architecture_inputs_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        let receipt = Receipt {
+            id: "rcpt_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            status: "success".into(),
+            executor_name: "fake".into(),
+            changed_files: vec!["tracked.txt".into()],
+            artifacts: ReceiptArtifacts {
+                stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+            },
+            checks_run: vec![],
+            duration_ms: 1,
+            cost_usd: None,
+            summary: "done".into(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
+        attach_verification_context(&root, &mut run, &["tracked.txt"]);
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        fs::remove_file(root.join(".punk/runs/run_1/harness-spec.json")).unwrap();
+
+        let gate = GateService::new(&root, &global);
+        let decision = gate.gate_run("run_1").unwrap();
+
+        assert_eq!(
+            decision.decision,
+            Decision::Block,
+            "{:?}",
+            decision.decision_basis
+        );
+        assert!(
+            decision
+                .decision_basis
+                .iter()
+                .any(|reason| reason.contains("frozen harness snapshot missing")),
+            "{:?}",
+            decision.decision_basis
+        );
+        assert!(decision.harness_evidence.is_empty());
+        assert!(decision.declared_harness_evidence.is_empty());
+
         let _ = fs::remove_dir_all(&root);
     }
 

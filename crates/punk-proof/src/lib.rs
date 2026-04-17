@@ -98,6 +98,14 @@ impl ProofService {
                 }
             }
         }
+        for evidence in &decision.declared_harness_evidence {
+            if let Some(source_ref) = &evidence.source_ref {
+                hashes.insert(
+                    source_ref.clone(),
+                    self.events.file_sha256(self.repo_root.join(source_ref))?,
+                );
+            }
+        }
         for evidence in &decision.harness_evidence {
             if let Some(source_ref) = &evidence.source_ref {
                 hashes.insert(
@@ -248,8 +256,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
         fs::create_dir_all(root.join(".punk/runs/run_1/checks")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1/harness-artifacts")).unwrap();
         fs::create_dir_all(root.join(".punk/decisions")).unwrap();
-        fs::create_dir_all(root.join(".punk/project")).unwrap();
         fs::write(
             root.join("Cargo.toml"),
             "[package]\nname='demo'\nversion='0.1.0'\n",
@@ -266,8 +274,13 @@ mod tests {
             "",
         )
         .unwrap();
-        fs::write(root.join(".punk/project/harness.json"), "{ }\n").unwrap();
-        fs::write(root.join("tracked.txt"), "ok\n").unwrap();
+        fs::write(root.join(".punk/runs/run_1/harness-spec.json"), "{ }\n").unwrap();
+        fs::write(
+            root.join(".punk/runs/run_1/harness-artifacts/tracked.txt"),
+            "ok\n",
+        )
+        .unwrap();
+        fs::write(root.join("tracked.txt"), "live-ok\n").unwrap();
         fs::write(
             root.join(".punk/contracts/feat_1/capability-resolution.json"),
             "{ \"schema\": \"specpunk/contract-capability-resolution/v1\" }\n",
@@ -375,16 +388,16 @@ mod tests {
             declared_harness_evidence: vec![DeclaredHarnessEvidence {
                 evidence_type: "log_query".into(),
                 profile: "default".into(),
-                source_ref: Some(".punk/project/harness.json".into()),
+                source_ref: Some(".punk/runs/run_1/harness-spec.json".into()),
                 summary: "declared harness surface log_query from profile default".into(),
             }],
             harness_evidence: vec![HarnessEvidence {
                 evidence_type: "artifact_assertion".into(),
                 profile: "default".into(),
                 status: CheckStatus::Pass,
-                summary: "artifact_assertion passed for profile default: tracked.txt exists".into(),
-                source_ref: Some(".punk/project/harness.json".into()),
-                artifact_ref: Some("tracked.txt".into()),
+                summary: "artifact_assertion passed for profile default: frozen snapshot captured tracked.txt".into(),
+                source_ref: Some(".punk/runs/run_1/harness-spec.json".into()),
+                artifact_ref: Some(".punk/runs/run_1/harness-artifacts/tracked.txt".into()),
             }],
             created_at: now_rfc3339(),
         };
@@ -441,8 +454,12 @@ mod tests {
         assert!(proofpack
             .hashes
             .contains_key(".punk/contracts/feat_1/capability-resolution.json"));
-        assert!(proofpack.hashes.contains_key(".punk/project/harness.json"));
-        assert!(proofpack.hashes.contains_key("tracked.txt"));
+        assert!(proofpack
+            .hashes
+            .contains_key(".punk/runs/run_1/harness-spec.json"));
+        assert!(proofpack
+            .hashes
+            .contains_key(".punk/runs/run_1/harness-artifacts/tracked.txt"));
 
         std::thread::sleep(std::time::Duration::from_millis(5));
         let replayed = service.write_proofpack("dec_1").unwrap();
@@ -458,6 +475,87 @@ mod tests {
             normalized_proofpack_value(&replayed),
             normalized_proofpack_value(&persisted)
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn proofpack_hashes_declared_harness_source_without_recipe_evidence() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "punk-proof-declared-harness-{}-{suffix}",
+            std::process::id()
+        ));
+        let global = root.join("global");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".punk/contracts/feat_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/runs/run_1")).unwrap();
+        fs::create_dir_all(root.join(".punk/decisions")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join(".punk/contracts/feat_1/v1.json"), "{}\n").unwrap();
+        fs::write(root.join(".punk/runs/run_1/harness-spec.json"), "{ }\n").unwrap();
+        write_json(
+            &root.join(".punk/runs/run_1/receipt.json"),
+            &Receipt {
+                id: "rcpt_1".into(),
+                run_id: "run_1".into(),
+                task_id: "task_1".into(),
+                status: "success".into(),
+                executor_name: "fake-executor".into(),
+                changed_files: vec![],
+                artifacts: ReceiptArtifacts {
+                    stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                    stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+                },
+                checks_run: Vec::new(),
+                duration_ms: 1,
+                cost_usd: None,
+                summary: "ok".into(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .unwrap();
+        let decision = DecisionObject {
+            id: "dec_1".into(),
+            run_id: "run_1".into(),
+            contract_id: "ct_1".into(),
+            decision: Decision::Accept,
+            deterministic_status: DeterministicStatus::Pass,
+            target_status: CheckStatus::Pass,
+            integrity_status: CheckStatus::Pass,
+            confidence_estimate: 1.0,
+            decision_basis: vec!["ok".into()],
+            contract_ref: ".punk/contracts/feat_1/v1.json".into(),
+            receipt_ref: ".punk/runs/run_1/receipt.json".into(),
+            check_refs: Vec::new(),
+            verification_context_ref: None,
+            verification_context_identity: None,
+            command_evidence: Vec::new(),
+            declared_harness_evidence: vec![DeclaredHarnessEvidence {
+                evidence_type: "log_query".into(),
+                profile: "default".into(),
+                source_ref: Some(".punk/runs/run_1/harness-spec.json".into()),
+                summary: "declared harness surface log_query from profile default".into(),
+            }],
+            harness_evidence: Vec::new(),
+            created_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/decisions/dec_1.json"), &decision).unwrap();
+
+        let proofpack = ProofService::new(&root, &global)
+            .write_proofpack("dec_1")
+            .unwrap();
+
+        assert!(proofpack
+            .hashes
+            .contains_key(".punk/runs/run_1/harness-spec.json"));
 
         let _ = fs::remove_dir_all(&root);
     }
