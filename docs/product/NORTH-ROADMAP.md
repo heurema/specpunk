@@ -73,6 +73,8 @@ Recommended order unless a production bug forces reprioritization:
 ## Current operator-shell note
 
 - Goal-intake commands such as `punk start` and `punk go --fallback-staged` should fail early with one explicit recovery path when the workspace is not VCS-backed, instead of surfacing late repo-scan or adapter errors.
+- When `punk` blocks or escalates for deterministic runtime-style reasons while operating inside another repo, the shell should emit one explicit incident path: capture locally first (`punk incident capture <proof-id>`), then optionally promote into the upstream `specpunk` repo with `punk incident promote <incident-id> --repo <path>`. If the operator explicitly opts in with `--auto-run`, that upstream promotion may continue through approve/execute/gate/proof inside the target repo and write those refs back onto `prom_<id>`, but only when the effective promote target matches deterministic local `specpunk` markers; otherwise the lane should stay draft-only. Failed internal attempts should also leave durable attempt/failure metadata on `prom_<id>` so retry can use `punk incident rerun <promotion-id> --auto-run` without relying on shell history. Repeated upstream targets should be configurable with explicit precedence: CLI flag first, then repo-local incident defaults, then operator-wide global defaults.
+- External GitHub submission now exists as an explicit opt-in lane: `punk incident submit <incident-id> --github owner/repo` prepares a sanitized bundle first, and `--publish` is the only step that actually talks to GitHub.
 
 ## Cross-cutting harness note
 

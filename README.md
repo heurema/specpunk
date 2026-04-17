@@ -184,6 +184,44 @@ If the first accepted cycle only proves a controller-created bootstrap scaffold 
 
 If autonomy blocks or escalates, `punk` prepares a staged recovery contract and returns a non-zero exit.
 
+If the blocked or escalated proof looks like a `punk` runtime failure rather than a normal project check failure, the shell may also suggest:
+
+```bash
+punk incident capture <proof-id>
+punk inspect inc_<id>
+punk inspect inc_<id> --json
+punk incident promote <incident-id> --repo /path/to/specpunk
+punk incident promote <incident-id> --auto-run   # uses default --repo when configured
+punk inspect prom_<id>
+punk inspect prom_<id> --json
+punk incident defaults --repo /path/to/specpunk --github owner/repo
+punk incident defaults
+punk incident defaults --global
+punk incident defaults --global --repo /path/to/specpunk --github owner/repo
+punk incident promote <incident-id>         # uses default --repo when configured
+punk incident submit <incident-id>          # uses default --github when configured
+punk incident submit <incident-id> --publish
+punk incident rerun <promotion-id> --auto-run
+punk incident resubmit <submission-id> --publish
+punk inspect sub_<id>
+punk inspect sub_<id> --json
+```
+
+The current incident lane has three bounded slices:
+
+- repo-local capture freezes an inspectable bundle under `.punk/incidents/`
+- internal promote copies that bundle into another `punk` repo, drafts an inspectable upstream contract there, records the handoff under `.punk/promotions/`, and can explicitly continue with `--auto-run`
+- external submit prepares a sanitized GitHub issue bundle under `.punk/submissions/` and only publishes when `--publish` is passed explicitly
+
+Current GitHub publish uses `gh`, so missing auth should still leave an inspectable `sub_<id>` bundle even when publication fails.
+If publish fails after prepare, retry the same submission bundle with `punk incident resubmit <submission-id> --publish` instead of generating a new issue body snapshot.
+You can avoid repeating `--repo` / `--github` by configuring repo-local incident defaults under `.punk/project/incident-defaults.json` via `punk incident defaults`, or operator-wide defaults under `~/.punk/config/incident-defaults.json` via `punk incident defaults --global`.
+Resolution precedence is: explicit flag > repo-local default > global default.
+`punk incident capture` / `punk inspect inc_<id>` now surface the effective promote target, whether auto-run is eligible, and a setup hint when no promote target is configured.
+`punk incident promote --auto-run` is still explicit opt-in; when used it auto-approves the drafted upstream contract, runs it, gates it, writes a proof, and stores that execution snapshot back onto the promotion record.
+Auto-run is only suggested and permitted when the effective promote target looks like a local `specpunk` repo by deterministic markers (`Cargo.toml`, `crates/punk-cli/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`). Otherwise the lane stays draft-only.
+If that internal auto-run fails before it reaches a proof, the promotion record now keeps the last failed phase plus any partial run/receipt/decision refs; retry the same promotion with `punk incident rerun <promotion-id> --auto-run` instead of creating a new promotion bundle.
+
 The intended operator experience is:
 
 - plain goal in

@@ -5,12 +5,15 @@ use std::process::Command as ProcessCommand;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use punk_adapters::{CodexCliContractDrafter, CodexCliExecutor};
-use punk_domain::Project;
+use punk_adapters::{CodexCliContractDrafter, CodexCliExecutor, Executor};
+use punk_domain::{
+    now_rfc3339, IncidentPromotionExecution, IncidentPromotionFailure, IncidentPromotionRecord,
+    Project,
+};
 use punk_gate::GateService;
 use punk_orch::{
-    project_id as runtime_project_id, read_json, relative_ref, write_json, ArchitectureMode,
-    OrchService,
+    project_id as runtime_project_id, read_json, relative_ref,
+    suspected_runtime_bug_reasons_for_decision, write_json, ArchitectureMode, OrchService,
 };
 use punk_proof::ProofService;
 use punk_vcs::{
@@ -35,6 +38,7 @@ enum Command {
     Go(GoCommand),
     Start(StartCommand),
     Research(ResearchCommand),
+    Incident(IncidentCommand),
     Plot(PlotCommand),
     Cut(CutCommand),
     Gate(GateCommand),
@@ -74,6 +78,12 @@ struct StartCommand {
 struct ResearchCommand {
     #[command(subcommand)]
     action: ResearchAction,
+}
+
+#[derive(Args)]
+struct IncidentCommand {
+    #[command(subcommand)]
+    action: IncidentAction,
 }
 
 #[derive(Subcommand)]
@@ -146,6 +156,57 @@ enum ResearchAction {
     },
     Escalate {
         research_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum IncidentAction {
+    Capture {
+        proof_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Promote {
+        incident_id: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long = "auto-run")]
+        auto_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Rerun {
+        promotion_id: String,
+        #[arg(long = "auto-run")]
+        auto_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Submit {
+        incident_id: String,
+        #[arg(long = "github")]
+        github_repo: Option<String>,
+        #[arg(long)]
+        publish: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Resubmit {
+        submission_id: String,
+        #[arg(long)]
+        publish: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Defaults {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long = "github")]
+        github_repo: Option<String>,
+        #[arg(long)]
+        global: bool,
         #[arg(long)]
         json: bool,
     },
@@ -401,6 +462,167 @@ fn run() -> Result<()> {
                 render(json, &view, &format_research_summary(&view))
             }
         },
+        Command::Incident(incident) => match incident.action {
+            IncidentAction::Capture { proof_id, json } => {
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let incident = orch.capture_incident(&proof_id)?;
+                let next_actions = if json {
+                    None
+                } else {
+                    Some(derive_incident_next_actions(&orch, &incident)?)
+                };
+                render(
+                    json,
+                    &incident,
+                    &format_incident_summary(&incident, next_actions.as_ref()),
+                )
+            }
+            IncidentAction::Promote {
+                incident_id,
+                repo,
+                auto_run,
+                json,
+            } => {
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let drafter = CodexCliContractDrafter::default();
+                let target_repo = resolve_incident_promote_repo(&orch, repo.as_deref())?;
+                let promotion = orch.promote_incident(&drafter, &incident_id, &target_repo)?;
+                if auto_run {
+                    let executor = CodexCliExecutor::default();
+                    let auto_run = auto_run_existing_incident_promotion(
+                        &orch,
+                        &global_root,
+                        &executor,
+                        &promotion,
+                    )?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&auto_run.promotion)?);
+                    } else {
+                        let policy = inspect_incident_auto_run_policy(Path::new(
+                            &auto_run.promotion.target_repo_root,
+                        ));
+                        println!(
+                            "{}",
+                            format_incident_promotion_summary(&auto_run.promotion, Some(&policy),)
+                        );
+                    }
+                    if go_decision_succeeds(&auto_run.decision.decision) {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(format_incident_auto_run_error(
+                            &auto_run.promotion,
+                            &auto_run.proof.id,
+                            &auto_run.decision.decision,
+                        )))
+                    }
+                } else {
+                    let policy =
+                        inspect_incident_auto_run_policy(Path::new(&promotion.target_repo_root));
+                    render(
+                        json,
+                        &promotion,
+                        &format_incident_promotion_summary(&promotion, Some(&policy)),
+                    )
+                }
+            }
+            IncidentAction::Rerun {
+                promotion_id,
+                auto_run,
+                json,
+            } => {
+                if !auto_run {
+                    return Err(anyhow!(
+                        "incident rerun requires --auto-run to avoid silently rerunning the target contract"
+                    ));
+                }
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let executor = CodexCliExecutor::default();
+                let promotion = orch.inspect_incident_promotion(&promotion_id)?;
+                let auto_run = auto_run_existing_incident_promotion(
+                    &orch,
+                    &global_root,
+                    &executor,
+                    &promotion,
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&auto_run.promotion)?);
+                } else {
+                    let policy = inspect_incident_auto_run_policy(Path::new(
+                        &auto_run.promotion.target_repo_root,
+                    ));
+                    println!(
+                        "{}",
+                        format_incident_promotion_summary(&auto_run.promotion, Some(&policy))
+                    );
+                }
+                if go_decision_succeeds(&auto_run.decision.decision) {
+                    Ok(())
+                } else {
+                    Err(anyhow!(format_incident_auto_run_error(
+                        &auto_run.promotion,
+                        &auto_run.proof.id,
+                        &auto_run.decision.decision,
+                    )))
+                }
+            }
+            IncidentAction::Submit {
+                incident_id,
+                github_repo,
+                publish,
+                json,
+            } => {
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let github_repo = resolve_incident_submit_repo(&orch, github_repo.as_deref())?;
+                let submission = orch.submit_incident(&incident_id, &github_repo, publish)?;
+                render(
+                    json,
+                    &submission,
+                    &format_incident_submission_summary(&submission),
+                )
+            }
+            IncidentAction::Resubmit {
+                submission_id,
+                publish,
+                json,
+            } => {
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let submission = orch.resubmit_incident_submission(&submission_id, publish)?;
+                render(
+                    json,
+                    &submission,
+                    &format_incident_submission_summary(&submission),
+                )
+            }
+            IncidentAction::Defaults {
+                repo,
+                github_repo,
+                global,
+                json,
+            } => {
+                let orch = OrchService::new(&repo_root, &global_root)?;
+                let defaults = if repo.is_some() || github_repo.is_some() {
+                    if global {
+                        orch.set_global_incident_defaults(repo.as_deref(), github_repo.as_deref())?
+                    } else {
+                        orch.set_incident_defaults(repo.as_deref(), github_repo.as_deref())?
+                    }
+                } else if global {
+                    orch.inspect_global_incident_defaults()?
+                } else {
+                    orch.inspect_incident_defaults()?
+                };
+                let label = if global {
+                    "Global incident defaults"
+                } else {
+                    "Incident defaults"
+                };
+                render(
+                    json,
+                    &defaults,
+                    &format_incident_defaults_summary(label, &defaults),
+                )
+            }
+        },
         Command::Plot(plot) => match plot.action {
             PlotAction::Contract {
                 prompt,
@@ -551,13 +773,40 @@ fn run() -> Result<()> {
                 let proof = orch.inspect_proofpack(&inspect.target)?;
                 return render(false, &proof, &format_proofpack_summary(&proof));
             }
+            if !inspect.json && inspect.id.is_none() && inspect.target.starts_with("inc_") {
+                let incident = orch.inspect_incident(&inspect.target)?;
+                let next_actions = derive_incident_next_actions(&orch, &incident)?;
+                return render(
+                    false,
+                    &incident,
+                    &format_incident_summary(&incident, Some(&next_actions)),
+                );
+            }
+            if !inspect.json && inspect.id.is_none() && inspect.target.starts_with("prom_") {
+                let promotion = orch.inspect_incident_promotion(&inspect.target)?;
+                let policy =
+                    inspect_incident_auto_run_policy(Path::new(&promotion.target_repo_root));
+                return render(
+                    false,
+                    &promotion,
+                    &format_incident_promotion_summary(&promotion, Some(&policy)),
+                );
+            }
+            if !inspect.json && inspect.id.is_none() && inspect.target.starts_with("sub_") {
+                let submission = orch.inspect_incident_submission(&inspect.target)?;
+                return render(
+                    false,
+                    &submission,
+                    &format_incident_submission_summary(&submission),
+                );
+            }
             if inspect.id.is_none() && inspect.target.starts_with("research_") {
                 let research = orch.inspect_research(&inspect.target)?;
                 return render(inspect.json, &research, &format_research_summary(&research));
             }
             if !inspect.json || inspect.id.is_some() {
                 return Err(anyhow!(
-                    "inspect for object ids currently requires `punk inspect <id> --json`; only `proof_<id>` and `research_<id>` currently support human inspect output. Use `punk inspect project` or `punk inspect work [id]` for human inspect views"
+                    "inspect for object ids currently requires `punk inspect <id> --json`; only `proof_<id>`, `inc_<id>`, `prom_<id>`, `sub_<id>`, and `research_<id>` currently support human inspect output. Use `punk inspect project` or `punk inspect work [id]` for human inspect views"
                 ));
             }
             let value = orch.inspect(&inspect.target)?;
@@ -884,6 +1133,24 @@ fn bootstrap_json_mode(command: &Command) -> Option<bool> {
         }) => Some(*json),
         Command::Research(ResearchCommand {
             action: ResearchAction::Escalate { json, .. },
+        }) => Some(*json),
+        Command::Incident(IncidentCommand {
+            action: IncidentAction::Capture { json, .. },
+        }) => Some(*json),
+        Command::Incident(IncidentCommand {
+            action: IncidentAction::Promote { json, .. },
+        }) => Some(*json),
+        Command::Incident(IncidentCommand {
+            action: IncidentAction::Rerun { json, .. },
+        }) => Some(*json),
+        Command::Incident(IncidentCommand {
+            action: IncidentAction::Submit { json, .. },
+        }) => Some(*json),
+        Command::Incident(IncidentCommand {
+            action: IncidentAction::Resubmit { json, .. },
+        }) => Some(*json),
+        Command::Incident(IncidentCommand {
+            action: IncidentAction::Defaults { json, .. },
         }) => Some(*json),
         _ => None,
     }
@@ -1354,6 +1621,14 @@ fn cmd_go(
     let status = orch.status(Some(&final_cycle.run.id))?;
     let project = infer_project_id(&project_root).unwrap_or_else(|| status.project_id.clone());
     let next_command = format!("punk inspect {} --json", final_cycle.proof.id);
+    let incident_capture_command = {
+        let reasons = suspected_runtime_bug_reasons_for_decision(
+            Some(final_cycle.receipt.summary.as_str()),
+            &final_cycle.decision.decision_basis,
+            &final_cycle.decision.decision,
+        );
+        (!reasons.is_empty()).then(|| format!("punk incident capture {}", final_cycle.proof.id))
+    };
     let auto_chain_note = follow_up_cycle.as_ref().map(|cycle| {
         format!(
             "bootstrap proof {} triggered follow-up implementation cycle {}",
@@ -1392,6 +1667,7 @@ fn cmd_go(
                 "recovery_command": recovery_command,
                 "recovery_contract": staged_recovery,
                 "recovery_next_command": recovery_next_command,
+                "incident_capture_command": incident_capture_command,
                 "auto_chain_note": auto_chain_note,
                 "follow_up": next_command,
             }))?
@@ -1417,6 +1693,7 @@ fn cmd_go(
                     .as_ref()
                     .map(|contract| contract.id.as_str()),
                 recovery_next_command.as_deref(),
+                incident_capture_command.as_deref(),
             )
         );
     }
@@ -1440,6 +1717,37 @@ struct GoCycleResult {
     proof: punk_domain::Proofpack,
 }
 
+#[derive(Debug)]
+struct IncidentPromotionAutoRunResult {
+    promotion: IncidentPromotionRecord,
+    decision: punk_domain::DecisionObject,
+    proof: punk_domain::Proofpack,
+}
+
+struct IncidentPromotionAttemptError {
+    phase: &'static str,
+    error: anyhow::Error,
+    contract_status: Option<String>,
+    run_id: Option<String>,
+    receipt_ref: Option<String>,
+    decision_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IncidentAutoRunPolicy {
+    allowed: bool,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct IncidentNextActions {
+    promote_target: Option<String>,
+    promote_command: Option<String>,
+    auto_run_policy: Option<String>,
+    auto_run_command: Option<String>,
+    setup_hint: Option<String>,
+}
+
 fn run_go_cycle(
     orch: &OrchService,
     drafter: &CodexCliContractDrafter,
@@ -1460,6 +1768,170 @@ fn run_go_cycle(
         decision,
         proof,
     })
+}
+
+fn attempt_incident_promotion_auto_run(
+    source_orch: &OrchService,
+    global_root: &Path,
+    executor: &dyn Executor,
+    promotion: IncidentPromotionRecord,
+) -> std::result::Result<IncidentPromotionAutoRunResult, IncidentPromotionAttemptError> {
+    let target_repo_root = PathBuf::from(&promotion.target_repo_root);
+    let target_orch = OrchService::new(&target_repo_root, global_root).map_err(|error| {
+        IncidentPromotionAttemptError {
+            phase: "target_repo_init",
+            error,
+            contract_status: None,
+            run_id: None,
+            receipt_ref: None,
+            decision_id: None,
+        }
+    })?;
+    let approved =
+        ensure_incident_promotion_contract_ready(&target_orch, &promotion.draft_contract_id)
+            .map_err(|error| IncidentPromotionAttemptError {
+                phase: "contract_ready",
+                error,
+                contract_status: target_orch
+                    .inspect_contract(&promotion.draft_contract_id)
+                    .ok()
+                    .map(|contract| format_contract_status_label(&contract.status).to_string()),
+                run_id: None,
+                receipt_ref: None,
+                decision_id: None,
+            })?;
+    let (run, receipt) = target_orch
+        .cut_run(executor, &approved.id)
+        .map_err(|error| IncidentPromotionAttemptError {
+            phase: "cut_run",
+            error,
+            contract_status: Some(format_contract_status_label(&approved.status).to_string()),
+            run_id: None,
+            receipt_ref: None,
+            decision_id: None,
+        })?;
+    let gate = GateService::new(&target_repo_root, global_root);
+    let decision = gate
+        .gate_run(&run.id)
+        .map_err(|error| IncidentPromotionAttemptError {
+            phase: "gate_run",
+            error,
+            contract_status: Some(format_contract_status_label(&approved.status).to_string()),
+            run_id: Some(run.id.clone()),
+            receipt_ref: Some(format!(".punk/runs/{}/receipt.json", run.id)),
+            decision_id: None,
+        })?;
+    let proof_service = ProofService::new(&target_repo_root, global_root);
+    let proof = proof_service
+        .write_proofpack(&decision.id)
+        .map_err(|error| IncidentPromotionAttemptError {
+            phase: "proof_write",
+            error,
+            contract_status: Some(format_contract_status_label(&approved.status).to_string()),
+            run_id: Some(run.id.clone()),
+            receipt_ref: Some(decision.receipt_ref.clone()),
+            decision_id: Some(decision.id.clone()),
+        })?;
+    let execution = IncidentPromotionExecution {
+        run_id: run.id.clone(),
+        receipt_ref: decision.receipt_ref.clone(),
+        decision_id: decision.id.clone(),
+        proof_id: proof.id.clone(),
+        decision_outcome: decision_label(&decision.decision).to_string(),
+        receipt_summary: receipt.summary.clone(),
+        completed_at: now_rfc3339(),
+    };
+    let promotion = source_orch
+        .record_incident_promotion_execution(&promotion.id, execution)
+        .map_err(|error| IncidentPromotionAttemptError {
+            phase: "promotion_record_update",
+            error,
+            contract_status: Some(format_contract_status_label(&approved.status).to_string()),
+            run_id: Some(run.id.clone()),
+            receipt_ref: Some(decision.receipt_ref.clone()),
+            decision_id: Some(decision.id.clone()),
+        })?;
+    Ok(IncidentPromotionAutoRunResult {
+        promotion,
+        decision,
+        proof,
+    })
+}
+
+fn auto_run_existing_incident_promotion(
+    source_orch: &OrchService,
+    global_root: &Path,
+    executor: &dyn Executor,
+    promotion: &IncidentPromotionRecord,
+) -> Result<IncidentPromotionAutoRunResult> {
+    if promotion.execution.is_some() {
+        return Err(anyhow!(
+            "promotion {} already has a completed execution; inspect it before rerunning",
+            promotion.id
+        ));
+    }
+    let policy = ensure_incident_promotion_auto_run_allowed(promotion)?;
+    match attempt_incident_promotion_auto_run(source_orch, global_root, executor, promotion.clone())
+    {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let failure = IncidentPromotionFailure {
+                phase: error.phase.to_string(),
+                summary: error.error.to_string(),
+                contract_status: error.contract_status.clone(),
+                run_id: error.run_id.clone(),
+                receipt_ref: error.receipt_ref.clone(),
+                decision_id: error.decision_id.clone(),
+                failed_at: now_rfc3339(),
+            };
+            match source_orch.record_incident_promotion_failure(&promotion.id, failure) {
+                Ok(updated) => Err(anyhow!(format_incident_auto_run_failure(
+                    &updated,
+                    error.error.as_ref(),
+                ))),
+                Err(record_error) => Err(anyhow!(
+                    "{} Additional persistence error: {}",
+                    format_incident_auto_run_failure_with_policy(
+                        promotion,
+                        error.error.as_ref(),
+                        &policy,
+                    ),
+                    record_error
+                )),
+            }
+        }
+    }
+}
+
+fn ensure_incident_promotion_auto_run_allowed(
+    promotion: &IncidentPromotionRecord,
+) -> Result<IncidentAutoRunPolicy> {
+    let policy = inspect_incident_auto_run_policy(Path::new(&promotion.target_repo_root));
+    if policy.allowed {
+        Ok(policy)
+    } else {
+        Err(anyhow!(format_incident_auto_run_policy_error(
+            promotion, &policy
+        )))
+    }
+}
+
+fn ensure_incident_promotion_contract_ready(
+    target_orch: &OrchService,
+    contract_id: &str,
+) -> Result<punk_domain::Contract> {
+    let contract = target_orch.inspect_contract(contract_id)?;
+    match contract.status {
+        punk_domain::ContractStatus::Draft => target_orch.approve_contract(contract_id),
+        punk_domain::ContractStatus::Approved => Ok(contract),
+        punk_domain::ContractStatus::Superseded | punk_domain::ContractStatus::Cancelled => {
+            Err(anyhow!(
+                "promotion contract {} is no longer runnable because it is {}",
+                contract_id,
+                format_contract_status_label(&contract.status)
+            ))
+        }
+    }
 }
 
 fn should_auto_chain_after_bootstrap(goal: &str, cycle: &GoCycleResult) -> bool {
@@ -1650,6 +2122,7 @@ fn format_go_summary(
     recovery_command: Option<&str>,
     recovery_contract_id: Option<&str>,
     recovery_next_command: Option<&str>,
+    incident_capture_command: Option<&str>,
 ) -> String {
     let mut rendered = format!(
         "Goal: {goal}\nProject: {project}\nApproved contract: {contract_id}\nRun: {run_id} ({receipt_status})\nSummary: {receipt_summary}\nOutcome: {outcome}\nGate: {decision}\nBasis: {basis_summary}\nProof: {proof_id}\nNext: {next_command}"
@@ -1665,6 +2138,9 @@ fn format_go_summary(
     }
     if let Some(recovery_next_command) = recovery_next_command {
         rendered.push_str(&format!("\nRecovery next: {recovery_next_command}"));
+    }
+    if let Some(incident_capture_command) = incident_capture_command {
+        rendered.push_str(&format!("\nIncident capture: {incident_capture_command}"));
     }
     rendered
 }
@@ -1739,6 +2215,132 @@ fn format_go_error(
         rendered.push_str(&format!(" Retry in staged mode with `{recovery_command}`."));
     }
     rendered
+}
+
+fn format_incident_auto_run_error(
+    promotion: &IncidentPromotionRecord,
+    proof_id: &str,
+    decision: &punk_domain::Decision,
+) -> String {
+    format!(
+        "incident promote --auto-run ended with gate decision {} (proof: {}). Inspect details with `cd {} && punk inspect {}`.",
+        decision_label(decision),
+        proof_id,
+        promotion.target_repo_root,
+        proof_id
+    )
+}
+
+fn format_incident_auto_run_failure(
+    promotion: &IncidentPromotionRecord,
+    error: &dyn std::error::Error,
+) -> String {
+    format!(
+        "promotion {} auto-run failed: {}. Inspect with `punk inspect {}`. Retry with `punk incident rerun {} --auto-run`.",
+        promotion.id, error, promotion.id, promotion.id
+    )
+}
+
+fn format_incident_auto_run_failure_with_policy(
+    promotion: &IncidentPromotionRecord,
+    error: &dyn std::error::Error,
+    policy: &IncidentAutoRunPolicy,
+) -> String {
+    format!(
+        "{} Policy: {}.",
+        format_incident_auto_run_failure(promotion, error),
+        policy.detail
+    )
+}
+
+fn format_incident_auto_run_policy_error(
+    promotion: &IncidentPromotionRecord,
+    policy: &IncidentAutoRunPolicy,
+) -> String {
+    format!(
+        "promotion {} drafted, but auto-run is blocked by policy: {}. Inspect with `punk inspect {}`. Review the drafted contract with `cd {} && punk inspect {}`.",
+        promotion.id,
+        policy.detail,
+        promotion.id,
+        promotion.target_repo_root,
+        promotion.draft_contract_id,
+    )
+}
+
+fn inspect_incident_auto_run_policy(target_repo_root: &Path) -> IncidentAutoRunPolicy {
+    let markers = [
+        "Cargo.toml",
+        "crates/punk-cli/src/main.rs",
+        "crates/punk-orch/src/lib.rs",
+        "docs/product/CLI.md",
+    ];
+    let missing = markers
+        .iter()
+        .filter_map(|marker| (!target_repo_root.join(marker).exists()).then(|| marker.to_string()))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        IncidentAutoRunPolicy {
+            allowed: true,
+            detail: "target repo matches specpunk upstream markers".to_string(),
+        }
+    } else {
+        IncidentAutoRunPolicy {
+            allowed: false,
+            detail: format!(
+                "target repo does not look like specpunk upstream; missing {}",
+                missing.join(", ")
+            ),
+        }
+    }
+}
+
+fn derive_incident_next_actions(
+    orch: &OrchService,
+    incident: &punk_domain::IncidentRecord,
+) -> Result<IncidentNextActions> {
+    let defaults = orch.inspect_effective_incident_defaults()?;
+    let promote_target = defaults.promote_repo_root.clone();
+    let promote_command = promote_target
+        .as_ref()
+        .map(|_| format!("punk incident promote {}", incident.id));
+    let (auto_run_policy, auto_run_command) =
+        if let Some(target_repo_root) = promote_target.as_deref() {
+            let policy = inspect_incident_auto_run_policy(Path::new(target_repo_root));
+            let policy_line = if policy.allowed {
+                format!("allowed: {}", policy.detail)
+            } else {
+                format!("blocked: {}", policy.detail)
+            };
+            let command = policy
+                .allowed
+                .then(|| format!("punk incident promote {} --auto-run", incident.id));
+            (Some(policy_line), command)
+        } else {
+            (None, None)
+        };
+    let setup_hint = if promote_target.is_none() {
+        Some(
+            "configure a promote target with `punk incident defaults --repo /path/to/specpunk` or `punk incident defaults --global --repo /path/to/specpunk`".to_string(),
+        )
+    } else {
+        None
+    };
+    Ok(IncidentNextActions {
+        promote_target,
+        promote_command,
+        auto_run_policy,
+        auto_run_command,
+        setup_hint,
+    })
+}
+
+fn format_contract_status_label(status: &punk_domain::ContractStatus) -> &'static str {
+    match status {
+        punk_domain::ContractStatus::Draft => "draft",
+        punk_domain::ContractStatus::Approved => "approved",
+        punk_domain::ContractStatus::Superseded => "superseded",
+        punk_domain::ContractStatus::Cancelled => "cancelled",
+    }
 }
 
 fn format_project_overlay_summary(overlay: &punk_orch::ProjectOverlay) -> String {
@@ -2378,6 +2980,224 @@ fn format_proofpack_summary(proof: &punk_domain::Proofpack) -> String {
     )
 }
 
+fn format_incident_summary(
+    incident: &punk_domain::IncidentRecord,
+    next_actions: Option<&IncidentNextActions>,
+) -> String {
+    let autonomy = incident.autonomy_ref.as_deref().unwrap_or("none");
+    let blocked_reason = incident.blocked_reason.as_deref().unwrap_or("none");
+    let capture_basis = if incident.capture_basis.is_empty() {
+        "none".to_string()
+    } else {
+        incident
+            .capture_basis
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let promote_lines = next_actions
+        .map(|actions| {
+            let mut rendered = String::new();
+            if let Some(target) = actions.promote_target.as_deref() {
+                rendered.push_str(&format!("\nPromote target: {target}"));
+            }
+            if let Some(command) = actions.promote_command.as_deref() {
+                rendered.push_str(&format!("\nPromote draft: {command}"));
+            }
+            if let Some(policy) = actions.auto_run_policy.as_deref() {
+                rendered.push_str(&format!("\nAuto-run policy: {policy}"));
+            }
+            if let Some(command) = actions.auto_run_command.as_deref() {
+                rendered.push_str(&format!("\nAuto-run next: {command}"));
+            }
+            if let Some(setup_hint) = actions.setup_hint.as_deref() {
+                rendered.push_str(&format!("\nPromote setup: {setup_hint}"));
+            }
+            rendered
+        })
+        .unwrap_or_default();
+    format!(
+        "Incident: {incident_id}\nKind: {incident_kind}\nProject: {project_id}\nWork: {work_id}\nOutcome: {decision_outcome}\nFailure signature: {failure_signature}\nSummary: {summary}\nBlocked reason: {blocked_reason}\nGoal: {goal}\nContract: {contract_ref}\nRun: {run_ref}\nDecision: {decision_ref}\nProof: {proof_ref}\nAutonomy: {autonomy}\nIssue draft: {issue_draft_ref}\nRepro note: {repro_ref}\nCapture basis:\n{capture_basis}{promote_lines}",
+        incident_id = incident.id,
+        incident_kind = incident.incident_kind,
+        project_id = incident.project_id,
+        work_id = incident.work_id,
+        decision_outcome = incident.decision_outcome,
+        failure_signature = incident.failure_signature,
+        summary = incident.summary,
+        blocked_reason = blocked_reason,
+        goal = incident.goal,
+        contract_ref = incident.contract_ref,
+        run_ref = incident.run_ref,
+        decision_ref = incident.decision_ref,
+        proof_ref = incident.proof_ref,
+        autonomy = autonomy,
+        issue_draft_ref = incident.issue_draft_ref,
+        repro_ref = incident.repro_ref,
+        capture_basis = capture_basis,
+        promote_lines = promote_lines,
+    )
+}
+
+fn format_incident_promotion_summary(
+    promotion: &IncidentPromotionRecord,
+    policy: Option<&IncidentAutoRunPolicy>,
+) -> String {
+    let state = if promotion.execution.is_some() {
+        "completed"
+    } else if promotion.last_failure.is_some() {
+        "failed"
+    } else {
+        "drafted"
+    };
+    let attempts = promotion.auto_run_attempts;
+    let last_attempt_at = promotion.last_attempt_at.as_deref().unwrap_or("none");
+    let failure_lines = promotion
+        .last_failure
+        .as_ref()
+        .map(|failure| {
+            let contract_status = failure.contract_status.as_deref().unwrap_or("unknown");
+            let run_id = failure.run_id.as_deref().unwrap_or("none");
+            let receipt_ref = failure.receipt_ref.as_deref().unwrap_or("none");
+            let decision_id = failure.decision_id.as_deref().unwrap_or("none");
+            format!(
+                "\nLast failure: {phase}: {summary}\nLast failure contract status: {contract_status}\nLast failure run: {run_id}\nLast failure receipt: {receipt_ref}\nLast failure decision: {decision_id}",
+                phase = failure.phase,
+                summary = failure.summary,
+                contract_status = contract_status,
+                run_id = run_id,
+                receipt_ref = receipt_ref,
+                decision_id = decision_id,
+            )
+        })
+        .unwrap_or_else(|| "\nLast failure: none".to_string());
+    let execution_lines = promotion
+        .execution
+        .as_ref()
+        .map(|execution| {
+            format!(
+                "\nRun: {run_id}\nReceipt: {receipt_ref}\nDecision: {decision_outcome}\nProof: {proof_id}\nExecution summary: {receipt_summary}",
+                run_id = execution.run_id,
+                receipt_ref = execution.receipt_ref,
+                decision_outcome = execution.decision_outcome,
+                proof_id = execution.proof_id,
+                receipt_summary = execution.receipt_summary,
+            )
+        })
+        .unwrap_or_default();
+    let auto_run_policy = policy
+        .map(|policy| {
+            let state = if policy.allowed { "allowed" } else { "blocked" };
+            format!("\nAuto-run policy: {state}: {}", policy.detail)
+        })
+        .unwrap_or_default();
+    let next = if let Some(execution) = promotion.execution.as_ref() {
+        format!(
+            "cd {} && punk inspect {}",
+            promotion.target_repo_root, execution.proof_id
+        )
+    } else if promotion.last_failure.is_some() {
+        format!("punk incident rerun {} --auto-run", promotion.id)
+    } else {
+        format!(
+            "cd {} && punk inspect {}",
+            promotion.target_repo_root, promotion.draft_contract_id
+        )
+    };
+    format!(
+        "Promotion: {promotion_id}\nIncident: {incident_id}\nSource project: {source_project_id}\nSource repo: {source_repo_root}\nTarget project: {target_project_id}\nTarget repo: {target_repo_root}\nImported incident: {imported_incident_ref}\nImported issue draft: {imported_issue_draft_ref}\nImported repro note: {imported_repro_ref}\nPrepared goal: {prepared_goal}\nDraft feature: {draft_feature_id}\nDraft contract: {draft_contract_id}\nState: {state}\nAuto-run attempts: {attempts}\nLast attempt at: {last_attempt_at}{auto_run_policy}{failure_lines}{execution_lines}\nNext: {next}",
+        promotion_id = promotion.id,
+        incident_id = promotion.incident_id,
+        source_project_id = promotion.source_project_id,
+        source_repo_root = promotion.source_repo_root,
+        target_project_id = promotion.target_project_id,
+        target_repo_root = promotion.target_repo_root,
+        imported_incident_ref = promotion.imported_incident_ref,
+        imported_issue_draft_ref = promotion.imported_issue_draft_ref,
+        imported_repro_ref = promotion.imported_repro_ref,
+        prepared_goal = promotion.prepared_goal,
+        draft_feature_id = promotion.draft_feature_id,
+        draft_contract_id = promotion.draft_contract_id,
+        state = state,
+        attempts = attempts,
+        last_attempt_at = last_attempt_at,
+        auto_run_policy = auto_run_policy,
+        failure_lines = failure_lines,
+        execution_lines = execution_lines,
+        next = next,
+    )
+}
+
+fn format_incident_submission_summary(
+    submission: &punk_domain::IncidentSubmissionRecord,
+) -> String {
+    let issue_url = submission
+        .published_issue_url
+        .as_deref()
+        .unwrap_or("not published");
+    let issue_number = submission
+        .published_issue_number
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "not published".to_string());
+    let publish_error = submission.publish_error.as_deref().unwrap_or("none");
+    format!(
+        "Submission: {submission_id}\nIncident: {incident_id}\nKind: {submission_kind}\nGitHub repo: {github_repo}\nState: {state}\nIssue title: {issue_title}\nBody snapshot: {body_ref}\nPreview command: {preview_command}\nPublished issue: {issue_url}\nPublished number: {issue_number}\nPublish error: {publish_error}",
+        submission_id = submission.id,
+        incident_id = submission.incident_id,
+        submission_kind = submission.submission_kind,
+        github_repo = submission.github_repo,
+        state = submission.state,
+        issue_title = submission.issue_title,
+        body_ref = submission.body_ref,
+        preview_command = submission.preview_command,
+        issue_url = issue_url,
+        issue_number = issue_number,
+        publish_error = publish_error,
+    )
+}
+
+fn format_incident_defaults_summary(label: &str, defaults: &punk_orch::IncidentDefaults) -> String {
+    let promote_repo_root = defaults
+        .promote_repo_root
+        .as_deref()
+        .unwrap_or("not configured");
+    let github_repo = defaults.github_repo.as_deref().unwrap_or("not configured");
+    let updated_at = defaults.updated_at.as_deref().unwrap_or("never");
+    format!(
+        "{label}\nPromote repo: {promote_repo_root}\nGitHub repo: {github_repo}\nUpdated at: {updated_at}",
+        label = label,
+        promote_repo_root = promote_repo_root,
+        github_repo = github_repo,
+        updated_at = updated_at,
+    )
+}
+
+fn resolve_incident_promote_repo(orch: &OrchService, repo: Option<&Path>) -> Result<PathBuf> {
+    if let Some(repo) = repo {
+        return Ok(repo.to_path_buf());
+    }
+    let defaults = orch.inspect_effective_incident_defaults()?;
+    let configured = defaults.promote_repo_root.ok_or_else(|| {
+        anyhow!(
+            "missing promote target repo; pass --repo or configure it with `punk incident defaults --repo /path/to/specpunk` or `punk incident defaults --global --repo /path/to/specpunk`"
+        )
+    })?;
+    Ok(PathBuf::from(configured))
+}
+
+fn resolve_incident_submit_repo(orch: &OrchService, github_repo: Option<&str>) -> Result<String> {
+    if let Some(github_repo) = github_repo {
+        return Ok(github_repo.to_string());
+    }
+    let defaults = orch.inspect_effective_incident_defaults()?;
+    defaults.github_repo.ok_or_else(|| {
+        anyhow!(
+            "missing GitHub repo; pass --github owner/repo or configure it with `punk incident defaults --github owner/repo` or `punk incident defaults --global --github owner/repo`"
+        )
+    })
+}
+
 fn check_status_summary_label(status: &punk_domain::CheckStatus) -> &'static str {
     match status {
         punk_domain::CheckStatus::Pass => "pass",
@@ -2519,9 +3339,10 @@ fn cmd_vcs_enable_jj(repo_root: &PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use punk_adapters::{ContractDrafter, ExecuteInput, ExecuteOutput, Executor};
     use punk_domain::{
-        CheckStatus, Decision, DecisionObject, DeterministicStatus, Receipt, ReceiptArtifacts, Run,
-        RunStatus, RunVcs, VcsKind,
+        CheckStatus, Decision, DecisionObject, DeterministicStatus, DraftInput, DraftProposal,
+        Receipt, ReceiptArtifacts, RefineInput, Run, RunStatus, RunVcs, VcsKind,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2535,6 +3356,238 @@ mod tests {
             std::env::temp_dir().join(format!("punk-cli-{label}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn init_git_repo_with_commit(root: &Path) {
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test User",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(root)
+            .output()
+            .unwrap();
+    }
+
+    struct TestDrafter;
+
+    impl ContractDrafter for TestDrafter {
+        fn name(&self) -> &'static str {
+            "test-drafter"
+        }
+
+        fn draft(&self, input: DraftInput) -> Result<DraftProposal> {
+            let scope = input
+                .scan
+                .candidate_file_scope_paths
+                .first()
+                .cloned()
+                .or_else(|| input.scan.candidate_entry_points.first().cloned())
+                .unwrap_or_else(|| "demo.txt".into());
+            let check = input
+                .scan
+                .candidate_integrity_checks
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "true".into());
+            Ok(DraftProposal {
+                title: "demo contract".into(),
+                summary: input.prompt,
+                entry_points: vec![scope.clone()],
+                import_paths: vec![],
+                expected_interfaces: vec!["demo interface".into()],
+                behavior_requirements: vec!["implement the requested behavior".into()],
+                allowed_scope: vec![scope],
+                target_checks: vec![check.clone()],
+                integrity_checks: vec![check],
+                risk_level: "medium".into(),
+            })
+        }
+
+        fn refine(&self, input: RefineInput) -> Result<DraftProposal> {
+            Ok(input.current)
+        }
+    }
+
+    struct ScopedWriteExecutor;
+
+    impl Executor for ScopedWriteExecutor {
+        fn name(&self) -> &'static str {
+            "scoped-write"
+        }
+
+        fn execute_contract(&self, input: ExecuteInput) -> Result<ExecuteOutput> {
+            let rel = input
+                .contract
+                .allowed_scope
+                .iter()
+                .find(|path| !path.starts_with(".punk/"))
+                .cloned()
+                .or_else(|| {
+                    input
+                        .contract
+                        .entry_points
+                        .iter()
+                        .find(|path| !path.starts_with(".punk/"))
+                        .cloned()
+                })
+                .or_else(|| {
+                    input
+                        .contract
+                        .allowed_scope
+                        .first()
+                        .cloned()
+                        .or_else(|| input.contract.entry_points.first().cloned())
+                })
+                .unwrap_or_else(|| "demo.txt".into());
+            let path = input.repo_root.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let existing = fs::read_to_string(&path).unwrap_or_default();
+            let body = match path.extension().and_then(|ext| ext.to_str()) {
+                Some("rs") => format!("{existing}\n// updated by test executor\n").into_bytes(),
+                Some("toml") => format!("{existing}\n# updated by test executor\n").into_bytes(),
+                _ => format!("{existing}\nok\n").into_bytes(),
+            };
+            fs::write(path, body)?;
+            fs::write(&input.stdout_path, b"done")?;
+            fs::write(&input.stderr_path, b"")?;
+            Ok(ExecuteOutput {
+                success: true,
+                summary: "done".into(),
+                checks_run: vec![],
+                cost_usd: None,
+                duration_ms: 1,
+            })
+        }
+    }
+
+    fn prepare_captured_incident_fixture(
+        source_root: &Path,
+        global_root: &Path,
+    ) -> (OrchService, punk_domain::IncidentRecord) {
+        let _ = fs::remove_dir_all(source_root);
+        let _ = fs::remove_dir_all(global_root);
+        fs::create_dir_all(source_root.join("docs/product")).unwrap();
+        fs::write(
+            source_root.join(".gitignore"),
+            ".punk/\ntarget/\n.playwright-mcp/\n",
+        )
+        .unwrap();
+        fs::write(
+            source_root.join("Cargo.toml"),
+            "[package]\nname='source-demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        init_git_repo_with_commit(source_root);
+
+        let service = OrchService::new(source_root, global_root).unwrap();
+        let contract = service
+            .draft_contract(&TestDrafter, "capture runtime incident")
+            .unwrap();
+        let approved = service.approve_contract(&contract.id).unwrap();
+        let (run, _receipt) = service.cut_run(&ScopedWriteExecutor, &approved.id).unwrap();
+
+        let run_dir = source_root.join(".punk/runs").join(&run.id);
+        let receipt_path = run_dir.join("receipt.json");
+        let mut receipt: Receipt = read_json(&receipt_path).unwrap();
+        receipt.status = "failure".into();
+        receipt.summary = "controller stalled with no-progress and left no product changes".into();
+        write_json(&receipt_path, &receipt).unwrap();
+
+        let decision = punk_domain::DecisionObject {
+            id: format!("dec_{}", run.id.trim_start_matches("run_")),
+            run_id: run.id.clone(),
+            contract_id: approved.id.clone(),
+            decision: punk_domain::Decision::Block,
+            deterministic_status: punk_domain::DeterministicStatus::Fail,
+            target_status: punk_domain::CheckStatus::Pass,
+            integrity_status: punk_domain::CheckStatus::Fail,
+            confidence_estimate: 0.42,
+            decision_basis: vec![
+                "no-progress failure after bounded execution".into(),
+                "controller should surface a durable incident bundle".into(),
+            ],
+            contract_ref: format!(".punk/contracts/{}/v1.json", run.feature_id),
+            receipt_ref: format!(".punk/runs/{}/receipt.json", run.id),
+            check_refs: Vec::new(),
+            verification_context_ref: run.verification_context_ref.clone(),
+            verification_context_identity: None,
+            command_evidence: Vec::new(),
+            declared_harness_evidence: Vec::new(),
+            harness_evidence: Vec::new(),
+            created_at: now_rfc3339(),
+        };
+        let decision_path = source_root
+            .join(".punk/decisions")
+            .join(format!("{}.json", decision.id));
+        write_json(&decision_path, &decision).unwrap();
+
+        let proof = punk_domain::Proofpack {
+            id: format!("proof_{}", decision.id.trim_start_matches("dec_")),
+            decision_id: decision.id.clone(),
+            run_id: run.id.clone(),
+            run_ref: Some(format!(".punk/runs/{}/run.json", run.id)),
+            contract_ref: decision.contract_ref.clone(),
+            receipt_ref: decision.receipt_ref.clone(),
+            decision_ref: format!(".punk/decisions/{}.json", decision.id),
+            check_refs: Vec::new(),
+            workspace_lineage: Some(run.vcs.clone()),
+            verification_context_ref: decision.verification_context_ref.clone(),
+            verification_context_identity: None,
+            executor_identity: None,
+            reproducibility_claim: None,
+            command_evidence: Vec::new(),
+            declared_harness_evidence: Vec::new(),
+            harness_evidence: Vec::new(),
+            hashes: Default::default(),
+            summary: "proof for incident capture".into(),
+            created_at: now_rfc3339(),
+        };
+        let proof_dir = source_root.join(".punk/proofs").join(&decision.id);
+        fs::create_dir_all(&proof_dir).unwrap();
+        let proof_path = proof_dir.join("proofpack.json");
+        write_json(&proof_path, &proof).unwrap();
+
+        service.record_autonomy_outcome(&proof.id, None).unwrap();
+        let incident = service.capture_incident(&proof.id).unwrap();
+        (service, incident)
+    }
+
+    fn write_specpunk_target_markers(root: &Path) {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
+        fs::create_dir_all(root.join("docs/product")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='target-demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn runtime_lane() {}\n").unwrap();
+        fs::write(root.join("crates/punk-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("crates/punk-orch/src/lib.rs"),
+            "pub fn demo() {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("docs/product/CLI.md"), "# CLI\n").unwrap();
     }
 
     #[test]
@@ -2896,7 +3949,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_json_mode_supports_start_plot_and_research_commands() {
+    fn bootstrap_json_mode_supports_start_plot_research_and_incident_commands() {
         let go = Command::Go(GoCommand {
             goal: "ship interview summary".into(),
             fallback_staged: false,
@@ -2968,6 +4021,50 @@ mod tests {
                 json: true,
             },
         });
+        let incident = Command::Incident(IncidentCommand {
+            action: IncidentAction::Capture {
+                proof_id: "proof_123".into(),
+                json: true,
+            },
+        });
+        let incident_promote = Command::Incident(IncidentCommand {
+            action: IncidentAction::Promote {
+                incident_id: "inc_123".into(),
+                repo: Some(PathBuf::from("/tmp/specpunk")),
+                auto_run: true,
+                json: false,
+            },
+        });
+        let incident_rerun = Command::Incident(IncidentCommand {
+            action: IncidentAction::Rerun {
+                promotion_id: "prom_123".into(),
+                auto_run: true,
+                json: true,
+            },
+        });
+        let incident_submit = Command::Incident(IncidentCommand {
+            action: IncidentAction::Submit {
+                incident_id: "inc_123".into(),
+                github_repo: Some("heurema/specpunk".into()),
+                publish: true,
+                json: true,
+            },
+        });
+        let incident_resubmit = Command::Incident(IncidentCommand {
+            action: IncidentAction::Resubmit {
+                submission_id: "sub_123".into(),
+                publish: true,
+                json: false,
+            },
+        });
+        let incident_defaults = Command::Incident(IncidentCommand {
+            action: IncidentAction::Defaults {
+                repo: Some(PathBuf::from("/tmp/specpunk")),
+                github_repo: Some("heurema/specpunk".into()),
+                global: false,
+                json: true,
+            },
+        });
         let status = Command::Status(StatusCommand {
             id: None,
             json: false,
@@ -2981,6 +4078,12 @@ mod tests {
         assert_eq!(bootstrap_json_mode(&research_synthesis), Some(true));
         assert_eq!(bootstrap_json_mode(&research_complete), Some(false));
         assert_eq!(bootstrap_json_mode(&research_escalate), Some(true));
+        assert_eq!(bootstrap_json_mode(&incident), Some(true));
+        assert_eq!(bootstrap_json_mode(&incident_promote), Some(false));
+        assert_eq!(bootstrap_json_mode(&incident_rerun), Some(true));
+        assert_eq!(bootstrap_json_mode(&incident_submit), Some(true));
+        assert_eq!(bootstrap_json_mode(&incident_resubmit), Some(false));
+        assert_eq!(bootstrap_json_mode(&incident_defaults), Some(true));
         assert_eq!(bootstrap_json_mode(&status), None);
     }
 
@@ -3051,6 +4154,7 @@ mod tests {
             "target checks passed; integrity checks passed",
             "proof_789",
             "punk inspect proof_789 --json",
+            None,
             None,
             None,
             None,
@@ -3314,6 +4418,321 @@ mod tests {
     }
 
     #[test]
+    fn incident_capture_command_parses_with_proof_id() {
+        let cli = Cli::try_parse_from(["punk", "incident", "capture", "proof_123"]).unwrap();
+        match cli.command {
+            Command::Incident(IncidentCommand {
+                action: IncidentAction::Capture { proof_id, json },
+            }) => {
+                assert_eq!(proof_id, "proof_123");
+                assert!(!json);
+            }
+            _ => panic!("expected incident capture command"),
+        }
+    }
+
+    #[test]
+    fn incident_promote_command_parses_with_target_repo() {
+        let cli = Cli::try_parse_from([
+            "punk",
+            "incident",
+            "promote",
+            "inc_123",
+            "--repo",
+            "/tmp/specpunk",
+            "--auto-run",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Incident(IncidentCommand {
+                action:
+                    IncidentAction::Promote {
+                        incident_id,
+                        repo,
+                        auto_run,
+                        json,
+                    },
+            }) => {
+                assert_eq!(incident_id, "inc_123");
+                assert_eq!(repo, Some(PathBuf::from("/tmp/specpunk")));
+                assert!(auto_run);
+                assert!(json);
+            }
+            _ => panic!("expected incident promote command"),
+        }
+    }
+
+    #[test]
+    fn incident_submit_command_parses_with_github_repo_and_publish() {
+        let cli = Cli::try_parse_from([
+            "punk",
+            "incident",
+            "submit",
+            "inc_123",
+            "--github",
+            "heurema/specpunk",
+            "--publish",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Incident(IncidentCommand {
+                action:
+                    IncidentAction::Submit {
+                        incident_id,
+                        github_repo,
+                        publish,
+                        json,
+                    },
+            }) => {
+                assert_eq!(incident_id, "inc_123");
+                assert_eq!(github_repo.as_deref(), Some("heurema/specpunk"));
+                assert!(publish);
+                assert!(json);
+            }
+            _ => panic!("expected incident submit command"),
+        }
+    }
+
+    #[test]
+    fn incident_rerun_command_parses_with_auto_run_flag() {
+        let cli = Cli::try_parse_from([
+            "punk",
+            "incident",
+            "rerun",
+            "prom_123",
+            "--auto-run",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Incident(IncidentCommand {
+                action:
+                    IncidentAction::Rerun {
+                        promotion_id,
+                        auto_run,
+                        json,
+                    },
+            }) => {
+                assert_eq!(promotion_id, "prom_123");
+                assert!(auto_run);
+                assert!(json);
+            }
+            _ => panic!("expected incident rerun command"),
+        }
+    }
+
+    #[test]
+    fn incident_resubmit_command_parses_with_publish_flag() {
+        let cli = Cli::try_parse_from([
+            "punk",
+            "incident",
+            "resubmit",
+            "sub_123",
+            "--publish",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Incident(IncidentCommand {
+                action:
+                    IncidentAction::Resubmit {
+                        submission_id,
+                        publish,
+                        json,
+                    },
+            }) => {
+                assert_eq!(submission_id, "sub_123");
+                assert!(publish);
+                assert!(json);
+            }
+            _ => panic!("expected incident resubmit command"),
+        }
+    }
+
+    #[test]
+    fn incident_defaults_command_parses_repo_and_github_flags() {
+        let cli = Cli::try_parse_from([
+            "punk",
+            "incident",
+            "defaults",
+            "--repo",
+            "/tmp/specpunk",
+            "--github",
+            "heurema/specpunk",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Incident(IncidentCommand {
+                action:
+                    IncidentAction::Defaults {
+                        repo,
+                        github_repo,
+                        global,
+                        json,
+                    },
+            }) => {
+                assert_eq!(repo, Some(PathBuf::from("/tmp/specpunk")));
+                assert_eq!(github_repo.as_deref(), Some("heurema/specpunk"));
+                assert!(!global);
+                assert!(json);
+            }
+            _ => panic!("expected incident defaults command"),
+        }
+    }
+
+    #[test]
+    fn incident_defaults_command_parses_global_repo_and_github_flags() {
+        let cli = Cli::try_parse_from([
+            "punk",
+            "incident",
+            "defaults",
+            "--global",
+            "--repo",
+            "/tmp/specpunk",
+            "--github",
+            "heurema/specpunk",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Incident(IncidentCommand {
+                action:
+                    IncidentAction::Defaults {
+                        repo,
+                        github_repo,
+                        global,
+                        json,
+                    },
+            }) => {
+                assert_eq!(repo, Some(PathBuf::from("/tmp/specpunk")));
+                assert_eq!(github_repo.as_deref(), Some("heurema/specpunk"));
+                assert!(global);
+                assert!(!json);
+            }
+            _ => panic!("expected global incident defaults command"),
+        }
+    }
+
+    #[test]
+    fn incident_rerun_reuses_existing_promotion_after_partial_auto_run_failure() {
+        let source_root = temp_test_dir("incident-rerun-source");
+        let target_root = temp_test_dir("incident-rerun-target");
+        let global_root = temp_test_dir("incident-rerun-global");
+
+        let (source_service, incident) =
+            prepare_captured_incident_fixture(&source_root, &global_root);
+
+        write_specpunk_target_markers(&target_root);
+        fs::write(
+            target_root.join(".gitignore"),
+            ".punk/\ntarget/\n.playwright-mcp/\n",
+        )
+        .unwrap();
+        init_git_repo_with_commit(&target_root);
+
+        let promotion = source_service
+            .promote_incident(&TestDrafter, &incident.id, &target_root)
+            .unwrap();
+
+        let target_service = OrchService::new(&target_root, &global_root).unwrap();
+        let approved = target_service
+            .approve_contract(&promotion.draft_contract_id)
+            .unwrap();
+        assert_eq!(approved.status, punk_domain::ContractStatus::Approved);
+
+        let rerun = auto_run_existing_incident_promotion(
+            &source_service,
+            &global_root,
+            &ScopedWriteExecutor,
+            &promotion,
+        )
+        .unwrap();
+        assert!(
+            go_decision_succeeds(&rerun.decision.decision),
+            "decision={:?} basis={:?}",
+            rerun.decision.decision,
+            rerun.decision.decision_basis
+        );
+        assert_eq!(rerun.promotion.id, promotion.id);
+        let execution = rerun
+            .promotion
+            .execution
+            .expect("execution should be recorded");
+        assert_eq!(execution.decision_id, rerun.decision.id);
+        assert_eq!(execution.proof_id, rerun.proof.id);
+
+        let updated_target = target_service
+            .inspect_incident_promotion(&promotion.id)
+            .unwrap();
+        assert_eq!(
+            updated_target
+                .execution
+                .as_ref()
+                .map(|value| value.proof_id.as_str()),
+            Some(rerun.proof.id.as_str())
+        );
+
+        let _ = fs::remove_dir_all(&source_root);
+        let _ = fs::remove_dir_all(&target_root);
+        let _ = fs::remove_dir_all(&global_root);
+    }
+
+    #[test]
+    fn incident_auto_run_records_failure_metadata_on_contract_readiness_error() {
+        let source_root = temp_test_dir("incident-rerun-failure-source");
+        let target_root = temp_test_dir("incident-rerun-failure-target");
+        let global_root = temp_test_dir("incident-rerun-failure-global");
+
+        let (source_service, incident) =
+            prepare_captured_incident_fixture(&source_root, &global_root);
+
+        write_specpunk_target_markers(&target_root);
+        fs::write(
+            target_root.join(".gitignore"),
+            ".punk/\ntarget/\n.playwright-mcp/\n",
+        )
+        .unwrap();
+        init_git_repo_with_commit(&target_root);
+
+        let promotion = source_service
+            .promote_incident(&TestDrafter, &incident.id, &target_root)
+            .unwrap();
+
+        let contract_path = target_root
+            .join(".punk/contracts")
+            .join(&promotion.draft_feature_id)
+            .join("v1.json");
+        fs::remove_file(&contract_path).unwrap();
+
+        let error = auto_run_existing_incident_promotion(
+            &source_service,
+            &global_root,
+            &ScopedWriteExecutor,
+            &promotion,
+        )
+        .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("punk incident rerun prom_"));
+
+        let updated = source_service
+            .inspect_incident_promotion(&promotion.id)
+            .unwrap();
+        assert_eq!(updated.auto_run_attempts, 1);
+        let failure = updated
+            .last_failure
+            .expect("failure metadata should be persisted");
+        assert_eq!(failure.phase, "contract_ready");
+        assert_eq!(failure.contract_status.as_deref(), None);
+        assert!(failure.summary.contains(&promotion.draft_contract_id));
+
+        let _ = fs::remove_dir_all(&source_root);
+        let _ = fs::remove_dir_all(&target_root);
+        let _ = fs::remove_dir_all(&global_root);
+    }
+
+    #[test]
     fn proofpack_summary_mentions_command_declared_and_harness_evidence() {
         let proof = punk_domain::Proofpack {
             id: "proof_789".into(),
@@ -3416,6 +4835,492 @@ mod tests {
         assert!(rendered.contains("- artifact_assertion pass [default]: AGENTS.md"));
         assert!(rendered
             .contains("- artifact_assertion pass [default]: .punk/bootstrap/specpunk-core.md"));
+    }
+
+    #[test]
+    fn incident_summary_mentions_bundle_and_refs() {
+        let incident = punk_domain::IncidentRecord {
+            id: "inc_123".into(),
+            project_id: "specpunk".into(),
+            repo_root: "/tmp/specpunk".into(),
+            work_id: "feat_123".into(),
+            goal: "capture runtime bug".into(),
+            contract_ref: ".punk/contracts/feat_123/v1.json".into(),
+            run_ref: ".punk/runs/run_123/run.json".into(),
+            decision_ref: ".punk/decisions/dec_123.json".into(),
+            proof_ref: ".punk/proofs/dec_123/proofpack.json".into(),
+            autonomy_ref: Some(".punk/autonomy/feat_123/auto_123.json".into()),
+            incident_kind: "suspected_runtime_bug".into(),
+            decision_outcome: "blocked".into(),
+            summary: "controller stalled with no-progress".into(),
+            blocked_reason: Some("no-progress failure".into()),
+            failure_signature: "blocked:no-progress".into(),
+            capture_basis: vec![
+                "decision outcome: blocked".into(),
+                "matched runtime marker: no-progress".into(),
+            ],
+            issue_draft_ref: ".punk/incidents/feat_123/inc_123/issue.md".into(),
+            repro_ref: ".punk/incidents/feat_123/inc_123/repro.md".into(),
+            created_at: "2026-04-16T00:00:00Z".into(),
+        };
+
+        let rendered = format_incident_summary(&incident, None);
+        assert!(rendered.contains("Incident: inc_123"));
+        assert!(rendered.contains("Kind: suspected_runtime_bug"));
+        assert!(rendered.contains("Failure signature: blocked:no-progress"));
+        assert!(rendered.contains("Issue draft: .punk/incidents/feat_123/inc_123/issue.md"));
+        assert!(rendered.contains("Repro note: .punk/incidents/feat_123/inc_123/repro.md"));
+        assert!(rendered.contains("Capture basis:"));
+        assert!(rendered.contains("- matched runtime marker: no-progress"));
+    }
+
+    #[test]
+    fn incident_promotion_summary_mentions_target_contract_and_bundle() {
+        let promotion = IncidentPromotionRecord {
+            id: "prom_123".into(),
+            incident_id: "inc_123".into(),
+            source_project_id: "foreign-demo".into(),
+            source_repo_root: "/tmp/source".into(),
+            source_incident_ref: ".punk/incidents/feat_123/inc_123/incident.json".into(),
+            source_issue_draft_ref: ".punk/incidents/feat_123/inc_123/issue.md".into(),
+            source_repro_ref: ".punk/incidents/feat_123/inc_123/repro.md".into(),
+            target_project_id: "specpunk".into(),
+            target_repo_root: "/tmp/specpunk".into(),
+            imported_incident_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/incident.json".into(),
+            imported_issue_draft_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/issue.md".into(),
+            imported_repro_ref: ".punk/imported-incidents/foreign-demo/inc_123/prom_123/repro.md"
+                .into(),
+            prepared_goal: "Investigate and fix promoted incident inc_123".into(),
+            draft_feature_id: "feat_456".into(),
+            draft_contract_id: "ct_456_v1".into(),
+            auto_run_attempts: 0,
+            last_attempt_at: None,
+            last_failure: None,
+            execution: None,
+            created_at: "2026-04-16T00:30:00Z".into(),
+        };
+
+        let rendered = format_incident_promotion_summary(&promotion, None);
+        assert!(rendered.contains("Promotion: prom_123"));
+        assert!(rendered.contains("Target repo: /tmp/specpunk"));
+        assert!(rendered.contains("Draft contract: ct_456_v1"));
+        assert!(rendered.contains("State: drafted"));
+        assert!(rendered.contains("Auto-run attempts: 0"));
+        assert!(rendered.contains("Last failure: none"));
+        assert!(rendered.contains(
+            "Imported incident: .punk/imported-incidents/foreign-demo/inc_123/prom_123/incident.json"
+        ));
+        assert!(rendered.contains("Next: cd /tmp/specpunk && punk inspect ct_456_v1"));
+    }
+
+    #[test]
+    fn incident_promotion_summary_mentions_auto_run_execution_when_present() {
+        let promotion = IncidentPromotionRecord {
+            id: "prom_123".into(),
+            incident_id: "inc_123".into(),
+            source_project_id: "foreign-demo".into(),
+            source_repo_root: "/tmp/source".into(),
+            source_incident_ref: ".punk/incidents/feat_123/inc_123/incident.json".into(),
+            source_issue_draft_ref: ".punk/incidents/feat_123/inc_123/issue.md".into(),
+            source_repro_ref: ".punk/incidents/feat_123/inc_123/repro.md".into(),
+            target_project_id: "specpunk".into(),
+            target_repo_root: "/tmp/specpunk".into(),
+            imported_incident_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/incident.json".into(),
+            imported_issue_draft_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/issue.md".into(),
+            imported_repro_ref: ".punk/imported-incidents/foreign-demo/inc_123/prom_123/repro.md"
+                .into(),
+            prepared_goal: "Investigate and fix promoted incident inc_123".into(),
+            draft_feature_id: "feat_456".into(),
+            draft_contract_id: "ct_456_v1".into(),
+            auto_run_attempts: 2,
+            last_attempt_at: Some("2026-04-16T00:45:00Z".into()),
+            last_failure: None,
+            execution: Some(IncidentPromotionExecution {
+                run_id: "run_456".into(),
+                receipt_ref: ".punk/runs/run_456/receipt.json".into(),
+                decision_id: "dec_456".into(),
+                proof_id: "proof_456".into(),
+                decision_outcome: "accept".into(),
+                receipt_summary: "bounded fix applied and checks passed".into(),
+                completed_at: "2026-04-16T00:45:00Z".into(),
+            }),
+            created_at: "2026-04-16T00:30:00Z".into(),
+        };
+
+        let rendered = format_incident_promotion_summary(&promotion, None);
+        assert!(rendered.contains("State: completed"));
+        assert!(rendered.contains("Auto-run attempts: 2"));
+        assert!(rendered.contains("Run: run_456"));
+        assert!(rendered.contains("Decision: accept"));
+        assert!(rendered.contains("Proof: proof_456"));
+        assert!(rendered.contains("Next: cd /tmp/specpunk && punk inspect proof_456"));
+    }
+
+    #[test]
+    fn incident_promotion_summary_mentions_auto_run_policy_when_provided() {
+        let promotion = IncidentPromotionRecord {
+            id: "prom_123".into(),
+            incident_id: "inc_123".into(),
+            source_project_id: "foreign-demo".into(),
+            source_repo_root: "/tmp/source".into(),
+            source_incident_ref: ".punk/incidents/feat_123/inc_123/incident.json".into(),
+            source_issue_draft_ref: ".punk/incidents/feat_123/inc_123/issue.md".into(),
+            source_repro_ref: ".punk/incidents/feat_123/inc_123/repro.md".into(),
+            target_project_id: "specpunk".into(),
+            target_repo_root: "/tmp/specpunk".into(),
+            imported_incident_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/incident.json".into(),
+            imported_issue_draft_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/issue.md".into(),
+            imported_repro_ref: ".punk/imported-incidents/foreign-demo/inc_123/prom_123/repro.md"
+                .into(),
+            prepared_goal: "Investigate and fix promoted incident inc_123".into(),
+            draft_feature_id: "feat_456".into(),
+            draft_contract_id: "ct_456_v1".into(),
+            auto_run_attempts: 0,
+            last_attempt_at: None,
+            last_failure: None,
+            execution: None,
+            created_at: "2026-04-16T00:30:00Z".into(),
+        };
+        let policy = IncidentAutoRunPolicy {
+            allowed: true,
+            detail: "target repo matches specpunk upstream markers".into(),
+        };
+
+        let rendered = format_incident_promotion_summary(&promotion, Some(&policy));
+        assert!(rendered
+            .contains("Auto-run policy: allowed: target repo matches specpunk upstream markers"));
+    }
+
+    #[test]
+    fn incident_promotion_summary_mentions_last_failure_and_rerun_next_step() {
+        let promotion = IncidentPromotionRecord {
+            id: "prom_123".into(),
+            incident_id: "inc_123".into(),
+            source_project_id: "foreign-demo".into(),
+            source_repo_root: "/tmp/source".into(),
+            source_incident_ref: ".punk/incidents/feat_123/inc_123/incident.json".into(),
+            source_issue_draft_ref: ".punk/incidents/feat_123/inc_123/issue.md".into(),
+            source_repro_ref: ".punk/incidents/feat_123/inc_123/repro.md".into(),
+            target_project_id: "specpunk".into(),
+            target_repo_root: "/tmp/specpunk".into(),
+            imported_incident_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/incident.json".into(),
+            imported_issue_draft_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/issue.md".into(),
+            imported_repro_ref: ".punk/imported-incidents/foreign-demo/inc_123/prom_123/repro.md"
+                .into(),
+            prepared_goal: "Investigate and fix promoted incident inc_123".into(),
+            draft_feature_id: "feat_456".into(),
+            draft_contract_id: "ct_456_v1".into(),
+            auto_run_attempts: 1,
+            last_attempt_at: Some("2026-04-16T00:40:00Z".into()),
+            last_failure: Some(IncidentPromotionFailure {
+                phase: "proof_write".into(),
+                summary: "proofpack write failed after gate output".into(),
+                contract_status: Some("approved".into()),
+                run_id: Some("run_456".into()),
+                receipt_ref: Some(".punk/runs/run_456/receipt.json".into()),
+                decision_id: Some("dec_456".into()),
+                failed_at: "2026-04-16T00:40:00Z".into(),
+            }),
+            execution: None,
+            created_at: "2026-04-16T00:30:00Z".into(),
+        };
+
+        let rendered = format_incident_promotion_summary(&promotion, None);
+        assert!(rendered.contains("State: failed"));
+        assert!(rendered.contains("Auto-run attempts: 1"));
+        assert!(rendered
+            .contains("Last failure: proof_write: proofpack write failed after gate output"));
+        assert!(rendered.contains("Last failure run: run_456"));
+        assert!(rendered.contains("Last failure decision: dec_456"));
+        assert!(rendered.contains("Next: punk incident rerun prom_123 --auto-run"));
+    }
+
+    #[test]
+    fn incident_auto_run_policy_allows_specpunk_like_target_repo() {
+        let root = temp_test_dir("incident-auto-run-policy-allowed");
+        write_specpunk_target_markers(&root);
+
+        let policy = inspect_incident_auto_run_policy(&root);
+        assert!(policy.allowed);
+        assert!(policy.detail.contains("matches specpunk upstream markers"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn incident_auto_run_policy_blocks_non_specpunk_target_repo() {
+        let root = temp_test_dir("incident-auto-run-policy-blocked");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+
+        let policy = inspect_incident_auto_run_policy(&root);
+        assert!(!policy.allowed);
+        assert!(policy
+            .detail
+            .contains("does not look like specpunk upstream"));
+        assert!(policy.detail.contains("crates/punk-cli/src/main.rs"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn incident_summary_mentions_auto_run_next_when_defaults_target_is_eligible() {
+        let source_root = temp_test_dir("incident-summary-auto-run-source");
+        let global_root = temp_test_dir("incident-summary-auto-run-global");
+        let target_root = temp_test_dir("incident-summary-auto-run-target");
+        write_specpunk_target_markers(&target_root);
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&source_root)
+            .output()
+            .unwrap();
+
+        let (orch, incident) = prepare_captured_incident_fixture(&source_root, &global_root);
+        orch.set_global_incident_defaults(Some(&target_root), None)
+            .unwrap();
+
+        let next_actions = derive_incident_next_actions(&orch, &incident).unwrap();
+        let rendered = format_incident_summary(&incident, Some(&next_actions));
+
+        assert!(rendered.contains("Promote draft: punk incident promote inc_"));
+        assert!(rendered
+            .contains("Auto-run policy: allowed: target repo matches specpunk upstream markers"));
+        assert!(rendered.contains("Auto-run next: punk incident promote inc_"));
+        assert!(rendered.contains("--auto-run"));
+
+        let _ = fs::remove_dir_all(&source_root);
+        let _ = fs::remove_dir_all(&global_root);
+        let _ = fs::remove_dir_all(&target_root);
+    }
+
+    #[test]
+    fn incident_summary_mentions_auto_run_policy_block_when_defaults_target_is_not_eligible() {
+        let source_root = temp_test_dir("incident-summary-policy-source");
+        let global_root = temp_test_dir("incident-summary-policy-global");
+        let target_root = temp_test_dir("incident-summary-policy-target");
+        fs::create_dir_all(target_root.join("src")).unwrap();
+        fs::write(
+            target_root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&source_root)
+            .output()
+            .unwrap();
+
+        let (orch, incident) = prepare_captured_incident_fixture(&source_root, &global_root);
+        orch.set_global_incident_defaults(Some(&target_root), None)
+            .unwrap();
+
+        let next_actions = derive_incident_next_actions(&orch, &incident).unwrap();
+        let rendered = format_incident_summary(&incident, Some(&next_actions));
+
+        assert!(rendered.contains("Promote draft: punk incident promote inc_"));
+        assert!(rendered.contains(
+            "Auto-run policy: blocked: target repo does not look like specpunk upstream"
+        ));
+        assert!(!rendered.contains("Auto-run next:"));
+
+        let _ = fs::remove_dir_all(&source_root);
+        let _ = fs::remove_dir_all(&global_root);
+        let _ = fs::remove_dir_all(&target_root);
+    }
+
+    #[test]
+    fn incident_auto_run_policy_error_mentions_promotion_inspect_and_contract_review() {
+        let promotion = IncidentPromotionRecord {
+            id: "prom_123".into(),
+            incident_id: "inc_123".into(),
+            source_project_id: "foreign-demo".into(),
+            source_repo_root: "/tmp/source".into(),
+            source_incident_ref: ".punk/incidents/feat_123/inc_123/incident.json".into(),
+            source_issue_draft_ref: ".punk/incidents/feat_123/inc_123/issue.md".into(),
+            source_repro_ref: ".punk/incidents/feat_123/inc_123/repro.md".into(),
+            target_project_id: "some-target".into(),
+            target_repo_root: "/tmp/not-specpunk".into(),
+            imported_incident_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/incident.json".into(),
+            imported_issue_draft_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/issue.md".into(),
+            imported_repro_ref: ".punk/imported-incidents/foreign-demo/inc_123/prom_123/repro.md"
+                .into(),
+            prepared_goal: "Investigate and fix promoted incident inc_123".into(),
+            draft_feature_id: "feat_456".into(),
+            draft_contract_id: "ct_456_v1".into(),
+            auto_run_attempts: 0,
+            last_attempt_at: None,
+            last_failure: None,
+            execution: None,
+            created_at: "2026-04-16T00:30:00Z".into(),
+        };
+        let policy = IncidentAutoRunPolicy {
+            allowed: false,
+            detail: "target repo does not look like specpunk upstream; missing crates/punk-cli/src/main.rs".into(),
+        };
+
+        let rendered = format_incident_auto_run_policy_error(&promotion, &policy);
+        assert!(rendered.contains("auto-run is blocked by policy"));
+        assert!(rendered.contains("punk inspect prom_123"));
+        assert!(rendered.contains("cd /tmp/not-specpunk && punk inspect ct_456_v1"));
+    }
+
+    #[test]
+    fn incident_auto_run_failure_message_mentions_rerun_command() {
+        let promotion = IncidentPromotionRecord {
+            id: "prom_123".into(),
+            incident_id: "inc_123".into(),
+            source_project_id: "foreign-demo".into(),
+            source_repo_root: "/tmp/source".into(),
+            source_incident_ref: ".punk/incidents/feat_123/inc_123/incident.json".into(),
+            source_issue_draft_ref: ".punk/incidents/feat_123/inc_123/issue.md".into(),
+            source_repro_ref: ".punk/incidents/feat_123/inc_123/repro.md".into(),
+            target_project_id: "specpunk".into(),
+            target_repo_root: "/tmp/specpunk".into(),
+            imported_incident_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/incident.json".into(),
+            imported_issue_draft_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/issue.md".into(),
+            imported_repro_ref: ".punk/imported-incidents/foreign-demo/inc_123/prom_123/repro.md"
+                .into(),
+            prepared_goal: "Investigate and fix promoted incident inc_123".into(),
+            draft_feature_id: "feat_456".into(),
+            draft_contract_id: "ct_456_v1".into(),
+            auto_run_attempts: 0,
+            last_attempt_at: None,
+            last_failure: None,
+            execution: None,
+            created_at: "2026-04-16T00:30:00Z".into(),
+        };
+
+        let error = anyhow::anyhow!("target repo lost the imported bundle");
+        let rendered = format_incident_auto_run_failure(&promotion, error.as_ref());
+        assert!(rendered.contains("promotion prom_123 auto-run failed"));
+        assert!(rendered.contains("punk inspect prom_123"));
+        assert!(rendered.contains("punk incident rerun prom_123 --auto-run"));
+    }
+
+    #[test]
+    fn incident_submission_summary_mentions_preview_and_publish_state() {
+        let submission = punk_domain::IncidentSubmissionRecord {
+            id: "sub_123".into(),
+            incident_id: "inc_123".into(),
+            submission_kind: "github_issue".into(),
+            github_repo: "heurema/specpunk".into(),
+            issue_title: "punk runtime bug [inc_123]: blocked:no-progress".into(),
+            body_ref: ".punk/submissions/inc_123/sub_123/body.md".into(),
+            preview_command:
+                "gh issue create --repo \"heurema/specpunk\" --title \"punk runtime bug [inc_123]: blocked:no-progress\" --body-file \".punk/submissions/inc_123/sub_123/body.md\""
+                    .into(),
+            state: "submitted".into(),
+            published_issue_url: Some("https://github.com/heurema/specpunk/issues/123".into()),
+            published_issue_number: Some(123),
+            publish_error: None,
+            created_at: "2026-04-16T01:00:00Z".into(),
+            updated_at: "2026-04-16T01:01:00Z".into(),
+        };
+
+        let rendered = format_incident_submission_summary(&submission);
+        assert!(rendered.contains("Submission: sub_123"));
+        assert!(rendered.contains("GitHub repo: heurema/specpunk"));
+        assert!(rendered.contains("State: submitted"));
+        assert!(rendered.contains("Body snapshot: .punk/submissions/inc_123/sub_123/body.md"));
+        assert!(
+            rendered.contains("Published issue: https://github.com/heurema/specpunk/issues/123")
+        );
+    }
+
+    #[test]
+    fn incident_defaults_summary_mentions_repo_and_github_defaults() {
+        let defaults = punk_orch::IncidentDefaults {
+            promote_repo_root: Some("/tmp/specpunk".into()),
+            github_repo: Some("heurema/specpunk".into()),
+            updated_at: Some("2026-04-16T02:00:00Z".into()),
+        };
+
+        let rendered = format_incident_defaults_summary("Incident defaults", &defaults);
+        assert!(rendered.contains("Promote repo: /tmp/specpunk"));
+        assert!(rendered.contains("GitHub repo: heurema/specpunk"));
+        assert!(rendered.contains("Updated at: 2026-04-16T02:00:00Z"));
+    }
+
+    #[test]
+    fn resolve_incident_targets_fall_back_to_repo_local_defaults() {
+        let root = temp_test_dir("incident-defaults-cli");
+        let global = temp_test_dir("incident-defaults-cli-global");
+        let target = temp_test_dir("incident-defaults-cli-target");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='defaults-demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let orch = OrchService::new(&root, &global).unwrap();
+        orch.set_incident_defaults(Some(&target), Some("heurema/specpunk"))
+            .unwrap();
+
+        let promote_repo = resolve_incident_promote_repo(&orch, None).unwrap();
+        let github_repo = resolve_incident_submit_repo(&orch, None).unwrap();
+
+        assert_eq!(promote_repo, target.canonicalize().unwrap());
+        assert_eq!(github_repo, "heurema/specpunk");
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        let _ = fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn resolve_incident_targets_fall_back_to_global_defaults_when_repo_local_is_missing() {
+        let root = temp_test_dir("incident-defaults-cli-global-fallback");
+        let global = temp_test_dir("incident-defaults-cli-global-root");
+        let target = temp_test_dir("incident-defaults-cli-global-target");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='defaults-demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let orch = OrchService::new(&root, &global).unwrap();
+        orch.set_global_incident_defaults(Some(&target), Some("heurema/specpunk"))
+            .unwrap();
+
+        let promote_repo = resolve_incident_promote_repo(&orch, None).unwrap();
+        let github_repo = resolve_incident_submit_repo(&orch, None).unwrap();
+
+        assert_eq!(promote_repo, target.canonicalize().unwrap());
+        assert_eq!(github_repo, "heurema/specpunk");
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        let _ = fs::remove_dir_all(&target);
     }
 
     #[test]
@@ -3984,11 +5889,13 @@ mod tests {
             Some("punk start \"ship feature\""),
             Some("ct_999"),
             Some("punk plot approve ct_999"),
+            Some("punk incident capture proof_789"),
         );
         assert!(rendered.contains("Auto-chain: bootstrap proof proof_111 triggered follow-up implementation cycle proof_789"));
         assert!(rendered.contains("Recovery: punk start \"ship feature\""));
         assert!(rendered.contains("Recovery contract: ct_999"));
         assert!(rendered.contains("Recovery next: punk plot approve ct_999"));
+        assert!(rendered.contains("Incident capture: punk incident capture proof_789"));
     }
 
     #[test]

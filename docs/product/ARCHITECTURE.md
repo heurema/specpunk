@@ -491,6 +491,10 @@ The storage/layout split must stay explicit:
 | architecture assessment | `.punk/runs/<run-id>/architecture-assessment.json` | derived | `gate` | deterministic assessment of frozen contract commitments vs receipt/check state |
 | decision object | `.punk/decisions/<decision-id>.json` | canonical | `gate` | final verdict; carries the architecture assessment ref through `check_refs` |
 | proofpack | `.punk/proofs/<decision-id>/proofpack.json` | canonical | `gate` | hash-linked proof chain; hashes the architecture assessment and frozen capability artifact when present |
+| incident bundle | `.punk/incidents/<work-id>/<incident-id>/incident.json` | derived recovery/export artifact | `incident capture` | repo-local runtime-failure packet linked back to proof/run/decision/autonomy refs |
+| imported incident bundle | `.punk/imported-incidents/<source-project>/<incident-id>/<promotion-id>/incident.json` | derived transfer artifact | `incident promote` | copied upstream evidence bundle inside the target repo before any fix contract runs |
+| incident promotion record | `.punk/promotions/<incident-id>/<promotion-id>.json` | derived transfer ledger | `incident promote` | durable link between source incident, imported target bundle, drafted upstream contract, plus auto-run attempt/failure/completion metadata |
+| incident submission record | `.punk/submissions/<incident-id>/<submission-id>/submission.json` | derived outbound ledger | `incident submit` | sanitized GitHub issue packet plus publish outcome/error state for external reporting |
 
 That means there is still only one contract truth and one final verdict truth:
 
@@ -860,6 +864,100 @@ The architecture should distinguish:
 
 That distinction is important for both shell UX and later inspection.
 
+### Derived runtime-incident lane
+
+Blocked or escalated autonomy can also expose a narrower derived artifact:
+
+```text
+IncidentRecord
+  work_id
+  goal
+  contract_ref
+  run_ref
+  decision_ref
+  proof_ref
+  autonomy_ref?
+  incident_kind
+  decision_outcome
+  summary
+  blocked_reason
+  failure_signature
+  capture_basis[]
+  issue_draft_ref
+  repro_ref
+  created_at
+```
+
+Rules:
+
+- this is a **derived recovery/export artifact**, not a new primitive truth object
+- it should be captured from persisted proof/run/decision/autonomy artifacts, not terminal scraping
+- the shell may suggest incident capture only for deterministic suspected-runtime-bug cases, not for every blocked project check failure
+- internal promotion copies that bundle into another `punk` repo, drafts an inspectable contract there, and records the handoff under `.punk/promotions/...`
+- plain promotion stops at draft creation; `--auto-run` is the explicit opt-in for continuing with approve/execute/gate/proof upstream
+- `--auto-run` must stay deterministic and policy-gated: only suggest or permit it when the effective promote target matches local `specpunk` markers (`Cargo.toml`, `crates/punk-cli/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`), otherwise keep the lane draft-only
+- failed internal auto-run attempts should still update the promotion record with attempt count and the last failed phase/error/partial refs, so retry does not depend on shell history
+- external submission writes a sanitized `.punk/submissions/...` bundle first and only publishes to GitHub with explicit operator opt-in
+- repo-local incident defaults remain project-scoped under `.punk/project/incident-defaults.json`, while operator-wide defaults live under `~/.punk/config/incident-defaults.json`; target resolution precedence is explicit flag > repo-local default > global default
+- this lane exists to make foreign-repo `punk` failures inspectable and transferable without trying to fix `punk` inside the foreign repo itself
+
+The second derived record is:
+
+```text
+IncidentPromotionRecord
+  incident_id
+  source_project_id
+  source_repo_root
+  source_incident_ref
+  source_issue_draft_ref
+  source_repro_ref
+  target_project_id
+  target_repo_root
+  imported_incident_ref
+  imported_issue_draft_ref
+  imported_repro_ref
+  prepared_goal
+  draft_feature_id
+  draft_contract_id
+  auto_run_attempts
+  last_attempt_at?
+  last_failure?
+    phase
+    summary
+    contract_status?
+    run_id?
+    receipt_ref?
+    decision_id?
+    failed_at
+  execution?
+    run_id
+    receipt_ref
+    decision_id
+    proof_id
+    decision_outcome
+    receipt_summary
+    completed_at
+  created_at
+```
+
+The external-report record is:
+
+```text
+IncidentSubmissionRecord
+  incident_id
+  submission_kind
+  github_repo
+  issue_title
+  body_ref
+  preview_command
+  state
+  published_issue_url?
+  published_issue_number?
+  publish_error?
+  created_at
+  updated_at
+```
+
 ---
 
 ## 9. Storage layout
@@ -869,6 +967,8 @@ That distinction is important for both shell UX and later inspection.
 ```text
 ~/.punk/
   config.toml
+  config/
+    incident-defaults.json
   events/
   views/
 ```
@@ -879,6 +979,7 @@ Use this for:
 - materialized views
 - global config
 - skill/eval metadata that is not repo-tracked
+- operator-wide incident routing defaults that should apply across repos
 
 ### Repo-local artifacts
 

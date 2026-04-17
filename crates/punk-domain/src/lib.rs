@@ -645,6 +645,106 @@ pub struct AutonomyRecord {
     pub recorded_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentRecord {
+    pub id: String,
+    pub project_id: String,
+    pub repo_root: String,
+    pub work_id: String,
+    pub goal: String,
+    pub contract_ref: String,
+    pub run_ref: String,
+    pub decision_ref: String,
+    pub proof_ref: String,
+    #[serde(default)]
+    pub autonomy_ref: Option<String>,
+    pub incident_kind: String,
+    pub decision_outcome: String,
+    pub summary: String,
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
+    pub failure_signature: String,
+    #[serde(default)]
+    pub capture_basis: Vec<String>,
+    pub issue_draft_ref: String,
+    pub repro_ref: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentPromotionExecution {
+    pub run_id: String,
+    pub receipt_ref: String,
+    pub decision_id: String,
+    pub proof_id: String,
+    pub decision_outcome: String,
+    pub receipt_summary: String,
+    pub completed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentPromotionFailure {
+    pub phase: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<String>,
+    pub failed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentPromotionRecord {
+    pub id: String,
+    pub incident_id: String,
+    pub source_project_id: String,
+    pub source_repo_root: String,
+    pub source_incident_ref: String,
+    pub source_issue_draft_ref: String,
+    pub source_repro_ref: String,
+    pub target_project_id: String,
+    pub target_repo_root: String,
+    pub imported_incident_ref: String,
+    pub imported_issue_draft_ref: String,
+    pub imported_repro_ref: String,
+    pub prepared_goal: String,
+    pub draft_feature_id: String,
+    pub draft_contract_id: String,
+    #[serde(default)]
+    pub auto_run_attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<IncidentPromotionFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<IncidentPromotionExecution>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentSubmissionRecord {
+    pub id: String,
+    pub incident_id: String,
+    pub submission_kind: String,
+    pub github_repo: String,
+    pub issue_title: String,
+    pub body_ref: String,
+    pub preview_command: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_issue_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_issue_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResearchBudget {
     pub max_rounds: u32,
@@ -1083,5 +1183,109 @@ mod tests {
         assert_eq!(integrity.touched_roots_max, Some(1));
         assert_eq!(integrity.file_loc_budgets[0].max_after_loc, 900);
         assert_eq!(integrity.forbidden_path_dependencies.len(), 1);
+    }
+
+    #[test]
+    fn incident_record_round_trips_through_json() {
+        let incident = IncidentRecord {
+            id: "inc_123".into(),
+            project_id: "specpunk".into(),
+            repo_root: "/tmp/specpunk".into(),
+            work_id: "feat_123".into(),
+            goal: "capture runtime bug".into(),
+            contract_ref: ".punk/contracts/feat_123/v1.json".into(),
+            run_ref: ".punk/runs/feat_123/run.json".into(),
+            decision_ref: ".punk/decisions/dec_123.json".into(),
+            proof_ref: ".punk/proofs/dec_123/proofpack.json".into(),
+            autonomy_ref: Some(".punk/autonomy/feat_123/auto_123.json".into()),
+            incident_kind: "suspected_runtime_bug".into(),
+            decision_outcome: "blocked".into(),
+            summary: "bounded run stalled without product changes".into(),
+            blocked_reason: Some("no-progress failure".into()),
+            failure_signature: "blocked:no-progress".into(),
+            capture_basis: vec![
+                "decision outcome: blocked".into(),
+                "matched runtime marker: no-progress".into(),
+            ],
+            issue_draft_ref: ".punk/incidents/feat_123/inc_123/issue.md".into(),
+            repro_ref: ".punk/incidents/feat_123/inc_123/repro.md".into(),
+            created_at: "2026-04-16T00:00:00Z".into(),
+        };
+
+        let json = serde_json::to_value(&incident).unwrap();
+        let decoded: IncidentRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, incident);
+    }
+
+    #[test]
+    fn incident_promotion_record_round_trips_through_json() {
+        let promotion = IncidentPromotionRecord {
+            id: "prom_123".into(),
+            incident_id: "inc_123".into(),
+            source_project_id: "foreign-demo".into(),
+            source_repo_root: "/tmp/source".into(),
+            source_incident_ref: ".punk/incidents/feat_123/inc_123/incident.json".into(),
+            source_issue_draft_ref: ".punk/incidents/feat_123/inc_123/issue.md".into(),
+            source_repro_ref: ".punk/incidents/feat_123/inc_123/repro.md".into(),
+            target_project_id: "specpunk".into(),
+            target_repo_root: "/tmp/target".into(),
+            imported_incident_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/incident.json".into(),
+            imported_issue_draft_ref:
+                ".punk/imported-incidents/foreign-demo/inc_123/prom_123/issue.md".into(),
+            imported_repro_ref: ".punk/imported-incidents/foreign-demo/inc_123/prom_123/repro.md"
+                .into(),
+            prepared_goal: "Investigate and fix promoted incident inc_123".into(),
+            draft_feature_id: "feat_456".into(),
+            draft_contract_id: "ct_456_v1".into(),
+            auto_run_attempts: 2,
+            last_attempt_at: Some("2026-04-16T00:45:00Z".into()),
+            last_failure: Some(IncidentPromotionFailure {
+                phase: "proof_write".into(),
+                summary: "proofpack write failed after gate output".into(),
+                contract_status: Some("approved".into()),
+                run_id: Some("run_456".into()),
+                receipt_ref: Some(".punk/runs/run_456/receipt.json".into()),
+                decision_id: Some("dec_456".into()),
+                failed_at: "2026-04-16T00:40:00Z".into(),
+            }),
+            execution: Some(IncidentPromotionExecution {
+                run_id: "run_456".into(),
+                receipt_ref: ".punk/runs/run_456/receipt.json".into(),
+                decision_id: "dec_456".into(),
+                proof_id: "proof_456".into(),
+                decision_outcome: "accept".into(),
+                receipt_summary: "bounded fix applied and checks passed".into(),
+                completed_at: "2026-04-16T00:45:00Z".into(),
+            }),
+            created_at: "2026-04-16T00:30:00Z".into(),
+        };
+
+        let json = serde_json::to_value(&promotion).unwrap();
+        let decoded: IncidentPromotionRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, promotion);
+    }
+
+    #[test]
+    fn incident_submission_record_round_trips_through_json() {
+        let submission = IncidentSubmissionRecord {
+            id: "sub_123".into(),
+            incident_id: "inc_123".into(),
+            submission_kind: "github_issue".into(),
+            github_repo: "heurema/specpunk".into(),
+            issue_title: "punk runtime bug [inc_123]: blocked:no-progress".into(),
+            body_ref: ".punk/submissions/inc_123/sub_123/body.md".into(),
+            preview_command: "gh issue create --repo heurema/specpunk".into(),
+            state: "submitted".into(),
+            published_issue_url: Some("https://github.com/heurema/specpunk/issues/123".into()),
+            published_issue_number: Some(123),
+            publish_error: None,
+            created_at: "2026-04-16T01:00:00Z".into(),
+            updated_at: "2026-04-16T01:01:00Z".into(),
+        };
+
+        let json = serde_json::to_value(&submission).unwrap();
+        let decoded: IncidentSubmissionRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, submission);
     }
 }

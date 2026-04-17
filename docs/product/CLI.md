@@ -195,6 +195,50 @@ Current proof inspect surface:
 - `punk inspect proof_<id> --json`
 - `punk inspect proof_<id>`
 
+Current incident inspect surface:
+
+- `punk incident defaults`
+- `punk incident defaults --global`
+- `punk incident defaults --repo </absolute/or/relative/path> --github owner/repo`
+- `punk incident defaults --global --repo </absolute/or/relative/path> --github owner/repo`
+- `punk incident capture <proof-id>`
+- `punk incident promote <incident-id> [--repo </absolute/or/relative/path>]`
+- `punk incident promote <incident-id> [--repo </absolute/or/relative/path>] --auto-run`
+- `punk incident rerun <promotion-id> --auto-run`
+- `punk incident submit <incident-id> --github owner/repo`
+- `punk incident submit <incident-id> --github owner/repo --publish`
+- `punk incident resubmit <submission-id> --publish`
+- `punk inspect inc_<id> --json`
+- `punk inspect inc_<id>`
+- `punk inspect prom_<id> --json`
+- `punk inspect prom_<id>`
+- `punk inspect sub_<id> --json`
+- `punk inspect sub_<id>`
+
+Current promote semantics:
+
+- `incident defaults` shows the current repo-local defaults, or updates them when `--repo` and/or `--github` is passed
+- `incident defaults --global` shows the current operator-wide defaults, or updates them when `--repo` and/or `--github` is passed
+- repo-local defaults persist in `.punk/project/incident-defaults.json`
+- global defaults persist in `~/.punk/config/incident-defaults.json`
+- target resolution precedence is explicit flag > repo-local default > global default
+- once defaults exist, `incident promote` may omit `--repo` and `incident submit` may omit `--github`
+- `incident capture` writes a repo-local incident bundle under `.punk/incidents/...`
+- `incident capture` and `punk inspect inc_<id>` also show the effective promote target plus auto-run eligibility when a promote target is configured
+- `incident promote` copies that bundle into the target repo under `.punk/imported-incidents/...`
+- `incident promote` also drafts a contract in the target repo and records a durable promotion link under `.punk/promotions/...`
+- plain `incident promote` stops at draft creation
+- `incident promote --auto-run` is explicit opt-in and then auto-approves, executes, gates, and writes a proof for that drafted upstream contract
+- auto-run is suggested and permitted only when the target repo matches deterministic `specpunk` markers (`Cargo.toml`, `crates/punk-cli/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`); otherwise the promotion remains draft-only
+- auto-run stores the resulting `run_id`, `receipt_ref`, `decision_id`, and `proof_id` back on the promotion record so `punk inspect prom_<id>` stays inspectable
+- promotion records also persist `auto_run_attempts`, `last_attempt_at`, and `last_failure` metadata so failed internal retries remain inspectable without shell scrollback
+- if internal auto-run fails before proof creation, `incident rerun <promotion-id> --auto-run` reuses the same promotion record and target contract instead of creating a second promotion bundle
+- `incident submit` writes a sanitized GitHub issue bundle under `.punk/submissions/...`
+- `incident submit` prepares only by default; `--publish` is the explicit networked step
+- publish currently uses `gh api`, so missing `gh` auth should fail after writing an inspectable `sub_<id>` bundle
+- `incident resubmit` reuses an existing `.punk/submissions/...` bundle and requires `--publish`
+- `incident resubmit` rejects already-published `sub_<id>` records to avoid accidental duplicate issues
+
 Current bounded research freeze/start surface:
 
 ```bash
@@ -395,6 +439,12 @@ punk gate proof <run-id|decision-id>
 punk gc stale --dry-run
 punk status [id]
 punk inspect <id> --json
+punk incident defaults [--global] [--repo </absolute/or/relative/path>] [--github owner/repo]
+punk incident capture <proof-id>
+punk incident promote <incident-id> [--repo </absolute/or/relative/path>] [--auto-run]
+punk incident rerun <promotion-id> --auto-run
+punk incident submit <incident-id> [--github owner/repo] [--publish]
+punk incident resubmit <submission-id> --publish
 ```
 
 ---
@@ -481,6 +531,18 @@ When `--fallback-staged` is set and autonomy blocks:
 - a staged recovery contract is drafted automatically
 - recovery metadata and next command are returned
 - an autonomy-linked durable record is written so later inspection does not depend on old shell output
+- when the blocked or escalated proof matches deterministic runtime-bug markers (`no-progress`, corruption, orphan/stall/timeout, or controller/executor unexpected state), the shell may also return `punk incident capture <proof-id>`
+- after capture, operators can explicitly hand the bundle upstream with `punk incident promote <incident-id> --repo <specpunk-repo>`
+- if they already trust the drafted upstream contract, `punk incident promote <incident-id> --auto-run` continues all the way through `approve -> cut -> gate -> proof` in the target repo and records those execution artifacts back onto `prom_<id>`
+- that `--auto-run` path is only suggested and permitted when the effective promote target looks like a local `specpunk` repo by deterministic file markers; otherwise the shell should keep the lane draft-only
+- if that internal auto-run fails partway through, `punk incident rerun <promotion-id> --auto-run` retries the same promoted contract from its current target-repo state instead of drafting a fresh promotion
+- `punk inspect prom_<id>` should show whether the promotion is still `drafted`, has a `last_failure`, or already has a completed execution, plus the next obvious recovery command
+- external users can instead prepare a GitHub issue with `punk incident submit <incident-id> --github owner/repo`
+- repo-local defaults from `punk incident defaults` and global defaults from `punk incident defaults --global` can remove those repeated flags; resolution precedence is explicit flag > repo-local > global
+- actual GitHub publication requires explicit `--publish`
+- plain promote copies the incident bundle into the target repo, drafts an inspectable contract there, and does not auto-approve or auto-run anything
+- submit writes a sanitized `.punk/submissions/...` bundle first so failed publication still leaves something inspectable
+- resubmit lets the operator retry the exact same prepared submission bundle after fixing `gh` auth or network issues
 
 The intended durable behavior is stronger than shell text:
 
