@@ -43,9 +43,16 @@ Current reality:
 
 The exact repo truth lives in [`docs/product/REPO-STATUS.md`](docs/product/REPO-STATUS.md).
 
-## Quickstart
+## Getting started
 
-Run the CLI from the source tree:
+Current public flow:
+
+1. install or run from source
+2. initialize a repository
+3. use the default happy path through `punk go`
+4. use staged mode only when you want explicit review between phases
+
+Source-first entrypoint today:
 
 ```bash
 cargo run -p punk-cli -- --help
@@ -57,29 +64,13 @@ Initialize a repository:
 cargo run -p punk-cli -- init --enable-jj --verify
 ```
 
-If `punk` is already on your `PATH`, you can use:
-
-```bash
-punk init --enable-jj --verify
-```
-
 Default happy path:
 
 ```bash
-punk go --fallback-staged "<goal>"
+cargo run -p punk-cli -- go --fallback-staged "<goal>"
 ```
 
-Staged path:
-
-```bash
-punk start "<goal>"
-punk plot approve <contract-id>
-punk cut run <contract-id>
-punk gate run <run-id>
-punk gate proof <run-id|decision-id>
-```
-
-`jj` is preferred when available. `git` is the fallback.
+If `punk` is already on your `PATH`, you can use the shorter commands.
 
 ## Read this first
 
@@ -111,6 +102,7 @@ Public docs layer:
 
 - Mintlify config: [`docs.json`](docs.json)
 - Public overview source: [`index.mdx`](index.mdx)
+- Public install source: [`install.mdx`](install.mdx)
 - Public quickstart source: [`quickstart.mdx`](quickstart.mdx)
 - Public roadmap source: [`roadmap.mdx`](roadmap.mdx)
 
