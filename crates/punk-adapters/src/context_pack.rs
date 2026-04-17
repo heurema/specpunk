@@ -1392,6 +1392,7 @@ fn anchor_score(
     let signature_lc = signature.to_ascii_lowercase();
     let path_lc = path.to_ascii_lowercase();
     let contract_surface_lc = contract_surface.to_ascii_lowercase();
+    let cli_command_wiring_surface = is_main_rs_cli_command_wiring_surface(&contract_surface_lc);
     let mut score = 0usize;
     for term in contract_terms {
         if signature_lc.contains(term) {
@@ -1506,6 +1507,21 @@ fn anchor_score(
     {
         score = score.saturating_sub(10);
     }
+    if path_lc.ends_with("main.rs") && cli_command_wiring_surface {
+        if signature_lc.starts_with("pub enum command") || signature_lc.starts_with("enum command")
+        {
+            score += 24;
+        }
+        if signature_lc.contains("parse_args") {
+            score += 22;
+        }
+        if signature_lc.starts_with("pub fn run(") || signature_lc.starts_with("fn run(") {
+            score += 18;
+        }
+        if signature_lc.contains("usage") || signature_lc.contains("help") {
+            score += 12;
+        }
+    }
     if path_lc.ends_with("eval.rs")
         && (signature_lc.starts_with("pub struct ") || signature_lc.starts_with("struct "))
         && contract_surface_lc.contains("reuse existing")
@@ -1532,6 +1548,20 @@ fn anchor_score(
         score = score.saturating_sub(6);
     }
     score
+}
+
+fn is_main_rs_cli_command_wiring_surface(contract_surface_lc: &str) -> bool {
+    [
+        "--json",
+        "cli",
+        "subcommand",
+        "parse_args",
+        "help/usage",
+        "help",
+        "usage",
+    ]
+    .iter()
+    .any(|marker| contract_surface_lc.contains(marker))
 }
 
 fn anchor_symbol_name(signature: &str) -> Option<&str> {
@@ -2352,6 +2382,85 @@ mod tests {
                     other.path == "punk/punk-run/src/main.rs"
                         && other.symbol.contains("fn cmd_status")
                 })
+        }));
+    }
+
+    #[test]
+    fn derive_plan_seed_prefers_main_rs_command_cluster_for_cli_json_slice() {
+        let contract = Contract {
+            id: "ct_pubpunk_review_json".into(),
+            feature_id: "feat_pubpunk_review_json".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Implement ONLY minimal pubpunk review --json skeleton. Keep scope bounded to crates/pubpunk-core/src/review.rs, crates/pubpunk-core/src/lib.rs, and crates/pubpunk-cli/src/main.rs.".into(),
+            entry_points: vec![
+                "crates/pubpunk-core/src/review.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "crates/pubpunk-cli/src/main.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "Add a local-only deterministic review path that returns structured JSON without network side effects.".into(),
+                "CLI wiring must expose pubpunk review --json without disturbing the existing command flow.".into(),
+            ],
+            behavior_requirements: vec![
+                "Resolve defaults.target and load the matching local draft artifact under .pubpunk/local/drafts.".into(),
+                "Return structured JSON with artifact path and issues.".into(),
+                "Do not add publish or network side effects.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-core/src/review.rs".into(),
+                "crates/pubpunk-core/src/lib.rs".into(),
+                "crates/pubpunk-cli/src/main.rs".into(),
+            ],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let pack = ContextPack {
+            files: vec![
+                ContextFileExcerpt {
+                    path: "crates/pubpunk-core/src/review.rs".into(),
+                    start_line: 1,
+                    end_line: 16,
+                    truncated_at_test_boundary: false,
+                    content: "pub struct ReviewReport {\n    pub issues: Vec<String>,\n}\n\npub fn review_report(root: &Path, json: bool) -> Result<ReviewReport, String> {\n    todo!()\n}\n".into(),
+                },
+                ContextFileExcerpt {
+                    path: "crates/pubpunk-core/src/lib.rs".into(),
+                    start_line: 1,
+                    end_line: 8,
+                    truncated_at_test_boundary: false,
+                    content: "pub mod review;\n\npub use review::review_report;\n".into(),
+                },
+                ContextFileExcerpt {
+                    path: "crates/pubpunk-cli/src/main.rs".into(),
+                    start_line: 1,
+                    end_line: 42,
+                    truncated_at_test_boundary: false,
+                    content: "enum Command {\n    Validate { json: bool },\n    Publish,\n}\n\nfn print_usage() {\n    println!(\"usage\");\n}\n\nfn parse_args<I>(args: I) -> Result<Command, String>\nwhere\n    I: IntoIterator,\n{\n    todo!()\n}\n\nfn run(command: Command) -> Result<(), String> {\n    match command {\n        Command::Validate { json } => {\n            let _ = json;\n            Ok(())\n        }\n        Command::Publish => Ok(()),\n    }\n}\n".into(),
+                },
+            ],
+            missing_paths: vec![],
+            recipe_seed: None,
+            patch_seed: None,
+            plan_seed: None,
+        };
+
+        let seed = derive_plan_seed(&contract, &pack);
+
+        assert_eq!(seed.targets.len(), 3);
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "crates/pubpunk-cli/src/main.rs"
+                && target.symbol.contains("enum Command")
+        }));
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "crates/pubpunk-cli/src/main.rs" && target.symbol.contains("parse_args")
+        }));
+        assert!(seed.targets.iter().any(|target| {
+            target.path == "crates/pubpunk-cli/src/main.rs" && target.symbol.contains("fn run")
         }));
     }
 
