@@ -11,9 +11,7 @@ If you are running from the source tree, prepend commands with:
 cargo run -p punk-cli --
 ```
 
-## Primary entrypoints
-
-The current public entrypoints are:
+## Most users only need these commands
 
 ```bash
 punk init --enable-jj --verify
@@ -25,7 +23,7 @@ punk inspect <id> --json
 
 ## Goal-first path
 
-For initialized repositories, the default happy path is goal-first:
+For initialized repositories, the default happy path is:
 
 ```bash
 punk go --fallback-staged "<goal>"
@@ -51,6 +49,8 @@ punk gate proof <run-id|decision-id>
 
 ## Mode-level commands
 
+These are the lower-level commands behind the staged path:
+
 ```bash
 punk plot contract "<goal>"
 punk plot refine <contract-id> "<guidance>"
@@ -60,7 +60,7 @@ punk gate run <run-id>
 punk gate proof <run-id|decision-id>
 ```
 
-## Read surfaces
+## Read and inspect surfaces
 
 Use these to inspect current state and artifacts:
 
@@ -70,16 +70,6 @@ punk inspect work [id]
 punk inspect project
 punk inspect <id> --json
 ```
-
-## Not part of the current public CLI
-
-These are not part of the current operator surface:
-
-- interactive shell
-- daemon
-- queue
-- always-on council flow
-- broad research workflow as a public default
 
 ## Canonical source
 
