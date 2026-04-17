@@ -81,8 +81,8 @@ When proposing a bounded slice, name:
 
 ## Git rules
 
-- Never push directly to `main`
-- Use a branch + PR flow
+- Direct push to `main` is allowed
+- Branch + PR flow is optional, not required
 - Keep working tree reviewable
 
 ## What specpunk is trying to be
