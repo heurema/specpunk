@@ -11,7 +11,7 @@ This doc covers both:
 Current status:
 - canonical current-truth matrix: `docs/product/IMPLEMENTATION-STATUS.md`
 - crate status: dedicated `punk-research` crate is **planned only**
-- capability status: bounded `punk research ...` commands already exist today in `punk-cli` + `punk-orch` + `punk-domain`
+- capability status: bounded `punk research ...` commands already exist today in `specpunk` + `punk-orch` + `punk-domain`
 - operator-surface status: bounded research is a current **expert/control surface**, not the default operator path
 
 It is not endless autoresearch.

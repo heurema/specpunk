@@ -1183,7 +1183,7 @@ mod tests {
                 }],
                 forbidden_path_dependencies: vec![ArchitectureForbiddenPathDependency {
                     from_glob: "crates/punk-gate/**".into(),
-                    to_glob: "crates/punk-cli/**".into(),
+                    to_glob: "crates/specpunk/**".into(),
                 }],
             }),
             capability_resolution_ref: Some(

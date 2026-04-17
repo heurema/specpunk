@@ -5,7 +5,7 @@
 # - planned_only: target-shape crate not present in today's workspace membership
 members = [
   # active_v0_surface
-  "crates/punk-cli",
+  "crates/specpunk",
   "crates/punk-domain",
   "crates/punk-events",
   "crates/punk-core",

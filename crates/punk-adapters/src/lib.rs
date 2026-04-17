@@ -5020,7 +5020,7 @@ fn is_self_referential_reliability_slice(contract: &Contract) -> bool {
 fn is_self_referential_control_plane_path(path: &str) -> bool {
     path.starts_with("crates/punk-adapters/")
         || path.starts_with("crates/punk-vcs/")
-        || path.starts_with("crates/punk-cli/")
+        || path.starts_with("crates/specpunk/")
         || path.starts_with("crates/punk-orch/")
 }
 
@@ -7991,14 +7991,14 @@ mod tests {
             prompt_source: "Add JSON output to punk vcs status".into(),
             entry_points: vec![
                 "crates/punk-vcs/src/lib.rs".into(),
-                "crates/punk-cli/src/main.rs".into(),
+                "crates/specpunk/src/main.rs".into(),
             ],
             import_paths: vec![],
             expected_interfaces: vec!["punk vcs status --json emits structured JSON".into()],
             behavior_requirements: vec!["preserve human output".into()],
             allowed_scope: vec![
                 "crates/punk-vcs/src/lib.rs".into(),
-                "crates/punk-cli/src/main.rs".into(),
+                "crates/specpunk/src/main.rs".into(),
             ],
             target_checks: vec!["cargo test -p punk-vcs".into()],
             integrity_checks: vec!["cargo test --workspace".into()],
@@ -9534,7 +9534,7 @@ mod tests {
                 candidate_file_scope_paths: vec!["src/lib.rs".into()],
                 candidate_directory_scope_paths: vec!["src".into()],
                 candidate_target_checks: vec![
-                    "cargo build -p punk-cli".into(),
+                    "cargo build -p specpunk".into(),
                     "cargo test -p punk-adapters".into(),
                 ],
                 candidate_integrity_checks: vec!["cargo test --workspace".into()],
@@ -9576,7 +9576,7 @@ mod tests {
                 candidate_file_scope_paths: vec!["src/lib.rs".into()],
                 candidate_directory_scope_paths: vec!["src".into()],
                 candidate_target_checks: vec![
-                    "cargo build -p punk-cli".into(),
+                    "cargo build -p specpunk".into(),
                     "cargo test -p punk-adapters".into(),
                 ],
                 candidate_integrity_checks: vec!["cargo test --workspace".into()],
@@ -10195,7 +10195,7 @@ mod tests {
         fs::write(&stdout_path, "").unwrap();
         fs::write(
             &stderr_path,
-            "exec\n/bin/zsh -lc 'cargo build -p punk-cli && cargo test -p punk-council && cargo test --workspace'\n",
+            "exec\n/bin/zsh -lc 'cargo build -p specpunk && cargo test -p punk-council && cargo test --workspace'\n",
         )
         .unwrap();
 

@@ -2330,7 +2330,7 @@ fn inspect_incident_auto_run_policy(
     }
     let markers = [
         "Cargo.toml",
-        "crates/punk-cli/src/main.rs",
+        "crates/specpunk/src/main.rs",
         "crates/punk-orch/src/lib.rs",
         "docs/product/CLI.md",
     ];
@@ -3635,7 +3635,7 @@ mod tests {
     fn write_specpunk_target_markers(root: &Path) {
         fs::create_dir_all(root.join(".punk")).unwrap();
         fs::create_dir_all(root.join("src")).unwrap();
-        fs::create_dir_all(root.join("crates/punk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/specpunk/src")).unwrap();
         fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
         fs::create_dir_all(root.join("docs/product")).unwrap();
         let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -3658,7 +3658,7 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn runtime_lane() {}\n").unwrap();
-        fs::write(root.join("crates/punk-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("crates/specpunk/src/main.rs"), "fn main() {}\n").unwrap();
         fs::write(
             root.join("crates/punk-orch/src/lib.rs"),
             "pub fn demo() {}\n",
@@ -4400,7 +4400,7 @@ mod tests {
             lifecycle_state: "accepted".into(),
             blocked_reason: None,
             latest_proof_command_evidence_summary: vec![
-                "target pass: cargo test -p punk-cli".into(),
+                "target pass: cargo test -p specpunk".into(),
                 "integrity pass: cargo test --workspace".into(),
             ],
             next_action: Some("inspect_proof".into()),
@@ -4426,7 +4426,7 @@ mod tests {
         assert!(rendered.contains("assessment: .punk/runs/run_456/architecture-assessment.json"));
         assert!(rendered.contains("assessment outcome: block"));
         assert!(rendered.contains("Latest proof evidence:"));
-        assert!(rendered.contains("- target pass: cargo test -p punk-cli"));
+        assert!(rendered.contains("- target pass: cargo test -p specpunk"));
         assert!(rendered.contains("Latest proof harness evidence:"));
         assert!(rendered
             .contains("- declared log_query [default]: declared surface from persisted packet"));
@@ -4847,7 +4847,7 @@ mod tests {
                 punk_domain::CommandEvidence {
                     evidence_type: "command".into(),
                     lane: "target".into(),
-                    command: "cargo test -p punk-cli".into(),
+                    command: "cargo test -p specpunk".into(),
                     status: punk_domain::CheckStatus::Pass,
                     summary: "target check passed".into(),
                     stdout_ref: Some(".punk/runs/run_789/checks/target-01.stdout.log".into()),
@@ -4903,7 +4903,7 @@ mod tests {
         assert!(rendered.contains("Environment digest: missing"));
         assert!(rendered.contains("Claim limits:"));
         assert!(rendered.contains("Command evidence:"));
-        assert!(rendered.contains("- target pass: cargo test -p punk-cli"));
+        assert!(rendered.contains("- target pass: cargo test -p specpunk"));
         assert!(rendered.contains("- integrity pass: cargo test --workspace"));
         assert!(rendered.contains("Declared harness evidence:"));
         assert!(rendered.contains(

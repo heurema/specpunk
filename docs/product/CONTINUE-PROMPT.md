@@ -39,7 +39,7 @@ Status vocabulary:
 - planned only
 
 Current crates:
-- active v0 surface: `punk-cli`, `punk-domain`, `punk-events`, `punk-vcs`, `punk-core`, `punk-orch`, `punk-gate`, `punk-proof`, `punk-adapters`
+- active v0 surface: `specpunk`, `punk-domain`, `punk-events`, `punk-vcs`, `punk-core`, `punk-orch`, `punk-gate`, `punk-proof`, `punk-adapters`
 - in-tree but inactive: `punk-council`
 - planned only as separate crates: `punk-shell`, `punk-skills`, `punk-eval`, `punk-research`
 
@@ -60,7 +60,7 @@ Current expert/control surfaces:
 Important distinctions:
 - `punk go --fallback-staged` already exists today as a shell mechanism.
 - The standalone `Goal` primitive is still deferred from the current v0 domain/runtime.
-- `punk research ...` already exists today as a bounded capability in `punk-cli` + `punk-orch` + `punk-domain`.
+- `punk research ...` already exists today as a bounded capability in `specpunk` + `punk-orch` + `punk-domain`.
 - The dedicated `punk-research` crate is still planned only.
 - `punk-council` is buildable in-tree but inactive and not part of the current default operator path.
 - The future interactive `punk-shell` crate does not exist yet.

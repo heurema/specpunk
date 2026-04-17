@@ -12832,7 +12832,7 @@ fn ok() {}
             .unwrap();
 
         let service = OrchService::new(&root, &global).unwrap();
-        let prompt = "Scaffold crate with `crates/punk-council/Cargo.toml` and `crates/punk-council/src/lib.rs`. Target checks should include cargo build -p punk-cli and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
+        let prompt = "Scaffold crate with `crates/punk-council/Cargo.toml` and `crates/punk-council/src/lib.rs`. Target checks should include cargo build -p specpunk and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
         let contract = service
             .draft_contract(&ExplicitDetailsIgnoringDrafter, prompt)
             .unwrap();
@@ -12848,7 +12848,7 @@ fn ok() {}
         assert_eq!(
             contract.target_checks,
             vec![
-                "cargo build -p punk-cli".to_string(),
+                "cargo build -p specpunk".to_string(),
                 "cargo test -p punk-council".to_string()
             ]
         );
@@ -14488,7 +14488,7 @@ fn ok() {}
         let global = root.join("global");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
-        fs::create_dir_all(root.join("crates/punk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/specpunk/src")).unwrap();
         fs::create_dir_all(root.join(".punk/project")).unwrap();
         fs::write(
             root.join("Cargo.toml"),
@@ -14501,7 +14501,7 @@ fn ok() {}
         )
         .unwrap();
         fs::write(
-            root.join("crates/punk-cli/Cargo.toml"),
+            root.join("crates/specpunk/Cargo.toml"),
             "[package]\nname = \"punk-cli\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
@@ -14510,7 +14510,7 @@ fn ok() {}
             "pub fn orch() {}\n",
         )
         .unwrap();
-        fs::write(root.join("crates/punk-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("crates/specpunk/src/main.rs"), "fn main() {}\n").unwrap();
         fs::write(root.join(".punk/project/harness.json"), "{}\n").unwrap();
         std::process::Command::new("git")
             .args(["init"])
@@ -14525,7 +14525,7 @@ fn ok() {}
                 "Add the next bounded harness slice for project inspect.",
             )
             .unwrap();
-        let guidance = "Restrict allowed_scope exactly to these two files and nothing else: crates/punk-orch/src/lib.rs; crates/punk-cli/src/main.rs. Mention the generated packet `.punk/project/harness.json` in docs, but do not include it in allowed_scope or entry_points because it is a runtime artifact destination. target_checks must contain exactly one command: cargo test -p punk-core -p punk-orch. integrity_checks must contain exactly one command: cargo test --workspace.";
+        let guidance = "Restrict allowed_scope exactly to these two files and nothing else: crates/punk-orch/src/lib.rs; crates/specpunk/src/main.rs. Mention the generated packet `.punk/project/harness.json` in docs, but do not include it in allowed_scope or entry_points because it is a runtime artifact destination. target_checks must contain exactly one command: cargo test -p punk-core -p punk-orch. integrity_checks must contain exactly one command: cargo test --workspace.";
         let refined = service
             .refine_contract(&FakeDrafter, &contract.id, guidance)
             .unwrap();
@@ -14534,7 +14534,7 @@ fn ok() {}
             refined.allowed_scope,
             vec![
                 "crates/punk-orch/src/lib.rs".to_string(),
-                "crates/punk-cli/src/main.rs".to_string(),
+                "crates/specpunk/src/main.rs".to_string(),
             ]
         );
         assert_eq!(refined.entry_points, refined.allowed_scope);
@@ -14584,7 +14584,7 @@ fn ok() {}
             .unwrap();
 
         let service = OrchService::new(&root, &global).unwrap();
-        let prompt = "Implement the proposal phase in punk-council. Add bounded proposal orchestration that persists proposal artifacts under .punk/council/<id>/proposals/. Target checks should include cargo build -p punk-cli and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
+        let prompt = "Implement the proposal phase in punk-council. Add bounded proposal orchestration that persists proposal artifacts under .punk/council/<id>/proposals/. Target checks should include cargo build -p specpunk and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
         let contract = service
             .draft_contract(&PlaceholderScopeDrafter, prompt)
             .unwrap();
@@ -14600,7 +14600,7 @@ fn ok() {}
         assert_eq!(
             contract.target_checks,
             vec![
-                "cargo build -p punk-cli".to_string(),
+                "cargo build -p specpunk".to_string(),
                 "cargo test -p punk-council".to_string(),
             ]
         );
@@ -14648,7 +14648,7 @@ fn ok() {}
             .unwrap();
 
         let service = OrchService::new(&root, &global).unwrap();
-        let prompt = "Add council synthesis and final record completion in punk-council. Take the deterministic scoreboard and produce a typed CouncilSynthesis with Leader, Hybrid, or Escalate, persist synthesis.json, and write a final record.json that points to packet, proposals, reviews, scoreboard, and synthesis artifacts. Keep the slice advisory-only and inside punk-council. Target checks should include cargo build -p punk-cli and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
+        let prompt = "Add council synthesis and final record completion in punk-council. Take the deterministic scoreboard and produce a typed CouncilSynthesis with Leader, Hybrid, or Escalate, persist synthesis.json, and write a final record.json that points to packet, proposals, reviews, scoreboard, and synthesis artifacts. Keep the slice advisory-only and inside punk-council. Target checks should include cargo build -p specpunk and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
         let contract = service
             .draft_contract(&StructurallyInvalidSynthesisDrafter, prompt)
             .unwrap();
@@ -14665,7 +14665,7 @@ fn ok() {}
         assert_eq!(
             contract.target_checks,
             vec![
-                "cargo build -p punk-cli".to_string(),
+                "cargo build -p specpunk".to_string(),
                 "cargo test -p punk-council".to_string(),
             ]
         );
@@ -17343,7 +17343,7 @@ fn ok() {}
     #[test]
     fn runtime_bug_reasons_ignore_normal_target_check_failures() {
         let reasons = suspected_runtime_bug_reasons_for_decision(
-            Some("target check failed: cargo test -p punk-cli"),
+            Some("target check failed: cargo test -p specpunk"),
             &["blocked by checks".into()],
             &punk_domain::Decision::Block,
         );

@@ -85,7 +85,7 @@ SpecPunk still lacks a native bootstrap path that makes the repo self-describing
    - `.punk/project.json`
    - `.punk/bootstrap/<project>-core.md` or a successor packet
 2. `punk inspect project` reads only native artifacts.
-3. `punk-cli` no longer calls `punk-run init`.
+3. `specpunk` no longer calls `punk-run init`.
 4. All operator-facing errors and help text mention only `punk`.
 
 ### Concrete tasks
@@ -107,7 +107,7 @@ SpecPunk still lacks a native bootstrap path that makes the repo self-describing
 
 ### Files to update
 
-- `crates/punk-cli/src/main.rs`
+- `crates/specpunk/src/main.rs`
 - `crates/punk-orch/src/lib.rs`
 - `README.md`
 - `docs/product/CLI.md`

@@ -311,7 +311,7 @@ Canonical full matrix: `docs/product/IMPLEMENTATION-STATUS.md`
 
 Current workspace members in the active v0 surface:
 
-- `punk-cli`
+- `specpunk`
 - `punk-domain`
 - `punk-events`
 - `punk-vcs`
@@ -336,7 +336,7 @@ Planned-only crates for later stages:
 
 | Crate | Status | Owns |
 |---|---|---|
-| `punk-cli` | active v0 surface | non-interactive command entrypoint |
+| `specpunk` | active v0 surface | non-interactive command entrypoint |
 | `punk-shell` | planned only (Stage 1+) | interactive REPL, mode switching, context routing |
 | `punk-domain` | active v0 surface | canonical types and schemas |
 | `punk-events` | active v0 surface | append-only event log and projections |
@@ -356,7 +356,7 @@ Stage-boundary note:
 - workspace membership is not the same thing as active operator surface
 - a crate may exist in-tree before its stage is active
 - `punk-council` is the current example: it remains a workspace member, but it is still in-tree but inactive until Stage 2 is promoted
-- capability reality can lead crate extraction: the current frozen research-packet slice already lives in `punk-cli` + `punk-orch` + `punk-domain` even though `punk-research` remains planned only
+- capability reality can lead crate extraction: the current frozen research-packet slice already lives in `specpunk` + `punk-orch` + `punk-domain` even though `punk-research` remains planned only
 
 Traits are only required where real backend choice exists.
 
@@ -906,7 +906,7 @@ Rules:
 - the shell may suggest incident capture only for deterministic suspected-runtime-bug cases, not for every blocked project check failure
 - internal promotion copies that bundle into another `punk` repo, drafts an inspectable contract there, and records the handoff under `.punk/promotions/...`
 - plain promotion stops at draft creation; `--auto-run` is the explicit opt-in for continuing with approve/execute/gate/proof upstream
-- `--auto-run` must stay deterministic and policy-gated: only suggest or permit it when the effective promote target has a matching `.punk/project.json` identity packet, an `AGENTS.md` guide that identifies `specpunk`, and the expected local `specpunk` markers (`Cargo.toml`, `crates/punk-cli/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`); otherwise keep the lane draft-only
+- `--auto-run` must stay deterministic and policy-gated: only suggest or permit it when the effective promote target has a matching `.punk/project.json` identity packet, an `AGENTS.md` guide that identifies `specpunk`, and the expected local `specpunk` markers (`Cargo.toml`, `crates/specpunk/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`); otherwise keep the lane draft-only
 - failed internal auto-run attempts should still update the promotion record with attempt count and the last failed phase/error/partial refs, so retry does not depend on shell history
 - external submission writes a sanitized `.punk/submissions/...` bundle first and only publishes to GitHub with explicit operator opt-in
 - repo-local incident defaults remain project-scoped under `.punk/project/incident-defaults.json`, while operator-wide defaults live under `~/.punk/config/incident-defaults.json`; target resolution precedence is explicit flag > repo-local default > global default
@@ -1324,7 +1324,7 @@ This is the long-term role of a dedicated `punk-research` crate and `delve`-styl
 Current status note:
 
 - the dedicated `punk-research` crate is still **planned only**
-- the bounded `punk research ...` capability below is already real today in `punk-cli` + `punk-orch` + `punk-domain`
+- the bounded `punk research ...` capability below is already real today in `specpunk` + `punk-orch` + `punk-domain`
 
 Current implemented boundary:
 

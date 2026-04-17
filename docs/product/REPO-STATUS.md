@@ -24,7 +24,7 @@ For the full matrix, read:
 
 ### Active v0 surface
 
-- `punk-cli`
+- `specpunk`
 - `punk-domain`
 - `punk-events`
 - `punk-vcs`

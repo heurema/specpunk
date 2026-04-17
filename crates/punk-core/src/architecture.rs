@@ -1169,7 +1169,7 @@ mod tests {
     fn scan_forbidden_path_dependency_uses_all_matching_package_roots() {
         let root = temp_repo_root("duplicate-package-roots");
         fs::create_dir_all(root.join("crates/app/src")).unwrap();
-        fs::create_dir_all(root.join("crates/punk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/specpunk/src")).unwrap();
         fs::create_dir_all(root.join("punk/punk-cli/src")).unwrap();
         fs::write(
             root.join("crates/app/Cargo.toml"),
@@ -1177,7 +1177,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            root.join("crates/punk-cli/Cargo.toml"),
+            root.join("crates/specpunk/Cargo.toml"),
             "[package]\nname = \"punk-cli\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
@@ -1192,7 +1192,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            root.join("crates/punk-cli/src/commands.rs"),
+            root.join("crates/specpunk/src/commands.rs"),
             "pub fn run() {}\n",
         )
         .unwrap();
@@ -1206,7 +1206,7 @@ mod tests {
             &root,
             &["crates/app/src/lib.rs".into()],
             "crates/app/**",
-            "crates/punk-cli/**",
+            "crates/specpunk/**",
         )
         .unwrap();
 
@@ -1214,7 +1214,7 @@ mod tests {
             scan.violating_edges,
             vec![ForbiddenPathDependencyViolation {
                 from_path: "crates/app/src/lib.rs".into(),
-                to_path: "crates/punk-cli/src/commands.rs".into(),
+                to_path: "crates/specpunk/src/commands.rs".into(),
             }]
         );
     }

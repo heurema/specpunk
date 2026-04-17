@@ -178,7 +178,7 @@ Add a dedicated `punk-shell` crate over the same services.
 
 Current note:
 
-- the repo already has shell mechanisms in `punk-cli`
+- the repo already has shell mechanisms in `specpunk`
 - this stage is about extracting the dedicated shell crate, not inventing the shell path from zero
 
 ### Stage 2 — council / diverge
@@ -236,7 +236,7 @@ Detailed spec: `docs/product/RESEARCH.md`
 
 Current note:
 
-- the bounded research packet/artifact/synthesis surface already exists today in `punk-cli` + `punk-orch` + `punk-domain`
+- the bounded research packet/artifact/synthesis surface already exists today in `specpunk` + `punk-orch` + `punk-domain`
 - this stage is about extracting/expanding that behavior into a dedicated `punk-research` crate and deeper execution loops
 
 Rules:

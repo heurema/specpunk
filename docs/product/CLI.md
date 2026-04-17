@@ -111,7 +111,7 @@ punk init --project <id> --enable-jj --verify
 
 Use `--project <id>` only when the repo basename is not a suitable project id.
 
-Bootstrap is native inside `punk-cli`; the init/bootstrap path does not require `punk-run`.
+Bootstrap is native inside `specpunk`; the init/bootstrap path does not require `punk-run`.
 
 Bootstrap should:
 
@@ -232,7 +232,7 @@ Current promote semantics:
 - `incident promote` also drafts a contract in the target repo and records a durable promotion link under `.punk/promotions/...`
 - plain `incident promote` stops at draft creation
 - `incident promote --auto-run` is explicit opt-in and then auto-approves, executes, gates, and writes a proof for that drafted upstream contract
-- auto-run is suggested and permitted only when the target repo has a matching `.punk/project.json` identity packet, an `AGENTS.md` guide that identifies `specpunk`, and the deterministic local `specpunk` markers (`Cargo.toml`, `crates/punk-cli/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`); otherwise the promotion remains draft-only
+- auto-run is suggested and permitted only when the target repo has a matching `.punk/project.json` identity packet, an `AGENTS.md` guide that identifies `specpunk`, and the deterministic local `specpunk` markers (`Cargo.toml`, `crates/specpunk/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`); otherwise the promotion remains draft-only
 - auto-run stores the resulting `run_id`, `receipt_ref`, `decision_id`, and `proof_id` back on the promotion record so `punk inspect prom_<id>` stays inspectable
 - promotion records also persist `auto_run_attempts`, `last_attempt_at`, and `last_failure` metadata so failed internal retries remain inspectable without shell scrollback
 - if internal auto-run fails before proof creation, `incident rerun <promotion-id> --auto-run` reuses the same promotion record and target contract instead of creating a second promotion bundle
@@ -296,7 +296,7 @@ Current research inspect surface:
 
 Current implementation note:
 
-- this bounded research capability already lives in `punk-cli` + `punk-orch` + `punk-domain`
+- this bounded research capability already lives in `specpunk` + `punk-orch` + `punk-domain`
 - it is real today even though the dedicated `punk-research` crate is still **planned only**
 
 Current research-start semantics:

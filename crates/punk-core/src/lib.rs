@@ -2274,17 +2274,17 @@ mod generated_runtime_artifact_scope_tests {
     fn explicit_scope_paths_excludes_generated_runtime_artifacts_from_prompt_scope() {
         let repo_root = create_temp_repo_root("exclude-generated-runtime-artifacts");
         seed_scope_fixture(&repo_root, "crates/punk-orch/src/lib.rs");
-        seed_scope_fixture(&repo_root, "crates/punk-cli/src/main.rs");
+        seed_scope_fixture(&repo_root, "crates/specpunk/src/main.rs");
         seed_scope_fixture(&repo_root, ".punk/project/harness.json");
 
-        let prompt = "Review crates/punk-orch/src/lib.rs and crates/punk-cli/src/main.rs before writing .punk/project/harness.json as the generated runtime packet destination.";
+        let prompt = "Review crates/punk-orch/src/lib.rs and crates/specpunk/src/main.rs before writing .punk/project/harness.json as the generated runtime packet destination.";
         let paths = explicit_scope_paths(prompt, &repo_root);
 
         assert_eq!(
             paths,
             vec![
                 "crates/punk-orch/src/lib.rs".to_string(),
-                "crates/punk-cli/src/main.rs".to_string()
+                "crates/specpunk/src/main.rs".to_string()
             ]
         );
         assert!(!paths
@@ -3615,7 +3615,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("crates")).unwrap();
 
-        let prompt = "Scaffold crate with `crates/punk-council/Cargo.toml` and `crates/punk-council/src/lib.rs`. Target checks should include cargo build -p punk-cli and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
+        let prompt = "Scaffold crate with `crates/punk-council/Cargo.toml` and `crates/punk-council/src/lib.rs`. Target checks should include cargo build -p specpunk and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
         let mut proposal = DraftProposal {
             title: "wrong".into(),
             summary: "wrong".into(),
@@ -3642,7 +3642,7 @@ mod tests {
         assert_eq!(
             proposal.target_checks,
             vec![
-                "cargo build -p punk-cli".to_string(),
+                "cargo build -p specpunk".to_string(),
                 "cargo test -p punk-council".to_string()
             ]
         );
@@ -3835,24 +3835,24 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
-        fs::create_dir_all(root.join("crates/punk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/specpunk/src")).unwrap();
         fs::create_dir_all(root.join(".punk/project")).unwrap();
         fs::write(
             root.join("crates/punk-orch/src/lib.rs"),
             "pub fn orch() {}\n",
         )
         .unwrap();
-        fs::write(root.join("crates/punk-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("crates/specpunk/src/main.rs"), "fn main() {}\n").unwrap();
         fs::write(root.join(".punk/project/harness.json"), "{}\n").unwrap();
 
-        let guidance = "Restrict allowed_scope exactly to these two files and nothing else: crates/punk-orch/src/lib.rs; crates/punk-cli/src/main.rs. Mention the generated packet `.punk/project/harness.json` in docs, but do not include it in allowed_scope or entry_points because it is a runtime artifact destination.";
+        let guidance = "Restrict allowed_scope exactly to these two files and nothing else: crates/punk-orch/src/lib.rs; crates/specpunk/src/main.rs. Mention the generated packet `.punk/project/harness.json` in docs, but do not include it in allowed_scope or entry_points because it is a runtime artifact destination.";
         let explicit = explicit_scope_override(guidance, &root).unwrap();
 
         assert_eq!(
             explicit,
             vec![
                 "crates/punk-orch/src/lib.rs".to_string(),
-                "crates/punk-cli/src/main.rs".to_string(),
+                "crates/specpunk/src/main.rs".to_string(),
             ]
         );
 
@@ -4023,7 +4023,7 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = "Implement the proposal phase in punk-council. Add bounded proposal orchestration that persists proposal artifacts under .punk/council/<id>/proposals/. Target checks should include cargo build -p punk-cli and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
+        let prompt = "Implement the proposal phase in punk-council. Add bounded proposal orchestration that persists proposal artifacts under .punk/council/<id>/proposals/. Target checks should include cargo build -p specpunk and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
         let scan = scan_repo(&root, prompt).unwrap();
         let proposal = DraftProposal {
             title: "proposal phase".into(),
@@ -4056,7 +4056,7 @@ mod tests {
         assert_eq!(
             fallback.target_checks,
             vec![
-                "cargo build -p punk-cli".to_string(),
+                "cargo build -p specpunk".to_string(),
                 "cargo test -p punk-council".to_string(),
             ]
         );
@@ -4094,7 +4094,7 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = "Implement the review phase in punk-council. Add bounded review orchestration that persists typed review payloads under .punk/council/<id>/reviews/. Target checks should include cargo build -p punk-cli, cargo test -p punk-core, and cargo test -p punk-orch. Integrity checks should include cargo test --workspace.";
+        let prompt = "Implement the review phase in punk-council. Add bounded review orchestration that persists typed review payloads under .punk/council/<id>/reviews/. Target checks should include cargo build -p specpunk, cargo test -p punk-core, and cargo test -p punk-orch. Integrity checks should include cargo test --workspace.";
         let scan = scan_repo(&root, prompt).unwrap();
         let proposal = DraftProposal {
             title: "review phase".into(),
@@ -4124,7 +4124,7 @@ mod tests {
         assert_eq!(
             fallback.target_checks,
             vec![
-                "cargo build -p punk-cli".to_string(),
+                "cargo build -p specpunk".to_string(),
                 "cargo test -p punk-core".to_string(),
                 "cargo test -p punk-orch".to_string(),
             ]
@@ -4164,7 +4164,7 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = "Add deterministic council scoring in punk-council. Keep the slice scoring-only. Target checks should include cargo build -p punk-cli and cargo test -p punk-core. Integrity checks should include cargo test --workspace.";
+        let prompt = "Add deterministic council scoring in punk-council. Keep the slice scoring-only. Target checks should include cargo build -p specpunk and cargo test -p punk-core. Integrity checks should include cargo test --workspace.";
         let scan = scan_repo(&root, prompt).unwrap();
         let proposal = DraftProposal {
             title: "scoring phase".into(),
@@ -4227,7 +4227,7 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = "Add council synthesis and final record completion in punk-council. Keep the slice advisory-only. Target checks should include cargo build -p punk-cli and cargo test -p punk-orch. Integrity checks should include cargo test --workspace.";
+        let prompt = "Add council synthesis and final record completion in punk-council. Keep the slice advisory-only. Target checks should include cargo build -p specpunk and cargo test -p punk-orch. Integrity checks should include cargo test --workspace.";
         let scan = scan_repo(&root, prompt).unwrap();
         let proposal = DraftProposal {
             title: "synthesis phase".into(),
@@ -4286,7 +4286,7 @@ mod tests {
             "pub fn packet() {}\n",
         )
         .unwrap();
-        let prompt = "Add council synthesis and final record completion in punk-council. Take the deterministic scoreboard and produce a typed CouncilSynthesis with Leader, Hybrid, or Escalate, persist synthesis.json, and write a final record.json that points to packet, proposals, reviews, scoreboard, and synthesis artifacts. Keep the slice advisory-only. Target checks should include cargo build -p punk-cli and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
+        let prompt = "Add council synthesis and final record completion in punk-council. Take the deterministic scoreboard and produce a typed CouncilSynthesis with Leader, Hybrid, or Escalate, persist synthesis.json, and write a final record.json that points to packet, proposals, reviews, scoreboard, and synthesis artifacts. Keep the slice advisory-only. Target checks should include cargo build -p specpunk and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
         let scan = scan_repo(&root, prompt).unwrap();
         let proposal = DraftProposal {
             title: "synthesis phase".into(),
@@ -4323,7 +4323,7 @@ mod tests {
         assert_eq!(
             fallback.target_checks,
             vec![
-                "cargo build -p punk-cli".to_string(),
+                "cargo build -p specpunk".to_string(),
                 "cargo test -p punk-council".to_string(),
             ]
         );
@@ -4518,7 +4518,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("crates/punk-council/src")).unwrap();
-        fs::create_dir_all(root.join("crates/punk-cli/src")).unwrap();
+        fs::create_dir_all(root.join("crates/specpunk/src")).unwrap();
         fs::write(
             root.join("Cargo.toml"),
             "[workspace]\nmembers = [\"crates/*\"]\n",
@@ -4534,9 +4534,9 @@ mod tests {
             "pub fn persist() {}\n",
         )
         .unwrap();
-        fs::write(root.join("crates/punk-cli/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("crates/specpunk/src/main.rs"), "fn main() {}\n").unwrap();
 
-        let prompt = "Add council synthesis and final record completion in punk-council. Take the deterministic scoreboard and produce a typed CouncilSynthesis with Leader, Hybrid, or Escalate, persist synthesis.json, and write a final record.json that points to packet, proposals, reviews, scoreboard, and synthesis artifacts. Keep the slice advisory-only and inside punk-council. Target checks should include cargo build -p punk-cli and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
+        let prompt = "Add council synthesis and final record completion in punk-council. Take the deterministic scoreboard and produce a typed CouncilSynthesis with Leader, Hybrid, or Escalate, persist synthesis.json, and write a final record.json that points to packet, proposals, reviews, scoreboard, and synthesis artifacts. Keep the slice advisory-only and inside punk-council. Target checks should include cargo build -p specpunk and cargo test -p punk-council. Integrity checks should include cargo test --workspace.";
         let scan = scan_repo(&root, prompt).unwrap();
         let proposal = DraftProposal {
             title: "synthesis phase".into(),

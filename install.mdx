@@ -29,14 +29,14 @@ cd specpunk
 Use Cargo to run the `punk` binary from the workspace:
 
 ```bash
-cargo run -p punk-cli -- --help
+cargo run -p specpunk -- --help
 ```
 
 You can also run commands this way:
 
 ```bash
-cargo run -p punk-cli -- init --enable-jj --verify
-cargo run -p punk-cli -- go --fallback-staged "add a bounded CLI feature with tests"
+cargo run -p specpunk -- init --enable-jj --verify
+cargo run -p specpunk -- go --fallback-staged "add a bounded CLI feature with tests"
 ```
 
 ## Build a local binary
@@ -44,7 +44,7 @@ cargo run -p punk-cli -- go --fallback-staged "add a bounded CLI feature with te
 If you want a local compiled binary:
 
 ```bash
-cargo build --release -p punk-cli
+cargo build --release -p specpunk
 ./target/release/punk --help
 ```
 

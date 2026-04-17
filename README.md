@@ -229,7 +229,7 @@ You can avoid repeating `--repo` / `--github` by configuring repo-local incident
 Resolution precedence is: explicit flag > repo-local default > global default.
 `punk incident capture` / `punk inspect inc_<id>` now surface the effective promote target, whether auto-run is eligible, and a setup hint when no promote target is configured.
 `punk incident promote --auto-run` is still explicit opt-in; when used it auto-approves the drafted upstream contract, runs it, gates it, writes a proof, and stores that execution snapshot back onto the promotion record.
-Auto-run is only suggested and permitted when the effective promote target has a matching `.punk/project.json` identity packet, an `AGENTS.md` guide that identifies `specpunk`, and the expected local `specpunk` markers (`Cargo.toml`, `crates/punk-cli/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`). Otherwise the lane stays draft-only.
+Auto-run is only suggested and permitted when the effective promote target has a matching `.punk/project.json` identity packet, an `AGENTS.md` guide that identifies `specpunk`, and the expected local `specpunk` markers (`Cargo.toml`, `crates/specpunk/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`). Otherwise the lane stays draft-only.
 If that internal auto-run fails before it reaches a proof, the promotion record now keeps the last failed phase plus any partial run/receipt/decision refs; retry the same promotion with `punk incident rerun <promotion-id> --auto-run` instead of creating a new promotion bundle.
 
 The intended operator experience is:
@@ -313,7 +313,7 @@ punk research escalate <research-id>
 
 Current reality:
 
-- this capability already lives in `punk-cli` + `punk-orch` + `punk-domain`
+- this capability already lives in `specpunk` + `punk-orch` + `punk-domain`
 - it is an **expert/control surface**, not the default operator path
 - it freezes repo-local research packets, artifacts, synthesis, and terminal state
 - it does **not** imply that a separate `punk-research` crate already exists
@@ -404,10 +404,10 @@ It should be treated as:
 
 Also note:
 
-- active v0 surface today: `punk-cli`, `punk-domain`, `punk-events`, `punk-vcs`, `punk-core`, `punk-orch`, `punk-gate`, `punk-proof`, `punk-adapters`
+- active v0 surface today: `specpunk`, `punk-domain`, `punk-events`, `punk-vcs`, `punk-core`, `punk-orch`, `punk-gate`, `punk-proof`, `punk-adapters`
 - `crates/punk-council/` is **in-tree but inactive**: it stays buildable in the workspace, but is **not** part of the active v0 operator surface yet
 - `punk-shell`, `punk-skills`, `punk-eval`, and `punk-research` are **planned only** as separate crates
-- `punk go --fallback-staged` and `punk start` already exist today as shell mechanisms in `punk-cli`, while the standalone `Goal` primitive remains deferred
+- `punk go --fallback-staged` and `punk start` already exist today as shell mechanisms in `specpunk`, while the standalone `Goal` primitive remains deferred
 - `punk research ...` commands already exist today in the active CLI/orch/domain surface, while the dedicated `punk-research` crate remains planned only
 - the short crate-status note lives in `docs/product/REPO-STATUS.md`
 - the full current-truth matrix lives in `docs/product/IMPLEMENTATION-STATUS.md`
