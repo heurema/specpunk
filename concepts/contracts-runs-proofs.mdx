@@ -1,0 +1,75 @@
+---
+title: Contracts, Runs, and Proofs
+description: The core work objects behind the current SpecPunk flow.
+---
+
+SpecPunk is contract-first. A change is not complete just because files changed. It is complete when the run is verified and the proof chain exists.
+
+## Canonical chain
+
+The long-term object chain is:
+
+```text
+Project
+  -> Goal
+    -> Feature
+      -> Contract
+        -> Task
+          -> Run
+            -> Receipt
+            -> DecisionObject
+            -> Proofpack
+```
+
+In the current public flow, the most important objects are the contract, the run, the decision, and the proof.
+
+## Contract
+
+A contract is the bounded spec for a slice of work.
+
+A good contract answers:
+
+- what is being changed
+- what is in scope
+- what is out of scope
+- what checks must pass
+- what integrity must be preserved
+
+`cut` should run against an approved contract, not an open-ended prompt.
+
+## Run
+
+A run is one execution attempt for an approved slice.
+
+A run produces:
+
+- a receipt
+- execution context
+- check outputs
+- later, a gate decision and proof
+
+This lets SpecPunk reason about a concrete attempt instead of treating all work as one fuzzy session.
+
+## DecisionObject
+
+The final decision is written by `gate`.
+
+The v0 outcomes are:
+
+- `Accept`
+- `Block`
+- `Escalate`
+
+This keeps final acceptance separate from planning or implementation chatter.
+
+## Proofpack
+
+A proofpack is the hash-linked bundle for what was verified.
+
+In practice, it ties together the run, checks, decision, and supporting refs so an operator can see what passed, what failed, and what was actually evaluated.
+
+## Why this matters
+
+SpecPunk is built around one artifact chain and one final decision writer.
+
+That makes the public workflow easier to inspect, safer to operate, and clearer than a chat-only coding loop.

@@ -1,0 +1,55 @@
+---
+title: Install
+description: Run SpecPunk from source with Cargo.
+---
+
+The current install story is intentionally simple: run SpecPunk from source with Cargo.
+
+This matches the current state of the project. A broader packaged install story can be added later.
+
+## Prerequisites
+
+You need:
+
+- Rust toolchain
+- Cargo
+- Git
+
+`jj` is preferred when available, but it is not required to start.
+
+## Clone the repository
+
+```bash
+git clone https://github.com/heurema/specpunk.git
+cd specpunk
+```
+
+## Run the CLI directly from source
+
+Use Cargo to run the `punk` binary from the workspace:
+
+```bash
+cargo run -p punk-cli -- --help
+```
+
+You can also run individual commands this way:
+
+```bash
+cargo run -p punk-cli -- init --enable-jj --verify
+cargo run -p punk-cli -- go --fallback-staged "add a bounded CLI feature with tests"
+```
+
+## Build a local binary
+
+If you want a local compiled binary:
+
+```bash
+cargo build --release -p punk-cli
+./target/release/punk --help
+```
+
+## What this page covers
+
+This page covers how to get the current CLI running.
+
+For the first working flow after install, continue to [Quickstart](/quickstart).

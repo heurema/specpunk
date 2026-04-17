@@ -1,0 +1,60 @@
+---
+title: Architecture overview
+description: The target shape and current architectural stance for SpecPunk.
+---
+
+SpecPunk is being built around a small, stable core and a clear operator path.
+
+## Architectural north star
+
+The target architecture has four pillars:
+
+1. Kernel
+2. Stewardship
+3. Council
+4. Skill and eval ratchet
+
+The current public product is earlier than that full target shape.
+
+## What is current today
+
+The active v0 public surface is centered on:
+
+- `punk-cli`
+- `punk-domain`
+- `punk-events`
+- `punk-vcs`
+- `punk-core`
+- `punk-orch`
+- `punk-gate`
+- `punk-proof`
+- `punk-adapters`
+
+The current vertical slice is:
+
+```text
+plot contract -> approve -> cut run -> gate run -> proof
+```
+
+## What is not current today
+
+- `punk-council` is in-tree but inactive
+- `punk-shell` is planned only
+- `punk-skills` is planned only
+- `punk-eval` is planned only
+- `punk-research` is planned only
+
+## Core rules
+
+The current architectural story is built around a few rules:
+
+- one CLI: `punk`
+- one vocabulary: `plot / cut / gate`
+- one state truth: append-only event log plus derived views
+- one decision writer: `gate`
+- frozen verification context for gate
+- provider wrapping where possible instead of provider duplication
+
+## Canonical source
+
+The detailed architectural source of truth for the project lives in `docs/product/ARCHITECTURE.md` in the repository. This public page is the short external overview.

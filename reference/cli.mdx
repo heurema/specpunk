@@ -1,0 +1,78 @@
+---
+title: CLI reference
+description: The current public command surface for SpecPunk.
+---
+
+This page summarizes the current public CLI surface. It is intentionally shorter than the full product CLI spec in the repository.
+
+## Primary entrypoints
+
+The current public entrypoints are:
+
+```bash
+punk init --enable-jj --verify
+punk go --fallback-staged "<goal>"
+punk start "<goal>"
+punk status [id]
+punk inspect <id> --json
+```
+
+## Default path
+
+For initialized repositories, the default happy path is goal-first:
+
+```bash
+punk go --fallback-staged "<goal>"
+```
+
+This is the intended flow:
+
+```text
+goal -> draft -> approve -> cut -> gate -> proof
+```
+
+## Staged path
+
+Use the staged path when you want review between phases:
+
+```bash
+punk start "<goal>"
+punk plot approve <contract-id>
+punk cut run <contract-id>
+punk gate run <run-id>
+punk gate proof <run-id|decision-id>
+```
+
+## Current mode-level commands
+
+```bash
+punk plot contract "<goal>"
+punk plot refine <contract-id> "<guidance>"
+punk plot approve <contract-id>
+punk cut run <contract-id>
+punk gate run <run-id>
+punk gate proof <run-id|decision-id>
+```
+
+## Read surfaces
+
+```bash
+punk status [id]
+punk inspect work [id]
+punk inspect project
+punk inspect <id> --json
+```
+
+## What is not part of the current public CLI
+
+These are not part of the current operator surface:
+
+- interactive shell
+- daemon
+- queue
+- always-on council flow
+- broad research workflow as a public default
+
+## Canonical source
+
+The detailed CLI contract for the project lives in `docs/product/CLI.md` in the repository. This public page is the short operator-facing view.

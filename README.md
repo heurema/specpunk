@@ -30,10 +30,14 @@ No backward compatibility is required. The project has not launched, so the repo
 
 If you are orienting in the repo or choosing the next bounded slice, read in this order:
 
-1. `docs/product/CURRENT-ROADMAP.md`
-2. `docs/product/ADR-provider-alignment.md`
-3. `docs/product/ARCHITECTURE.md`
-4. `docs/product/NORTH-ROADMAP.md`
+1. `docs/product/REPO-STATUS.md`
+2. `docs/product/CURRENT-ROADMAP.md`
+3. `docs/product/CLI.md`
+4. `docs/product/ARCHITECTURE.md`
+5. `docs/product/ADR-provider-alignment.md`
+6. `docs/product/VISION.md`
+7. `docs/product/ACTION-PLAN.md`
+8. `docs/product/NORTH-ROADMAP.md`
 
 Short version:
 
@@ -296,21 +300,40 @@ What is explicitly out of scope for v0:
 
 ## Docs
 
+Core product docs:
+
+- `docs/product/REPO-STATUS.md` — current repo truth and active/inactive/planned surfaces
 - `docs/product/CURRENT-ROADMAP.md` — short active roadmap for current-forward work
-- `docs/product/ACTION-PLAN.md` — current bounded execution plan derived from the 2026-04-11 architecture review
+- `docs/product/CLI.md` — command surface and shell UX
+- `docs/product/ARCHITECTURE.md` — kernel, stewardship, council, skills/eval architecture
 - `docs/product/ADR-provider-alignment.md` — accepted build/wrap/avoid rule for provider alignment
 - `docs/product/VISION.md` — product boundary and laws
-- `docs/product/ARCHITECTURE.md` — kernel, stewardship, council, skills/eval architecture
+- `docs/product/ACTION-PLAN.md` — current bounded execution plan derived from the 2026-04-11 architecture review
+- `docs/product/NORTH-ROADMAP.md` — durable strategic backlog and linked research tracks
+- `docs/product/DOCS-SYSTEM.md` — how repo docs and public docs map together
 - `docs/product/COUNCIL.md` — advisory multi-model deliberation protocols
 - `docs/product/SKILLS.md` — skill packets, overlays, and candidate skill patches
 - `docs/product/EVAL.md` — task eval, skill eval, and promotion decisions
 - `docs/product/RESEARCH.md` — bounded deep-research protocols
 - `docs/product/DOGFOODING.md` — bounded self-hosting and trust-separation rules
-- `docs/product/CLI.md` — command surface and shell UX
-- `docs/product/NORTH-ROADMAP.md` — durable strategic backlog and linked research tracks
 - `docs/product/MASTER-PLAN.md` — staged build plan
 - `docs/product/CONTINUE-PROMPT.md` — handoff prompt for the next build session
 - `docs/research/2026-04-11-specpunk-architecture-review.md` — review memo that drove the current action plan
+
+Public docs layer:
+
+- `docs.json` — Mintlify config for the public docs site
+- `index.mdx` — public overview
+- `install.mdx` — public install guide
+- `quickstart.mdx` — public quickstart
+- `roadmap.mdx` — public roadmap
+- `reference/cli.mdx` — public CLI reference
+- `reference/architecture.mdx` — public architecture overview
+- `reference/repo-status.mdx` — public repo status overview
+- `concepts/plot-cut-gate.mdx` — public plot/cut/gate concept page
+- `concepts/contracts-runs-proofs.mdx` — public contracts/runs/proofs concept page
+
+The public docs site is a curated layer over the repo. Canonical product truth still lives in the repository.
 
 ## Target repo shape
 
