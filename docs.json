@@ -26,6 +26,7 @@
           "index",
           "install",
           "quickstart",
+          "reference/cli",
           "roadmap"
         ]
       },
@@ -39,7 +40,6 @@
       {
         "group": "Reference",
         "pages": [
-          "reference/cli",
           "reference/repo-status",
           "reference/architecture"
         ]
