@@ -498,9 +498,10 @@ fn run() -> Result<()> {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&auto_run.promotion)?);
                     } else {
-                        let policy = inspect_incident_auto_run_policy(Path::new(
-                            &auto_run.promotion.target_repo_root,
-                        ));
+                        let policy = inspect_incident_auto_run_policy(
+                            Path::new(&auto_run.promotion.target_repo_root),
+                            Some(auto_run.promotion.target_project_id.as_str()),
+                        );
                         println!(
                             "{}",
                             format_incident_promotion_summary(&auto_run.promotion, Some(&policy),)
@@ -516,8 +517,10 @@ fn run() -> Result<()> {
                         )))
                     }
                 } else {
-                    let policy =
-                        inspect_incident_auto_run_policy(Path::new(&promotion.target_repo_root));
+                    let policy = inspect_incident_auto_run_policy(
+                        Path::new(&promotion.target_repo_root),
+                        Some(promotion.target_project_id.as_str()),
+                    );
                     render(
                         json,
                         &promotion,
@@ -547,9 +550,10 @@ fn run() -> Result<()> {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&auto_run.promotion)?);
                 } else {
-                    let policy = inspect_incident_auto_run_policy(Path::new(
-                        &auto_run.promotion.target_repo_root,
-                    ));
+                    let policy = inspect_incident_auto_run_policy(
+                        Path::new(&auto_run.promotion.target_repo_root),
+                        Some(auto_run.promotion.target_project_id.as_str()),
+                    );
                     println!(
                         "{}",
                         format_incident_promotion_summary(&auto_run.promotion, Some(&policy))
@@ -784,8 +788,10 @@ fn run() -> Result<()> {
             }
             if !inspect.json && inspect.id.is_none() && inspect.target.starts_with("prom_") {
                 let promotion = orch.inspect_incident_promotion(&inspect.target)?;
-                let policy =
-                    inspect_incident_auto_run_policy(Path::new(&promotion.target_repo_root));
+                let policy = inspect_incident_auto_run_policy(
+                    Path::new(&promotion.target_repo_root),
+                    Some(promotion.target_project_id.as_str()),
+                );
                 return render(
                     false,
                     &promotion,
@@ -1906,7 +1912,10 @@ fn auto_run_existing_incident_promotion(
 fn ensure_incident_promotion_auto_run_allowed(
     promotion: &IncidentPromotionRecord,
 ) -> Result<IncidentAutoRunPolicy> {
-    let policy = inspect_incident_auto_run_policy(Path::new(&promotion.target_repo_root));
+    let policy = inspect_incident_auto_run_policy(
+        Path::new(&promotion.target_repo_root),
+        Some(promotion.target_project_id.as_str()),
+    );
     if policy.allowed {
         Ok(policy)
     } else {
@@ -2258,7 +2267,7 @@ fn format_incident_auto_run_policy_error(
     policy: &IncidentAutoRunPolicy,
 ) -> String {
     format!(
-        "promotion {} drafted, but auto-run is blocked by policy: {}. Inspect with `punk inspect {}`. Review the drafted contract with `cd {} && punk inspect {}`.",
+        "promotion {} drafted, but auto-run is blocked by policy: {}. Inspect with `punk inspect {}`. Review the drafted contract with `cd {} && punk inspect {} --json`.",
         promotion.id,
         policy.detail,
         promotion.id,
@@ -2267,7 +2276,58 @@ fn format_incident_auto_run_policy_error(
     )
 }
 
-fn inspect_incident_auto_run_policy(target_repo_root: &Path) -> IncidentAutoRunPolicy {
+fn inspect_incident_auto_run_policy(
+    target_repo_root: &Path,
+    expected_project_id: Option<&str>,
+) -> IncidentAutoRunPolicy {
+    let canonical_target_repo_root =
+        fs::canonicalize(target_repo_root).unwrap_or_else(|_| target_repo_root.to_path_buf());
+    let project_packet_path = canonical_target_repo_root.join(".punk/project.json");
+    let project: Project = match read_json(&project_packet_path) {
+        Ok(project) => project,
+        Err(_) => {
+            return IncidentAutoRunPolicy {
+                allowed: false,
+                detail: "target repo is missing a readable .punk/project.json identity packet"
+                    .to_string(),
+            }
+        }
+    };
+    if let Some(expected_project_id) = expected_project_id {
+        if project.id != expected_project_id {
+            return IncidentAutoRunPolicy {
+                allowed: false,
+                detail: format!(
+                    "target repo identity packet does not match the promoted target id {}",
+                    expected_project_id
+                ),
+            };
+        }
+    }
+    let packet_repo_root =
+        fs::canonicalize(&project.path).unwrap_or_else(|_| PathBuf::from(&project.path));
+    if packet_repo_root != canonical_target_repo_root {
+        return IncidentAutoRunPolicy {
+            allowed: false,
+            detail: "target repo identity packet points at a different repo root".to_string(),
+        };
+    }
+    let agents_path = canonical_target_repo_root.join("AGENTS.md");
+    let agents_contents = match fs::read_to_string(&agents_path) {
+        Ok(contents) => contents,
+        Err(_) => {
+            return IncidentAutoRunPolicy {
+                allowed: false,
+                detail: "target repo is missing a readable AGENTS.md identity guide".to_string(),
+            }
+        }
+    };
+    if !agents_contents.contains("for specpunk") {
+        return IncidentAutoRunPolicy {
+            allowed: false,
+            detail: "target repo AGENTS.md does not identify specpunk upstream".to_string(),
+        };
+    }
     let markers = [
         "Cargo.toml",
         "crates/punk-cli/src/main.rs",
@@ -2276,18 +2336,20 @@ fn inspect_incident_auto_run_policy(target_repo_root: &Path) -> IncidentAutoRunP
     ];
     let missing = markers
         .iter()
-        .filter_map(|marker| (!target_repo_root.join(marker).exists()).then(|| marker.to_string()))
+        .filter_map(|marker| {
+            (!canonical_target_repo_root.join(marker).exists()).then(|| marker.to_string())
+        })
         .collect::<Vec<_>>();
     if missing.is_empty() {
         IncidentAutoRunPolicy {
             allowed: true,
-            detail: "target repo matches specpunk upstream markers".to_string(),
+            detail: "target repo identity matches specpunk upstream markers".to_string(),
         }
     } else {
         IncidentAutoRunPolicy {
             allowed: false,
             detail: format!(
-                "target repo does not look like specpunk upstream; missing {}",
+                "target repo identity matches, but specpunk upstream markers are missing: {}",
                 missing.join(", ")
             ),
         }
@@ -2305,7 +2367,7 @@ fn derive_incident_next_actions(
         .map(|_| format!("punk incident promote {}", incident.id));
     let (auto_run_policy, auto_run_command) =
         if let Some(target_repo_root) = promote_target.as_deref() {
-            let policy = inspect_incident_auto_run_policy(Path::new(target_repo_root));
+            let policy = inspect_incident_auto_run_policy(Path::new(target_repo_root), None);
             let policy_line = if policy.allowed {
                 format!("allowed: {}", policy.detail)
             } else {
@@ -3101,7 +3163,7 @@ fn format_incident_promotion_summary(
         format!("punk incident rerun {} --auto-run", promotion.id)
     } else {
         format!(
-            "cd {} && punk inspect {}",
+            "cd {} && punk inspect {} --json",
             promotion.target_repo_root, promotion.draft_contract_id
         )
     };
@@ -3571,10 +3633,25 @@ mod tests {
     }
 
     fn write_specpunk_target_markers(root: &Path) {
+        fs::create_dir_all(root.join(".punk")).unwrap();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("crates/punk-cli/src")).unwrap();
         fs::create_dir_all(root.join("crates/punk-orch/src")).unwrap();
         fs::create_dir_all(root.join("docs/product")).unwrap();
+        let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let project = Project {
+            id: runtime_project_id(root).unwrap(),
+            path: canonical_root.display().to_string(),
+            vcs_backend: Some(punk_domain::VcsKind::Git),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        };
+        write_json(&root.join(".punk/project.json"), &project).unwrap();
+        fs::write(
+            root.join("AGENTS.md"),
+            "# AI Contributor Guide for specpunk\n\nThis file is for AI agents contributing changes to `specpunk` itself.\n",
+        )
+        .unwrap();
         fs::write(
             root.join("Cargo.toml"),
             "[package]\nname='target-demo'\nversion='0.1.0'\nedition='2021'\n",
@@ -4912,7 +4989,7 @@ mod tests {
         assert!(rendered.contains(
             "Imported incident: .punk/imported-incidents/foreign-demo/inc_123/prom_123/incident.json"
         ));
-        assert!(rendered.contains("Next: cd /tmp/specpunk && punk inspect ct_456_v1"));
+        assert!(rendered.contains("Next: cd /tmp/specpunk && punk inspect ct_456_v1 --json"));
     }
 
     #[test]
@@ -4989,12 +5066,13 @@ mod tests {
         };
         let policy = IncidentAutoRunPolicy {
             allowed: true,
-            detail: "target repo matches specpunk upstream markers".into(),
+            detail: "target repo identity matches specpunk upstream markers".into(),
         };
 
         let rendered = format_incident_promotion_summary(&promotion, Some(&policy));
-        assert!(rendered
-            .contains("Auto-run policy: allowed: target repo matches specpunk upstream markers"));
+        assert!(rendered.contains(
+            "Auto-run policy: allowed: target repo identity matches specpunk upstream markers"
+        ));
     }
 
     #[test]
@@ -5048,9 +5126,25 @@ mod tests {
         let root = temp_test_dir("incident-auto-run-policy-allowed");
         write_specpunk_target_markers(&root);
 
-        let policy = inspect_incident_auto_run_policy(&root);
+        let policy = inspect_incident_auto_run_policy(&root, None);
         assert!(policy.allowed);
-        assert!(policy.detail.contains("matches specpunk upstream markers"));
+        assert!(policy
+            .detail
+            .contains("identity matches specpunk upstream markers"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn incident_auto_run_policy_blocks_mismatched_project_identity() {
+        let root = temp_test_dir("incident-auto-run-policy-mismatch");
+        write_specpunk_target_markers(&root);
+
+        let policy = inspect_incident_auto_run_policy(&root, Some("specpunk-other"));
+        assert!(!policy.allowed);
+        assert!(policy
+            .detail
+            .contains("does not match the promoted target id specpunk-other"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -5065,12 +5159,11 @@ mod tests {
         )
         .unwrap();
 
-        let policy = inspect_incident_auto_run_policy(&root);
+        let policy = inspect_incident_auto_run_policy(&root, None);
         assert!(!policy.allowed);
         assert!(policy
             .detail
-            .contains("does not look like specpunk upstream"));
-        assert!(policy.detail.contains("crates/punk-cli/src/main.rs"));
+            .contains("missing a readable .punk/project.json identity packet"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -5095,8 +5188,9 @@ mod tests {
         let rendered = format_incident_summary(&incident, Some(&next_actions));
 
         assert!(rendered.contains("Promote draft: punk incident promote inc_"));
-        assert!(rendered
-            .contains("Auto-run policy: allowed: target repo matches specpunk upstream markers"));
+        assert!(rendered.contains(
+            "Auto-run policy: allowed: target repo identity matches specpunk upstream markers"
+        ));
         assert!(rendered.contains("Auto-run next: punk incident promote inc_"));
         assert!(rendered.contains("--auto-run"));
 
@@ -5131,7 +5225,7 @@ mod tests {
 
         assert!(rendered.contains("Promote draft: punk incident promote inc_"));
         assert!(rendered.contains(
-            "Auto-run policy: blocked: target repo does not look like specpunk upstream"
+            "Auto-run policy: blocked: target repo is missing a readable .punk/project.json identity packet"
         ));
         assert!(!rendered.contains("Auto-run next:"));
 
@@ -5169,13 +5263,14 @@ mod tests {
         };
         let policy = IncidentAutoRunPolicy {
             allowed: false,
-            detail: "target repo does not look like specpunk upstream; missing crates/punk-cli/src/main.rs".into(),
+            detail: "target repo identity packet does not match the promoted target id some-target"
+                .into(),
         };
 
         let rendered = format_incident_auto_run_policy_error(&promotion, &policy);
         assert!(rendered.contains("auto-run is blocked by policy"));
         assert!(rendered.contains("punk inspect prom_123"));
-        assert!(rendered.contains("cd /tmp/not-specpunk && punk inspect ct_456_v1"));
+        assert!(rendered.contains("cd /tmp/not-specpunk && punk inspect ct_456_v1 --json"));
     }
 
     #[test]

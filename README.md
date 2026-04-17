@@ -219,7 +219,7 @@ You can avoid repeating `--repo` / `--github` by configuring repo-local incident
 Resolution precedence is: explicit flag > repo-local default > global default.
 `punk incident capture` / `punk inspect inc_<id>` now surface the effective promote target, whether auto-run is eligible, and a setup hint when no promote target is configured.
 `punk incident promote --auto-run` is still explicit opt-in; when used it auto-approves the drafted upstream contract, runs it, gates it, writes a proof, and stores that execution snapshot back onto the promotion record.
-Auto-run is only suggested and permitted when the effective promote target looks like a local `specpunk` repo by deterministic markers (`Cargo.toml`, `crates/punk-cli/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`). Otherwise the lane stays draft-only.
+Auto-run is only suggested and permitted when the effective promote target has a matching `.punk/project.json` identity packet, an `AGENTS.md` guide that identifies `specpunk`, and the expected local `specpunk` markers (`Cargo.toml`, `crates/punk-cli/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`). Otherwise the lane stays draft-only.
 If that internal auto-run fails before it reaches a proof, the promotion record now keeps the last failed phase plus any partial run/receipt/decision refs; retry the same promotion with `punk incident rerun <promotion-id> --auto-run` instead of creating a new promotion bundle.
 
 The intended operator experience is:

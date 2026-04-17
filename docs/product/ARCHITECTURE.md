@@ -895,7 +895,7 @@ Rules:
 - the shell may suggest incident capture only for deterministic suspected-runtime-bug cases, not for every blocked project check failure
 - internal promotion copies that bundle into another `punk` repo, drafts an inspectable contract there, and records the handoff under `.punk/promotions/...`
 - plain promotion stops at draft creation; `--auto-run` is the explicit opt-in for continuing with approve/execute/gate/proof upstream
-- `--auto-run` must stay deterministic and policy-gated: only suggest or permit it when the effective promote target matches local `specpunk` markers (`Cargo.toml`, `crates/punk-cli/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`), otherwise keep the lane draft-only
+- `--auto-run` must stay deterministic and policy-gated: only suggest or permit it when the effective promote target has a matching `.punk/project.json` identity packet, an `AGENTS.md` guide that identifies `specpunk`, and the expected local `specpunk` markers (`Cargo.toml`, `crates/punk-cli/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`); otherwise keep the lane draft-only
 - failed internal auto-run attempts should still update the promotion record with attempt count and the last failed phase/error/partial refs, so retry does not depend on shell history
 - external submission writes a sanitized `.punk/submissions/...` bundle first and only publishes to GitHub with explicit operator opt-in
 - repo-local incident defaults remain project-scoped under `.punk/project/incident-defaults.json`, while operator-wide defaults live under `~/.punk/config/incident-defaults.json`; target resolution precedence is explicit flag > repo-local default > global default
