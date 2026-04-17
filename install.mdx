@@ -7,7 +7,7 @@ The current install story is intentionally simple: run SpecPunk from source with
 
 This matches the current state of the project. A broader packaged install story can be added later.
 
-## Prerequisites
+## Requirements
 
 You need:
 
@@ -24,7 +24,7 @@ git clone https://github.com/heurema/specpunk.git
 cd specpunk
 ```
 
-## Run the CLI directly from source
+## Run from source
 
 Use Cargo to run the `punk` binary from the workspace:
 
@@ -32,7 +32,7 @@ Use Cargo to run the `punk` binary from the workspace:
 cargo run -p punk-cli -- --help
 ```
 
-You can also run individual commands this way:
+You can also run commands this way:
 
 ```bash
 cargo run -p punk-cli -- init --enable-jj --verify
@@ -48,8 +48,8 @@ cargo build --release -p punk-cli
 ./target/release/punk --help
 ```
 
-## What this page covers
+## Next step
 
-This page covers how to get the current CLI running.
+This page only covers how to get the current CLI running.
 
 For the first working flow after install, continue to [Quickstart](/quickstart).
