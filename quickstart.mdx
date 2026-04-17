@@ -7,6 +7,15 @@ This quickstart focuses on the current v0 working flow.
 
 It assumes you can already invoke `punk`. If not, start with [Install](/install).
 
+## What you will do
+
+In the current public flow, you will:
+
+1. initialize a repository
+2. give SpecPunk a plain goal
+3. let `go` run the default happy path
+4. inspect status or fall back to the staged path when needed
+
 ## Initialize a repository
 
 In the repository you want to work on:
@@ -23,7 +32,7 @@ cargo run -p punk-cli -- init --enable-jj --verify
 
 `jj` is preferred when available. `git` is the fallback.
 
-## Default autonomous path
+## Run the default happy path
 
 Give SpecPunk a plain goal:
 
@@ -31,7 +40,7 @@ Give SpecPunk a plain goal:
 punk go --fallback-staged "add a bounded CLI feature with tests"
 ```
 
-This is the default happy path:
+This is the default path:
 
 ```text
 goal -> draft -> approve -> cut -> gate -> proof
@@ -39,7 +48,22 @@ goal -> draft -> approve -> cut -> gate -> proof
 
 If autonomy blocks, SpecPunk prepares a staged recovery path instead of hiding the failure.
 
-## Staged or manual path
+## Inspect the result
+
+After the run, the most useful follow-up commands are:
+
+```bash
+punk status
+punk inspect work
+```
+
+Use JSON inspect when you want the underlying structured artifact view:
+
+```bash
+punk inspect <id> --json
+```
+
+## Use the staged path when needed
 
 Use the staged path when you want review between phases:
 
@@ -59,4 +83,4 @@ punk gate proof <run-id|decision-id>
 - examples gallery
 - research workflows
 
-For the current command surface, see [CLI reference](/reference/cli).
+For the full current command surface, see [CLI reference](/reference/cli).
