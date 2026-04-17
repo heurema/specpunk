@@ -40,6 +40,11 @@ use punk_domain::{Contract, DraftInput, DraftProposal, FrozenCapabilityResolutio
 const BLOCKED_EXECUTION_SENTINEL: &str = "PUNK_EXECUTION_BLOCKED:";
 const SUCCESSFUL_EXECUTION_SENTINEL: &str = "PUNK_EXECUTION_COMPLETE:";
 
+#[cfg(test)]
+static TEST_CODEX_BIN_OVERRIDE: Mutex<Option<OsString>> = Mutex::new(None);
+#[cfg(test)]
+static TEST_CODEX_DRAFTER_TIMEOUT_OVERRIDE: Mutex<Option<Duration>> = Mutex::new(None);
+
 pub struct ExecuteInput {
     pub repo_root: PathBuf,
     pub contract: Contract,
@@ -605,7 +610,7 @@ impl CodexCliContractDrafter {
         timeout: Duration,
     ) -> std::result::Result<DraftProposal, DrafterAttemptError> {
         let _ = fs::remove_file(output_path);
-        let mut command = Command::new("codex");
+        let mut command = Command::new(codex_cli_program());
         command
             .arg("exec")
             .arg("--full-auto")
@@ -828,7 +833,7 @@ impl CodexCliExecutor {
                 retry_feedback.as_deref(),
             );
 
-            let mut command = Command::new("codex");
+            let mut command = Command::new(codex_cli_program());
             command
                 .arg("exec")
                 .arg("--full-auto")
@@ -1180,7 +1185,7 @@ impl CodexCliExecutor {
         let mut prepass_context = context_pack.clone();
         prepass_context.plan_seed = Some(derive_plan_seed(&input.contract, context_pack));
         let prompt = build_patch_plan_prompt(&input.contract, &prepass_context);
-        let mut command = Command::new("codex");
+        let mut command = Command::new(codex_cli_program());
         command
             .arg("exec")
             .arg("--full-auto")
@@ -1294,7 +1299,7 @@ impl CodexCliExecutor {
         } else {
             None
         };
-        let mut command = Command::new("codex");
+        let mut command = Command::new(codex_cli_program());
         command
             .arg("exec")
             .arg("--full-auto")
@@ -4241,6 +4246,15 @@ fn codex_executor_orphan_grace_timeout() -> Duration {
 }
 
 fn codex_drafter_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = TEST_CODEX_DRAFTER_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap()
+        .to_owned()
+    {
+        return timeout;
+    }
+
     let seconds = std::env::var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -4273,6 +4287,17 @@ fn drafter_attempt_timeouts(
         Duration::from_millis(total_millis - retry_millis),
         Some(Duration::from_millis(retry_millis)),
     )
+}
+
+fn codex_cli_program() -> OsString {
+    #[cfg(test)]
+    if let Some(program) = TEST_CODEX_BIN_OVERRIDE.lock().unwrap().to_owned() {
+        return program;
+    }
+
+    std::env::var_os("PUNK_CODEX_BIN")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from("codex"))
 }
 
 fn codex_executor_reasoning_effort(contract: &Contract) -> Option<&'static str> {
@@ -6776,6 +6801,22 @@ mod tests {
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+    fn test_codex_bin_override() -> Option<OsString> {
+        TEST_CODEX_BIN_OVERRIDE.lock().unwrap().clone()
+    }
+
+    fn set_test_codex_bin_override(value: Option<OsString>) {
+        *TEST_CODEX_BIN_OVERRIDE.lock().unwrap() = value;
+    }
+
+    fn test_codex_drafter_timeout_override() -> Option<Duration> {
+        *TEST_CODEX_DRAFTER_TIMEOUT_OVERRIDE.lock().unwrap()
+    }
+
+    fn set_test_codex_drafter_timeout_override(value: Option<Duration>) {
+        *TEST_CODEX_DRAFTER_TIMEOUT_OVERRIDE.lock().unwrap() = value;
+    }
+
     #[test]
     fn build_exec_prompt_mentions_scope_when_present() {
         let contract = Contract {
@@ -6873,11 +6914,7 @@ mod tests {
         let fake_bin = root.join("bin");
         fs::create_dir_all(&fake_bin).unwrap();
         let fake_codex = fake_bin.join("codex");
-        fs::write(
-            &fake_codex,
-            "#!/usr/bin/env python3\nimport time\ntime.sleep(5)\n",
-        )
-        .unwrap();
+        fs::write(&fake_codex, "#!/bin/sh\nsleep 15\n").unwrap();
         #[cfg(unix)]
         {
             let mut perms = fs::metadata(&fake_codex).unwrap().permissions();
@@ -6885,18 +6922,10 @@ mod tests {
             fs::set_permissions(&fake_codex, perms).unwrap();
         }
 
-        let old_path = std::env::var_os("PATH");
-        let old_timeout = std::env::var_os("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
-        std::env::set_var(
-            "PATH",
-            std::env::join_paths(
-                [fake_bin.clone()]
-                    .into_iter()
-                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
-            )
-            .unwrap(),
-        );
-        std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", "3");
+        let old_codex_bin = test_codex_bin_override();
+        let old_timeout = test_codex_drafter_timeout_override();
+        set_test_codex_bin_override(Some(fake_codex.as_os_str().to_os_string()));
+        set_test_codex_drafter_timeout_override(Some(Duration::from_secs(9)));
 
         let drafter = CodexCliContractDrafter::default();
         let input = DraftInput {
@@ -6922,20 +6951,12 @@ mod tests {
         let err = drafter.draft(input).unwrap_err().to_string();
         let elapsed = start.elapsed();
 
-        if let Some(path) = old_path {
-            std::env::set_var("PATH", path);
-        } else {
-            std::env::remove_var("PATH");
-        }
-        if let Some(timeout) = old_timeout {
-            std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", timeout);
-        } else {
-            std::env::remove_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
-        }
+        set_test_codex_bin_override(old_codex_bin);
+        set_test_codex_drafter_timeout_override(old_timeout);
 
-        assert!(err.contains("timed out after 3s"), "{err}");
+        assert!(err.contains("timed out after 9s"), "{err}");
         assert!(
-            elapsed < Duration::from_secs(5),
+            elapsed < Duration::from_secs(12),
             "drafter elapsed too long: {elapsed:?}"
         );
 
@@ -6962,7 +6983,8 @@ mod tests {
         fs::write(
             &fake_codex,
             format!(
-                "#!/usr/bin/env python3\nimport pathlib, time\ncount_path = pathlib.Path({count_path:?})\ncount = int(count_path.read_text()) if count_path.exists() else 0\ncount_path.write_text(str(count + 1))\ntime.sleep(5)\n"
+                "#!/bin/sh\ncount=0\nif [ -f \"{count_path}\" ]; then count=$(cat \"{count_path}\"); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > \"{count_path}\"\nsleep 15\n",
+                count_path = count_path.display(),
             ),
         )
         .unwrap();
@@ -6973,18 +6995,10 @@ mod tests {
             fs::set_permissions(&fake_codex, perms).unwrap();
         }
 
-        let old_path = std::env::var_os("PATH");
-        let old_timeout = std::env::var_os("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
-        std::env::set_var(
-            "PATH",
-            std::env::join_paths(
-                [fake_bin.clone()]
-                    .into_iter()
-                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
-            )
-            .unwrap(),
-        );
-        std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", "6");
+        let old_codex_bin = test_codex_bin_override();
+        let old_timeout = test_codex_drafter_timeout_override();
+        set_test_codex_bin_override(Some(fake_codex.as_os_str().to_os_string()));
+        set_test_codex_drafter_timeout_override(Some(Duration::from_secs(9)));
 
         let drafter = CodexCliContractDrafter::default();
         let input = DraftInput {
@@ -7008,18 +7022,10 @@ mod tests {
 
         let err = drafter.draft(input).unwrap_err().to_string();
 
-        if let Some(path) = old_path {
-            std::env::set_var("PATH", path);
-        } else {
-            std::env::remove_var("PATH");
-        }
-        if let Some(timeout) = old_timeout {
-            std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", timeout);
-        } else {
-            std::env::remove_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
-        }
+        set_test_codex_bin_override(old_codex_bin);
+        set_test_codex_drafter_timeout_override(old_timeout);
 
-        assert!(err.contains("timed out after 6s"), "{err}");
+        assert!(err.contains("timed out after 9s"), "{err}");
         assert_eq!(fs::read_to_string(&count_path).unwrap(), "1");
 
         let _ = fs::remove_dir_all(&root);
@@ -7045,7 +7051,8 @@ mod tests {
         fs::write(
             &fake_codex,
             format!(
-                "#!/usr/bin/env python3\nimport pathlib, sys, time\ncount_path = pathlib.Path({count_path:?})\ncount = int(count_path.read_text()) if count_path.exists() else 0\ncount_path.write_text(str(count + 1))\nfor _ in range(6):\n    sys.stderr.write('mcp: engram/mem_search (completed)\\\\n')\n    sys.stderr.flush()\n    time.sleep(0.5)\n"
+                "#!/bin/sh\ncount=0\nif [ -f \"{count_path}\" ]; then count=$(cat \"{count_path}\"); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > \"{count_path}\"\ni=0\nwhile [ \"$i\" -lt 20 ]; do\n  printf 'mcp: engram/mem_search (completed)\\n' >&2\n  i=$((i + 1))\n  sleep 0.5\ndone\n",
+                count_path = count_path.display(),
             ),
         )
         .unwrap();
@@ -7056,18 +7063,10 @@ mod tests {
             fs::set_permissions(&fake_codex, perms).unwrap();
         }
 
-        let old_path = std::env::var_os("PATH");
-        let old_timeout = std::env::var_os("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
-        std::env::set_var(
-            "PATH",
-            std::env::join_paths(
-                [fake_bin.clone()]
-                    .into_iter()
-                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
-            )
-            .unwrap(),
-        );
-        std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", "6");
+        let old_codex_bin = test_codex_bin_override();
+        let old_timeout = test_codex_drafter_timeout_override();
+        set_test_codex_bin_override(Some(fake_codex.as_os_str().to_os_string()));
+        set_test_codex_drafter_timeout_override(Some(Duration::from_secs(9)));
 
         let drafter = CodexCliContractDrafter::default();
         let input = DraftInput {
@@ -7091,18 +7090,10 @@ mod tests {
 
         let err = drafter.draft(input).unwrap_err().to_string();
 
-        if let Some(path) = old_path {
-            std::env::set_var("PATH", path);
-        } else {
-            std::env::remove_var("PATH");
-        }
-        if let Some(timeout) = old_timeout {
-            std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", timeout);
-        } else {
-            std::env::remove_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
-        }
+        set_test_codex_bin_override(old_codex_bin);
+        set_test_codex_drafter_timeout_override(old_timeout);
 
-        assert!(err.contains("timed out after 6s"), "{err}");
+        assert!(err.contains("timed out after 9s"), "{err}");
         assert_eq!(fs::read_to_string(&count_path).unwrap(), "1");
 
         let _ = fs::remove_dir_all(&root);
@@ -7128,7 +7119,8 @@ mod tests {
         fs::write(
             &fake_codex,
             format!(
-                "#!/usr/bin/env python3\nimport pathlib, sys, time\ncount_path = pathlib.Path({count_path:?})\ncount = int(count_path.read_text()) if count_path.exists() else 0\ncount_path.write_text(str(count + 1))\nsys.stderr.write('{{\\\"allowed_scope\\\":[')\nsys.stderr.flush()\ntime.sleep(5)\n"
+                "#!/bin/sh\ncount=0\nif [ -f \"{count_path}\" ]; then count=$(cat \"{count_path}\"); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > \"{count_path}\"\nprintf '{{\\\"allowed_scope\\\":[' >&2\nsleep 15\n",
+                count_path = count_path.display(),
             ),
         )
         .unwrap();
@@ -7139,18 +7131,10 @@ mod tests {
             fs::set_permissions(&fake_codex, perms).unwrap();
         }
 
-        let old_path = std::env::var_os("PATH");
-        let old_timeout = std::env::var_os("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
-        std::env::set_var(
-            "PATH",
-            std::env::join_paths(
-                [fake_bin.clone()]
-                    .into_iter()
-                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
-            )
-            .unwrap(),
-        );
-        std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", "6");
+        let old_codex_bin = test_codex_bin_override();
+        let old_timeout = test_codex_drafter_timeout_override();
+        set_test_codex_bin_override(Some(fake_codex.as_os_str().to_os_string()));
+        set_test_codex_drafter_timeout_override(Some(Duration::from_secs(9)));
 
         let drafter = CodexCliContractDrafter::default();
         let input = DraftInput {
@@ -7174,16 +7158,8 @@ mod tests {
 
         let _err = drafter.draft(input).unwrap_err().to_string();
 
-        if let Some(path) = old_path {
-            std::env::set_var("PATH", path);
-        } else {
-            std::env::remove_var("PATH");
-        }
-        if let Some(timeout) = old_timeout {
-            std::env::set_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS", timeout);
-        } else {
-            std::env::remove_var("PUNK_CODEX_DRAFTER_TIMEOUT_SECS");
-        }
+        set_test_codex_bin_override(old_codex_bin);
+        set_test_codex_drafter_timeout_override(old_timeout);
 
         assert_eq!(fs::read_to_string(&count_path).unwrap(), "2");
 
@@ -7221,16 +7197,8 @@ mod tests {
             fs::set_permissions(&fake_codex, perms).unwrap();
         }
 
-        let old_path = std::env::var_os("PATH");
-        std::env::set_var(
-            "PATH",
-            std::env::join_paths(
-                [fake_bin.clone()]
-                    .into_iter()
-                    .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
-            )
-            .unwrap(),
-        );
+        let old_codex_bin = test_codex_bin_override();
+        set_test_codex_bin_override(Some(fake_codex.as_os_str().to_os_string()));
 
         let drafter = CodexCliContractDrafter::default();
         let schema_path = root.join("schema.json");
@@ -7248,11 +7216,7 @@ mod tests {
             Err(_) => panic!("fake codex should succeed"),
         };
 
-        if let Some(path) = old_path {
-            std::env::set_var("PATH", path);
-        } else {
-            std::env::remove_var("PATH");
-        }
+        set_test_codex_bin_override(old_codex_bin);
 
         let args: Vec<String> = serde_json::from_slice(&fs::read(&args_path).unwrap()).unwrap();
         let separator_index = args
