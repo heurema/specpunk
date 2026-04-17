@@ -346,6 +346,19 @@ impl Executor for CodexCliExecutor {
             return Ok(output);
         }
 
+        if let Some(summary) = patch_apply_lane_precondition_block_summary(
+            &effective_input.repo_root,
+            &effective_input.contract,
+        ) {
+            return Ok(ExecuteOutput {
+                success: false,
+                summary,
+                checks_run: Vec::new(),
+                cost_usd: None,
+                duration_ms: 0,
+            });
+        }
+
         match execution_lane_for_contract(&effective_input.repo_root, &effective_input.contract) {
             ExecutionLane::Manual => {
                 let summary = manual_mode_block_summary(&effective_input.contract)
@@ -1502,7 +1515,7 @@ Requirements:\n\
 - use only `*** Update File:` sections in this lane\n\
 - do not add, delete, move, or rename files in this lane\n\
 - do not run `rg`, `grep`, `sed`, `cat`, `find`, `ls`, or any other shell command for orientation in this lane\n\
-- the controller-owned plan excerpts already include the exact local edit windows; do not use python or any shell/interpreter command to rediscover them\n\
+- if controller-owned plan excerpts are present, treat them as the exact local edit windows; do not use python or any shell/interpreter command to rediscover them\n\
 - prefer the smallest bounded patch that follows any controller-owned plan targets exactly before doing broader exploration\n\
 - each update hunk must include enough unchanged or removed context lines for deterministic controller-side application\n\
 - prefer the smallest bounded patch that gets the implementation started and covers the approved behavior\n\
@@ -4438,6 +4451,11 @@ fn is_fail_closed_scope_task(contract: &Contract) -> bool {
 }
 
 fn is_patch_apply_lane_candidate(repo_root: &Path, contract: &Contract) -> bool {
+    patch_apply_has_authoritative_context(repo_root, contract).unwrap_or(false)
+        && patch_apply_shape_candidate(repo_root, contract)
+}
+
+fn patch_apply_shape_candidate(repo_root: &Path, contract: &Contract) -> bool {
     if !is_fail_closed_scope_task(contract) {
         return false;
     }
@@ -4490,6 +4508,45 @@ fn is_patch_apply_lane_candidate(repo_root: &Path, contract: &Contract) -> bool 
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+fn patch_apply_lane_precondition_block_summary(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Option<String> {
+    if !patch_apply_shape_candidate(repo_root, contract) {
+        return None;
+    }
+    match patch_apply_has_authoritative_context(repo_root, contract) {
+        Ok(true) => None,
+        Ok(false) => Some(format!(
+            "{BLOCKED_EXECUTION_SENTINEL} patch/apply lane requires controller-provided edit windows for all allowed files; unsupported scope: {}",
+            patch_apply_contextless_scope_paths(contract).join(", ")
+        )),
+        Err(err) => Some(format!(
+            "{BLOCKED_EXECUTION_SENTINEL} patch/apply lane could not build controller context: {err}"
+        )),
+    }
+}
+
+fn patch_apply_has_authoritative_context(repo_root: &Path, contract: &Contract) -> Result<bool> {
+    let pack = build_context_pack(repo_root, contract)?;
+    Ok(!pack.files.is_empty() || !pack.missing_paths.is_empty() || pack.patch_seed.is_some())
+}
+
+fn patch_apply_contextless_scope_paths(contract: &Contract) -> Vec<String> {
+    let mut paths = Vec::new();
+    for path in contract
+        .entry_points
+        .iter()
+        .chain(contract.allowed_scope.iter())
+    {
+        if !is_explicit_repo_file_scope(path) {
+            continue;
+        }
+        extend_unique_paths(&mut paths, std::slice::from_ref(path));
+    }
+    paths
 }
 
 fn needs_patch_plan_prepass(contract: &Contract, context_pack: &ContextPack) -> bool {
@@ -7261,7 +7318,7 @@ mod tests {
         assert!(prompt.contains("do not output JSON"));
         assert!(prompt.contains("do not run `rg`, `grep`, `sed`, `cat`, `find`, `ls`, or any other shell command for orientation"));
         assert!(prompt
-            .contains("do not use python or any shell/interpreter command to rediscover them"));
+            .contains("if controller-owned plan excerpts are present, treat them as the exact local edit windows"));
         assert!(prompt.contains(blocked_execution_template()));
         assert!(!prompt.contains("match the provided schema exactly"));
     }
@@ -7691,6 +7748,87 @@ mod tests {
         assert_eq!(
             output.summary,
             "PUNK_EXECUTION_BLOCKED: self-referential reliability slice requires manual bounded implementation"
+        );
+        assert_eq!(output.duration_ms, 0);
+        assert!(!root.join("stdout.log").exists());
+        assert!(!root.join("stderr.log").exists());
+        assert!(!root.join("executor.json").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn execute_contract_short_circuits_patch_lane_without_controller_context() {
+        let root = std::env::temp_dir().join(format!(
+            "punk-adapters-patch-lane-blocked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("docs/ops")).unwrap();
+        fs::create_dir_all(root.join("docs/specs")).unwrap();
+        fs::write(root.join("README.md"), "# baseline\n").unwrap();
+        fs::write(root.join("docs/ops/STATUS.md"), "status\n").unwrap();
+        fs::write(
+            root.join("docs/specs/dispatch-track-runtime-spec-v1.md"),
+            "spec\n",
+        )
+        .unwrap();
+
+        let contract = Contract {
+            id: "ct_baseline_docs".into(),
+            feature_id: "feat_baseline_docs".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source:
+                "Harden reliable-agent-building live track report/dispatch/cli summary surface"
+                    .into(),
+            entry_points: vec![
+                "README.md".into(),
+                "docs/ops/STATUS.md".into(),
+                "docs/specs/dispatch-track-runtime-spec-v1.md".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["bounded implementation slice".into()],
+            behavior_requirements: vec!["report summary output stays honest".into()],
+            allowed_scope: vec![
+                "README.md".into(),
+                "docs/ops/STATUS.md".into(),
+                "docs/specs/dispatch-track-runtime-spec-v1.md".into(),
+            ],
+            target_checks: vec!["cargo check -p baseline-cli".into()],
+            integrity_checks: vec!["npm run check".into()],
+            risk_level: "medium".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        assert_eq!(
+            patch_apply_lane_precondition_block_summary(&root, &contract).as_deref(),
+            Some(
+                "PUNK_EXECUTION_BLOCKED: patch/apply lane requires controller-provided edit windows for all allowed files; unsupported scope: README.md, docs/ops/STATUS.md, docs/specs/dispatch-track-runtime-spec-v1.md"
+            )
+        );
+
+        let executor = CodexCliExecutor::default();
+        let output = executor
+            .execute_contract(ExecuteInput {
+                repo_root: root.clone(),
+                contract,
+                capability_resolution: None,
+                stdout_path: root.join("stdout.log"),
+                stderr_path: root.join("stderr.log"),
+                executor_pid_path: root.join("executor.json"),
+            })
+            .unwrap();
+
+        assert!(!output.success);
+        assert_eq!(
+            output.summary,
+            "PUNK_EXECUTION_BLOCKED: patch/apply lane requires controller-provided edit windows for all allowed files; unsupported scope: README.md, docs/ops/STATUS.md, docs/specs/dispatch-track-runtime-spec-v1.md"
         );
         assert_eq!(output.duration_ms, 0);
         assert!(!root.join("stdout.log").exists());

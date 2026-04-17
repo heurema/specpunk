@@ -3732,6 +3732,7 @@ mod tests {
                 base_ref: Some("base123".into()),
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: "now".into(),
             ended_at: Some("later".into()),
         };
@@ -5870,6 +5871,7 @@ mod tests {
                     base_ref: None,
                 },
                 verification_context_ref: None,
+                architecture_inputs_ref: None,
             },
             receipt: punk_domain::Receipt {
                 id: "rcpt_123".into(),

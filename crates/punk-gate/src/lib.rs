@@ -13,8 +13,8 @@ use punk_domain::{
     ArchitectureFileLocAssessment, ArchitectureForbiddenPathDependencyAssessment,
     ArchitectureSeverity, ArchitectureSignals, CheckStatus, CommandEvidence, Contract,
     ContractStatus, Decision, DecisionObject, DeclaredHarnessEvidence, DeterministicStatus,
-    EventEnvelope, HarnessEvidence, ModeId, PersistedContract, Receipt, VerificationContext,
-    VerificationContextFileState, VerificationContextIdentity,
+    EventEnvelope, FrozenArchitectureInputs, HarnessEvidence, ModeId, PersistedContract, Receipt,
+    VerificationContext, VerificationContextFileState, VerificationContextIdentity,
 };
 use punk_events::EventStore;
 use punk_orch::project_id;
@@ -51,6 +51,17 @@ struct VerificationContextOutcome {
 struct ArchitectureAssessmentArtifact {
     assessment: ArchitectureAssessment,
     assessment_ref: String,
+    frozen_refs: Vec<String>,
+}
+
+struct FrozenArchitectureInputsOutcome {
+    manifest_ref: Option<String>,
+    signals_ref: Option<String>,
+    signals: Option<ArchitectureSignals>,
+    brief_ref: Option<String>,
+    reasons: Vec<String>,
+    reason_codes: Vec<String>,
+    valid: bool,
 }
 
 impl GateService {
@@ -84,7 +95,6 @@ impl GateService {
             &self.repo_root,
             &run,
             &receipt,
-            &contract_path,
             &persisted_contract,
             verification_context.check_root.as_deref(),
         )?;
@@ -155,10 +165,16 @@ impl GateService {
         };
         check_refs.extend(target.refs.iter().cloned());
         check_refs.extend(integrity.refs.iter().cloned());
+        check_refs.extend(architecture.frozen_refs.iter().cloned());
         check_refs.push(architecture.assessment_ref.clone());
         decision_basis.extend(target.reasons.clone());
         decision_basis.extend(integrity.reasons.clone());
         decision_basis.extend(harness.reasons.clone());
+        if let Some(manifest_ref) = architecture.frozen_refs.first() {
+            if manifest_ref.ends_with("/architecture-inputs.json") {
+                decision_basis.push(format!("architecture evidence frozen at {manifest_ref}"));
+            }
+        }
         decision_basis.extend(architecture.assessment.reasons.clone());
         command_evidence.extend(target.command_evidence);
         command_evidence.extend(integrity.command_evidence);
@@ -235,18 +251,12 @@ fn assess_architecture(
     repo_root: &Path,
     run: &punk_domain::Run,
     receipt: &Receipt,
-    contract_path: &Path,
     persisted_contract: &PersistedContract,
     check_root: Option<&Path>,
 ) -> Result<ArchitectureAssessmentArtifact> {
-    let signals_ref = persisted_contract
-        .architecture_signals_ref
-        .clone()
-        .or_else(|| default_architecture_signals_ref(repo_root, contract_path));
-    let signals = signals_ref
-        .as_ref()
-        .map(|reference| read_json::<ArchitectureSignals>(&repo_root.join(reference)))
-        .transpose()?;
+    let frozen_inputs = load_frozen_architecture_inputs(repo_root, run, persisted_contract)?;
+    let signals_ref = frozen_inputs.signals_ref.clone();
+    let signals = frozen_inputs.signals.clone();
     let severity = signals
         .as_ref()
         .map(|signals| signals.severity.clone())
@@ -261,8 +271,11 @@ fn assess_architecture(
     let mut reason_codes = Vec::new();
     let mut file_loc_results = Vec::new();
     let mut forbidden_path_dependency_results = Vec::new();
-    let mut blocked = false;
+    let mut blocked = !frozen_inputs.valid;
     let mut escalated = false;
+
+    reason_codes.extend(frozen_inputs.reason_codes.clone());
+    reasons.extend(frozen_inputs.reasons.clone());
 
     if matches!(severity, ArchitectureSeverity::Critical) && integrity.is_none() {
         escalated = true;
@@ -423,7 +436,7 @@ fn assess_architecture(
         run_id: run.id.clone(),
         contract_id: run.contract_id.clone(),
         signals_ref: signals_ref.clone(),
-        brief_ref: integrity.map(|integrity| integrity.brief_ref.clone()),
+        brief_ref: frozen_inputs.brief_ref.clone(),
         severity,
         outcome,
         review_required: integrity
@@ -451,15 +464,216 @@ fn assess_architecture(
     Ok(ArchitectureAssessmentArtifact {
         assessment,
         assessment_ref: relative_ref(repo_root, &assessment_path)?,
+        frozen_refs: architecture_frozen_refs(repo_root, &frozen_inputs),
     })
 }
 
-fn default_architecture_signals_ref(repo_root: &Path, contract_path: &Path) -> Option<String> {
-    let signals_path = contract_path.with_file_name("architecture-signals.json");
-    signals_path
-        .exists()
-        .then(|| relative_ref(repo_root, &signals_path).ok())
-        .flatten()
+fn architecture_frozen_refs(
+    repo_root: &Path,
+    frozen_inputs: &FrozenArchitectureInputsOutcome,
+) -> Vec<String> {
+    let mut refs = Vec::new();
+    if let Some(manifest_ref) = frozen_inputs.manifest_ref.as_ref() {
+        if repo_root.join(manifest_ref).exists() {
+            refs.push(manifest_ref.clone());
+        }
+    }
+    if let Some(signals_ref) = frozen_inputs.signals_ref.as_ref() {
+        if repo_root.join(signals_ref).exists() {
+            refs.push(signals_ref.clone());
+        }
+    }
+    if let Some(brief_ref) = frozen_inputs.brief_ref.as_ref() {
+        if repo_root.join(brief_ref).exists() {
+            refs.push(brief_ref.clone());
+        }
+    }
+    refs
+}
+
+fn load_frozen_architecture_inputs(
+    repo_root: &Path,
+    run: &punk_domain::Run,
+    persisted_contract: &PersistedContract,
+) -> Result<FrozenArchitectureInputsOutcome> {
+    let expected_signals_source = persisted_contract.architecture_signals_ref.clone();
+    let expected_brief_source = persisted_contract
+        .architecture_integrity
+        .as_ref()
+        .map(|integrity| integrity.brief_ref.clone());
+    let expects_architecture_inputs =
+        expected_signals_source.is_some() || expected_brief_source.is_some();
+
+    let Some(manifest_ref) = run.architecture_inputs_ref.clone() else {
+        if expects_architecture_inputs {
+            return Ok(FrozenArchitectureInputsOutcome {
+                manifest_ref: None,
+                signals_ref: None,
+                signals: None,
+                brief_ref: None,
+                reasons: vec![
+                    "frozen architecture inputs missing from run despite approved architecture evidence"
+                        .to_string(),
+                ],
+                reason_codes: vec!["frozen_architecture_inputs_unavailable".to_string()],
+                valid: false,
+            });
+        }
+        return Ok(FrozenArchitectureInputsOutcome {
+            manifest_ref: None,
+            signals_ref: None,
+            signals: None,
+            brief_ref: None,
+            reasons: Vec::new(),
+            reason_codes: Vec::new(),
+            valid: true,
+        });
+    };
+
+    let manifest_path = repo_root.join(&manifest_ref);
+    if !manifest_path.exists() {
+        return Ok(FrozenArchitectureInputsOutcome {
+            manifest_ref: Some(manifest_ref),
+            signals_ref: None,
+            signals: None,
+            brief_ref: None,
+            reasons: vec![format!(
+                "frozen architecture inputs missing at {}",
+                manifest_path.display()
+            )],
+            reason_codes: vec!["frozen_architecture_inputs_unavailable".to_string()],
+            valid: false,
+        });
+    }
+
+    let manifest: FrozenArchitectureInputs = match read_json(&manifest_path) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            return Ok(FrozenArchitectureInputsOutcome {
+                manifest_ref: Some(manifest_ref),
+                signals_ref: None,
+                signals: None,
+                brief_ref: None,
+                reasons: vec![format!("unable to read frozen architecture inputs: {err}")],
+                reason_codes: vec!["frozen_architecture_inputs_unavailable".to_string()],
+                valid: false,
+            });
+        }
+    };
+
+    let mut reasons = Vec::new();
+    let mut reason_codes = Vec::new();
+
+    if expected_signals_source != manifest.signals_source_ref {
+        reasons.push(format!(
+            "frozen architecture signals source drifted: {:?} != {:?}",
+            manifest.signals_source_ref, expected_signals_source
+        ));
+        reason_codes.push("frozen_architecture_inputs_unavailable".to_string());
+    }
+    if expected_brief_source != manifest.brief_source_ref {
+        reasons.push(format!(
+            "frozen architecture brief source drifted: {:?} != {:?}",
+            manifest.brief_source_ref, expected_brief_source
+        ));
+        reason_codes.push("frozen_architecture_inputs_unavailable".to_string());
+    }
+
+    let event_store = EventStore::new(repo_root);
+    let mut signals = None;
+    if let Some(source_ref) = manifest.signals_source_ref.as_ref() {
+        let (Some(signals_ref), Some(signals_sha256)) = (
+            manifest.signals_ref.as_ref(),
+            manifest.signals_sha256.as_ref(),
+        ) else {
+            reasons.push(format!(
+                "frozen architecture signals snapshot missing for declared source {source_ref}"
+            ));
+            reason_codes.push("frozen_architecture_inputs_unavailable".to_string());
+            return Ok(FrozenArchitectureInputsOutcome {
+                manifest_ref: Some(manifest_ref),
+                signals_ref: manifest.signals_ref,
+                signals,
+                brief_ref: manifest.brief_ref,
+                reasons,
+                reason_codes,
+                valid: false,
+            });
+        };
+        let signals_path = repo_root.join(signals_ref);
+        if !signals_path.exists() {
+            reasons.push(format!(
+                "frozen architecture signals snapshot missing at {}",
+                signals_path.display()
+            ));
+            reason_codes.push("frozen_architecture_inputs_unavailable".to_string());
+        } else {
+            let actual_sha256 = event_store.file_sha256(&signals_path)?;
+            if actual_sha256 != *signals_sha256 {
+                reasons.push(format!(
+                    "frozen architecture signals hash drifted at {signals_ref}: {actual_sha256} != {signals_sha256}"
+                ));
+                reason_codes.push("frozen_architecture_inputs_hash_drifted".to_string());
+            } else {
+                match read_json::<ArchitectureSignals>(&signals_path) {
+                    Ok(loaded) => signals = Some(loaded),
+                    Err(err) => {
+                        reasons.push(format!(
+                            "unable to read frozen architecture signals {signals_ref}: {err}"
+                        ));
+                        reason_codes.push("frozen_architecture_inputs_unavailable".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(source_ref) = manifest.brief_source_ref.as_ref() {
+        let (Some(brief_ref), Some(brief_sha256)) =
+            (manifest.brief_ref.as_ref(), manifest.brief_sha256.as_ref())
+        else {
+            reasons.push(format!(
+                "frozen architecture brief snapshot missing for declared source {source_ref}"
+            ));
+            reason_codes.push("frozen_architecture_inputs_unavailable".to_string());
+            return Ok(FrozenArchitectureInputsOutcome {
+                manifest_ref: Some(manifest_ref),
+                signals_ref: manifest.signals_ref,
+                signals,
+                brief_ref: manifest.brief_ref,
+                reasons,
+                reason_codes,
+                valid: false,
+            });
+        };
+        let brief_path = repo_root.join(brief_ref);
+        if !brief_path.exists() {
+            reasons.push(format!(
+                "frozen architecture brief snapshot missing at {}",
+                brief_path.display()
+            ));
+            reason_codes.push("frozen_architecture_inputs_unavailable".to_string());
+        } else {
+            let actual_sha256 = event_store.file_sha256(&brief_path)?;
+            if actual_sha256 != *brief_sha256 {
+                reasons.push(format!(
+                    "frozen architecture brief hash drifted at {brief_ref}: {actual_sha256} != {brief_sha256}"
+                ));
+                reason_codes.push("frozen_architecture_inputs_hash_drifted".to_string());
+            }
+        }
+    }
+
+    let valid = reasons.is_empty();
+    Ok(FrozenArchitectureInputsOutcome {
+        manifest_ref: Some(manifest_ref),
+        signals_ref: manifest.signals_ref,
+        signals,
+        brief_ref: manifest.brief_ref,
+        reasons,
+        reason_codes,
+        valid,
+    })
 }
 
 fn architecture_changed_files(changed_files: &[String]) -> Vec<String> {
@@ -1171,7 +1385,8 @@ mod tests {
     use punk_core::write_json;
     use punk_domain::{
         ArchitectureFileLocBudget, ArchitectureSignals, ArchitectureThresholds,
-        ContractArchitectureIntegrity, PersistedContract, ReceiptArtifacts, RunStatus, VcsKind,
+        ContractArchitectureIntegrity, FrozenArchitectureInputs, PersistedContract,
+        ReceiptArtifacts, RunStatus, VcsKind,
     };
 
     fn normalized_decision_value(decision: &punk_domain::DecisionObject) -> serde_json::Value {
@@ -1317,6 +1532,58 @@ mod tests {
         .unwrap();
     }
 
+    fn freeze_architecture_inputs_for_run(root: &Path, run_id: &str) -> String {
+        let persisted: PersistedContract =
+            read_json(&root.join(".punk/contracts/feat_1/v1.json")).unwrap();
+        let event_store = EventStore::new(root);
+        let run_dir = root.join(".punk/runs").join(run_id);
+        fs::create_dir_all(&run_dir).unwrap();
+
+        let signals_source_ref = persisted.architecture_signals_ref.clone();
+        let signals_ref = signals_source_ref.as_ref().and_then(|source_ref| {
+            let source_path = root.join(source_ref);
+            if !source_path.exists() {
+                return None;
+            }
+            let destination = run_dir.join("architecture-signals.json");
+            fs::copy(&source_path, &destination).unwrap();
+            Some(relative_ref(root, &destination).unwrap())
+        });
+        let signals_sha256 = signals_ref
+            .as_ref()
+            .map(|reference| event_store.file_sha256(root.join(reference)).unwrap());
+
+        let brief_source_ref = persisted
+            .architecture_integrity
+            .as_ref()
+            .map(|integrity| integrity.brief_ref.clone());
+        let brief_ref = brief_source_ref.as_ref().and_then(|source_ref| {
+            let source_path = root.join(source_ref);
+            if !source_path.exists() {
+                return None;
+            }
+            let destination = run_dir.join("architecture-brief.md");
+            fs::copy(&source_path, &destination).unwrap();
+            Some(relative_ref(root, &destination).unwrap())
+        });
+        let brief_sha256 = brief_ref
+            .as_ref()
+            .map(|reference| event_store.file_sha256(root.join(reference)).unwrap());
+
+        let manifest = FrozenArchitectureInputs {
+            signals_source_ref,
+            signals_ref,
+            signals_sha256,
+            brief_source_ref,
+            brief_ref,
+            brief_sha256,
+            captured_at: now_rfc3339(),
+        };
+        let manifest_path = run_dir.join("architecture-inputs.json");
+        write_json(&manifest_path, &manifest).unwrap();
+        relative_ref(root, &manifest_path).unwrap()
+    }
+
     #[test]
     fn gate_blocks_scope_violation() {
         let root = std::env::temp_dir().join(format!("punk-gate-{}", std::process::id()));
@@ -1362,6 +1629,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -1472,6 +1740,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -1495,6 +1764,7 @@ mod tests {
         };
         write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
         attach_verification_context(&root, &mut run, &["tracked.txt"]);
+        run.architecture_inputs_ref = Some(freeze_architecture_inputs_for_run(&root, "run_1"));
         write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
 
         let gate = GateService::new(&root, &global);
@@ -1508,6 +1778,10 @@ mod tests {
         let assessment: ArchitectureAssessment =
             read_json(&root.join(".punk/runs/run_1/architecture-assessment.json")).unwrap();
         assert_eq!(assessment.outcome, ArchitectureAssessmentOutcome::Escalate);
+        assert_eq!(
+            assessment.signals_ref.as_deref(),
+            Some(".punk/runs/run_1/architecture-signals.json")
+        );
         assert!(assessment
             .reason_codes
             .contains(&"critical_signals_missing_contract_architecture_integrity".to_string()));
@@ -1597,6 +1871,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -1620,6 +1895,7 @@ mod tests {
         };
         write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
         attach_verification_context(&root, &mut run, &["tracked.txt"]);
+        run.architecture_inputs_ref = Some(freeze_architecture_inputs_for_run(&root, "run_1"));
         write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
 
         let gate = GateService::new(&root, &global);
@@ -1629,6 +1905,14 @@ mod tests {
         let assessment: ArchitectureAssessment =
             read_json(&root.join(".punk/runs/run_1/architecture-assessment.json")).unwrap();
         assert_eq!(assessment.outcome, ArchitectureAssessmentOutcome::Block);
+        assert_eq!(
+            assessment.signals_ref.as_deref(),
+            Some(".punk/runs/run_1/architecture-signals.json")
+        );
+        assert_eq!(
+            assessment.brief_ref.as_deref(),
+            Some(".punk/runs/run_1/architecture-brief.md")
+        );
         assert_eq!(assessment.file_loc_results[0].status, CheckStatus::Fail);
         assert!(assessment
             .reason_codes
@@ -1749,6 +2033,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -1772,6 +2057,7 @@ mod tests {
         };
         write_json(&root.join(".punk/runs/run_1/receipt.json"), &receipt).unwrap();
         attach_verification_context(&root, &mut run, &["crates/app-core/src/lib.rs"]);
+        run.architecture_inputs_ref = Some(freeze_architecture_inputs_for_run(&root, "run_1"));
         write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
 
         let gate = GateService::new(&root, &global);
@@ -1782,12 +2068,299 @@ mod tests {
             read_json(&root.join(".punk/runs/run_1/architecture-assessment.json")).unwrap();
         assert_eq!(assessment.outcome, ArchitectureAssessmentOutcome::Block);
         assert_eq!(
+            assessment.signals_ref.as_deref(),
+            Some(".punk/runs/run_1/architecture-signals.json")
+        );
+        assert_eq!(
+            assessment.brief_ref.as_deref(),
+            Some(".punk/runs/run_1/architecture-brief.md")
+        );
+        assert_eq!(
             assessment.forbidden_path_dependency_results[0].status,
             CheckStatus::Fail
         );
         assert!(assessment
             .reason_codes
             .contains(&"forbidden_path_dependency_violated".to_string()));
+    }
+
+    #[test]
+    fn gate_uses_frozen_architecture_inputs_even_if_live_contract_artifacts_change_after_cut() {
+        let (root, global) = architecture_test_root("frozen-architecture-live-mutation");
+        fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
+        fs::write(
+            root.join(".punk/contracts/feat_1/architecture-brief.md"),
+            "# brief\n",
+        )
+        .unwrap();
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "x".into(),
+            entry_points: vec!["tracked.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["tracked.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "medium".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_persisted_contract(
+            &root,
+            contract,
+            Some(ArchitectureSignals {
+                contract_id: "ct_1".into(),
+                feature_id: "feat_1".into(),
+                scope_roots: vec!["tracked.txt".into()],
+                oversized_files: Vec::new(),
+                distinct_scope_roots: 1,
+                entry_point_count: 1,
+                expected_interface_count: 1,
+                import_path_count: 0,
+                has_cleanup_obligations: false,
+                has_docs_obligations: false,
+                has_migration_sensitive_surfaces: false,
+                severity: ArchitectureSeverity::Warn,
+                trigger_reasons: vec!["deterministic review".into()],
+                thresholds: ArchitectureThresholds {
+                    warn_file_loc: 600,
+                    critical_file_loc: 1200,
+                    critical_scope_roots: 1,
+                    warn_expected_interfaces: 2,
+                    warn_import_paths: 5,
+                },
+                computed_at: now_rfc3339(),
+            }),
+            Some(ContractArchitectureIntegrity {
+                review_required: true,
+                brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
+                touched_roots_max: Some(1),
+                file_loc_budgets: Vec::new(),
+                forbidden_path_dependencies: Vec::new(),
+            }),
+        );
+
+        let mut run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            architecture_inputs_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        write_json(
+            &root.join(".punk/runs/run_1/receipt.json"),
+            &Receipt {
+                id: "rcpt_1".into(),
+                run_id: "run_1".into(),
+                task_id: "task_1".into(),
+                status: "success".into(),
+                executor_name: "fake".into(),
+                changed_files: vec!["tracked.txt".into()],
+                artifacts: ReceiptArtifacts {
+                    stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                    stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+                },
+                checks_run: vec![],
+                duration_ms: 1,
+                cost_usd: None,
+                summary: "done".into(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .unwrap();
+        attach_verification_context(&root, &mut run, &["tracked.txt"]);
+        run.architecture_inputs_ref = Some(freeze_architecture_inputs_for_run(&root, "run_1"));
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+
+        fs::write(
+            root.join(".punk/contracts/feat_1/architecture-signals.json"),
+            "{not-valid-json}\n",
+        )
+        .unwrap();
+        fs::remove_file(root.join(".punk/contracts/feat_1/architecture-brief.md")).unwrap();
+
+        let decision = GateService::new(&root, &global).gate_run("run_1").unwrap();
+        assert_eq!(
+            decision.decision,
+            Decision::Accept,
+            "{:?}",
+            decision.decision_basis
+        );
+        assert!(decision
+            .check_refs
+            .contains(&".punk/runs/run_1/architecture-inputs.json".to_string()));
+        assert!(decision
+            .check_refs
+            .contains(&".punk/runs/run_1/architecture-signals.json".to_string()));
+        assert!(decision
+            .check_refs
+            .contains(&".punk/runs/run_1/architecture-brief.md".to_string()));
+        assert!(!decision
+            .check_refs
+            .iter()
+            .any(|reference| reference.contains(".punk/contracts/feat_1/architecture-")));
+
+        let assessment: ArchitectureAssessment =
+            read_json(&root.join(".punk/runs/run_1/architecture-assessment.json")).unwrap();
+        assert_eq!(
+            assessment.signals_ref.as_deref(),
+            Some(".punk/runs/run_1/architecture-signals.json")
+        );
+        assert_eq!(
+            assessment.brief_ref.as_deref(),
+            Some(".punk/runs/run_1/architecture-brief.md")
+        );
+    }
+
+    #[test]
+    fn gate_blocks_when_frozen_architecture_signal_snapshot_is_missing() {
+        let (root, global) = architecture_test_root("missing-frozen-architecture-signal");
+        fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
+        fs::write(
+            root.join(".punk/contracts/feat_1/architecture-brief.md"),
+            "# brief\n",
+        )
+        .unwrap();
+
+        let contract = Contract {
+            id: "ct_1".into(),
+            feature_id: "feat_1".into(),
+            version: 1,
+            status: ContractStatus::Approved,
+            prompt_source: "x".into(),
+            entry_points: vec!["tracked.txt".into()],
+            import_paths: vec![],
+            expected_interfaces: vec!["x".into()],
+            behavior_requirements: vec!["x".into()],
+            allowed_scope: vec!["tracked.txt".into()],
+            target_checks: vec!["true".into()],
+            integrity_checks: vec!["true".into()],
+            risk_level: "medium".into(),
+            created_at: now_rfc3339(),
+            approved_at: Some(now_rfc3339()),
+        };
+        write_persisted_contract(
+            &root,
+            contract,
+            Some(ArchitectureSignals {
+                contract_id: "ct_1".into(),
+                feature_id: "feat_1".into(),
+                scope_roots: vec!["tracked.txt".into()],
+                oversized_files: Vec::new(),
+                distinct_scope_roots: 1,
+                entry_point_count: 1,
+                expected_interface_count: 1,
+                import_path_count: 0,
+                has_cleanup_obligations: false,
+                has_docs_obligations: false,
+                has_migration_sensitive_surfaces: false,
+                severity: ArchitectureSeverity::Warn,
+                trigger_reasons: vec!["deterministic review".into()],
+                thresholds: ArchitectureThresholds {
+                    warn_file_loc: 600,
+                    critical_file_loc: 1200,
+                    critical_scope_roots: 1,
+                    warn_expected_interfaces: 2,
+                    warn_import_paths: 5,
+                },
+                computed_at: now_rfc3339(),
+            }),
+            Some(ContractArchitectureIntegrity {
+                review_required: true,
+                brief_ref: ".punk/contracts/feat_1/architecture-brief.md".into(),
+                touched_roots_max: Some(1),
+                file_loc_budgets: Vec::new(),
+                forbidden_path_dependencies: Vec::new(),
+            }),
+        );
+
+        let mut run = punk_domain::Run {
+            id: "run_1".into(),
+            task_id: "task_1".into(),
+            feature_id: "feat_1".into(),
+            contract_id: "ct_1".into(),
+            attempt: 1,
+            status: RunStatus::Finished,
+            mode_origin: ModeId::Cut,
+            vcs: punk_domain::RunVcs {
+                backend: VcsKind::Git,
+                workspace_ref: root.display().to_string(),
+                change_ref: "head".into(),
+                base_ref: None,
+            },
+            verification_context_ref: None,
+            architecture_inputs_ref: None,
+            started_at: now_rfc3339(),
+            ended_at: Some(now_rfc3339()),
+        };
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+        write_json(
+            &root.join(".punk/runs/run_1/receipt.json"),
+            &Receipt {
+                id: "rcpt_1".into(),
+                run_id: "run_1".into(),
+                task_id: "task_1".into(),
+                status: "success".into(),
+                executor_name: "fake".into(),
+                changed_files: vec!["tracked.txt".into()],
+                artifacts: ReceiptArtifacts {
+                    stdout_ref: ".punk/runs/run_1/stdout.log".into(),
+                    stderr_ref: ".punk/runs/run_1/stderr.log".into(),
+                },
+                checks_run: vec![],
+                duration_ms: 1,
+                cost_usd: None,
+                summary: "done".into(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .unwrap();
+        attach_verification_context(&root, &mut run, &["tracked.txt"]);
+        run.architecture_inputs_ref = Some(freeze_architecture_inputs_for_run(&root, "run_1"));
+        fs::remove_file(root.join(".punk/runs/run_1/architecture-signals.json")).unwrap();
+        write_json(&root.join(".punk/runs/run_1/run.json"), &run).unwrap();
+
+        let decision = GateService::new(&root, &global).gate_run("run_1").unwrap();
+        assert_eq!(
+            decision.decision,
+            Decision::Block,
+            "{:?}",
+            decision.decision_basis
+        );
+
+        let assessment: ArchitectureAssessment =
+            read_json(&root.join(".punk/runs/run_1/architecture-assessment.json")).unwrap();
+        assert_eq!(assessment.outcome, ArchitectureAssessmentOutcome::Block);
+        assert!(assessment
+            .reason_codes
+            .contains(&"frozen_architecture_inputs_unavailable".to_string()));
+        assert!(assessment
+            .reasons
+            .iter()
+            .any(|reason| { reason.contains("frozen architecture signals snapshot missing") }));
+        assert_eq!(
+            assessment.brief_ref.as_deref(),
+            Some(".punk/runs/run_1/architecture-brief.md")
+        );
     }
 
     #[test]
@@ -1836,6 +2409,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -1977,6 +2551,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -2114,6 +2689,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -2275,6 +2851,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -2399,6 +2976,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -2522,6 +3100,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -2646,6 +3225,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -2748,6 +3328,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -2865,6 +3446,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -2965,6 +3547,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
@@ -3147,6 +3730,7 @@ mod tests {
                 base_ref: None,
             },
             verification_context_ref: None,
+            architecture_inputs_ref: None,
             started_at: now_rfc3339(),
             ended_at: Some(now_rfc3339()),
         };
