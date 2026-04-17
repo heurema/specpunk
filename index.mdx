@@ -5,7 +5,7 @@ description: Local-first, stewarded multi-agent engineering runtime.
 
 SpecPunk is a repository-first runtime for AI-driven engineering work across codebases. It is built around bounded execution, deterministic gate semantics, proof-bearing decisions, and a small operator-facing surface.
 
-## What SpecPunk is
+## At a glance
 
 SpecPunk is designed for engineering work that needs to be:
 
@@ -21,14 +21,11 @@ The public surface is intentionally small:
 - one vocabulary: `plot / cut / gate`
 - one final decision writer: `gate`
 
-## What SpecPunk is not
+## Why it exists
 
-SpecPunk is not trying to be:
+SpecPunk is not trying to be a provider-zoo shell, a broad hosted control plane, or an always-on swarm interface.
 
-- a provider-zoo shell
-- a broad hosted control plane
-- an always-on swarm interface
-- a second product surface next to the repository
+It exists to make AI-assisted engineering work more legible, safer to operate, and easier to verify at the repository level.
 
 ## Current status
 
@@ -36,29 +33,20 @@ SpecPunk is in an active rebuild phase. These docs describe the current operator
 
 Today:
 
-- `punk` is the public CLI.
-- The active v0 path is `init -> start/go -> plot -> cut -> gate -> proof`.
-- `punk-council` is in-tree but inactive.
-- `punk-shell`, `punk-skills`, `punk-eval`, and `punk-research` are planned only.
+- `punk` is the public CLI
+- the active v0 path is `init -> start/go -> plot -> cut -> gate -> proof`
+- `punk-council` is in-tree but inactive
+- `punk-shell`, `punk-skills`, `punk-eval`, and `punk-research` are planned only
 
 ## Start here
 
-Use this order if you are new to the project:
+If you are new to the project, use this order:
 
 1. [Install](/install)
 2. [Quickstart](/quickstart)
-3. [Roadmap](/roadmap)
-4. [CLI reference](/reference/cli)
-5. [Repo status](/reference/repo-status)
-
-## Core principles
-
-- one CLI
-- one vocabulary: `plot / cut / gate`
-- contract first
-- proof before acceptance
-- `gate` writes the final decision
-- local-first, VCS-aware operation
+3. [CLI reference](/reference/cli)
+4. [Repo status](/reference/repo-status)
+5. [Roadmap](/roadmap)
 
 ## Scope of this site
 
@@ -66,7 +54,8 @@ This site is a public, curated layer over the repository. It focuses on:
 
 - what SpecPunk is
 - how to run the current CLI
-- what is real today
-- what is on the current roadmap
+- how the current operator path works
+- what is current today
+- what is on the roadmap
 
 Internal research notes are intentionally not part of the public docs.
