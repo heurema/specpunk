@@ -11,6 +11,12 @@ SpecPunk uses three canonical runtime modes:
 
 These are not tone presets. They are permission boundaries.
 
+## Why this split exists
+
+SpecPunk is designed to keep planning, implementation, and final acceptance distinct.
+
+That separation makes the workflow easier to inspect and reduces the chance that a single fuzzy session quietly becomes the source of truth for everything.
+
 ## Plot
 
 `plot` is the planning and inspection mode.
@@ -22,10 +28,10 @@ Use it to:
 - shape scope before execution
 - prepare a bounded slice of work
 
-What `plot` does not do:
+`plot` does not:
 
 - change repository files as part of implementation
-- run the final acceptance decision
+- write the final acceptance decision
 
 ## Cut
 
@@ -37,7 +43,7 @@ Use it to:
 - change repository files inside approved scope
 - run checks and produce a receipt
 
-What `cut` does not do:
+`cut` does not:
 
 - write the final decision
 - write proof artifacts
@@ -53,17 +59,17 @@ Use it to:
 - write the final `DecisionObject`
 - write proof artifacts
 
-What `gate` does not do:
+`gate` does not:
 
 - act like a second implementation pass
 - replace the bounded execution flow
 
-## Why this matters
+## How they work together
 
-The current public surface is intentionally built around one vocabulary:
+The current public path is intentionally simple:
 
-- one CLI: `punk`
-- one runtime shape: `plot / cut / gate`
-- one final decision writer: `gate`
+```text
+goal -> draft -> approve -> cut -> gate -> proof
+```
 
-That keeps the operator path small and makes it easier to tell what is current, what is advisory, and what is only planned.
+That flow keeps one CLI, one vocabulary, and one final decision writer.
