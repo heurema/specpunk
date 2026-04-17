@@ -5,6 +5,12 @@ description: The current public command surface for SpecPunk.
 
 This page summarizes the current public CLI surface. It is intentionally shorter than the full product CLI spec in the repository.
 
+If you are running from the source tree, prepend commands with:
+
+```bash
+cargo run -p punk-cli --
+```
+
 ## Primary entrypoints
 
 The current public entrypoints are:
@@ -17,7 +23,7 @@ punk status [id]
 punk inspect <id> --json
 ```
 
-## Default path
+## Goal-first path
 
 For initialized repositories, the default happy path is goal-first:
 
@@ -43,7 +49,7 @@ punk gate run <run-id>
 punk gate proof <run-id|decision-id>
 ```
 
-## Current mode-level commands
+## Mode-level commands
 
 ```bash
 punk plot contract "<goal>"
@@ -56,6 +62,8 @@ punk gate proof <run-id|decision-id>
 
 ## Read surfaces
 
+Use these to inspect current state and artifacts:
+
 ```bash
 punk status [id]
 punk inspect work [id]
@@ -63,7 +71,7 @@ punk inspect project
 punk inspect <id> --json
 ```
 
-## What is not part of the current public CLI
+## Not part of the current public CLI
 
 These are not part of the current operator surface:
 
