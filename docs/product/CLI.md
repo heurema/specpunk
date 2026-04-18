@@ -248,11 +248,12 @@ Current promote semantics:
 - `issue admit` prepares only by default; `--publish` is the explicit networked step that applies the `admission:*` label, posts the admission comment, and closes the issue when the decision is `close_now`
 - the admission policy is intentionally conservative:
   - `close_now` when the issue is closed/duplicate/obsolete, targets a decommissioned or cut surface, or otherwise should never enter the active core intake lane
-  - `core_now` when the issue is either a valid high-severity runtime report or a manual repo issue that clearly targets an active core surface and carries blocker/bug signals
+  - `core_now` when the issue is either a valid high-severity runtime report, a deterministic runtime report that clearly blocks an active core surface, or a manual repo issue that clearly targets an active core surface and carries blocker/bug signals
   - `defer_after_core` when the issue is real enough to keep, but should remain outside immediate core stabilization
 - runtime reports use the embedded machine packet plus runtime marker vocabulary:
   - high-severity markers such as `no-progress`, `timeout`, `panic`, `controller`, `executor`, `zero-byte-file`, or `patch-apply` go to `core_now`
-  - valid runtime reports without those markers go to `defer_after_core`
+  - deterministic runtime reports without those markers still go to `core_now` when they target current core surfaces, carry blocker/failure signals, and do not read as later-track work
+  - other valid runtime reports without those markers go to `defer_after_core`
 - manual/backlog issues use strategic surface checks:
   - legacy `punk-supervisor` / decommissioned / cut surfaces go to `close_now`
   - active core blockers may go to `core_now`

@@ -5501,6 +5501,28 @@ fn evaluate_incident_issue_admission(
             ("workspace", "workspace"),
         ],
     );
+    let runtime_core_blocker_markers = collect_named_markers(
+        &combined_text,
+        &[
+            ("punk init", "punk init"),
+            ("punk start", "punk start"),
+            ("punk go", "punk go"),
+            ("go --fallback-staged", "go --fallback-staged"),
+            ("punk plot", "punk plot"),
+            ("punk cut", "punk cut"),
+            ("punk gate", "punk gate"),
+            ("punk status", "punk status"),
+            ("punk inspect", "punk inspect"),
+            ("proofpack", "proofpack"),
+            ("work ledger", "work ledger"),
+            ("receipt", "receipt"),
+            ("verification context", "verification context"),
+            ("allowed_scope", "allowed_scope"),
+            ("incident promote", "incident promote"),
+            ("incident submit", "incident submit"),
+            ("issue admit", "issue admit"),
+        ],
+    );
     let later_track_markers = collect_named_markers(
         &combined_text,
         &[
@@ -5656,6 +5678,20 @@ fn evaluate_incident_issue_admission(
         reasons.push(format!(
             "valid runtime report matched high-severity runtime markers: {}",
             matched_runtime_markers.join(", ")
+        ));
+        IncidentAdmissionDecision::CoreNow
+    } else if has_runtime_report
+        && !runtime_core_blocker_markers.is_empty()
+        && !blocker_markers.is_empty()
+        && later_track_markers.is_empty()
+    {
+        reasons.push(format!(
+            "valid runtime report targets current core surfaces without later-track markers: {}",
+            runtime_core_blocker_markers.join(", ")
+        ));
+        reasons.push(format!(
+            "runtime report carries blocker signals even without high-severity runtime markers: {}",
+            blocker_markers.join(", ")
         ));
         IncidentAdmissionDecision::CoreNow
     } else if has_runtime_report {
@@ -18395,6 +18431,116 @@ fn ok() {}
         assert!(log.contains("repos/heurema/specpunk/issues/123"));
         assert!(log.contains("repos/heurema/specpunk/issues?state=all&per_page=100"));
         assert!(!log.contains("comments"));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&global);
+        let _ = fs::remove_file(&fake_gh);
+        let _ = fs::remove_file(&log_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admit_incident_issue_classifies_active_core_blocking_runtime_report_without_high_severity_as_core_now(
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "punk-orch-incident-admit-core-blocker-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = std::env::temp_dir().join(format!(
+            "punk-orch-incident-admit-core-blocker-preview-global-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let fake_gh = std::env::temp_dir().join(format!(
+            "punk-orch-fake-gh-admit-core-blocker-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log_path = std::env::temp_dir().join(format!(
+            "punk-orch-fake-gh-admit-core-blocker-preview-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let (service, _incident) = prepare_captured_incident_fixture(&root, &global);
+        let issue_title = "punk runtime bug [inc_20260418131132298]: blocked";
+        let issue_body = r#"# Suspected punk runtime bug: blocked
+
+## Summary
+run receipt status is failure: publish command execution flow could not be extracted safely from crates/pubpunk-cli/src/main.rs.
+
+## Report context
+- incident_id: inc_20260418131132298
+- project_id: pubpunk-97a6e32805
+- work_id: feat_20260418131122248
+- decision_outcome: blocked
+
+## Goal
+Only extract the publish command execution from crates/pubpunk-cli/src/main.rs into crates/pubpunk-cli/src/publish_command.rs.
+
+## Blocked reason
+The current work receipt shows a bounded execution failure while trying to preserve exact behavior.
+
+## Why this looks runtime-related
+- decision outcome: blocked
+- work receipt stayed in failure after the bounded execution attempt
+"#;
+        let issue_json = serde_json::json!({
+            "number": 123,
+            "title": issue_title,
+            "body": issue_body,
+            "state": "open",
+            "html_url": "https://github.com/heurema/specpunk/issues/123",
+            "labels": []
+        })
+        .to_string();
+        let issues_json = serde_json::json!([{
+            "number": 123,
+            "title": issue_title,
+            "body": issue_body,
+            "state": "open",
+            "html_url": "https://github.com/heurema/specpunk/issues/123",
+            "labels": []
+        }])
+        .to_string();
+        write_fake_gh_router_script(&fake_gh, &log_path, &issue_json, &issues_json);
+
+        let admission = service
+            .admit_incident_issue_with_gh(123, "heurema/specpunk", false, &fake_gh)
+            .unwrap();
+
+        assert_eq!(admission.decision, IncidentAdmissionDecision::CoreNow);
+        assert_eq!(
+            admission.publish_state,
+            IncidentAdmissionPublishState::Preview
+        );
+        assert!(admission.assessment.has_runtime_report);
+        assert!(admission.assessment.has_deterministic_evidence);
+        assert!(admission.assessment.targets_active_core_surface);
+        assert!(admission.assessment.indicates_core_blocker);
+        assert!(!admission.assessment.high_severity_marker);
+        assert!(admission.matched_runtime_markers.is_empty());
+        assert!(admission.reasons.iter().any(|reason| {
+            reason.contains("targets current core surfaces without later-track markers")
+        }));
+        assert!(admission.reasons.iter().any(|reason| {
+            reason.contains(
+                "runtime report carries blocker signals even without high-severity runtime markers",
+            )
+        }));
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&global);

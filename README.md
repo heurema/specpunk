@@ -238,6 +238,7 @@ Resolution precedence is: explicit flag > repo-local default > global default.
 Auto-run is only suggested and permitted when the effective promote target has a matching `.punk/project.json` identity packet, an `AGENTS.md` guide that identifies `specpunk`, and the expected local `specpunk` markers (`Cargo.toml`, `crates/specpunk/src/main.rs`, `crates/punk-orch/src/lib.rs`, `docs/product/CLI.md`). Otherwise the lane stays draft-only.
 If that internal auto-run fails before it reaches a proof, the promotion record now keeps the last failed phase plus any partial run/receipt/decision refs; retry the same promotion with `punk incident rerun <promotion-id> --auto-run` instead of creating a new promotion bundle.
 `punk incident submit` now embeds a hidden machine-readable runtime packet in the published GitHub issue body, and `punk issue admit` is the general repo intake gate for both those runtime reports and manual backlog issues. It classifies each published GitHub issue as `admission:close-now`, `admission:defer-after-core`, or `admission:core-now`.
+Deterministic runtime reports can now also classify as `core_now` without a named high-severity marker when they clearly block an active core surface instead of describing later-track work.
 Only `core_now` admissions are eligible for immediate core-stabilization work intake; `defer_after_core` stays open but out of the active loop, and `close_now` is the close-now path for invalid, duplicate, obsolete, legacy-surface, or otherwise non-admissible issues.
 
 The intended operator experience is:
