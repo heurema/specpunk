@@ -72,7 +72,44 @@ pub(crate) struct ContextPack {
     pub plan_seed: Option<ContextPlanSeed>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextPackMode {
+    PatchLane,
+    ExecLane,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextFileKind {
+    Rust,
+    Markdown,
+}
+
 pub(crate) fn build_context_pack(repo_root: &Path, contract: &Contract) -> Result<ContextPack> {
+    build_context_pack_with_mode(repo_root, contract, ContextPackMode::PatchLane)
+}
+
+pub(crate) fn build_exec_context_pack(
+    repo_root: &Path,
+    contract: &Contract,
+) -> Result<ContextPack> {
+    build_context_pack_with_mode(repo_root, contract, ContextPackMode::ExecLane)
+}
+
+fn context_file_kind(path: &str, mode: ContextPackMode) -> Option<ContextFileKind> {
+    if path.ends_with(".rs") {
+        return Some(ContextFileKind::Rust);
+    }
+    if matches!(mode, ContextPackMode::ExecLane) && path.ends_with(".md") {
+        return Some(ContextFileKind::Markdown);
+    }
+    None
+}
+
+fn build_context_pack_with_mode(
+    repo_root: &Path,
+    contract: &Contract,
+    mode: ContextPackMode,
+) -> Result<ContextPack> {
     let mut pack = ContextPack::default();
     let mut included_paths = BTreeSet::new();
 
@@ -89,9 +126,9 @@ pub(crate) fn build_context_pack(repo_root: &Path, contract: &Contract) -> Resul
             continue;
         }
 
-        if !path.ends_with(".rs") {
+        let Some(kind) = context_file_kind(path, mode) else {
             continue;
-        }
+        };
 
         let file_path = repo_root.join(path);
         if !file_path.exists() {
@@ -103,7 +140,10 @@ pub(crate) fn build_context_pack(repo_root: &Path, contract: &Contract) -> Resul
 
         let source = fs::read_to_string(&file_path)
             .with_context(|| format!("read context-pack file {path}"))?;
-        pack.files.push(build_rust_excerpt(path, &source));
+        pack.files.push(match kind {
+            ContextFileKind::Rust => build_rust_excerpt(path, &source),
+            ContextFileKind::Markdown => build_markdown_excerpt(path, &source, contract),
+        });
     }
 
     pack.recipe_seed = build_recipe_seed(contract);
@@ -307,12 +347,29 @@ impl Drop for EntryPointExcerptGuard {
     }
 }
 
+fn context_fence_language(path: &str) -> &'static str {
+    if path.ends_with(".rs") {
+        "rust"
+    } else if path.ends_with(".md") {
+        "markdown"
+    } else if path.ends_with(".toml") {
+        "toml"
+    } else if path.ends_with(".json") {
+        "json"
+    } else if path.ends_with(".yml") || path.ends_with(".yaml") {
+        "yaml"
+    } else {
+        "text"
+    }
+}
+
 pub(crate) fn format_context_pack(pack: &ContextPack) -> String {
     let mut sections = Vec::new();
 
     if !pack.files.is_empty() {
         sections.push("Authoritative bounded context pack:".to_string());
         for file in &pack.files {
+            let fence = context_fence_language(&file.path);
             sections.push(format!(
                 "- {} (lines {}-{}, truncated_at_test_boundary: {})",
                 file.path,
@@ -324,7 +381,7 @@ pub(crate) fn format_context_pack(pack: &ContextPack) -> String {
                     "false"
                 }
             ));
-            sections.push("```rust".to_string());
+            sections.push(format!("```{fence}"));
             sections.push(file.content.clone());
             sections.push("```".to_string());
         }
@@ -354,8 +411,9 @@ pub(crate) fn format_context_pack(pack: &ContextPack) -> String {
         sections.push(format!("- title: {}", seed.title));
         sections.push(format!("- summary: {}", seed.summary));
         for file in &seed.files {
+            let fence = context_fence_language(&file.path);
             sections.push(format!("- file: {} ({})", file.path, file.purpose));
-            sections.push("```rust".to_string());
+            sections.push(format!("```{fence}"));
             sections.push(file.snippet.clone());
             sections.push("```".to_string());
         }
@@ -370,6 +428,7 @@ pub(crate) fn format_patch_context_pack(pack: &ContextPack) -> String {
     if !pack.files.is_empty() {
         sections.push("Patch lane bounded context:".to_string());
         for file in &pack.files {
+            let fence = context_fence_language(&file.path);
             sections.push(format!(
                 "- {} (lines {}-{}, truncated_at_test_boundary: {})",
                 file.path,
@@ -381,7 +440,7 @@ pub(crate) fn format_patch_context_pack(pack: &ContextPack) -> String {
                     "false"
                 }
             ));
-            sections.push("```rust".to_string());
+            sections.push(format!("```{fence}"));
             sections.push(compact_patch_excerpt(&file.content, 80, 4000));
             sections.push("```".to_string());
         }
@@ -399,8 +458,9 @@ pub(crate) fn format_patch_context_pack(pack: &ContextPack) -> String {
         sections.push(format!("- title: {}", seed.title));
         sections.push(format!("- summary: {}", seed.summary));
         for file in &seed.files {
+            let fence = context_fence_language(&file.path);
             sections.push(format!("- file: {} ({})", file.path, file.purpose));
-            sections.push("```rust".to_string());
+            sections.push(format!("```{fence}"));
             sections.push(compact_patch_excerpt(&file.snippet, 60, 2500));
             sections.push("```".to_string());
         }
@@ -417,7 +477,8 @@ pub(crate) fn format_patch_context_pack(pack: &ContextPack) -> String {
             ));
             sections.push(format!("  sketch: {}", target.execution_sketch));
             if !target.anchor_excerpt.trim().is_empty() {
-                sections.push("```rust".to_string());
+                let fence = context_fence_language(&target.path);
+                sections.push(format!("```{fence}"));
                 sections.push(target.anchor_excerpt.clone());
                 sections.push("```".to_string());
             }
@@ -447,6 +508,7 @@ pub(crate) fn format_plan_context_pack(pack: &ContextPack) -> String {
     if !pack.files.is_empty() {
         sections.push("Plan prepass bounded context:".to_string());
         for file in &pack.files {
+            let fence = context_fence_language(&file.path);
             sections.push(format!(
                 "- {} (lines {}-{}, truncated_at_test_boundary: {})",
                 file.path,
@@ -458,7 +520,7 @@ pub(crate) fn format_plan_context_pack(pack: &ContextPack) -> String {
                     "false"
                 }
             ));
-            sections.push("```rust".to_string());
+            sections.push(format!("```{fence}"));
             sections.push(compact_patch_excerpt(&file.content, 50, 2200));
             sections.push("```".to_string());
         }
@@ -482,7 +544,8 @@ pub(crate) fn format_plan_context_pack(pack: &ContextPack) -> String {
             ));
             sections.push(format!("  sketch: {}", target.execution_sketch));
             if !target.anchor_excerpt.trim().is_empty() {
-                sections.push("```rust".to_string());
+                let fence = context_fence_language(&target.path);
+                sections.push(format!("```{fence}"));
                 sections.push(target.anchor_excerpt.clone());
                 sections.push("```".to_string());
             }
@@ -789,6 +852,113 @@ fn build_rust_excerpt(path: &str, source: &str) -> ContextFileExcerpt {
         truncated_at_test_boundary: boundary_line.is_some(),
         content: excerpt_lines.join("\n"),
     }
+}
+
+fn build_markdown_excerpt(path: &str, source: &str, contract: &Contract) -> ContextFileExcerpt {
+    let lines: Vec<&str> = source.lines().collect();
+    if lines.is_empty() {
+        return ContextFileExcerpt {
+            path: path.to_string(),
+            start_line: 1,
+            end_line: 0,
+            truncated_at_test_boundary: false,
+            content: String::new(),
+        };
+    }
+
+    let section = best_markdown_excerpt_section(&lines, contract);
+    let content = lines[section.0 - 1..section.1].join("\n");
+    ContextFileExcerpt {
+        path: path.to_string(),
+        start_line: section.0,
+        end_line: section.1,
+        truncated_at_test_boundary: false,
+        content,
+    }
+}
+
+fn best_markdown_excerpt_section(lines: &[&str], contract: &Contract) -> (usize, usize) {
+    let sections = markdown_sections(lines);
+    if sections.is_empty() {
+        return (1, lines.len());
+    }
+
+    let terms = contract_terms(contract);
+    let best = sections
+        .iter()
+        .copied()
+        .max_by_key(|(start, end)| markdown_section_score(lines, *start, *end, &terms))
+        .unwrap_or((1, lines.len()));
+
+    let best_score = markdown_section_score(lines, best.0, best.1, &terms);
+    let selected = if best_score == 0 { sections[0] } else { best };
+    narrow_excerpt_window(lines, selected, &terms, 120)
+}
+
+fn markdown_sections(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut sections = Vec::new();
+    let mut start = 1usize;
+
+    for (idx, line) in lines.iter().enumerate().skip(1) {
+        if line.trim_start().starts_with('#') {
+            sections.push((start, idx));
+            start = idx + 1;
+        }
+    }
+    sections.push((start, lines.len()));
+    sections
+}
+
+fn markdown_section_score(
+    lines: &[&str],
+    start_line: usize,
+    end_line: usize,
+    terms: &[String],
+) -> usize {
+    let mut score = 0usize;
+    for (offset, line) in lines[start_line - 1..end_line].iter().enumerate() {
+        let lowered = line.to_ascii_lowercase();
+        for term in terms {
+            if lowered.contains(term) {
+                score += if offset == 0 && line.trim_start().starts_with('#') {
+                    3
+                } else {
+                    1
+                };
+            }
+        }
+    }
+    score
+}
+
+fn narrow_excerpt_window(
+    lines: &[&str],
+    section: (usize, usize),
+    terms: &[String],
+    max_lines: usize,
+) -> (usize, usize) {
+    let (section_start, section_end) = section;
+    let section_len = section_end.saturating_sub(section_start).saturating_add(1);
+    if section_len <= max_lines {
+        return section;
+    }
+
+    let match_line = lines[section_start - 1..section_end]
+        .iter()
+        .enumerate()
+        .find_map(|(offset, line)| {
+            let lowered = line.to_ascii_lowercase();
+            terms
+                .iter()
+                .any(|term| lowered.contains(term))
+                .then_some(section_start + offset)
+        });
+
+    let start_line = match_line
+        .map(|line| line.saturating_sub(20).max(section_start))
+        .unwrap_or(section_start);
+    let end_line = (start_line + max_lines - 1).min(section_end);
+    (start_line, end_line)
 }
 
 fn first_rust_test_boundary_line(source: &str) -> Option<usize> {
@@ -3292,6 +3462,75 @@ fn parse_project_toml_value(value: &str) -> Result<String, ()> {
         assert!(lib_excerpt.truncated_at_test_boundary);
         assert!(lib_excerpt.content.contains("pub fn keep() {}"));
         assert!(!lib_excerpt.content.contains("mod tests"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_exec_context_pack_includes_markdown_excerpt_for_docs_slice() {
+        let root =
+            std::env::temp_dir().join(format!("punk-context-pack-markdown-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(
+            root.join("docs/ARCHITECTURE.md"),
+            "# Architecture\n\n## Runtime\nPubPunk stores project-local data under .pubpunk/.\n\n## Global aliases\nUse the platform-native config directory for aliases.toml and the OS keyring for secrets.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("docs/PROJECT_CONTRACT.md"),
+            "# Project contract\n\n## Global aliases\nThe global alias contract must stay cross-platform and must not hardcode an XDG-only path.\n",
+        )
+        .unwrap();
+
+        let contract = Contract {
+            id: "ct_docs".into(),
+            feature_id: "feat_docs".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Update ONLY docs/ARCHITECTURE.md and docs/PROJECT_CONTRACT.md to fix the global alias contract as cross-platform.".into(),
+            entry_points: vec![
+                "docs/ARCHITECTURE.md".into(),
+                "docs/PROJECT_CONTRACT.md".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["platform-native config directory for aliases.toml".into()],
+            behavior_requirements: vec!["document OS keyring for secrets".into()],
+            allowed_scope: vec![
+                "docs/ARCHITECTURE.md".into(),
+                "docs/PROJECT_CONTRACT.md".into(),
+            ],
+            target_checks: vec![],
+            integrity_checks: vec![],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let patch_pack = build_context_pack(&root, &contract).unwrap();
+        assert!(patch_pack.files.is_empty());
+
+        let exec_pack = build_exec_context_pack(&root, &contract).unwrap();
+        let architecture = exec_pack
+            .files
+            .iter()
+            .find(|file| file.path == "docs/ARCHITECTURE.md")
+            .expect("expected architecture excerpt");
+        let project_contract = exec_pack
+            .files
+            .iter()
+            .find(|file| file.path == "docs/PROJECT_CONTRACT.md")
+            .expect("expected project contract excerpt");
+
+        assert!(architecture
+            .content
+            .contains("platform-native config directory"));
+        assert!(architecture.content.contains("OS keyring"));
+        assert!(project_contract.content.contains("cross-platform"));
+        assert!(project_contract.content.contains("XDG-only path"));
+
+        let rendered = format_context_pack(&exec_pack);
+        assert!(rendered.contains("```markdown"));
 
         let _ = fs::remove_dir_all(&root);
     }

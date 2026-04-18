@@ -30,11 +30,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use context_pack::{
-    build_context_pack, derive_plan_seed, ensure_retry_patch_seed, format_context_pack,
-    format_patch_context_pack, format_plan_context_pack, hydrate_plan_seed_excerpts,
-    materialize_missing_entry_points, restore_missing_materialized_entry_points,
-    restore_stale_entry_point_masks, scaffold_only_entry_points, ContextPack, ContextPlanSeed,
-    ContextPlanTarget, EntryPointExcerptGuard,
+    build_context_pack, build_exec_context_pack, derive_plan_seed, ensure_retry_patch_seed,
+    format_context_pack, format_patch_context_pack, format_plan_context_pack,
+    hydrate_plan_seed_excerpts, materialize_missing_entry_points,
+    restore_missing_materialized_entry_points, restore_stale_entry_point_masks,
+    scaffold_only_entry_points, ContextPack, ContextPlanSeed, ContextPlanTarget,
+    EntryPointExcerptGuard,
 };
 use punk_domain::{Contract, DraftInput, DraftProposal, FrozenCapabilityResolution, RefineInput};
 use std::collections::BTreeSet;
@@ -1272,7 +1273,7 @@ impl CodexCliExecutor {
         retry_mode: bool,
     ) -> Result<AttemptOutcome> {
         let context_pack = if is_fail_closed_scope_task(&input.contract) {
-            let mut pack = build_context_pack(&input.repo_root, &input.contract)?;
+            let mut pack = build_exec_context_pack(&input.repo_root, &input.contract)?;
             if retry_mode {
                 ensure_retry_patch_seed(&input.repo_root, &input.contract, &mut pack);
             }
@@ -7233,6 +7234,56 @@ mod tests {
         assert!(prompt.contains(
             "For this directory-scoped slice, treat these listed files as the initial bounded edit set before doing any more orientation."
         ));
+    }
+
+    #[test]
+    fn build_exec_prompt_embeds_markdown_context_pack_for_docs_slice() {
+        let contract = Contract {
+            id: "ct_docs".into(),
+            feature_id: "feat_docs".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "Update ONLY docs/ARCHITECTURE.md and docs/PROJECT_CONTRACT.md to fix the global alias contract as cross-platform.".into(),
+            entry_points: vec![
+                "docs/ARCHITECTURE.md".into(),
+                "docs/PROJECT_CONTRACT.md".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec!["platform-native config directory for aliases.toml".into()],
+            behavior_requirements: vec!["document OS keyring for secrets".into()],
+            allowed_scope: vec![
+                "docs/ARCHITECTURE.md".into(),
+                "docs/PROJECT_CONTRACT.md".into(),
+            ],
+            target_checks: vec![],
+            integrity_checks: vec![],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+
+        let prompt = build_exec_prompt(
+            &contract,
+            Some(&ContextPack {
+                files: vec![crate::context_pack::ContextFileExcerpt {
+                    path: "docs/ARCHITECTURE.md".into(),
+                    start_line: 1,
+                    end_line: 5,
+                    truncated_at_test_boundary: false,
+                    content: "# Architecture\n\n## Global aliases\nUse the platform-native config directory for aliases.toml and the OS keyring for secrets.\n".into(),
+                }],
+                missing_paths: Vec::new(),
+                recipe_seed: None,
+                patch_seed: None,
+                plan_seed: None,
+            }),
+            &[],
+        );
+
+        assert!(prompt.contains("Authoritative bounded context pack:"));
+        assert!(prompt.contains("```markdown"));
+        assert!(prompt.contains("platform-native config directory"));
+        assert!(prompt.contains("OS keyring"));
     }
 
     #[test]
