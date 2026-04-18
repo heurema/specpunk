@@ -697,7 +697,11 @@ fn find_target_anchor_excerpt(
         .map(|line| line.trim())
         .unwrap_or_default();
     if matched_line.starts_with("fn ") || matched_line.starts_with("pub fn ") {
-        return Some(render_function_excerpt(file, line_number, 120));
+        return Some(render_function_excerpt(
+            file,
+            line_number,
+            function_excerpt_line_budget(&file.path, matched_line),
+        ));
     }
 
     Some(render_window_excerpt(file, line_number, 2))
@@ -1685,7 +1689,7 @@ fn anchor_score(
         if signature_lc.contains("parse_args") {
             score += 22;
         }
-        if signature_lc.starts_with("pub fn run(") || signature_lc.starts_with("fn run(") {
+        if function_signature_has_name(&signature_lc, "run") {
             score += 18;
         }
         if signature_lc.contains("usage") || signature_lc.contains("help") {
@@ -1756,11 +1760,40 @@ fn anchor_symbol_name(signature: &str) -> Option<&str> {
     None
 }
 
+fn function_signature_has_name(signature_lc: &str, name: &str) -> bool {
+    ["pub fn ", "fn "].iter().any(|prefix| {
+        signature_lc.strip_prefix(prefix).is_some_and(|tail| {
+            tail.starts_with(name)
+                && tail
+                    .chars()
+                    .nth(name.len())
+                    .is_some_and(|ch| matches!(ch, '(' | '<' | ' '))
+        })
+    })
+}
+
 fn render_anchor_excerpt(file: &ContextFileExcerpt, anchor: &SymbolAnchor) -> String {
     if anchor.signature.starts_with("fn ") || anchor.signature.starts_with("pub fn ") {
-        return render_function_excerpt(file, anchor.line_number, 120);
+        return render_function_excerpt(
+            file,
+            anchor.line_number,
+            function_excerpt_line_budget(&file.path, &anchor.signature),
+        );
     }
     render_window_excerpt(file, anchor.line_number, 1)
+}
+
+fn function_excerpt_line_budget(path: &str, signature: &str) -> usize {
+    let path_lc = path.to_ascii_lowercase();
+    let signature_lc = signature.to_ascii_lowercase();
+    if path_lc.ends_with("main.rs")
+        && (function_signature_has_name(&signature_lc, "run")
+            || function_signature_has_name(&signature_lc, "parse_args"))
+    {
+        130
+    } else {
+        120
+    }
 }
 
 fn render_function_excerpt(
@@ -2631,6 +2664,202 @@ mod tests {
         }));
         assert!(seed.targets.iter().any(|target| {
             target.path == "crates/pubpunk-cli/src/main.rs" && target.symbol.contains("fn run")
+        }));
+    }
+
+    #[test]
+    fn derive_plan_seed_prefers_generic_run_and_publish_windows_for_cli_extract_slice() {
+        let contract = Contract {
+            id: "ct_pubpunk_publish_extract".into(),
+            feature_id: "feat_pubpunk_publish_extract".into(),
+            version: 1,
+            status: punk_domain::ContractStatus::Approved,
+            prompt_source: "only extract the publish command execution from crates/pubpunk-cli/src/main.rs into crates/pubpunk-cli/src/publish_command.rs; do not touch core, schemas, or tests; preserve behavior exactly; this is refactor-only headroom work".into(),
+            entry_points: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-cli/src/publish_command.rs".into(),
+            ],
+            import_paths: vec![],
+            expected_interfaces: vec![
+                "main.rs continues to own CLI wiring and delegates publish command execution to publish_command.rs.".into(),
+                "publish_command.rs exposes the extracted publish execution logic needed by main.rs without changing observable behavior.".into(),
+            ],
+            behavior_requirements: vec![
+                "Extract only the publish command execution flow from crates/pubpunk-cli/src/main.rs into crates/pubpunk-cli/src/publish_command.rs.".into(),
+                "Preserve behavior exactly; this is refactor-only work with no intended functional changes.".into(),
+                "Keep the CLI contract unchanged from the caller perspective.".into(),
+            ],
+            allowed_scope: vec![
+                "crates/pubpunk-cli/src/main.rs".into(),
+                "crates/pubpunk-cli/src/publish_command.rs".into(),
+            ],
+            target_checks: vec!["cargo test -p pubpunk-cli".into()],
+            integrity_checks: vec!["cargo test --workspace".into()],
+            risk_level: "low".into(),
+            created_at: "now".into(),
+            approved_at: Some("now".into()),
+        };
+        let pack = ContextPack {
+            files: vec![ContextFileExcerpt {
+                path: "crates/pubpunk-cli/src/main.rs".into(),
+                start_line: 1,
+                end_line: 131,
+                truncated_at_test_boundary: false,
+                content: r#"use std::env;
+use std::path::{Path, PathBuf};
+use std::process::{self, ExitCode};
+
+fn main() -> ExitCode {
+    match run(env::args().skip(1), Path::new(".")) {
+        Ok(output) => {
+            if !output.text.is_empty() {
+                println!("{}", output.text);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(output) => {
+            if !output.text.is_empty() {
+                eprintln!("{}", output.text);
+            }
+            process::ExitCode::from(1)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunOutput {
+    pub text: String,
+    pub prefer_stdout: bool,
+}
+
+pub fn run<I>(args: I, cwd: &Path) -> Result<RunOutput, RunOutput>
+where
+    I: IntoIterator<Item = String>,
+{
+    let command = parse_args(args).map_err(RunOutput::stderr)?;
+    match command {
+        Command::Init { json, force, project_root } => {
+            let _ = (json, force, project_root, cwd);
+            Ok(RunOutput::stdout("init".to_string()))
+        }
+        Command::Review { json, project_root } => {
+            let _ = (json, project_root, cwd);
+            Ok(RunOutput::stdout("review".to_string()))
+        }
+        Command::Publish { json, project_root } => {
+            let root = project_root.unwrap_or_else(|| cwd.to_path_buf());
+            let result = pubpunk_core::publish_local(&root)
+                .map_err(|err| RunOutput::stderr(format!("pubpunk publish failed: {err}")))?;
+            if json {
+                Ok(RunOutput::stdout(result.to_json()))
+            } else {
+                Ok(RunOutput::stdout("Publish preflight completed".to_string()))
+            }
+        }
+        Command::ConfigureStyle { json, project_root, request } => {
+            let _ = (json, project_root, request);
+            Ok(RunOutput::stdout("style".to_string()))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Command {
+    Init { json: bool, force: bool, project_root: Option<PathBuf> },
+    Review { json: bool, project_root: Option<PathBuf> },
+    Publish { json: bool, project_root: Option<PathBuf> },
+    ConfigureStyle { json: bool, project_root: Option<PathBuf>, request: String },
+}
+
+fn parse_args<I>(args: I) -> Result<Command, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let Some(command) = args.next() else {
+        return Err(usage());
+    };
+
+    match command.as_str() {
+        "review" => {
+            let mut json = false;
+            let mut project_root = None;
+            let mut args = args.peekable();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    "--project-root" => project_root = Some(PathBuf::from(args.next().unwrap())),
+                    _ => return Err(format!("unknown argument for review: {arg}\n{}", usage())),
+                }
+            }
+            Ok(Command::Review { json, project_root })
+        }
+        "publish" => {
+            let mut json = false;
+            let mut project_root = None;
+            let mut args = args.peekable();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    "--project-root" => project_root = Some(PathBuf::from(args.next().unwrap())),
+                    _ => return Err(format!("unknown argument for publish: {arg}\n{}", usage())),
+                }
+            }
+            Ok(Command::Publish { json, project_root })
+        }
+        _ => Err(format!("unknown command: {command}\n{}", usage())),
+    }
+}
+
+fn usage() -> String {
+    concat!(
+        "usage: pubpunk <init|validate|doctor|render|review|publish|configure|style|target> [--json] [--force] [--project-root <path>]\n",
+        "       pubpunk review [--json] [--project-root <path>]\n",
+        "       pubpunk publish [--json] [--project-root <path>]\n",
+    )
+    .to_string()
+}
+"#
+                .into(),
+            }],
+            missing_paths: vec![],
+            recipe_seed: None,
+            patch_seed: None,
+            plan_seed: None,
+        };
+
+        let seed = derive_plan_seed(&contract, &pack);
+
+        assert_eq!(seed.targets.len(), 3);
+        let run_target = seed
+            .targets
+            .iter()
+            .find(|target| {
+                target.path == "crates/pubpunk-cli/src/main.rs"
+                    && target.symbol.contains("pub fn run<I>")
+            })
+            .expect("expected generic run target");
+        assert!(run_target
+            .anchor_excerpt
+            .contains("Command::Publish { json, project_root } => {"));
+        assert!(run_target.anchor_excerpt.contains("result.to_json()"));
+        assert!(run_target
+            .anchor_excerpt
+            .contains("Publish preflight completed"));
+        let parse_args_target = seed
+            .targets
+            .iter()
+            .find(|target| {
+                target.path == "crates/pubpunk-cli/src/main.rs"
+                    && target.symbol.contains("fn parse_args<I>")
+            })
+            .expect("expected parse_args target");
+        assert!(parse_args_target
+            .anchor_excerpt
+            .contains("Ok(Command::Publish { json, project_root })"));
+        assert!(!seed.targets.iter().any(|target| {
+            target.path == "crates/pubpunk-cli/src/main.rs"
+                && target.symbol.contains("fn main() -> ExitCode")
         }));
     }
 
