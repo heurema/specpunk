@@ -7,3 +7,6 @@ docs/research/_delve_runs/
 docs/reference-repos/
 target/
 .playwright-mcp/
+site/node_modules/
+site/dist/
+site/.astro/

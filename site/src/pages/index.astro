@@ -1,0 +1,71 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import VeckMascot from '../components/VeckMascot.astro';
+import Wordmark from '../components/Wordmark.astro';
+import styles from './index.module.css';
+---
+
+<BaseLayout title="SpecPunk" description="The runtime that keeps AI agents on spec.">
+  <div class={styles.page}>
+    <nav class={styles.nav}>
+      <Wordmark />
+      <ul class={styles.navLinks}>
+        <li><a class={styles.navLink} href="https://docs.specpunk.com">Docs</a></li>
+        <li><a class={styles.navLink} href="https://github.com/heurema/specpunk">GitHub</a></li>
+      </ul>
+    </nav>
+
+    <main class={styles.hero}>
+      <section class={styles.copy}>
+        <div class:list={[styles.eyebrow, styles.fadeUp]}>
+          <span class={styles.eyebrowLine}></span>
+          <span class={styles.eyebrowText}>Local-first · v0.1 early access</span>
+        </div>
+
+        <h1 class:list={[styles.title, styles.fadeUp]}>The runtime that keeps<br />AI agents on spec.</h1>
+
+        <p class:list={[styles.subtitle, styles.fadeUp]}>
+          SpecPunk runs locally, tracks context, and enforces your specs — so AI work stays scoped,
+          bounded, and useful.
+        </p>
+
+        <div class:list={[styles.ctaRow, styles.fadeUp]}>
+          <a class={styles.buttonPrimary} href="https://docs.specpunk.com">
+            Read the docs
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+              <path
+                d="M2 6h8M7 3l3 3-3 3"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </a>
+          <a class={styles.buttonSecondary} href="https://github.com/heurema/specpunk">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <path d="M12 2C6.477 2 2 6.484 2 12.021c0 4.428 2.865 8.185 6.839 9.504.5.092.682-.217.682-.483 0-.237-.009-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844a9.59 9.59 0 012.504.337c1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.02 10.02 0 0022 12.021C22 6.484 17.522 2 12 2z" />
+            </svg>
+            GitHub
+          </a>
+        </div>
+      </section>
+
+      <section class:list={[styles.mascotColumn, styles.fadeIn]}>
+        <VeckMascot />
+      </section>
+    </main>
+
+    <div class={styles.statusStrip}>
+      <div class={styles.statusLive}>
+        <div class={styles.statusDot}></div>
+        runtime idle
+      </div>
+      <span class={styles.statusSep}>·</span>
+      <span>spec@0.1.0</span>
+      <span class={styles.statusSep}>·</span>
+      <span>no active context</span>
+      <span class={styles.statusRight}>local process · pid —</span>
+    </div>
+  </div>
+</BaseLayout>

@@ -1,0 +1,130 @@
+---
+import styles from './VeckMascot.module.css';
+---
+
+<svg class={styles.rings} width="460" height="460" viewBox="0 0 460 460" aria-hidden="true">
+  <circle cx="230" cy="230" r="90" stroke-dasharray="3 9" />
+  <circle cx="230" cy="230" r="148" stroke-dasharray="2 11" />
+  <circle cx="230" cy="230" r="206" stroke-dasharray="1.5 14" />
+</svg>
+
+<svg class={styles.frame} width="380" height="380" viewBox="0 0 380 380" aria-hidden="true">
+  <circle
+    cx="190"
+    cy="190"
+    r="162"
+    fill="none"
+    stroke="oklch(0.20 0.012 262)"
+    stroke-width="1"
+    stroke-dashoffset="0"
+    opacity="0.6"
+    pathLength="100"
+    stroke-dasharray="68 32"
+  />
+</svg>
+
+<div class={styles.glow} aria-hidden="true"></div>
+<div class={styles.floor} aria-hidden="true"></div>
+
+<div class={styles.wrap}>
+  <svg
+    class={styles.svg}
+    viewBox="0 0 220 210"
+    xmlns="http://www.w3.org/2000/svg"
+    fill="none"
+    aria-labelledby="veck-title veck-desc"
+    role="img"
+  >
+    <title id="veck-title">VECK mascot</title>
+    <desc id="veck-desc">Dark asymmetric SpecPunk mascot with a single blinking magenta eye.</desc>
+
+    <defs>
+      <radialGradient id="bodyFill" cx="55%" cy="42%" r="52%">
+        <stop offset="0%" stop-color="oklch(0.26 0.016 262)" />
+        <stop offset="60%" stop-color="oklch(0.16 0.015 262)" />
+        <stop offset="100%" stop-color="oklch(0.10 0.013 262)" />
+      </radialGradient>
+      <radialGradient id="eyeCore" cx="48%" cy="35%" r="58%">
+        <stop offset="0%" stop-color="oklch(0.94 0.14 330)" />
+        <stop offset="45%" stop-color="oklch(0.70 0.27 330)" />
+        <stop offset="100%" stop-color="oklch(0.50 0.26 330)" />
+      </radialGradient>
+      <filter id="eyeBloom" x="-50%" y="-50%" width="200%" height="200%">
+        <feGaussianBlur in="SourceGraphic" stdDeviation="3" result="blur" />
+        <feMerge>
+          <feMergeNode in="blur" />
+          <feMergeNode in="SourceGraphic" />
+        </feMerge>
+      </filter>
+    </defs>
+
+    <path
+      d="M 32 152 C 10 136 5 106 9 76 C 13 48 30 24 54 15 L 64 10 L 80 12 C 108 4 142 6 166 22 C 184 36 196 62 194 92 C 192 120 176 146 154 160 C 128 175 72 174 32 152 Z"
+      fill="url(#bodyFill)"
+      stroke="oklch(0.46 0.015 262)"
+      stroke-width="1.6"
+    />
+    <path
+      d="M 138 14 C 160 20 180 38 190 64"
+      fill="none"
+      stroke="oklch(0.34 0.014 262)"
+      stroke-width="1.2"
+      stroke-linecap="round"
+      opacity="0.75"
+    />
+    <path
+      d="M 60 15 C 52 5 46 -16 51 -36 L 55 -42 C 60 -26 66 -8 78 12 Z"
+      fill="oklch(0.16 0.015 262)"
+      stroke="oklch(0.36 0.016 262)"
+      stroke-width="1.4"
+      stroke-linejoin="round"
+    />
+    <path
+      d="M 62 14 C 58 2 56 -18 55 -42"
+      fill="none"
+      stroke="oklch(0.44 0.015 262)"
+      stroke-width="0.9"
+      stroke-linecap="round"
+    />
+    <path
+      d="M 80 13 C 76 4 74 -8 76 -18 L 78 -22 C 81 -13 83 -2 87 11 Z"
+      fill="oklch(0.13 0.013 262)"
+      stroke="oklch(0.28 0.013 262)"
+      stroke-width="1"
+      stroke-linejoin="round"
+    />
+    <path
+      d="M 122 68 L 152 57 L 176 63"
+      fill="none"
+      stroke="oklch(0.44 0.015 262)"
+      stroke-width="2.8"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+    <circle cx="64" cy="90" r="9" fill="oklch(0.11 0.013 262)" stroke="oklch(0.26 0.013 262)" stroke-width="1" />
+    <circle cx="64" cy="90" r="4.5" fill="oklch(0.07 0.010 262)" />
+    <circle cx="66" cy="88" r="1.2" fill="oklch(0.32 0.010 262)" opacity="0.7" />
+    <path
+      d="M 106 108 Q 128 116 144 112"
+      fill="none"
+      stroke="oklch(0.23 0.012 262)"
+      stroke-width="1.2"
+      stroke-linecap="round"
+      opacity="0.65"
+    />
+    <path
+      d="M 46 148 Q 96 168 152 158"
+      fill="none"
+      stroke="oklch(0.26 0.013 262)"
+      stroke-width="1.2"
+      stroke-linecap="round"
+      opacity="0.55"
+    />
+    <circle cx="154" cy="86" r="22" fill="oklch(0.10 0.013 262)" />
+    <circle cx="154" cy="86" r="20" fill="oklch(0.64 0.27 330 / 0.20)" filter="url(#eyeBloom)" />
+    <circle cx="154" cy="86" r="16" fill="url(#eyeCore)" filter="url(#eyeBloom)" class={styles.eyeOrb} />
+    <circle cx="154" cy="86" r="6" fill="oklch(0.08 0.02 320)" class={styles.eyePupil} />
+  </svg>
+</div>
+
+<div class={styles.label}>VECK · runtime agent</div>

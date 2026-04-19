@@ -27,6 +27,20 @@ This repo is in a **design reset / rebuild** phase.
 
 No backward compatibility is required. The project has not launched, so the repo is being reshaped toward the cleanest final design.
 
+## Landing site
+
+The public landing now lives as an Astro app under `site/`.
+
+Build it locally with:
+
+```bash
+cd site
+npm install
+npm run build
+```
+
+Cloudflare Pages should publish the generated output from `site/dist`.
+
 ## Read this first
 
 If you are orienting in the repo or choosing the next bounded slice, read in this order:

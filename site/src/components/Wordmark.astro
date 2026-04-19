@@ -1,0 +1,33 @@
+---
+import styles from './Wordmark.module.css';
+
+interface Props {
+  href?: string;
+}
+
+const { href = '/' } = Astro.props;
+---
+
+<a href={href} class={styles.wordmark} aria-label="SpecPunk home">
+  <div class={styles.icon}>
+    <svg viewBox="0 0 24 24" width="24" height="24" fill="none">
+      <path
+        d="M 3 19 C 1 17 1 13 2 10 C 3 7 5 5 8 4 L 10 3 L 9 1 L 11 3 C 14 2 17 3 19 5 C 21 7 22 10 21 13 C 20 16 18 18 15 19 C 12 21 6 21 3 19 Z"
+        fill="var(--bg-raised)"
+        stroke="oklch(0.30 0.013 262)"
+        stroke-width="0.8"
+      />
+      <path
+        d="M 9.5 3.5 C 8.5 1.5 8 0 8.5 -1 L 9 -1.5 C 9.5 0 10 1.5 11 3 Z"
+        fill="oklch(0.22 0.013 262)"
+        stroke="oklch(0.36 0.015 262)"
+        stroke-width="0.6"
+      />
+      <circle cx="15" cy="11" r="3.2" fill="var(--accent-oklch)" style="filter: drop-shadow(0 0 3px var(--accent-glow-oklch));" />
+      <circle cx="15" cy="11" r="1.2" fill="oklch(0.09 0.02 320)" />
+      <circle cx="9" cy="11.5" r="1.8" fill="oklch(0.12 0.012 262)" stroke="oklch(0.26 0.013 262)" stroke-width="0.6" />
+      <circle cx="9" cy="11.5" r="0.7" fill="oklch(0.07 0.01 262)" />
+    </svg>
+  </div>
+  <span class={styles.name}>Spec<span class={styles.accent}>Punk</span></span>
+</a>

@@ -1,0 +1,30 @@
+.wordmark {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  text-decoration: none;
+  color: var(--text);
+  color: var(--text-oklch);
+}
+
+.icon {
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+}
+
+.icon :global(svg) {
+  overflow: visible;
+}
+
+.name {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  line-height: 1;
+}
+
+.accent {
+  color: var(--accent);
+  color: var(--accent-oklch);
+}
